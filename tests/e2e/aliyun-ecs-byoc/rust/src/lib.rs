@@ -573,9 +573,44 @@ pub fn make_tags(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Encodes a PowerShell script as UTF-16LE Base64 for `powershell -EncodedCommand`.
+/// This avoids POSIX `exec_line()` / Windows `cmd.exe /d /s /c` quoting and `|` splitting issues.
+pub fn encode_powershell_utf16le_b64(script: &str) -> String {
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_powershell_utf16le_base64_safely_and_round_trips() {
+        assert_eq!(encode_powershell_utf16le_b64("hi"), "aABpAA==");
+
+        let probe = concat!(
+            "$ErrorActionPreference = 'Continue'; ",
+            "Get-Process -Name 'cua-spacesd' | Select-Object -First 1; ",
+            "Write-Output \"AUTO=$($wl.AutoAdminLogon)|中文\""
+        );
+        let encoded = encode_powershell_utf16le_b64(probe);
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')),
+            "encoded command must contain only shell-safe Base64 characters: {encoded}"
+        );
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .expect("valid base64");
+        assert_eq!(raw.len() % 2, 0, "UTF-16LE byte length must be even");
+        let code_units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let decoded = String::from_utf16(&code_units).expect("valid UTF-16LE");
+        assert_eq!(decoded, probe);
+    }
 
     #[test]
     fn decodes_cloud_config_b64_write_files_and_extracts_env_token() {

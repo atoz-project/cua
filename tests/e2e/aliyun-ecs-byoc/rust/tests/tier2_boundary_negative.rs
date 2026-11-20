@@ -1762,6 +1762,11 @@ async fn t2_f7_02() {
         ])
         .await;
     assert_ne!(out.code, 0);
+    let combined = out.combined();
+    assert!(
+        combined.contains("stopped") || combined.contains("before its sandbox came online"),
+        "expected boot-failure error message, got: {combined}"
+    );
     let f = w.aliyun.lock().unwrap();
     assert!(
         non_dry_run_instances_count(&f) >= 1,

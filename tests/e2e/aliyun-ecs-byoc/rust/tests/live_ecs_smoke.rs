@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use aliyun_ecs_byoc_e2e::resolve_cua_bin;
+use aliyun_ecs_byoc_e2e::{encode_powershell_utf16le_b64, resolve_cua_bin};
 use futures_util::FutureExt as _;
 use tokio::io::AsyncWriteExt;
 
@@ -418,6 +418,7 @@ async fn live_ecs_smoke() {
             "$act = ($_.Actions | ForEach-Object { \"$($_.Execute) $($_.Arguments)\" }) -join ';'; ",
             "Write-Output \"TASK=$($_.TaskName)|TRIG=$trig|ACT=$act\" }"
         );
+        let encoded_ps_probe = encode_powershell_utf16le_b64(ps_probe);
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &[
@@ -426,8 +427,8 @@ async fn live_ecs_smoke() {
                 &windows_native_name,
                 "powershell",
                 "-NoProfile",
-                "-Command",
-                ps_probe,
+                "-EncodedCommand",
+                &encoded_ps_probe,
             ],
             None,
         )
