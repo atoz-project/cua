@@ -639,7 +639,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             image: spec.image.pinned_ref.clone(),
             kind: "container".into(),
             machine_type: offer.machine_type.clone(),
-            disk_gb: disk_for(family),
+            disk_gb: self.api.default_disk_gb(family),
             cpus: Some(spec.cpus),
             memory_mb: Some(spec.memory_mb),
             tags: rec.tags.clone(),

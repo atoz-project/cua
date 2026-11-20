@@ -49,7 +49,7 @@ pub struct Verdict {
 fn delete_rank(resource_type: &str) -> u8 {
     match resource_type {
         "instance" | "sandbox" => 0,
-        "subnet" => 2,
+        "subnet" | "vswitch" => 2,
         "route_table" => 3,
         "internet_gateway" => 4,
         "vpc" => 5,
@@ -534,5 +534,13 @@ mod tests {
         assert!(!verdict(&sg, &t, "me", &[], false, false, NOW).delete);
         assert!(!verdict(&sg, &t, "me", &[], true, true, NOW).delete);
         assert!(verdict(&sg, &t, "me", &[], true, false, NOW).delete);
+    }
+
+    #[test]
+    fn delete_rank_orders_inside_out_with_vswitch_after_security_group() {
+        assert!(delete_rank("instance") < delete_rank("security_group"));
+        assert!(delete_rank("security_group") < delete_rank("vswitch"));
+        assert_eq!(delete_rank("vswitch"), delete_rank("subnet"));
+        assert!(delete_rank("vswitch") < delete_rank("vpc"));
     }
 }

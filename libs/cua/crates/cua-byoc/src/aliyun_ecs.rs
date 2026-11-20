@@ -18,17 +18,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use cua_sandbox_core::Error;
 use cua_sandbox_core::byoc::{CloudCredentials, CloudKind};
+use cua_sandbox_core::placement::Runtime;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::aliyun_net::{self, NetLocks, NetworkConfig};
 use crate::api::{
     CloudApi, Result, Secret, Target, Tested, cloud_err, retry_backoff, retryable_status,
 };
-use crate::model::{self, Capabilities, Connection, ProvisionSpec, Resource, Tier};
+use crate::model::{self, Capabilities, Connection, ProvisionSpec, Resource, Tier, tag};
 
 /// Default Alibaba Cloud region when neither `--region` nor a CLI profile specifies one.
 pub const DEFAULT_REGION: &str = "cn-hangzhou";
@@ -405,6 +408,8 @@ pub struct AliyunEcs {
     store: Arc<dyn TokenStore>,
     staged: Mutex<Option<std::result::Result<AliyunCredentials, String>>>,
     aliyun_config: Option<PathBuf>,
+    net_locks: NetLocks,
+    poll: Duration,
 }
 
 impl Default for AliyunEcs {
@@ -427,6 +432,8 @@ impl AliyunEcs {
             store: Arc::new(CuaCredentialStore),
             staged: Mutex::new(None),
             aliyun_config: aliyun_config_path(),
+            net_locks: NetLocks::new(),
+            poll: Duration::from_secs(2),
         }
     }
 
@@ -449,16 +456,32 @@ impl AliyunEcs {
             store,
             staged: Mutex::new(None),
             aliyun_config,
+            net_locks: NetLocks::new(),
+            poll: Duration::from_secs(2),
         }
     }
 
-    fn ecs_endpoint(&self, region: &str) -> String {
+    /// Overrides the polling interval for state waits and dependency retries (for fast tests).
+    pub fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    pub(crate) fn poll_interval(&self) -> Duration {
+        self.poll
+    }
+
+    pub(crate) fn profile_hint<'a>(&self, conn: &'a Connection) -> Option<&'a str> {
+        (!conn.profile.is_empty()).then_some(conn.profile.as_str())
+    }
+
+    pub(crate) fn ecs_endpoint(&self, region: &str) -> String {
         self.ecs_endpoint_override
             .clone()
             .unwrap_or_else(|| format!("https://ecs.{region}.aliyuncs.com"))
     }
 
-    fn vpc_endpoint(&self, region: &str) -> String {
+    pub(crate) fn vpc_endpoint(&self, region: &str) -> String {
         self.vpc_endpoint_override
             .clone()
             .unwrap_or_else(|| format!("https://vpc.{region}.aliyuncs.com"))
@@ -540,7 +563,7 @@ impl AliyunEcs {
         ))
     }
 
-    async fn call_raw(
+    pub(crate) async fn call_raw(
         &self,
         endpoint: &str,
         method: &str,
@@ -549,15 +572,24 @@ impl AliyunEcs {
         params: &[(String, String)],
         profile_hint: Option<&str>,
     ) -> Result<(reqwest::StatusCode, ApiBody)> {
+        let is_post = method.eq_ignore_ascii_case("POST");
         let idempotent = method.eq_ignore_ascii_case("GET");
         let (creds, _) = self.resolve_credentials(profile_hint)?;
         let base = endpoint.trim_end_matches('/');
-        let query = canonical_query_string(params);
-        let full_url = if query.is_empty() {
-            format!("{base}/")
-        } else {
-            format!("{base}/?{query}")
-        };
+        let encoded = canonical_query_string(params);
+        let (full_url, canonical_query, body_bytes, content_type): (_, _, Vec<u8>, Option<&str>) =
+            if is_post && !encoded.is_empty() {
+                (
+                    format!("{base}/"),
+                    String::new(),
+                    encoded.into_bytes(),
+                    Some("application/x-www-form-urlencoded"),
+                )
+            } else if encoded.is_empty() {
+                (format!("{base}/"), String::new(), Vec::new(), None)
+            } else {
+                (format!("{base}/?{encoded}"), encoded, Vec::new(), None)
+            };
         let parsed = url::Url::parse(&full_url)
             .map_err(|e| cloud_err("aliyun-ecs", action, format!("invalid URL: {e}")))?;
 
@@ -566,13 +598,22 @@ impl AliyunEcs {
             let now_ts = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
             let nonce = format!("{:032x}", rand::random::<u128>());
             let signed = sign_acs3(
-                method, &parsed, &query, action, version, b"", None, &now_ts, &nonce, &creds,
+                method,
+                &parsed,
+                &canonical_query,
+                action,
+                version,
+                &body_bytes,
+                content_type,
+                &now_ts,
+                &nonce,
+                &creds,
             );
             let req_method = match method {
                 "POST" => reqwest::Method::POST,
                 _ => reqwest::Method::GET,
             };
-            let resp = match self
+            let mut req = self
                 .http
                 .request(req_method, parsed.as_str())
                 .header("host", &signed.host)
@@ -581,10 +622,14 @@ impl AliyunEcs {
                 .header("x-acs-date", &signed.date)
                 .header("x-acs-signature-nonce", &signed.nonce)
                 .header("x-acs-content-sha256", &signed.content_sha256)
-                .header("authorization", &signed.authorization)
-                .send()
-                .await
-            {
+                .header("authorization", &signed.authorization);
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            if !body_bytes.is_empty() {
+                req = req.body(body_bytes.clone());
+            }
+            let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     if idempotent {
@@ -660,7 +705,7 @@ impl AliyunEcs {
         }
     }
 
-    async fn call_ok(
+    pub(crate) async fn call_ok(
         &self,
         endpoint: &str,
         method: &str,
@@ -684,9 +729,84 @@ impl AliyunEcs {
             )),
         }
     }
+
+    async fn resolve_ubuntu_image(&self, conn: &Connection, region: &str) -> Result<String> {
+        let profile_hint = self.profile_hint(conn);
+        let v = self
+            .call_ok(
+                &self.ecs_endpoint(region),
+                "GET",
+                "DescribeImages",
+                ECS_API_VERSION,
+                &[
+                    ("RegionId".into(), region.to_string()),
+                    ("ImageOwnerAlias".into(), "system".into()),
+                    ("OSType".into(), "linux".into()),
+                    ("Status".into(), "Available".into()),
+                    ("ImageName".into(), "ubuntu_24_04_x64*".into()),
+                    ("Architecture".into(), "x86_64".into()),
+                    ("PageSize".into(), "50".into()),
+                ],
+                profile_hint,
+            )
+            .await?;
+
+        let best = v["Images"]["Image"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|img| {
+                img["Status"]
+                    .as_str()
+                    .is_none_or(|s| s.eq_ignore_ascii_case("Available"))
+            })
+            .filter(|img| {
+                img["ImageId"]
+                    .as_str()
+                    .is_some_and(|id| !id.trim().is_empty())
+            })
+            .max_by(|a, b| {
+                let ca = a["CreationTime"].as_str().unwrap_or("");
+                let cb = b["CreationTime"].as_str().unwrap_or("");
+                ca.cmp(cb)
+            });
+
+        best.and_then(|img| img["ImageId"].as_str())
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| {
+                cloud_err(
+                    "aliyun-ecs",
+                    "DescribeImages",
+                    format!("no Ubuntu 24.04 system image found in {region}"),
+                )
+            })
+    }
+
+    async fn guard(
+        &self,
+        conn: &Connection,
+        r: &Resource,
+        owner: &str,
+        verb: &str,
+    ) -> Result<Option<String>> {
+        let Some((state, tags)) = self.describe(conn, r).await? else {
+            return Ok(None);
+        };
+        if !model::is_ours(&tags, owner) {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: refusing to {verb} {} {} (it does not carry {}=true and {}={})",
+                r.resource_type,
+                r.id,
+                tag::MANAGED,
+                tag::OWNER,
+                model::label_value(owner)
+            )));
+        }
+        Ok(Some(state))
+    }
 }
 
-enum ApiBody {
+pub(crate) enum ApiBody {
     Json(Value),
     Text(String),
 }
@@ -713,13 +833,13 @@ fn sanitize_snippet(bytes: &[u8]) -> String {
     out.trim().to_string()
 }
 
-fn api_error_code_message(v: &Value) -> (&str, &str) {
+pub(crate) fn api_error_code_message(v: &Value) -> (&str, &str) {
     let code = v["Code"].as_str().unwrap_or("");
     let msg = v["Message"].as_str().unwrap_or("");
     (code, msg)
 }
 
-fn map_api_error(
+pub(crate) fn map_api_error(
     action: &str,
     version: &str,
     status: reqwest::StatusCode,
@@ -786,14 +906,47 @@ fn state_of(s: &str) -> String {
     }
 }
 
-fn tags_of_instance(inst: &Value) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for item in inst["Tags"]["Tag"].as_array().into_iter().flatten() {
-        if let (Some(k), Some(v)) = (item["TagKey"].as_str(), item["TagValue"].as_str()) {
-            out.insert(k.to_string(), v.to_string());
-        }
+fn sanitize_hostname(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    s = s.trim_matches(['-', '.']).to_string();
+    if s.len() > 63 {
+        s.truncate(63);
+        s = s.trim_end_matches(['-', '.']).to_string();
     }
-    out
+    if s.len() < 2 { "cua-sandbox".into() } else { s }
+}
+
+fn is_zone_capacity_error(code: &str) -> bool {
+    matches!(
+        code,
+        "OperationDenied.NoStock"
+            | "OperationDenied.ZoneSoldOut"
+            | "Zone.NotOnSale"
+            | "InstanceType.NotOnSale"
+            | "InvalidInstanceType.NotSupported"
+            | "InvalidInstanceType.ValueNotSupported"
+            | "InvalidResource.NotEnough"
+            | "InsufficientInstanceCapacity"
+            | "InsufficientCapacity"
+            | "ResourceInsufficient"
+    )
+}
+
+fn is_instance_not_found(code: &str) -> bool {
+    matches!(
+        code,
+        "InvalidInstanceId.NotFound" | "InvalidInstanceID.NotFound"
+    )
 }
 
 #[async_trait]
@@ -812,6 +965,18 @@ impl CloudApi for AliyunEcs {
 
     fn arches(&self) -> Vec<&'static str> {
         vec!["amd64"]
+    }
+
+    fn runtimes(&self) -> Vec<Runtime> {
+        vec![Runtime::Other("docker".into())]
+    }
+
+    fn default_disk_gb(&self, family: &str) -> u32 {
+        match family {
+            "windows" => 60,
+            "linux" | "linux-slim" => 40,
+            _ => crate::provider::disk_for(family),
+        }
     }
 
     fn detect(&self) -> CloudCredentials {
@@ -1146,39 +1311,10 @@ impl CloudApi for AliyunEcs {
         }
 
         // 4. Image lookup: ecs:DescribeImages (Ubuntu 24.04)
-        let discovered_image = match self
-            .call_ok(
-                &ecs,
-                "GET",
-                "DescribeImages",
-                ECS_API_VERSION,
-                &[
-                    ("RegionId".into(), conn.region.clone()),
-                    ("ImageOwnerAlias".into(), "system".into()),
-                    ("OSType".into(), "linux".into()),
-                    ("Status".into(), "Available".into()),
-                    ("ImageName".into(), "ubuntu_24_04_x64*".into()),
-                ],
-                profile_hint,
-            )
-            .await
-        {
-            Ok(v) => {
-                if let Some(img_id) = v["Images"]["Image"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|img| img["ImageId"].as_str())
-                {
-                    t.check("image", true, format!("Ubuntu 24.04 ({img_id})"));
-                    img_id.to_string()
-                } else {
-                    t.check(
-                        "image",
-                        false,
-                        format!("no Ubuntu 24.04 system image found in {}", conn.region),
-                    );
-                    return t;
-                }
+        let discovered_image = match self.resolve_ubuntu_image(conn, &conn.region).await {
+            Ok(img_id) => {
+                t.check("image", true, format!("Ubuntu 24.04 ({img_id})"));
+                img_id
             }
             Err(e) => {
                 t.check("image", false, e.to_string());
@@ -1186,29 +1322,53 @@ impl CloudApi for AliyunEcs {
             }
         };
 
-        // 5. Permissions: DescribeInstances, DescribeVpcs, DescribeVSwitches, DescribeSecurityGroups, RunInstances DryRun=true
-        for (ep, action, ver) in [
-            (&ecs, "DescribeInstances", ECS_API_VERSION),
-            (&vpc, "DescribeVpcs", VPC_API_VERSION),
-        ] {
-            if let Err(e) = self
-                .call_ok(
-                    ep,
-                    "GET",
-                    action,
-                    ver,
-                    &[
-                        ("RegionId".into(), conn.region.clone()),
-                        ("PageSize".into(), "1".into()),
-                    ],
-                    profile_hint,
-                )
-                .await
-            {
+        // 5. Permissions: DescribeInstances, DescribeVpcs, DescribeVSwitches, DescribeSecurityGroups,
+        //    CreateVpc DryRun=true, CreateSecurityGroup DryRun=true, RunInstances DryRun=true
+        if let Err(e) = self
+            .call_ok(
+                &ecs,
+                "GET",
+                "DescribeInstances",
+                ECS_API_VERSION,
+                &[
+                    ("RegionId".into(), conn.region.clone()),
+                    ("PageSize".into(), "1".into()),
+                ],
+                profile_hint,
+            )
+            .await
+        {
+            t.check("permissions", false, e.to_string());
+            return t;
+        }
+
+        let vpcs = match self
+            .call_ok(
+                &vpc,
+                "GET",
+                "DescribeVpcs",
+                VPC_API_VERSION,
+                &[
+                    ("RegionId".into(), conn.region.clone()),
+                    ("PageSize".into(), "1".into()),
+                ],
+                profile_hint,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
                 t.check("permissions", false, e.to_string());
                 return t;
             }
-        }
+        };
+        let first_vpc_id = vpcs["Vpcs"]["Vpc"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|x| x["VpcId"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let vsw = match self
             .call_ok(
@@ -1282,10 +1442,100 @@ impl CloudApi for AliyunEcs {
                 .map(str::to_string)
         });
 
+        let vpc_dry_params = vec![
+            ("RegionId".into(), conn.region.clone()),
+            ("CidrBlock".into(), aliyun_net::VPC_CIDR.into()),
+            ("VpcName".into(), "cua-sb-dryrun".into()),
+            ("Tag.1.Key".into(), tag::MANAGED.into()),
+            ("Tag.1.Value".into(), "true".into()),
+            ("DryRun".into(), "true".into()),
+        ];
+        match self
+            .call_raw(
+                &vpc,
+                "POST",
+                "CreateVpc",
+                VPC_API_VERSION,
+                &vpc_dry_params,
+                profile_hint,
+            )
+            .await
+        {
+            Ok((status, body)) => {
+                let code = match &body {
+                    ApiBody::Json(v) => api_error_code_message(v).0,
+                    ApiBody::Text(_) => "",
+                };
+                if status.is_success() || code != "DryRunOperation" {
+                    t.check(
+                        "permissions",
+                        false,
+                        map_api_error("CreateVpc", VPC_API_VERSION, status, &body).to_string(),
+                    );
+                    return t;
+                }
+            }
+            Err(e) => {
+                t.check("permissions", false, e.to_string());
+                return t;
+            }
+        }
+
+        let sg_vpc_id = vsw_vpc_id.or(first_vpc_id);
+        let mut sg_dry_params = vec![
+            ("RegionId".into(), conn.region.clone()),
+            ("SecurityGroupName".into(), "cua-sandboxes-dryrun".into()),
+            ("SecurityGroupType".into(), "enterprise".into()),
+            ("Tag.1.Key".into(), tag::MANAGED.into()),
+            ("Tag.1.Value".into(), "true".into()),
+            ("DryRun".into(), "true".into()),
+        ];
+        let has_vpc = if let Some(ref vpc_id) = sg_vpc_id {
+            sg_dry_params.push(("VpcId".into(), vpc_id.clone()));
+            true
+        } else {
+            false
+        };
+        match self
+            .call_raw(
+                &ecs,
+                "POST",
+                "CreateSecurityGroup",
+                ECS_API_VERSION,
+                &sg_dry_params,
+                profile_hint,
+            )
+            .await
+        {
+            Ok((status, body)) => {
+                let code = match &body {
+                    ApiBody::Json(v) => api_error_code_message(v).0,
+                    ApiBody::Text(_) => "",
+                };
+                let ok_dry = !status.is_success()
+                    && (code == "DryRunOperation" || (!has_vpc && code == "InvalidVpcId.NotFound"));
+                if !ok_dry {
+                    t.check(
+                        "permissions",
+                        false,
+                        map_api_error("CreateSecurityGroup", ECS_API_VERSION, status, &body)
+                            .to_string(),
+                    );
+                    return t;
+                }
+            }
+            Err(e) => {
+                t.check("permissions", false, e.to_string());
+                return t;
+            }
+        }
+
         let mut run_params = vec![
             ("RegionId".into(), conn.region.clone()),
             ("ImageId".into(), discovered_image),
             ("InstanceType".into(), discovered_type),
+            ("Tag.1.Key".into(), tag::MANAGED.into()),
+            ("Tag.1.Value".into(), "true".into()),
             ("DryRun".into(), "true".into()),
         ];
         let has_vswitch = if let Some(id) = vsw_id {
@@ -1318,7 +1568,7 @@ impl CloudApi for AliyunEcs {
                     t.check(
                         "permissions",
                         true,
-                        "RAM permissions verified (RunInstances DryRun passed)",
+                        "RAM permissions verified (RunInstances, CreateVpc, CreateSecurityGroup DryRun passed)",
                     );
                 } else if !has_vswitch
                     && !status.is_success()
@@ -1347,11 +1597,233 @@ impl CloudApi for AliyunEcs {
         t
     }
 
-    async fn provision(&self, _conn: &Connection, _spec: &ProvisionSpec) -> Result<Vec<Resource>> {
-        Err(Error::Unsupported {
-            provider: cua_sandbox_core::ProviderKind::Contrib,
-            op: "aliyun-ecs sandbox provisioning is not yet implemented".into(),
-        })
+    async fn provision(&self, conn: &Connection, spec: &ProvisionSpec) -> Result<Vec<Resource>> {
+        if !matches!(spec.family.as_str(), "linux" | "linux-slim") {
+            return Err(Error::Unsupported {
+                provider: cua_sandbox_core::ProviderKind::Contrib,
+                op: format!(
+                    "aliyun-ecs does not yet support {} sandboxes (only linux Docker-on-VM)",
+                    spec.family
+                ),
+            });
+        }
+        if !spec.runtime.is_empty() && spec.runtime != "docker" {
+            return Err(Error::Unsupported {
+                provider: cua_sandbox_core::ProviderKind::Contrib,
+                op: format!("aliyun-ecs does not yet support --runtime {}", spec.runtime),
+            });
+        }
+        let owner = spec
+            .tags
+            .get(tag::OWNER)
+            .cloned()
+            .filter(|o| !o.is_empty())
+            .ok_or_else(|| Error::InvalidArgument("aliyun-ecs: missing cua-owner tag".into()))?;
+        let region = spec.region_or(conn).to_string();
+        let profile_hint = self.profile_hint(conn);
+        let ecs_ep = self.ecs_endpoint(&region);
+
+        let instance_type = if !spec.machine_type.is_empty() {
+            spec.machine_type.clone()
+        } else if spec.family == "linux-slim" {
+            SLIM_INSTANCE_TYPE.into()
+        } else {
+            LINUX_INSTANCE_TYPE.into()
+        };
+
+        let image_id = self.resolve_ubuntu_image(conn, &region).await?;
+        let net_cfg = NetworkConfig::from_connection(conn)?;
+        let net = aliyun_net::prepare_network(
+            self,
+            conn,
+            &region,
+            &owner,
+            &instance_type,
+            &net_cfg,
+            &self.net_locks,
+        )
+        .await?;
+
+        if net.candidates.is_empty() {
+            aliyun_net::rollback_made(self, conn, &net.made).await;
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: no availability zone in {region} supports {instance_type}"
+            )));
+        }
+
+        let disk_gb = spec.disk_gb.max(40);
+        let host_name = sanitize_hostname(&spec.name);
+        let auto_release =
+            (spec.ttl_secs > 0).then(|| model::rfc3339(model::now() + spec.ttl_secs.max(1860)));
+        let user_data_b64 = (!spec.user_data.is_empty())
+            .then(|| base64::engine::general_purpose::STANDARD.encode(spec.user_data.as_bytes()));
+
+        let mut tried = Vec::new();
+        for (idx, cand) in net.candidates.iter().enumerate() {
+            let (vswitch_id, made_vsw) = match &cand.vswitch_id {
+                Some(id) => (id.clone(), None),
+                None => match aliyun_net::ensure_vswitch_for_zone(
+                    self,
+                    conn,
+                    &region,
+                    &owner,
+                    &net.vpc_id,
+                    &cand.zone_id,
+                    &self.net_locks,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        aliyun_net::rollback_made(self, conn, &net.made).await;
+                        return Err(e);
+                    }
+                },
+            };
+
+            let client_token = if idx == 0 {
+                spec.name.clone()
+            } else {
+                format!("{}-z{idx}", spec.name)
+            };
+
+            let mut params = vec![
+                ("RegionId".into(), region.clone()),
+                ("ZoneId".into(), cand.zone_id.clone()),
+                ("VSwitchId".into(), vswitch_id.clone()),
+                ("SecurityGroupId".into(), net.security_group_id.clone()),
+                ("ImageId".into(), image_id.clone()),
+                ("InstanceType".into(), instance_type.clone()),
+                ("Amount".into(), "1".into()),
+                ("MinAmount".into(), "1".into()),
+                ("InstanceName".into(), spec.name.clone()),
+                ("HostName".into(), host_name.clone()),
+                ("InstanceChargeType".into(), "PostPaid".into()),
+                ("StoppedMode".into(), "StopCharging".into()),
+                ("DeletionProtection".into(), "false".into()),
+                ("HttpEndpoint".into(), "enabled".into()),
+                ("HttpTokens".into(), "required".into()),
+                ("SystemDisk.Category".into(), "cloud_essd".into()),
+                ("SystemDisk.Size".into(), disk_gb.to_string()),
+                ("ClientToken".into(), client_token),
+            ];
+            if net.public_ip_mbps > 0 {
+                params.push(("InternetChargeType".into(), "PayByTraffic".into()));
+                params.push((
+                    "InternetMaxBandwidthOut".into(),
+                    net.public_ip_mbps.to_string(),
+                ));
+            } else {
+                params.push(("InternetMaxBandwidthOut".into(), "0".into()));
+            }
+            if let Some(ref release) = auto_release {
+                params.push(("AutoReleaseTime".into(), release.clone()));
+            }
+            if let Some(ref ud) = user_data_b64 {
+                params.push(("UserData".into(), ud.clone()));
+            }
+            params.extend(aliyun_net::tag_params(&spec.tags));
+
+            match self
+                .call_raw(
+                    &ecs_ep,
+                    "POST",
+                    "RunInstances",
+                    ECS_API_VERSION,
+                    &params,
+                    profile_hint,
+                )
+                .await
+            {
+                Ok((status, body)) if status.is_success() => {
+                    let ApiBody::Json(v) = body else {
+                        if let Some(ref vsw) = made_vsw {
+                            let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                        }
+                        aliyun_net::rollback_made(self, conn, &net.made).await;
+                        return Err(cloud_err(
+                            "aliyun-ecs",
+                            "RunInstances",
+                            "unexpected non-JSON response",
+                        ));
+                    };
+                    let Some(inst_id) = v["InstanceIdSets"]["InstanceIdSet"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        if let Some(ref vsw) = made_vsw {
+                            let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                        }
+                        aliyun_net::rollback_made(self, conn, &net.made).await;
+                        return Err(cloud_err(
+                            "aliyun-ecs",
+                            "RunInstances",
+                            "RunInstances returned no InstanceId",
+                        ));
+                    };
+
+                    let mut r = Resource {
+                        provider: "aliyun-ecs".into(),
+                        id: inst_id.to_string(),
+                        resource_type: "instance".into(),
+                        name: spec.name.clone(),
+                        region: region.clone(),
+                        zone: cand.zone_id.clone(),
+                        created: model::now(),
+                        expires: model::tag_expires(&spec.tags),
+                        tags: spec.tags.clone(),
+                        state: "pending".into(),
+                        ..Default::default()
+                    };
+                    r.extra.insert("machine_type".into(), instance_type);
+                    r.extra.insert("image".into(), image_id);
+                    r.extra.insert("vpc".into(), net.vpc_id);
+                    r.extra.insert("vswitch".into(), vswitch_id);
+                    r.extra
+                        .insert("security_group".into(), net.security_group_id);
+
+                    let mut out = vec![r];
+                    out.extend(net.made);
+                    if let Some(vsw) = made_vsw {
+                        out.push(vsw);
+                    }
+                    return Ok(out);
+                }
+                Ok((status, body)) => {
+                    let code = match &body {
+                        ApiBody::Json(v) => api_error_code_message(v).0.to_string(),
+                        ApiBody::Text(_) => String::new(),
+                    };
+                    let err = map_api_error("RunInstances", ECS_API_VERSION, status, &body);
+                    if let Some(ref vsw) = made_vsw {
+                        let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                    }
+                    if is_zone_capacity_error(&code) {
+                        tried.push(format!("{} ({vswitch_id}): {err}", cand.zone_id));
+                        continue;
+                    }
+                    aliyun_net::rollback_made(self, conn, &net.made).await;
+                    return Err(err);
+                }
+                Err(e) => {
+                    if let Some(ref vsw) = made_vsw {
+                        let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                    }
+                    aliyun_net::rollback_made(self, conn, &net.made).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        aliyun_net::rollback_made(self, conn, &net.made).await;
+        Err(cloud_err(
+            "aliyun-ecs",
+            &format!("start a {instance_type} in {region}"),
+            format!("tried {} zones: {}", tried.len(), tried.join("; ")),
+        ))
     }
 
     async fn describe(
@@ -1359,7 +1831,13 @@ impl CloudApi for AliyunEcs {
         conn: &Connection,
         r: &Resource,
     ) -> Result<Option<(String, BTreeMap<String, String>)>> {
-        if r.resource_type != "instance" || r.id.is_empty() {
+        if r.id.is_empty() {
+            return Ok(None);
+        }
+        if aliyun_net::is_network_type(&r.resource_type) {
+            return aliyun_net::describe_part(self, conn, r).await;
+        }
+        if r.resource_type != "instance" {
             return Ok(None);
         }
         let region = if r.region.is_empty() {
@@ -1367,7 +1845,7 @@ impl CloudApi for AliyunEcs {
         } else {
             r.region.as_str()
         };
-        let profile_hint = (!conn.profile.is_empty()).then_some(conn.profile.as_str());
+        let profile_hint = self.profile_hint(conn);
         let ids_json = serde_json::to_string(&[&r.id]).unwrap_or_default();
         let v = self
             .call_ok(
@@ -1389,54 +1867,168 @@ impl CloudApi for AliyunEcs {
             return Ok(None);
         };
         let state = state_of(inst["Status"].as_str().unwrap_or(""));
-        Ok(Some((state, tags_of_instance(inst))))
+        Ok(Some((state, aliyun_net::tags_of(inst))))
     }
 
-    async fn stop(&self, _conn: &Connection, _r: &Resource, _owner: &str) -> Result<()> {
-        Err(Error::Unsupported {
-            provider: cua_sandbox_core::ProviderKind::Contrib,
-            op: "stop on aliyun-ecs".into(),
-        })
-    }
-
-    async fn start(&self, _conn: &Connection, _r: &Resource, _owner: &str) -> Result<()> {
-        Err(Error::Unsupported {
-            provider: cua_sandbox_core::ProviderKind::Contrib,
-            op: "start on aliyun-ecs".into(),
-        })
-    }
-
-    async fn delete(&self, _conn: &Connection, _r: &Resource, _owner: &str) -> Result<()> {
-        Err(Error::Unsupported {
-            provider: cua_sandbox_core::ProviderKind::Contrib,
-            op: "delete on aliyun-ecs".into(),
-        })
-    }
-
-    async fn list_owned(&self, conn: &Connection, owner: &str) -> Result<Vec<Resource>> {
-        let profile_hint = (!conn.profile.is_empty()).then_some(conn.profile.as_str());
-        let owner_val = model::label_value(owner);
-        let v = self
-            .call_ok(
-                &self.ecs_endpoint(&conn.region),
-                "GET",
-                "DescribeInstances",
+    async fn stop(&self, conn: &Connection, r: &Resource, owner: &str) -> Result<()> {
+        let Some(state) = self.guard(conn, r, owner, "stop").await? else {
+            return Err(Error::NotFound(format!("aliyun-ecs instance {}", r.id)));
+        };
+        if r.resource_type != "instance" {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: cannot stop {}",
+                r.resource_type
+            )));
+        }
+        if state == "stopped" {
+            return Ok(());
+        }
+        let region = if r.region.is_empty() {
+            conn.region.as_str()
+        } else {
+            r.region.as_str()
+        };
+        let profile_hint = self.profile_hint(conn);
+        if state != "stopping" {
+            self.call_ok(
+                &self.ecs_endpoint(region),
+                "POST",
+                "StopInstance",
                 ECS_API_VERSION,
                 &[
-                    ("RegionId".into(), conn.region.clone()),
-                    ("PageSize".into(), "50".into()),
-                    ("Tag.1.Key".into(), model::tag::MANAGED.into()),
-                    ("Tag.1.Value".into(), "true".into()),
-                    ("Tag.2.Key".into(), model::tag::OWNER.into()),
-                    ("Tag.2.Value".into(), owner_val),
+                    ("InstanceId".into(), r.id.clone()),
+                    ("StoppedMode".into(), "StopCharging".into()),
                 ],
                 profile_hint,
             )
             .await?;
+        }
+        for _ in 0..60 {
+            match self.describe(conn, r).await?.map(|(s, _)| s).as_deref() {
+                Some("stopped") | None => return Ok(()),
+                _ => tokio::time::sleep(self.poll).await,
+            }
+        }
+        Err(Error::Timeout(format!(
+            "aliyun-ecs: instance {} did not reach Stopped state",
+            r.id
+        )))
+    }
+
+    async fn start(&self, conn: &Connection, r: &Resource, owner: &str) -> Result<()> {
+        let Some(state) = self.guard(conn, r, owner, "start").await? else {
+            return Err(Error::NotFound(format!("aliyun-ecs instance {}", r.id)));
+        };
+        if r.resource_type != "instance" {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: cannot start {}",
+                r.resource_type
+            )));
+        }
+        if state == "running" {
+            return Ok(());
+        }
+        if state == "stopping" {
+            for _ in 0..60 {
+                match self.describe(conn, r).await?.map(|(s, _)| s).as_deref() {
+                    Some("stopping") => tokio::time::sleep(self.poll).await,
+                    _ => break,
+                }
+            }
+        }
+        let region = if r.region.is_empty() {
+            conn.region.as_str()
+        } else {
+            r.region.as_str()
+        };
+        let profile_hint = self.profile_hint(conn);
+        self.call_ok(
+            &self.ecs_endpoint(region),
+            "POST",
+            "StartInstance",
+            ECS_API_VERSION,
+            &[("InstanceId".into(), r.id.clone())],
+            profile_hint,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete(&self, conn: &Connection, r: &Resource, owner: &str) -> Result<()> {
+        let Some(state) = self.guard(conn, r, owner, "delete").await? else {
+            return Ok(());
+        };
+        if aliyun_net::is_network_type(&r.resource_type) {
+            return aliyun_net::delete_part(self, conn, r).await;
+        }
+        if r.resource_type != "instance" {
+            return Ok(());
+        }
+        if matches!(state.as_str(), "terminated" | "deleted") {
+            return Ok(());
+        }
+        let region = if r.region.is_empty() {
+            conn.region.as_str()
+        } else {
+            r.region.as_str()
+        };
+        let profile_hint = self.profile_hint(conn);
+        let (status, body) = self
+            .call_raw(
+                &self.ecs_endpoint(region),
+                "POST",
+                "DeleteInstance",
+                ECS_API_VERSION,
+                &[
+                    ("InstanceId".into(), r.id.clone()),
+                    ("Force".into(), "true".into()),
+                ],
+                profile_hint,
+            )
+            .await?;
+        if !status.is_success() {
+            let code = match &body {
+                ApiBody::Json(v) => api_error_code_message(v).0,
+                ApiBody::Text(_) => "",
+            };
+            if is_instance_not_found(code) {
+                return Ok(());
+            }
+            return Err(map_api_error(
+                "DeleteInstance",
+                ECS_API_VERSION,
+                status,
+                &body,
+            ));
+        }
+        for _ in 0..30 {
+            match self.describe(conn, r).await? {
+                None => return Ok(()),
+                Some((st, _)) if matches!(st.as_str(), "terminated" | "deleted") => return Ok(()),
+                _ => tokio::time::sleep(self.poll).await,
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_owned(&self, conn: &Connection, owner: &str) -> Result<Vec<Resource>> {
+        let profile_hint = self.profile_hint(conn);
+        let mut base = vec![("RegionId".into(), conn.region.clone())];
+        base.extend(aliyun_net::owner_tag_filters(owner));
+        let instances = aliyun_net::paginated_query(
+            self,
+            &self.ecs_endpoint(&conn.region),
+            "DescribeInstances",
+            ECS_API_VERSION,
+            &base,
+            ("Instances", "Instance"),
+            profile_hint,
+        )
+        .await?;
 
         let mut out = Vec::new();
-        for inst in v["Instances"]["Instance"].as_array().into_iter().flatten() {
-            let tags = tags_of_instance(inst);
+        for inst in instances {
+            let tags = aliyun_net::tags_of(&inst);
             if !model::is_ours(&tags, owner) {
                 continue;
             }
@@ -1444,7 +2036,7 @@ impl CloudApi for AliyunEcs {
             if id.is_empty() {
                 continue;
             }
-            out.push(Resource {
+            let mut r = Resource {
                 provider: "aliyun-ecs".into(),
                 id,
                 resource_type: "instance".into(),
@@ -1456,13 +2048,83 @@ impl CloudApi for AliyunEcs {
                     .as_str()
                     .unwrap_or(&conn.region)
                     .to_string(),
+                zone: inst["ZoneId"].as_str().unwrap_or_default().to_string(),
                 state: state_of(inst["Status"].as_str().unwrap_or("")),
                 expires: model::tag_expires(&tags),
                 tags,
                 ..Default::default()
-            });
+            };
+            if let Some(vpc) = inst["VpcAttributes"]["VpcId"].as_str()
+                && !vpc.is_empty()
+            {
+                r.extra.insert("vpc".into(), vpc.into());
+            }
+            if let Some(vsw) = inst["VpcAttributes"]["VSwitchId"].as_str()
+                && !vsw.is_empty()
+            {
+                r.extra.insert("vswitch".into(), vsw.into());
+            }
+            out.push(r);
         }
+        out.extend(aliyun_net::list_parts(self, conn, owner).await?);
         Ok(out)
+    }
+
+    async fn boot_log(&self, conn: &Connection, r: &Resource) -> Result<Option<String>> {
+        if r.id.is_empty() || r.resource_type != "instance" {
+            return Ok(None);
+        }
+        let region = if r.region.is_empty() {
+            conn.region.as_str()
+        } else {
+            r.region.as_str()
+        };
+        let profile_hint = self.profile_hint(conn);
+        let (status, body) = self
+            .call_raw(
+                &self.ecs_endpoint(region),
+                "GET",
+                "GetInstanceConsoleOutput",
+                ECS_API_VERSION,
+                &[
+                    ("RegionId".into(), region.to_string()),
+                    ("InstanceId".into(), r.id.clone()),
+                    ("RemoveSymbols".into(), "true".into()),
+                ],
+                profile_hint,
+            )
+            .await?;
+        if !status.is_success() {
+            let code = match &body {
+                ApiBody::Json(v) => api_error_code_message(v).0,
+                ApiBody::Text(_) => "",
+            };
+            if is_instance_not_found(code) {
+                return Ok(None);
+            }
+            return Err(map_api_error(
+                "GetInstanceConsoleOutput",
+                ECS_API_VERSION,
+                status,
+                &body,
+            ));
+        }
+        let ApiBody::Json(v) = body else {
+            return Ok(None);
+        };
+        let Some(encoded) = v["ConsoleOutput"].as_str() else {
+            return Ok(None);
+        };
+        let compact: String = encoded.split_whitespace().collect();
+        if compact.is_empty() {
+            return Ok(None);
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| encoded.to_string());
+        Ok(Some(decoded))
     }
 
     fn capabilities(&self, _conn: &Connection) -> Capabilities {

@@ -33,6 +33,7 @@ pub const GUEST_UID: u32 = 1000;
 /// address). `-I` inserts at the top, so the DNS exceptions go in last.
 pub const METADATA_RULES: &str = "[Service]\n\
      ExecStartPost=-/sbin/iptables -I DOCKER-USER -d 169.254.169.254 -j DROP\n\
+     ExecStartPost=-/sbin/iptables -I DOCKER-USER -d 100.100.100.200 -j DROP\n\
      ExecStartPost=-/sbin/iptables -I DOCKER-USER -d 169.254.169.254 -p udp --dport 53 -j RETURN\n\
      ExecStartPost=-/sbin/iptables -I DOCKER-USER -d 169.254.169.254 -p tcp --dport 53 -j RETURN\n";
 
@@ -403,6 +404,7 @@ mod tests {
         let drop = rules.find("-j DROP").unwrap();
         let dns = rules.find("--dport 53 -j RETURN").unwrap();
         assert!(dns > drop, "{rules}");
+        assert!(rules.contains("-d 100.100.100.200 -j DROP"), "{rules}");
         let script = decode(&y, "/usr/local/sbin/cua-first-boot");
         assert!(!script.contains("cua-host-net"), "{script}");
         assert!(!script.contains("-p 26500-26515"), "{script}");
