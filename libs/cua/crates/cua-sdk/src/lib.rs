@@ -454,3 +454,17 @@ mod thread_view_tests {
         assert_eq!(v.app.as_deref(), Some("Firefox"));
     }
 }
+
+#[cfg(all(test, not(any(target_arch = "wasm32", feature = "web"))))]
+mod location_tests {
+    #[test]
+    fn sandbox_locations_includes_aliyun_ecs_and_reserves_aliyun_sandbox() {
+        let locs = super::sandbox_locations();
+        assert!(locs.iter().any(|l| l == "aliyun-ecs"), "{locs:?}");
+        assert!(!locs.iter().any(|l| l == "aliyun-sandbox"), "{locs:?}");
+        assert!(
+            !locs.iter().any(|l| l == "aliyun-agent-sandbox"),
+            "{locs:?}"
+        );
+    }
+}

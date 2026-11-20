@@ -30,6 +30,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub mod alerts;
+#[cfg(feature = "aliyun-ecs")]
+pub mod aliyun_ecs;
 pub mod api;
 pub mod audit;
 pub mod autosweep;
@@ -105,6 +107,8 @@ pub fn builtin_apis() -> Vec<Arc<dyn CloudApi>> {
     v.push(Arc::new(hetzner::Hetzner::new()));
     #[cfg(feature = "azure")]
     v.push(Arc::new(azure::Azure::new()));
+    #[cfg(feature = "aliyun-ecs")]
+    v.push(Arc::new(aliyun_ecs::AliyunEcs::new()));
     v
 }
 

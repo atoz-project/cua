@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! `cua cloud`: Spaces in your own cloud account (AWS, Google Cloud,
-//! Hetzner, Modal) as a location for sandboxes and Spaces. The providers are the
-//! sandbox layer's (`cua-byoc`); this `cua` reaches them through the
-//! `cloud_*` tools, in the daemon when one runs, else in process.
+//! Hetzner, Modal, Alibaba Cloud ECS) as a location for sandboxes and Spaces.
+//! The providers are the sandbox layer's (`cua-byoc`); this `cua` reaches them
+//! through the `cloud_*` tools, in the daemon when one runs, else in process.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -79,6 +79,15 @@ Azure (always without a stored key):
      and a machine is validated.
   Verify: cua cloud status azure
 
+Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
+  Resolves credentials in order: --token-stdin (<access_key_id>:<access_key_secret>),
+  ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET, --profile <name>
+  in ~/.aliyun/config.json, saved credential store, or the active `current`
+  profile in ~/.aliyun/config.json. Default region: `cn-hangzhou`.
+    cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16
+    cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
+  Verify: cua cloud status aliyun-ecs
+
 Other clouds use their own CLI sign-in on this device.
 `cua cloud trust <cloud>` prints the trust setup file (aws, gcp, azure).
 Docs for agents: https://cua.ai/docs/spaces/guides/connect-a-cloud
@@ -104,18 +113,22 @@ Examples:
   # Seal the Hetzner token this device already has
   cua cloud connect hetzner --sealed --budget 50
   # Spaces there delete themselves after 4 hours (default 8; 0: never)
-  cua cloud connect aws --ttl-hours 4";
+  cua cloud connect aws --ttl-hours 4
+  # Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile
+  cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8
+  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou";
 
 /// Where in a cloud account Spaces go.
 #[derive(Args, Debug, Clone, Default)]
 pub struct TargetArgs {
-    /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`.
     pub provider: String,
-    /// AWS profile (`~/.aws/config`) or Modal profile (`~/.modal.toml`).
+    /// AWS profile (`~/.aws/config`), Modal profile (`~/.modal.toml`), or
+    /// Alibaba Cloud CLI profile (`~/.aliyun/config.json`).
     #[arg(long)]
     pub profile: Option<String>,
-    /// AWS, Google Cloud or Azure region, or Hetzner location (default
-    /// `fsn1`).
+    /// AWS, Google Cloud, Azure or Alibaba Cloud region, or Hetzner location
+    /// (default `fsn1` for Hetzner, `cn-hangzhou` for `aliyun-ecs`).
     #[arg(long)]
     pub region: Option<String>,
     /// Google Cloud zone (default: the region's `-a` zone).
@@ -127,11 +140,12 @@ pub struct TargetArgs {
     /// Modal environment (default: the profile's).
     #[arg(long)]
     pub environment: Option<String>,
-    /// Hetzner or Modal: read the API token from stdin (Hetzner: a Read &
-    /// Write project token, otherwise `HCLOUD_TOKEN`, the saved token or the
-    /// hcloud CLI's context; Modal: `<token id>:<token secret>`). Once the
-    /// checks pass it is sealed to your devices, or with --no-sealed saved
-    /// in this device's Cua credential store (Hetzner).
+    /// Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey
+    /// pair from stdin (Hetzner: Read & Write project token; Modal: `<token
+    /// id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`).
+    /// Hetzner and Modal seal to your devices when a budget is given (or with
+    /// --no-sealed save on this device); Alibaba Cloud ECS saves into this
+    /// device's Cua credential store.
     #[arg(long)]
     pub token_stdin: bool,
 }
@@ -167,7 +181,7 @@ pub enum CloudCmd {
   cua cloud status aws --json"
     )]
     Status {
-        /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`).
+        /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
         provider: Option<String>,
     },
     /// Connect a cloud account Spaces can be created in. Never prompts and
@@ -290,7 +304,7 @@ pub enum CloudCmd {
   # delete everything Cua created in the account, then disconnect
   cua cloud disconnect aws --delete")]
     Disconnect {
-        /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+        /// `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`.
         provider: String,
         /// Delete everything Cua created there first; disconnect only
         /// once the cloud confirms nothing is left.
@@ -2071,6 +2085,74 @@ mod tests {
             parse(&["test", "MODAL", "--environment", "e"]),
             CloudCmd::Test { target } if target.target().provider == "modal"
         ));
+    }
+
+    #[test]
+    fn aliyun_ecs_commands_and_help_parse() {
+        match parse(&[
+            "test",
+            "ALIYUN-ECS",
+            "--profile",
+            "webhook_manager",
+            "--region",
+            "cn-shanghai",
+        ]) {
+            CloudCmd::Test { target } => {
+                let t = target.target();
+                assert_eq!(t.provider, "aliyun-ecs");
+                assert_eq!(t.profile.as_deref(), Some("webhook_manager"));
+                assert_eq!(t.region.as_deref(), Some("cn-shanghai"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&[
+            "connect",
+            "aliyun-ecs",
+            "--token-stdin",
+            "--region",
+            "cn-hangzhou",
+            "--budget",
+            "50",
+            "--max-size",
+            "4x16",
+            "--ttl-hours",
+            "4",
+            "--default",
+        ]) {
+            CloudCmd::Connect {
+                target,
+                make_default,
+                ttl_hours,
+                budget,
+                max_size,
+                ..
+            } => {
+                assert_eq!(target.provider, "aliyun-ecs");
+                assert!(target.token_stdin);
+                assert_eq!(target.region.as_deref(), Some("cn-hangzhou"));
+                assert!(make_default);
+                assert_eq!(ttl_hours, Some(4));
+                assert_eq!(budget, Some(50.0));
+                assert_eq!(max_size.as_deref(), Some("4x16"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse(&["status", "aliyun-ecs"]),
+            CloudCmd::Status { provider: Some(p) } if p == "aliyun-ecs"
+        ));
+        assert!(matches!(
+            parse(&["disconnect", "aliyun-ecs"]),
+            CloudCmd::Disconnect { provider, delete: false } if provider == "aliyun-ecs"
+        ));
+        for needle in [
+            "aliyun-ecs",
+            "ALIBABA_CLOUD_ACCESS_KEY_ID",
+            "~/.aliyun/config.json",
+            "cn-hangzhou",
+        ] {
+            assert!(CONNECT_HELP.contains(needle), "{needle}");
+        }
     }
 
     #[test]

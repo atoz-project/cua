@@ -1649,7 +1649,15 @@ mod tests {
 
     #[test]
     fn every_own_cloud_word_parses_as_a_location() {
-        for w in ["aws", "gcp", "hetzner", "modal", "HETZNER"] {
+        for w in [
+            "aws",
+            "gcp",
+            "hetzner",
+            "modal",
+            "aliyun-ecs",
+            "ALIYUN-ECS",
+            "HETZNER",
+        ] {
             assert_eq!(
                 On::parse(w).unwrap(),
                 On::Provider(w.to_ascii_lowercase()),
@@ -1658,9 +1666,17 @@ mod tests {
         }
         assert!(crate::provider::is_cloud_location("hetzner"));
         assert!(crate::provider::is_provider_location("hetzner"));
-        // The error for an unknown word lists hetzner among the valid ones.
+        assert!(crate::provider::is_cloud_location("aliyun-ecs"));
+        assert!(crate::provider::is_provider_location("aliyun-ecs"));
+        // Reserved per ADR-0001: not registered as a location yet.
+        for reserved in ["aliyun-sandbox", "aliyun-agent-sandbox"] {
+            assert!(!crate::provider::is_cloud_location(reserved), "{reserved}");
+            assert!(On::parse(reserved).is_err(), "{reserved}");
+        }
+        // The error for an unknown word lists hetzner and aliyun-ecs among the valid ones.
         let e = On::parse("hetznr").unwrap_err();
         assert!(e.valid.iter().any(|v| v == "hetzner"), "{:?}", e.valid);
+        assert!(e.valid.iter().any(|v| v == "aliyun-ecs"), "{:?}", e.valid);
     }
 
     #[test]

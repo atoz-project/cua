@@ -146,7 +146,15 @@ pub fn pool_op(method: &str) -> PoolOp {
 }
 
 /// Providers a run may name in `on` that spend the owner's cloud account.
-const PROVIDERS: [&str; 6] = ["modal", "aws", "gcp", "hetzner", "cloud", "elastic"];
+const PROVIDERS: [&str; 7] = [
+    "modal",
+    "aws",
+    "gcp",
+    "hetzner",
+    "aliyun-ecs",
+    "cloud",
+    "elastic",
+];
 
 /// What a Space's `submit` may ask for, and what the daemon sets on it: the
 /// run becomes the Space's child wherever it is placed. Refused: a native
