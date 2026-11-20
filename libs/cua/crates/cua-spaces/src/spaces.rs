@@ -868,6 +868,7 @@ impl Spaces {
             .map(|r| {
                 let mut info = SpaceInfo::from_record(r)?;
                 (info.power, info.power_state) = self.power_of(&info.id);
+                self.apply_cloud_metadata(&mut info);
                 info.stop_reason = self.stop_reason_of(&info.id);
                 Ok(info)
             })
@@ -1659,7 +1660,24 @@ impl Spaces {
             .registry
             .get(&id.to_string())?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        SpaceInfo::from_record(&record)
+        let mut info = SpaceInfo::from_record(&record)?;
+        self.apply_cloud_metadata(&mut info);
+        Ok(info)
+    }
+
+    fn apply_cloud_metadata(&self, info: &mut SpaceInfo) {
+        if let Ok(SpaceId::Relay { machine_id }) = SpaceId::parse(&info.id)
+            && let Some((provider, place)) =
+                self.inner.sandboxes.cloud_of_relay_machine(&machine_id)
+        {
+            info.cloud = provider;
+            info.cloud_place = place.clone();
+            info.host_name = place;
+            info.cloud_delete = crate::cloud::DELETE_HERE.into();
+            if let Ok(Some(sandbox)) = self.inner.sandboxes.by_relay_machine(&machine_id) {
+                (info.power, info.power_state) = self.sandbox_power(&sandbox);
+            }
+        }
     }
 
     /// Keeps what a relay machine's cua-spacesd answered at connect (its
@@ -2307,58 +2325,92 @@ impl Spaces {
             // Cua Cloud has ended: a legacy `cloud:` Space cannot connect.
             SpaceId::Cloud { .. } => return Err(cua_sandbox_core::Error::CloudEnded.into()),
             SpaceId::Relay { machine_id } => {
-                let relay = self.relay()?;
-                // A Space one of your own machines provides prefers the mesh
-                // (often a LAN neighbour); others follow `CUA_MESH`.
-                // ... and so does a host whose routed Spaces ride its channel.
-                let provided = self.provided_by_a_host(machine_id, record).await
-                    || self.routes_through(machine_id);
-                let policy = if provided {
-                    crate::mesh::policy_for_provided()
-                } else {
-                    crate::mesh::policy()
-                };
-                // The WireGuard®-based mesh first (end to end, direct when
-                // possible); the relay's HTTPS path when the relay or the
-                // machine does not speak it yet (see `crate::mesh`).
-                match crate::mesh::connect_options(
-                    &self.inner.mesh,
-                    crate::mesh::Via::Account(&relay),
-                    machine_id,
-                    policy,
-                )
-                .await?
-                {
-                    crate::mesh::Route::Mesh(o, route) => {
-                        tracing::info!(machine = %machine_id, route = %route.describe(), "relay Space over the mesh");
-                        self.inner.mesh.note_routed(
-                            &id.to_string(),
-                            &crate::mesh::Via::Account(&relay),
-                            provided,
-                        );
-                        (Some(*o), None, Some(route))
+                if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
+                    let mut o = ConnectOptions::parse(url)?;
+                    o.token = credential.token.clone();
+                    let relay_url = o.endpoint.origin();
+                    let mut route = Some(crate::ChannelRoute::Relay(relay_url.clone()));
+                    if let Some(token) = credential.token.as_deref() {
+                        let via = crate::mesh::Via::Static {
+                            relay: &relay_url,
+                            token,
+                        };
+                        match crate::mesh::connect_options(
+                            &self.inner.mesh,
+                            crate::mesh::Via::Static {
+                                relay: &relay_url,
+                                token,
+                            },
+                            machine_id,
+                            crate::mesh::policy(),
+                        )
+                        .await?
+                        {
+                            crate::mesh::Route::Mesh(m, via_mesh) => {
+                                tracing::info!(machine = %machine_id, "relay Space over the mesh");
+                                self.inner.mesh.note_routed(&id.to_string(), &via, false);
+                                o = *m;
+                                route = Some(via_mesh);
+                            }
+                            crate::mesh::Route::Relay { fallback: why } => fallback = why,
+                        }
                     }
-                    crate::mesh::Route::Relay { fallback: why } => {
-                        fallback = why;
-                        if policy.uses_mesh() {
-                            // Its driver may join the mesh a moment later:
-                            // move there once it has (`Spaces::space`).
-                            self.inner.mesh.note_fallback(
+                    (Some(o), None, route)
+                } else {
+                    let relay = self.relay()?;
+                    // A Space one of your own machines provides prefers the mesh
+                    // (often a LAN neighbour); others follow `CUA_MESH`.
+                    // ... and so does a host whose routed Spaces ride its channel.
+                    let provided = self.provided_by_a_host(machine_id, record).await
+                        || self.routes_through(machine_id);
+                    let policy = if provided {
+                        crate::mesh::policy_for_provided()
+                    } else {
+                        crate::mesh::policy()
+                    };
+                    // The WireGuard®-based mesh first (end to end, direct when
+                    // possible); the relay's HTTPS path when the relay or the
+                    // machine does not speak it yet (see `crate::mesh`).
+                    match crate::mesh::connect_options(
+                        &self.inner.mesh,
+                        crate::mesh::Via::Account(&relay),
+                        machine_id,
+                        policy,
+                    )
+                    .await?
+                    {
+                        crate::mesh::Route::Mesh(o, route) => {
+                            tracing::info!(machine = %machine_id, route = %route.describe(), "relay Space over the mesh");
+                            self.inner.mesh.note_routed(
                                 &id.to_string(),
                                 &crate::mesh::Via::Account(&relay),
-                                machine_id,
+                                provided,
                             );
+                            (Some(*o), None, Some(route))
                         }
-                        let url = cua_host::RelayClient::new(&relay.url)?.machine_url(machine_id);
-                        // The account token rides in `authorization` and
-                        // this device's session next to it, fetched (and
-                        // refreshed) per call; the relay checks both and
-                        // swaps them for its signed identity assertion.
-                        let route = crate::ChannelRoute::Relay(relay.url.clone());
-                        let bearer = crate::relay::RelayBearer { account: relay };
-                        let mut o = ConnectOptions::parse(&url)?.gateway(Arc::new(bearer));
-                        o.token = credential.token.clone();
-                        (Some(o), None, Some(route))
+                        crate::mesh::Route::Relay { fallback: why } => {
+                            fallback = why;
+                            if policy.uses_mesh() {
+                                // Its driver may join the mesh a moment later:
+                                // move there once it has (`Spaces::space`).
+                                self.inner.mesh.note_fallback(
+                                    &id.to_string(),
+                                    &crate::mesh::Via::Account(&relay),
+                                    machine_id,
+                                );
+                            }
+                            let url =
+                                cua_host::RelayClient::new(&relay.url)?.machine_url(machine_id);
+                            // The account token rides in `authorization` and
+                            // this device's session next to it, fetched (and
+                            // refreshed) per call; the relay checks both and
+                            // swaps them for its signed identity assertion.
+                            let route = crate::ChannelRoute::Relay(relay.url.clone());
+                            let bearer = crate::relay::RelayBearer { account: relay };
+                            let mut o = ConnectOptions::parse(&url)?.gateway(Arc::new(bearer));
+                            o.token = credential.token.clone();
+                            (Some(o), None, Some(route))
+                        }
                     }
                 }
             }
@@ -4032,10 +4084,18 @@ impl Spaces {
     /// off and on. A Space one of your machines provides says so in its
     /// relay row instead ([`relay_info`]).
     pub fn power_of(&self, id: &str) -> (String, String) {
-        let Ok(SpaceId::Local { name }) = SpaceId::parse(id) else {
-            return Default::default();
-        };
-        self.sandbox_power(&name)
+        match SpaceId::parse(id) {
+            Ok(SpaceId::Local { name }) => self.sandbox_power(&name),
+            Ok(SpaceId::Relay { machine_id }) => self
+                .inner
+                .sandboxes
+                .by_relay_machine(&machine_id)
+                .ok()
+                .flatten()
+                .map(|name| self.sandbox_power(&name))
+                .unwrap_or_default(),
+            _ => Default::default(),
+        }
     }
 
     /// [`SpaceInfo::stop_reason`] of the Space `id`: why its local sandbox

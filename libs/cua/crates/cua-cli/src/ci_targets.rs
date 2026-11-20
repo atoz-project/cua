@@ -204,6 +204,9 @@ fn cloud_target(kind: Kind, region: &Option<String>) -> cua_sdk::CloudTarget {
         project: None,
         environment: None,
         token: None,
+        relay_url: None,
+        relay_mode: None,
+        relay_token: None,
     }
 }
 

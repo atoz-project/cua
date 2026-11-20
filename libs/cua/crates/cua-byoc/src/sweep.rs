@@ -276,16 +276,24 @@ pub async fn sweep_provider(
                         let _ = store.forget(rec);
                     }
                     if let Some(m) = machine {
-                        let _ = store.record(Resource {
-                            provider: r.provider.clone(),
-                            id: m.clone(),
-                            resource_type: model::RELAY_MACHINE.into(),
-                            name: m.clone(),
-                            machine: m,
-                            created: t,
-                            state: "orphaned".into(),
-                            ..Default::default()
-                        });
+                        if conn.is_static_relay() {
+                            let _ = crate::relay::remove_env_token(
+                                store.home().as_deref(),
+                                &r.provider,
+                                &m,
+                            );
+                        } else {
+                            let _ = store.record(Resource {
+                                provider: r.provider.clone(),
+                                id: m.clone(),
+                                resource_type: model::RELAY_MACHINE.into(),
+                                name: m.clone(),
+                                machine: m,
+                                created: t,
+                                state: "orphaned".into(),
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
                 Err(e) => {

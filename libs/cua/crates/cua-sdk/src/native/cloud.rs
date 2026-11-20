@@ -128,6 +128,14 @@ pub struct CloudProvider {
     /// ("Can open it").
     #[serde(default)]
     pub holders: Vec<String>,
+    /// Per-connection relay base URL (`https://relay.cua.ai` by default),
+    /// or `None` when not connected.
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`), or `None` when
+    /// not connected.
+    #[serde(default)]
+    pub relay_mode: Option<String>,
 }
 
 /// The next step of a `cloud_connect`: a command for the agent, or a page
@@ -367,12 +375,12 @@ pub struct CloudSweepReport {
 /// `HCLOUD_TOKEN`).
 #[derive(Clone, PartialEq, Default, uniffi::Record)]
 pub struct CloudTarget {
-    /// `aws`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: String,
-    /// AWS or Modal profile.
+    /// AWS, Modal, or Alibaba Cloud CLI profile.
     #[uniffi(default = None)]
     pub profile: Option<String>,
-    /// AWS or GCP region, or Hetzner location (`fsn1`).
+    /// AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
     #[uniffi(default = None)]
     pub region: Option<String>,
     /// GCP zone.
@@ -384,11 +392,22 @@ pub struct CloudTarget {
     /// Modal environment.
     #[uniffi(default = None)]
     pub environment: Option<String>,
-    /// Hetzner: the project's Read & Write API token. Secret: used for the
-    /// checks, saved in the Cua credential store when they pass, never
-    /// printed.
+    /// Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+    /// Secret: used for the checks, saved in the Cua credential store when
+    /// they pass, never printed.
     #[uniffi(default = None)]
     pub token: Option<String>,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[uniffi(default = None)]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to `account`).
+    #[uniffi(default = None)]
+    pub relay_mode: Option<String>,
+    /// Shared static relay registration token for Static Relay Mode. Secret:
+    /// never printed or stored in plaintext config.
+    #[uniffi(default = None)]
+    pub relay_token: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -401,6 +420,12 @@ impl std::fmt::Debug for CloudTarget {
             .field("project", &self.project)
             .field("environment", &self.environment)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "relay_token",
+                &self.relay_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -415,7 +440,21 @@ impl CloudTarget {
             "project": self.project,
             "environment": self.environment,
             "token": self.token,
+            "relay_url": self.relay_url,
+            "relay_mode": self.relay_mode,
+            "relay_token": self.relay_token,
         })
+    }
+
+    fn relay_fields_asked(&self) -> Vec<&'static str> {
+        [
+            ("relay_url", self.relay_url.is_some()),
+            ("relay_mode", self.relay_mode.is_some()),
+            ("relay_token", self.relay_token.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(k, set)| set.then_some(k))
+        .collect()
     }
 }
 
@@ -503,24 +542,26 @@ impl Spaces {
             let mut args = target.args();
             args["make_default"] = json!(make_default);
             args["ttl_hours"] = json!(ttl_hours);
+            let mut asked: Vec<&str> = target.relay_fields_asked();
             if let Some(o) = options {
                 // An older daemon ignores fields it does not know and would
-                // link through the CLI sign-in instead: refuse first.
-                let asked: Vec<&str> = [
-                    ("auth", o.auth.is_some()),
-                    ("budget_usd_month", o.budget_usd_month.is_some()),
-                    ("max_size", o.max_size.is_some()),
-                    ("account_id", o.account_id.is_some()),
-                    ("role_arn", o.role_arn.is_some()),
-                    ("check", o.check),
-                ]
-                .into_iter()
-                .filter_map(|(k, set)| set.then_some(k))
-                .collect();
+                // link through the CLI sign-in or default relay instead: refuse first.
+                asked.extend(
+                    [
+                        ("auth", o.auth.is_some()),
+                        ("budget_usd_month", o.budget_usd_month.is_some()),
+                        ("max_size", o.max_size.is_some()),
+                        ("account_id", o.account_id.is_some()),
+                        ("role_arn", o.role_arn.is_some()),
+                        ("check", o.check),
+                    ]
+                    .into_iter()
+                    .filter_map(|(k, set)| set.then_some(k)),
+                );
                 host.require_fields(
                     "cloud_connect",
                     &asked,
-                    "link a cloud with OIDC, a budget or a largest machine",
+                    "link a cloud with OIDC, a budget, a largest machine or a custom relay",
                 )
                 .await?;
                 args["auth"] = json!(o.auth);
@@ -536,6 +577,13 @@ impl Spaces {
                 args["resource_group"] = json!(o.resource_group);
                 args["check"] = json!(o.check);
                 args["agent"] = json!(o.agent);
+            } else if !asked.is_empty() {
+                host.require_fields(
+                    "cloud_connect",
+                    &asked,
+                    "connect a cloud with a custom or static relay",
+                )
+                .await?;
             }
             connected(host.tool_value("cloud_connect", args).await?)
         })
@@ -560,7 +608,19 @@ impl Spaces {
     /// Checks a cloud account without creating anything.
     pub async fn cloud_test(&self, target: CloudTarget) -> Result<CloudTestReport> {
         let host = self.tool_caller();
-        run(async move { parse(host.tool_value("cloud_test", target.args()).await?) }).await
+        run(async move {
+            let asked = target.relay_fields_asked();
+            if !asked.is_empty() {
+                host.require_fields(
+                    "cloud_test",
+                    &asked,
+                    "test a cloud with a custom or static relay",
+                )
+                .await?;
+            }
+            parse(host.tool_value("cloud_test", target.args()).await?)
+        })
+        .await
     }
 
     /// Forgets a connected cloud. Refused (listing them) while Cua
@@ -721,5 +781,32 @@ mod tests {
         assert!(r.dry_run);
         assert_eq!(r.resources[0].resource.resource_type, "instance");
         assert_eq!(r.resources[0].action, "delete");
+
+        // relay_mode, relay_url, relay_token wire & redaction round-trip.
+        let target = CloudTarget {
+            provider: "hetzner".into(),
+            relay_url: Some("https://relay.example.com".into()),
+            relay_mode: Some("static".into()),
+            relay_token: Some("super-secret-relay-token".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{target:?}").contains("super-secret-relay-token"));
+        let args = target.args();
+        assert_eq!(args["relay_url"], "https://relay.example.com");
+        assert_eq!(args["relay_mode"], "static");
+        assert_eq!(args["relay_token"], "super-secret-relay-token");
+        let p_wire = serde_json::to_value(cua_spaces::cloud::CloudProvider {
+            name: "hetzner".into(),
+            relay_url: Some("https://relay.example.com".into()),
+            relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+            ..Default::default()
+        })
+        .unwrap();
+        let p_sdk: CloudProvider = parse(p_wire).unwrap();
+        assert_eq!(p_sdk.relay_mode.as_deref(), Some("static"));
+        assert_eq!(
+            p_sdk.relay_url.as_deref(),
+            Some("https://relay.example.com")
+        );
     }
 }

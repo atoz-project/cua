@@ -184,7 +184,9 @@ pub fn container_env(boot: &VmBoot<'_>) -> String {
         "CUA_ENV_MACHINE_ID_FILE".into(),
         "/run/cua-relay/machine-id".into(),
     );
-    env.insert("CUA_RELAY_JWKS".into(), "/run/cua-relay/jwks.json".into());
+    if !boot.join.jwks_json.trim().is_empty() {
+        env.insert("CUA_RELAY_JWKS".into(), "/run/cua-relay/jwks.json".into());
+    }
     // Public TCP shares straight from this computer: the slots the container
     // publishes, which cua-spacesd serves only while a share holds one (and
     // the cloud firewall opens only then).
@@ -247,11 +249,13 @@ pub fn cloud_init(boot: &VmBoot<'_>) -> String {
         "0600",
         &format!("{}\n", boot.join.machine_id),
     ));
-    y.push_str(&file(
-        "/etc/cua/relay/jwks.json",
-        "0600",
-        &boot.join.jwks_json,
-    ));
+    if !boot.join.jwks_json.trim().is_empty() {
+        y.push_str(&file(
+            "/etc/cua/relay/jwks.json",
+            "0600",
+            &boot.join.jwks_json,
+        ));
+    }
     y.push_str(&file(
         "/etc/cua/relay/policy.json",
         "0600",
@@ -424,5 +428,41 @@ mod tests {
         assert!(!script.contains("shutdown -h +"));
         assert!(script.contains("'x'\\''y'"), "{script}");
         assert!(script.contains("--shm-size 64m"));
+    }
+
+    #[test]
+    fn static_relay_empty_jwks_omits_jwks_file_and_env() {
+        let j = Join {
+            relay_url: "https://relay.selfhosted.example".into(),
+            machine_id: "cloud-0123456789abcdef".into(),
+            machine_token: "static_secret_tok".into(),
+            jwks_json: String::new(),
+            owner: String::new(),
+            owner_email: String::new(),
+        };
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".to_string(), "envtok".to_string())]);
+        let y = cloud_init(&VmBoot {
+            join: &j,
+            image: "ghcr.io/trycua/linux@sha256:abc",
+            env: &env,
+            expires: 0,
+            ttl_secs: 0,
+            shm_mb: 512,
+            provider: "aws",
+            net_guard: true,
+            share_slots: false,
+        });
+        assert!(!y.contains("path: /etc/cua/relay/jwks.json"), "{y}");
+        let sb_env = decode(&y, "/etc/cua/sandbox.env");
+        assert!(!sb_env.contains("CUA_RELAY_JWKS="), "{sb_env}");
+        assert!(sb_env.contains("CUA_ENV_RELAY_URL=https://relay.selfhosted.example"));
+        assert_eq!(
+            decode(&y, "/etc/cua/relay/machine-token"),
+            "static_secret_tok"
+        );
+        let policy: serde_json::Value =
+            serde_json::from_str(&decode(&y, "/etc/cua/relay/policy.json")).unwrap();
+        assert!(policy.get("owner").is_none());
+        assert_eq!(policy["sharing"], true);
     }
 }

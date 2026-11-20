@@ -3047,7 +3047,9 @@ impl Sandbox {
                 }
                 if let Some(o) = provider.0.connect_options(instance, port) {
                     let mut o = o.map_err(|e| not_available(e.to_string()))?;
-                    o.token = token.clone();
+                    if token.is_some() {
+                        o.token = token.clone();
+                    }
                     o
                 } else {
                     let ep = provider
@@ -3062,7 +3064,9 @@ impl Sandbox {
                     }
                     let mut o =
                         ConnectOptions::parse(&ep.url).map_err(|e| not_available(e.to_string()))?;
-                    o.token = token.clone();
+                    if token.is_some() {
+                        o.token = token.clone();
+                    }
                     o
                 }
             }

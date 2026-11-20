@@ -51,15 +51,28 @@ impl std::fmt::Debug for Join {
 
 impl Join {
     /// The owner policy the guest's cua-spacesd enforces (the host policy
-    /// shape): the owner, sharing on, the relay's allowlist trusted.
+    /// shape): the owner (when account-backed), sharing on, the relay's
+    /// allowlist trusted.
     pub fn policy_json(&self) -> String {
-        serde_json::json!({
-            "owner": self.owner,
-            "owner_email": (!self.owner_email.is_empty()).then_some(&self.owner_email),
-            "sharing": true,
-            "trust_relay_allowlist": true,
-        })
-        .to_string()
+        let mut obj = serde_json::Map::new();
+        if !self.owner.is_empty() {
+            obj.insert(
+                "owner".into(),
+                serde_json::Value::String(self.owner.clone()),
+            );
+        }
+        if !self.owner_email.is_empty() {
+            obj.insert(
+                "owner_email".into(),
+                serde_json::Value::String(self.owner_email.clone()),
+            );
+        }
+        obj.insert("sharing".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "trust_relay_allowlist".into(),
+            serde_json::Value::Bool(true),
+        );
+        serde_json::Value::Object(obj).to_string()
     }
 
     /// The environment `cua-spacesd join` reads to join as this machine
@@ -74,9 +87,11 @@ impl Join {
             ("CUA_ENV_RELAY_URL".into(), self.relay_url.clone()),
             ("CUA_RELAY_TOKEN".into(), self.machine_token.clone()),
             ("CUA_ENV_MACHINE_ID".into(), self.machine_id.clone()),
-            ("CUA_RELAY_JWKS_JSON".into(), self.jwks_json.clone()),
             ("CUA_HOST_POLICY_JSON".into(), self.policy_json()),
         ]));
+        if !self.jwks_json.trim().is_empty() {
+            env.insert("CUA_RELAY_JWKS_JSON".into(), self.jwks_json.clone());
+        }
         env
     }
 }
@@ -152,6 +167,22 @@ impl RelayAccess {
     pub fn with_device(mut self, device: Arc<DeviceAuth>) -> Self {
         self.device = Some(device);
         self
+    }
+
+    /// Returns a `RelayAccess` targeting `url`, rebinding `device` if present.
+    pub fn rebind(&self, url: &str) -> Result<Self> {
+        if url == self.url {
+            return Ok(self.clone());
+        }
+        let device = match &self.device {
+            Some(d) => Some(Arc::new(d.rebind(url).map_err(relay_err)?)),
+            None => None,
+        };
+        Ok(RelayAccess {
+            url: url.to_string(),
+            tokens: self.tokens.clone(),
+            device,
+        })
     }
 
     /// The relay of `CUA_RELAY_URL` (else relay.cua.ai), the `cua auth
@@ -369,6 +400,250 @@ impl RelayAccess {
     }
 }
 
+/// Resolves the [`cua_auth::Store`] for `home`: in test processes or when
+/// `home` differs from `cua_auth::cua_home()`, uses a file-backed store under
+/// `home` so tests remain hermetic and never touch the user's real vault.
+pub(crate) fn secret_store(home: Option<&std::path::Path>) -> cua_auth::Store {
+    match home {
+        Some(h) if cua_home::is_test_process() || h != cua_auth::cua_home() => {
+            cua_auth::Store::File(h.join("credentials.json"))
+        }
+        _ => cua_auth::Store::from_env(),
+    }
+}
+
+fn store_err(e: cua_auth::Error) -> Error {
+    Error::Io(std::io::Error::other(e.to_string()))
+}
+
+fn secret_key(prefix: &str, provider: &str) -> Result<String> {
+    let p = provider.trim().to_ascii_lowercase();
+    if p.is_empty() || !p.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') {
+        return Err(Error::InvalidArgument(format!(
+            "invalid cloud provider name {provider:?}"
+        )));
+    }
+    Ok(format!("{prefix}{p}"))
+}
+
+pub(crate) fn load_static_relay_token(
+    home: Option<&std::path::Path>,
+    provider: &str,
+) -> Result<Option<crate::api::Secret>> {
+    let key = secret_key("byoc-relay-token-", provider)?;
+    let bytes = secret_store(home).load_secret(&key).map_err(store_err)?;
+    Ok(bytes.and_then(|b| {
+        String::from_utf8(b)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(crate::api::Secret::new)
+    }))
+}
+
+pub(crate) fn save_static_relay_token(
+    home: Option<&std::path::Path>,
+    provider: &str,
+    token: &str,
+) -> Result<()> {
+    let key = secret_key("byoc-relay-token-", provider)?;
+    secret_store(home)
+        .save_secret(&key, token.trim().as_bytes())
+        .map_err(store_err)
+}
+
+pub(crate) fn clear_static_relay_token(home: Option<&std::path::Path>, provider: &str) -> bool {
+    let Ok(key) = secret_key("byoc-relay-token-", provider) else {
+        return false;
+    };
+    secret_store(home).clear_secret(&key).unwrap_or(false)
+}
+
+static ENV_TOKENS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_env_tokens_map(store: &cua_auth::Store, key: &str) -> Result<BTreeMap<String, String>> {
+    let Some(bytes) = store.load_secret(key).map_err(store_err)? else {
+        return Ok(BTreeMap::new());
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+fn write_env_tokens_map(
+    store: &cua_auth::Store,
+    key: &str,
+    map: &BTreeMap<String, String>,
+) -> Result<()> {
+    if map.is_empty() {
+        let _ = store.clear_secret(key);
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(map).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    store.save_secret(key, &bytes).map_err(store_err)
+}
+
+pub(crate) fn save_env_token(
+    home: Option<&std::path::Path>,
+    provider: &str,
+    machine_id: &str,
+    token: &str,
+) -> Result<()> {
+    let key = secret_key("byoc-env-tokens-", provider)?;
+    let _g = ENV_TOKENS_LOCK.lock().expect("env tokens lock");
+    let store = secret_store(home);
+    let mut map = read_env_tokens_map(&store, &key)?;
+    map.insert(machine_id.to_string(), token.to_string());
+    write_env_tokens_map(&store, &key, &map)
+}
+
+pub(crate) fn load_env_token(
+    home: Option<&std::path::Path>,
+    provider: &str,
+    machine_id: &str,
+) -> Result<Option<String>> {
+    let key = secret_key("byoc-env-tokens-", provider)?;
+    let _g = ENV_TOKENS_LOCK.lock().expect("env tokens lock");
+    let store = secret_store(home);
+    let map = read_env_tokens_map(&store, &key)?;
+    Ok(map.get(machine_id).cloned())
+}
+
+pub(crate) fn remove_env_token(
+    home: Option<&std::path::Path>,
+    provider: &str,
+    machine_id: &str,
+) -> Result<()> {
+    let key = secret_key("byoc-env-tokens-", provider)?;
+    let _g = ENV_TOKENS_LOCK.lock().expect("env tokens lock");
+    let store = secret_store(home);
+    let mut map = read_env_tokens_map(&store, &key)?;
+    if map.remove(machine_id).is_some() {
+        write_env_tokens_map(&store, &key, &map)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn clear_env_tokens(home: Option<&std::path::Path>, provider: &str) -> bool {
+    let Ok(key) = secret_key("byoc-env-tokens-", provider) else {
+        return false;
+    };
+    let _g = ENV_TOKENS_LOCK.lock().expect("env tokens lock");
+    secret_store(home).clear_secret(&key).unwrap_or(false)
+}
+
+/// Probes `GET /v1/info` on a relay URL and checks mode compatibility.
+pub(crate) async fn probe_relay_check(
+    url: &str,
+    mode: cua_sandbox_core::byoc::RelayMode,
+) -> cua_sandbox_core::byoc::CloudCheck {
+    let client = match RelayClient::new(url) {
+        Ok(c) => c,
+        Err(e) => {
+            return cua_sandbox_core::byoc::CloudCheck {
+                name: "relay".into(),
+                ok: false,
+                detail: format!("invalid relay URL {url}: {e}"),
+            };
+        }
+    };
+    match client.info().await {
+        Ok(info) => match mode {
+            cua_sandbox_core::byoc::RelayMode::Static => {
+                if info.static_tokens {
+                    cua_sandbox_core::byoc::CloudCheck {
+                        name: "relay".into(),
+                        ok: true,
+                        detail: format!("Static Relay Mode at {url}"),
+                    }
+                } else {
+                    cua_sandbox_core::byoc::CloudCheck {
+                        name: "relay".into(),
+                        ok: false,
+                        detail: format!(
+                            "relay at {url} does not accept static tokens (`static_tokens: false`)"
+                        ),
+                    }
+                }
+            }
+            cua_sandbox_core::byoc::RelayMode::Account => {
+                if info.account_auth {
+                    cua_sandbox_core::byoc::CloudCheck {
+                        name: "relay".into(),
+                        ok: true,
+                        detail: format!("Account Relay Mode at {url}"),
+                    }
+                } else {
+                    cua_sandbox_core::byoc::CloudCheck {
+                        name: "relay".into(),
+                        ok: false,
+                        detail: format!(
+                            "relay at {url} does not accept account auth (`account_auth: false`)"
+                        ),
+                    }
+                }
+            }
+        },
+        Err(e) => cua_sandbox_core::byoc::CloudCheck {
+            name: "relay".into(),
+            ok: false,
+            detail: format!("relay at {url} unreachable: {e}"),
+        },
+    }
+}
+
+/// Waits until a Static Relay Mode machine answers authenticated
+/// `GetCapabilities` through `<relay_url>/m/<machine_id>` with `Bearer <env_token>`.
+/// Fails fast on `Unauthenticated` (wrong or rejected `env_token`).
+pub(crate) async fn wait_static_online<F, Fut>(
+    machine_url: &str,
+    env_token: &str,
+    timeout: Duration,
+    mut alive: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut polls = 0u32;
+    let mut opts = cua_spacesd_client::ConnectOptions::parse(machine_url)
+        .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    opts.gateway = None;
+    opts.token = Some(env_token.to_string());
+    opts.probe = true;
+    opts.probe_timeout = Duration::from_secs(5);
+    loop {
+        let last_error = match cua_spacesd_client::SpacesdClient::connect(opts.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(cua_spacesd_client::Error::Unauthenticated(d)) => {
+                return Err(Error::Cloud(format!(
+                    "static relay rejected environment token at {machine_url}: {d}"
+                )));
+            }
+            Err(e) => Some(e.to_string()),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Timeout(match last_error {
+                Some(e) => format!(
+                    "{machine_url} did not become reachable over the static relay within {}s \
+                     (last error: {e})",
+                    timeout.as_secs()
+                ),
+                None => format!(
+                    "{machine_url} did not become reachable over the static relay within {}s",
+                    timeout.as_secs()
+                ),
+            }));
+        }
+        polls += 1;
+        if polls == 1 || polls.is_multiple_of(4) {
+            alive().await?;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_secs(2))).await;
+    }
+}
+
 /// The relay gateway bearer: the account token plus this device's
 /// session header, fetched per call.
 struct Bearer(RelayAccess);
@@ -430,5 +705,28 @@ mod tests {
         let policy: serde_json::Value = serde_json::from_str(&j.policy_json()).unwrap();
         assert_eq!(policy["owner"], "acct");
         assert!(!format!("{j:?}").contains("cmt_secret"));
+    }
+
+    #[test]
+    fn static_join_omits_empty_jwks_and_owner_and_redacts_token() {
+        let j = Join {
+            relay_url: "https://relay.selfhosted.example".into(),
+            machine_id: "cloud-0123456789abcdef".into(),
+            machine_token: "static_secret_tok".into(),
+            jwks_json: String::new(),
+            owner: String::new(),
+            owner_email: String::new(),
+        };
+        let env = j.guest_env();
+        assert!(!env.contains_key("CUA_RELAY_JWKS_JSON"), "{env:?}");
+        assert_eq!(env["CUA_ENV_RELAY_URL"], "https://relay.selfhosted.example");
+        assert_eq!(env["CUA_RELAY_TOKEN"], "static_secret_tok");
+        assert_eq!(env["CUA_ENV_MACHINE_ID"], "cloud-0123456789abcdef");
+        let policy: serde_json::Value = serde_json::from_str(&j.policy_json()).unwrap();
+        assert!(policy.get("owner").is_none(), "{policy}");
+        assert!(policy.get("owner_email").is_none(), "{policy}");
+        assert_eq!(policy["sharing"], true);
+        assert_eq!(policy["trust_relay_allowlist"], true);
+        assert!(!format!("{j:?}").contains("static_secret_tok"));
     }
 }

@@ -1019,6 +1019,9 @@ impl Spaces {
         let Ok(c) = self.sandboxes().clouds() else {
             return false;
         };
+        if c.relay_mode(provider) == Some(cua_sandbox_core::byoc::RelayMode::Static) {
+            return false;
+        }
         c.host_offers()
             .await
             .is_ok_and(|o| o.iter().any(|o| o.provider == provider))

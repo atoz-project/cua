@@ -355,6 +355,12 @@ pub struct Connection {
     /// The largest machine Cua may create here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size: Option<MaxSize>,
+    /// Per-connection relay base URL (`None`: official `https://relay.cua.ai`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`None`: Account Relay Mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<cua_sandbox_core::byoc::RelayMode>,
 }
 
 fn default_ttl() -> u32 {
@@ -365,6 +371,24 @@ fn default_ttl() -> u32 {
 pub const DEFAULT_TTL_HOURS: u32 = 8;
 
 impl Connection {
+    /// Effective relay mode (`Account` when unset).
+    pub fn effective_relay_mode(&self) -> cua_sandbox_core::byoc::RelayMode {
+        self.relay_mode.unwrap_or_default()
+    }
+
+    /// Whether this connection uses Static Relay Mode.
+    pub fn is_static_relay(&self) -> bool {
+        self.effective_relay_mode() == cua_sandbox_core::byoc::RelayMode::Static
+    }
+
+    /// Effective relay base URL (`default` when `relay_url` is unset or empty).
+    pub fn effective_relay_url<'a>(&'a self, default: &'a str) -> &'a str {
+        self.relay_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .unwrap_or(default)
+    }
+
     /// "AWS · us-west-2", "Google Cloud · my-project", "Modal · main".
     pub fn label(&self, title: &str) -> String {
         let place = [&self.region, &self.project, &self.environment]

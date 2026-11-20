@@ -403,13 +403,13 @@ async fn dispatch(
         "cloud_test" => {
             let a: i::CloudTest = args(tool, a)?;
             let c = spaces.sandboxes().clouds()?;
-            Ok(json_of(&c.test(&cloud_target(a.target)).await?))
+            Ok(json_of(&c.test(&cloud_target(a.target)?).await?))
         }
         "cloud_connect" => {
             let a: i::CloudConnect = args(tool, a)?;
             let c = spaces.sandboxes().clouds()?;
             let req = cua_sandbox_core::byoc::ConnectRequest {
-                target: cloud_target(a.target),
+                target: cloud_target(a.target)?,
                 make_default: a.make_default.unwrap_or(false),
                 ttl_hours: a.ttl_hours,
                 auth: a.auth,
@@ -1059,9 +1059,16 @@ fn json_of<T: serde::Serialize>(v: &T) -> ToolOutcome {
 }
 
 /// A `cloud_*` target, trimmed.
-fn cloud_target(t: i::CloudTarget) -> cua_sandbox_core::byoc::CloudTarget {
+fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget> {
     let some = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
-    cua_sandbox_core::byoc::CloudTarget {
+    let relay_mode = t
+        .relay_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(cua_sandbox_core::byoc::RelayMode::parse)
+        .transpose()?;
+    Ok(cua_sandbox_core::byoc::CloudTarget {
         provider: t.provider.trim().to_ascii_lowercase(),
         profile: some(t.profile),
         region: some(t.region),
@@ -1070,7 +1077,11 @@ fn cloud_target(t: i::CloudTarget) -> cua_sandbox_core::byoc::CloudTarget {
         environment: some(t.environment),
         // Keep `Some("")` distinct from `None` so empty `--token-stdin` does not fall through.
         token: t.token.map(|v| v.trim().to_string()),
-    }
+        relay_url: t.relay_url.map(|v| v.trim().to_string()),
+        relay_mode,
+        // Keep `Some("")` distinct from `None` so empty `--relay-token-stdin` does not fall through.
+        relay_token: t.relay_token.map(|v| v.trim().to_string()),
+    })
 }
 
 /// The capability a contract tool belongs to when an extension serves it
@@ -1669,15 +1680,21 @@ mod tests {
         let out = cloud_target(i::CloudTarget {
             provider: "aliyun-ecs".into(),
             token: Some("  \n".into()),
+            relay_token: Some(" \t ".into()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(out.token.as_deref(), Some(""));
+        assert_eq!(out.relay_token.as_deref(), Some(""));
 
         let omitted = cloud_target(i::CloudTarget {
             provider: "aliyun-ecs".into(),
             token: None,
+            relay_token: None,
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert_eq!(omitted.token, None);
+        assert_eq!(omitted.relay_token, None);
     }
 }

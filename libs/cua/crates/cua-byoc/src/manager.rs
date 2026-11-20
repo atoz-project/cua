@@ -150,6 +150,7 @@ impl Clouds {
         dry_run: bool,
         actor: &str,
     ) -> Result<Vec<CloudSweepItem>> {
+        let conn = self.store.connection(provider).map_err(Error::Io)?;
         let t = model::now();
         let mut out = Vec::new();
         for rec in self
@@ -165,34 +166,58 @@ impl Clouds {
                 reason: "a relay computer a failed create left".into(),
             };
             if !dry_run {
-                match &self.relay {
-                    Some(relay) => match relay.forget(&rec.id).await {
-                        Ok(()) => {
-                            let _ = self.store.forget(&rec);
-                            item.action = "deleted".into();
-                            self.store.audit(audit::of_resource(
-                                "resource_deleted",
-                                &rec,
-                                actor,
-                                "ok",
-                                &item.reason,
-                            ));
-                        }
-                        Err(e) => {
-                            item.action = "failed".into();
-                            item.reason = e.to_string();
-                            self.store.audit(audit::of_resource(
-                                "resource_deleted",
-                                &rec,
-                                actor,
-                                "failed",
-                                &item.reason,
-                            ));
-                        }
-                    },
-                    None => {
+                if conn.as_ref().is_some_and(Connection::is_static_relay) {
+                    let _ = crate::relay::remove_env_token(
+                        self.store.home().as_deref(),
+                        provider,
+                        &rec.id,
+                    );
+                    let _ = self.store.forget(&rec);
+                    item.action = "deleted".into();
+                    self.store.audit(audit::of_resource(
+                        "resource_deleted",
+                        &rec,
+                        actor,
+                        "ok",
+                        &item.reason,
+                    ));
+                    out.push(item);
+                    continue;
+                }
+                let relay = match (&self.relay, &conn) {
+                    (Some(r), Some(c)) => r
+                        .rebind(c.effective_relay_url(&r.url))
+                        .unwrap_or_else(|_| r.clone()),
+                    (Some(r), None) => r.clone(),
+                    (None, _) => {
                         item.action = "failed".into();
                         item.reason = "no relay account in this process".into();
+                        out.push(item);
+                        continue;
+                    }
+                };
+                match relay.forget(&rec.id).await {
+                    Ok(()) => {
+                        let _ = self.store.forget(&rec);
+                        item.action = "deleted".into();
+                        self.store.audit(audit::of_resource(
+                            "resource_deleted",
+                            &rec,
+                            actor,
+                            "ok",
+                            &item.reason,
+                        ));
+                    }
+                    Err(e) => {
+                        item.action = "failed".into();
+                        item.reason = e.to_string();
+                        self.store.audit(audit::of_resource(
+                            "resource_deleted",
+                            &rec,
+                            actor,
+                            "failed",
+                            &item.reason,
+                        ));
                     }
                 }
             }
@@ -486,13 +511,108 @@ impl Clouds {
                 String::new()
             },
             holders: vec![],
+            relay_url: conn.map(|c| {
+                c.effective_relay_url(cua_sandbox_core::byoc::DEFAULT_RELAY_URL)
+                    .to_string()
+            }),
+            relay_mode: conn.map(|c| c.effective_relay_mode()),
             ..Default::default()
         }
     }
 }
 
+pub(crate) struct ResolvedTargetRelay {
+    pub mode: cua_sandbox_core::byoc::RelayMode,
+    pub url: Option<String>,
+    pub stored_mode: Option<cua_sandbox_core::byoc::RelayMode>,
+    pub staged_token: Option<crate::api::Secret>,
+    pub probe_url: Option<String>,
+}
+
+pub(crate) fn resolve_target_relay(
+    home: Option<&Path>,
+    provider: &str,
+    target: &CloudTarget,
+    existing: Option<&Connection>,
+) -> Result<ResolvedTargetRelay> {
+    use cua_sandbox_core::byoc::RelayMode;
+    let mode = target
+        .relay_mode
+        .or_else(|| existing.and_then(|c| c.relay_mode))
+        .unwrap_or(RelayMode::Account);
+    let mut staged_token = None;
+    match mode {
+        RelayMode::Account => {
+            if target.relay_token.is_some() {
+                return Err(Error::InvalidArgument(
+                    "--relay-token-stdin applies only to --relay-mode static".into(),
+                ));
+            }
+        }
+        RelayMode::Static => match target.relay_token.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "--relay-token-stdin was empty; expected a static relay token".into(),
+                    ));
+                }
+                staged_token = Some(crate::api::Secret::new(trimmed));
+            }
+            None => {
+                if crate::relay::load_static_relay_token(home, provider)?.is_none() {
+                    return Err(Error::InvalidArgument(
+                        "Static Relay Mode requires --relay-token-stdin (or a previously saved \
+                         static relay token)"
+                            .into(),
+                    ));
+                }
+            }
+        },
+    }
+    let url = match target.relay_url.as_deref() {
+        Some(raw) => Some(
+            cua_host::relay::normalize_base(raw)
+                .map_err(|e| Error::InvalidArgument(e.to_string()))?,
+        ),
+        None if target.relay_mode.is_none() => existing.and_then(|c| c.relay_url.clone()),
+        None if mode == RelayMode::Static => existing
+            .filter(|c| c.is_static_relay())
+            .and_then(|c| c.relay_url.clone()),
+        None => None,
+    };
+    if mode == RelayMode::Static && url.is_none() {
+        return Err(Error::InvalidArgument(
+            "--relay-url is required in Static Relay Mode".into(),
+        ));
+    }
+    let stored_mode = match mode {
+        RelayMode::Account if url.is_none() => None,
+        m => Some(m),
+    };
+    let probe_url = match mode {
+        RelayMode::Static => url.clone(),
+        RelayMode::Account => url.clone(),
+    };
+    Ok(ResolvedTargetRelay {
+        mode,
+        url,
+        stored_mode,
+        staged_token,
+        probe_url,
+    })
+}
+
 #[async_trait]
 impl CloudManager for Clouds {
+    fn relay_mode(&self, provider: &str) -> Option<cua_sandbox_core::byoc::RelayMode> {
+        self.store
+            .connection(provider)
+            .ok()
+            .flatten()
+            .map(|c| c.effective_relay_mode())
+    }
+
     async fn status(&self, provider: Option<&str>) -> Result<CloudStatusReport> {
         if let Some(n) = provider {
             self.api(n)?;
@@ -575,10 +695,23 @@ impl CloudManager for Clouds {
 
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
+        let existing = self.store.connection(p.name()).map_err(Error::Io)?;
+        let relay = resolve_target_relay(
+            self.store.home().as_deref(),
+            p.name(),
+            target,
+            existing.as_ref(),
+        )?;
         p.stage_secret(target);
         let _unstage = UnstageGuard(p.as_ref());
-        let conn = p.resolve(target)?;
-        let t = p.test(&conn).await;
+        let mut conn = p.resolve(target)?;
+        conn.relay_url = relay.url;
+        conn.relay_mode = relay.stored_mode;
+        let mut t = p.test(&conn).await;
+        if let Some(url) = relay.probe_url.as_deref() {
+            t.checks
+                .push(crate::relay::probe_relay_check(url, relay.mode).await);
+        }
         Ok(CloudTestReport {
             provider: p.name().into(),
             ok: t.ok(),
@@ -594,10 +727,24 @@ impl CloudManager for Clouds {
         ttl_hours: Option<u32>,
     ) -> Result<CloudConnected> {
         let p = self.api(&target.provider)?;
+        let existing = self.store.connection(p.name()).map_err(Error::Io)?;
+        let relay = resolve_target_relay(
+            self.store.home().as_deref(),
+            p.name(),
+            target,
+            existing.as_ref(),
+        )?;
         p.stage_secret(target);
         let _unstage = UnstageGuard(p.as_ref());
         let mut conn = p.resolve(target)?;
-        let tested = p.test(&conn).await;
+        conn.relay_url = relay.url;
+        conn.relay_mode = relay.stored_mode;
+        let mut tested = p.test(&conn).await;
+        if let Some(url) = relay.probe_url.as_deref() {
+            tested
+                .checks
+                .push(crate::relay::probe_relay_check(url, relay.mode).await);
+        }
         if !tested.ok() {
             let failed: Vec<String> = tested
                 .checks
@@ -624,6 +771,17 @@ impl CloudManager for Clouds {
         };
         conn.connected_at = model::rfc3339(model::now());
         p.persist_secret()?;
+        let home = self.store.home();
+        match relay.mode {
+            cua_sandbox_core::byoc::RelayMode::Static => {
+                if let Some(tok) = relay.staged_token {
+                    crate::relay::save_static_relay_token(home.as_deref(), p.name(), tok.expose())?;
+                }
+            }
+            cua_sandbox_core::byoc::RelayMode::Account => {
+                crate::relay::clear_static_relay_token(home.as_deref(), p.name());
+            }
+        }
         self.store.connect(conn.clone()).map_err(Error::Io)?;
         let mut a = audit::entry("connect", p.name(), "user");
         a.detail = format!("{} ttl {}h", conn.label(p.title()), conn.ttl_hours);
@@ -712,6 +870,9 @@ impl CloudManager for Clouds {
         }
         let disconnected = self.store.disconnect(p.name()).map_err(Error::Io)?;
         p.forget_secret();
+        let home = self.store.home();
+        crate::relay::clear_static_relay_token(home.as_deref(), p.name());
+        crate::relay::clear_env_tokens(home.as_deref(), p.name());
         if disconnected {
             let mut a = audit::entry("disconnect", p.name(), "user");
             a.detail = if delete {
