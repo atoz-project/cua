@@ -139,6 +139,11 @@ pub trait CloudApi: Send + Sync + 'static {
         vec![]
     }
 
+    /// Default boot disk size in GiB for `family`.
+    fn default_disk_gb(&self, family: &str) -> u32 {
+        crate::provider::disk_for(family)
+    }
+
     /// Whether the cloud enforces a Space's network rules itself, outside
     /// the guest ([`crate::modal_net`]). Otherwise a Space that asks for
     /// rules is refused here, never created without them.

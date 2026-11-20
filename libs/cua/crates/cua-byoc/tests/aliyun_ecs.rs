@@ -9,12 +9,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use cua_byoc::RelayAccess;
 use cua_byoc::aliyun_ecs::{AliyunEcs, TokenStore};
+use cua_byoc::aliyun_net;
 use cua_byoc::api::{CloudApi, Target};
-use cua_byoc::model::{self, Connection};
-use cua_sandbox_core::Sandboxes;
-use cua_sandbox_core::byoc::ConnectRequest;
+use cua_byoc::model::{self, Connection, ProvisionSpec, Resource};
+use cua_host::testing::FakeRelay;
+use cua_sandbox_core::byoc::{ConnectRequest, DETAIL_RELAY_MACHINE};
+use cua_sandbox_core::placement::Runtime;
+use cua_sandbox_core::{CreateOptions, ProviderKind, Sandboxes, Status};
 use serde_json::json;
 
 #[path = "support/fake_aliyun.rs"]
@@ -88,7 +92,8 @@ async fn start(aliyun_config: Option<std::path::PathBuf>) -> (AliyunEcs, S, Arc<
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://{addr}");
     let store = Arc::new(MemStore::default());
-    let api = AliyunEcs::with_endpoints(&base, &base, &base, store.clone(), aliyun_config);
+    let api = AliyunEcs::with_endpoints(&base, &base, &base, store.clone(), aliyun_config)
+        .with_poll(std::time::Duration::from_millis(5));
     (api, s, store)
 }
 
@@ -1165,4 +1170,1104 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
         Some("vsw-only-1")
     );
     assert!(!run.params.contains_key("SecurityGroupId"));
+}
+
+const HERMETIC_LINUX_IMAGE: &str = "registry.invalid/trycua/linux:24.04";
+
+fn decode_cloud_init_file(user_data: &str, path: &str) -> String {
+    let at = user_data
+        .find(&format!("path: {path}\n"))
+        .unwrap_or_else(|| panic!("missing {path} in user_data"));
+    let rest = &user_data[at..];
+    let c = rest.find("content: ").unwrap() + "content: ".len();
+    let end = rest[c..].find('\n').unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&rest[c..c + end])
+        .unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
+fn sb_create_opts(name: &str) -> CreateOptions {
+    let mut o = CreateOptions::new(ProviderKind::Contrib, HERMETIC_LINUX_IMAGE);
+    o.contrib = Some("aliyun-ecs".into());
+    o.name = Some(name.into());
+    o
+}
+
+#[tokio::test]
+async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+
+    // 1. Passing test sends Tag.1.Key=cua-managed on RunInstances, CreateVpc, CreateSecurityGroup DryRun=true.
+    let t = api.test(&conn(&api)).await;
+    assert!(t.ok(), "{:?}", t.checks);
+    {
+        let f = s.lock().unwrap();
+        assert!(f.vpcs.is_empty() && f.security_groups.is_empty() && f.instances.is_empty());
+        for action in ["RunInstances", "CreateVpc", "CreateSecurityGroup"] {
+            let call = f
+                .calls
+                .iter()
+                .find(|c| c.action == action)
+                .unwrap_or_else(|| panic!("missing DryRun call for {action}"));
+            assert_eq!(call.params.get("DryRun").map(String::as_str), Some("true"));
+            assert_eq!(
+                call.params.get("Tag.1.Key").map(String::as_str),
+                Some("cua-managed")
+            );
+            assert_eq!(
+                call.params.get("Tag.1.Value").map(String::as_str),
+                Some("true")
+            );
+        }
+    }
+
+    // 2. Forbidden.RAM on vpc:CreateVpc or ecs:CreateSecurityGroup fails permissions (never swallowed).
+    for perm_action in ["vpc:CreateVpc", "ecs:CreateSecurityGroup"] {
+        s.lock()
+            .unwrap()
+            .forbidden_actions
+            .insert(perm_action.into());
+        let t = api.test(&conn(&api)).await;
+        assert!(!t.ok(), "{perm_action} must fail test");
+        let perm = t.checks.iter().find(|c| c.name == "permissions").unwrap();
+        assert!(
+            !perm.ok && perm.detail.contains("Forbidden.RAM") && perm.detail.contains(perm_action),
+            "{perm:?}"
+        );
+        s.lock().unwrap().forbidden_actions.clear();
+    }
+
+    // 3. Account with zero VPCs returning InvalidVpcId.NotFound on CreateSecurityGroup DryRun=true passes.
+    s.lock().unwrap().create_sg_missing_vpc = true;
+    let t = api.test(&conn(&api)).await;
+    assert!(t.ok(), "{:?}", t.checks);
+}
+
+#[tokio::test]
+async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let relay_access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+
+    let (api, s, _store) = start(None).await;
+    // Seed pre-existing account network resources that Cua MUST NOT touch.
+    {
+        let mut f = s.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-acct-default",
+            "VpcName": "default-vpc",
+            "CidrBlock": "172.16.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": true,
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-acct-existing",
+            "VSwitchName": "prod-vsw",
+            "VpcId": "vpc-acct-default",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "172.16.0.0/24",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-acct-existing",
+            "SecurityGroupName": "prod-sg",
+            "VpcId": "vpc-acct-default",
+            "RegionId": "cn-hangzhou",
+            "SecurityGroupType": "normal",
+            "InnerAccessPolicy": "Accept",
+            "Tags": { "Tag": [] }
+        }));
+        // Simulate real guest boot: decode UserData #cloud-config and bring machine online on FakeRelay.
+        let relay_hook = relay.clone();
+        f.on_run_instance = Some(Arc::new(move |_inst_id, params| {
+            let ud_b64 = params.get("UserData").expect("UserData must be passed");
+            let ud = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(ud_b64)
+                    .unwrap(),
+            )
+            .unwrap();
+            let machine_id = decode_cloud_init_file(&ud, "/etc/cua/relay/machine-id")
+                .trim()
+                .to_string();
+            relay_hook.set_online(&machine_id, true, "0.1.0");
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        relay_access,
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+    clouds
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let owner = cua_byoc::Store::new(home.path()).owner_id().unwrap();
+    let owner_tag = model::label_value(&owner);
+
+    // Clear test/connect calls so we inspect provisioning calls cleanly.
+    s.lock().unwrap().calls.clear();
+
+    // 1. Create Linux Docker-on-VM sandbox with explicit `--runtime docker`.
+    let mut opts = sb_create_opts("sb-one");
+    opts.runtime = Runtime::Other("docker".into());
+    let sb1 = sandboxes.create(opts).await.unwrap();
+    let details1 = sb1.provider_details();
+    let machine1 = details1[DETAIL_RELAY_MACHINE].clone();
+    assert!(machine1.starts_with("cloud-"), "{details1:?}");
+    assert_eq!(
+        details1.get("runtime").map(String::as_str),
+        Some("docker-on-vm")
+    );
+
+    // Inspect created cloud calls & resources.
+    {
+        let f = s.lock().unwrap();
+        let create_vpc = f.calls.iter().find(|c| c.action == "CreateVpc").unwrap();
+        assert_eq!(
+            create_vpc.params.get("CidrBlock").map(String::as_str),
+            Some("10.77.0.0/16")
+        );
+        assert_eq!(
+            create_vpc.params.get("VpcName").map(String::as_str),
+            Some(aliyun_net::vpc_name(&owner).as_str())
+        );
+
+        let create_sg = f
+            .calls
+            .iter()
+            .find(|c| c.action == "CreateSecurityGroup")
+            .unwrap();
+        assert_eq!(
+            create_sg
+                .params
+                .get("SecurityGroupName")
+                .map(String::as_str),
+            Some(aliyun_net::sg_name(&owner).as_str())
+        );
+        assert_eq!(
+            create_sg
+                .params
+                .get("SecurityGroupType")
+                .map(String::as_str),
+            Some("enterprise")
+        );
+
+        let egress = f
+            .calls
+            .iter()
+            .find(|c| c.action == "AuthorizeSecurityGroupEgress")
+            .unwrap();
+        assert_eq!(
+            egress
+                .params
+                .get("Permissions.1.IpProtocol")
+                .map(String::as_str),
+            Some("all")
+        );
+        assert_eq!(
+            egress
+                .params
+                .get("Permissions.1.PortRange")
+                .map(String::as_str),
+            Some("-1/-1")
+        );
+        assert_eq!(
+            egress
+                .params
+                .get("Permissions.1.DestCidrIp")
+                .map(String::as_str),
+            Some("0.0.0.0/0")
+        );
+        assert_eq!(
+            egress
+                .params
+                .get("Permissions.1.Policy")
+                .map(String::as_str),
+            Some("accept")
+        );
+        // Never add any ingress rules!
+        assert!(
+            !f.calls
+                .iter()
+                .any(|c| c.action.starts_with("AuthorizeSecurityGroup")
+                    && c.action != "AuthorizeSecurityGroupEgress")
+        );
+
+        let run = f.calls.iter().find(|c| c.action == "RunInstances").unwrap();
+        assert_eq!(
+            run.params.get("InstanceType").map(String::as_str),
+            Some("ecs.e-c1m2.large")
+        );
+        assert_eq!(
+            run.params.get("ImageId").map(String::as_str),
+            Some("ubuntu_24_04_x64_20G_alibase_20250101.vhd")
+        );
+        assert_eq!(
+            run.params.get("SystemDisk.Category").map(String::as_str),
+            Some("cloud_essd")
+        );
+        assert_eq!(
+            run.params.get("SystemDisk.Size").map(String::as_str),
+            Some("40")
+        );
+        assert_eq!(
+            run.params.get("InstanceChargeType").map(String::as_str),
+            Some("PostPaid")
+        );
+        assert_eq!(
+            run.params.get("StoppedMode").map(String::as_str),
+            Some("StopCharging")
+        );
+        assert!(
+            run.params
+                .get("AutoReleaseTime")
+                .is_some_and(|s| s.ends_with('Z')),
+            "AutoReleaseTime missing: {:?}",
+            run.params
+        );
+        assert_eq!(
+            run.params.get("HttpEndpoint").map(String::as_str),
+            Some("enabled")
+        );
+        assert_eq!(
+            run.params.get("HttpTokens").map(String::as_str),
+            Some("required")
+        );
+        assert_eq!(
+            run.params.get("InternetChargeType").map(String::as_str),
+            Some("PayByTraffic")
+        );
+        assert_eq!(
+            run.params
+                .get("InternetMaxBandwidthOut")
+                .map(String::as_str),
+            Some("100")
+        );
+        assert!(!run.params.contains_key("KeyPairName"));
+        assert!(!run.params.contains_key("Password"));
+        assert!(!run.params.contains_key("RamRoleName"));
+
+        // Verify UserData (#cloud-config) blocks 100.100.100.200, installs docker, joins relay, schedules TTL.
+        let ud = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(run.params.get("UserData").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ud.starts_with("#cloud-config\n"));
+        assert!(!ud.contains("cmt_"), "token must not be in clear text");
+        let script = decode_cloud_init_file(&ud, "/usr/local/sbin/cua-first-boot");
+        assert!(script.contains("100.100.100.200/32"), "{script}");
+        assert!(script.contains("docker.io"), "{script}");
+        assert!(
+            script.contains("docker run -d --name cua-sandbox"),
+            "{script}"
+        );
+        assert!(script.contains("shutdown -h +480"), "{script}");
+        assert!(ud.contains("cua-expire.timer"));
+
+        // Verify all 6 tags on Instance, VPC, VSwitch, SG.
+        let inst = f.instances.values().next().unwrap();
+        let inst_tags = aliyun_net::tags_of(inst);
+        for key in [
+            "cua-managed",
+            "cua-owner",
+            "cua-space",
+            "cua-machine",
+            "cua-created-by",
+            "cua-expires",
+        ] {
+            assert!(inst_tags.contains_key(key), "missing {key}: {inst_tags:?}");
+        }
+        assert_eq!(inst_tags["cua-managed"], "true");
+        assert_eq!(inst_tags["cua-owner"], owner_tag);
+        assert_eq!(inst_tags["cua-space"], "sb-one");
+        assert_eq!(inst_tags["cua-machine"], machine1);
+
+        let cua_vpc = f
+            .vpcs
+            .iter()
+            .find(|v| v["VpcId"] != "vpc-acct-default")
+            .unwrap();
+        let vpc_tags = aliyun_net::tags_of(cua_vpc);
+        assert_eq!(vpc_tags.len(), 6, "{vpc_tags:?}");
+        assert_eq!(vpc_tags["cua-machine"], "");
+        assert_eq!(vpc_tags["cua-space"], "");
+
+        let cua_vsw = f
+            .vswitches
+            .iter()
+            .find(|v| v["VSwitchId"] != "vsw-acct-existing")
+            .unwrap();
+        assert_eq!(cua_vsw["CidrBlock"], "10.77.0.0/20");
+        let vsw_tags = aliyun_net::tags_of(cua_vsw);
+        assert_eq!(vsw_tags.len(), 6, "{vsw_tags:?}");
+        assert_eq!(vsw_tags["cua-machine"], "");
+
+        let cua_sg = f
+            .security_groups
+            .iter()
+            .find(|g| g["SecurityGroupId"] != "sg-acct-existing")
+            .unwrap();
+        let sg_tags = aliyun_net::tags_of(cua_sg);
+        assert_eq!(sg_tags.len(), 6, "{sg_tags:?}");
+        assert_eq!(sg_tags["cua-machine"], "");
+    }
+
+    // 2. Second sandbox reuses existing VPC, VSwitch, and SG without creating new ones.
+    s.lock().unwrap().calls.clear();
+    let _sb2 = sandboxes.create(sb_create_opts("sb-two")).await.unwrap();
+    {
+        let f = s.lock().unwrap();
+        assert!(!f.calls.iter().any(|c| c.action == "CreateVpc"));
+        assert!(!f.calls.iter().any(|c| c.action == "CreateVSwitch"));
+        assert!(!f.calls.iter().any(|c| c.action == "CreateSecurityGroup"));
+        assert!(
+            f.calls
+                .iter()
+                .any(|c| c.action == "DescribeSecurityGroupAttribute"),
+            "SG reuse must verify rules via DescribeSecurityGroupAttribute"
+        );
+        assert_eq!(f.vpcs.len(), 2);
+        assert_eq!(f.vswitches.len(), 2);
+        assert_eq!(f.security_groups.len(), 2);
+    }
+
+    // 3. Suspend (stop) preserves system disk & transitions to Stopped, resume (start) brings back Running.
+    sandboxes.suspend("sb-one").await.unwrap();
+    {
+        let f = s.lock().unwrap();
+        let stop_call = f.calls.iter().find(|c| c.action == "StopInstance").unwrap();
+        assert_eq!(
+            stop_call.params.get("StoppedMode").map(String::as_str),
+            Some("StopCharging")
+        );
+    }
+    let st_susp = sandboxes.get("sb-one").await.unwrap().status;
+    assert_eq!(st_susp, Status::Suspended);
+
+    sandboxes.resume("sb-one").await.unwrap();
+    assert_eq!(
+        sandboxes.get("sb-one").await.unwrap().status,
+        Status::Running
+    );
+
+    // 4. Delete both sandboxes; pre-existing account network remains untouched.
+    sandboxes.delete("sb-one").await.unwrap();
+    sandboxes.delete("sb-two").await.unwrap();
+    assert!(relay.machine(&machine1).is_none());
+    {
+        let f = s.lock().unwrap();
+        assert!(f.instances.is_empty());
+        assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-acct-default"));
+        assert!(
+            f.vswitches
+                .iter()
+                .any(|v| v["VSwitchId"] == "vsw-acct-existing")
+        );
+        assert!(
+            f.security_groups
+                .iter()
+                .any(|g| g["SecurityGroupId"] == "sg-acct-existing")
+        );
+    }
+}
+
+#[tokio::test]
+async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_calls() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    // 1. --max-size 1x2 rejects default 2c/4g BEFORE any cloud provisioning call.
+    let home1 = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", None);
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let (api1, s1, _) = start(None).await;
+    let sb_max = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home1.path().join("sandboxes")),
+        home1.path(),
+        vec![Arc::new(api1)],
+        access.clone(),
+    )
+    .build();
+    sb_max
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("1x2".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s1.lock().unwrap().calls.clear();
+
+    let err_size = sb_max.create(sb_create_opts("too-big")).await.unwrap_err();
+    assert!(
+        err_size
+            .to_string()
+            .contains("allows machines up to 1 vCPU"),
+        "{err_size}"
+    );
+    assert!(
+        s1.lock().unwrap().calls.is_empty(),
+        "max-size refusal must happen before ANY cloud API call"
+    );
+
+    // 2. --budget 0.01 rejects 0.043/h machine BEFORE any cloud provisioning call.
+    let home2 = tempfile::tempdir().unwrap();
+    let (api2, s2, _) = start(None).await;
+    let sb_budget = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home2.path().join("sandboxes")),
+        home2.path(),
+        vec![Arc::new(api2)],
+        access,
+    )
+    .build();
+    sb_budget
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            budget_usd_month: Some(0.01),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s2.lock().unwrap().calls.clear();
+
+    let err_budget = sb_budget
+        .create(sb_create_opts("over-budget"))
+        .await
+        .unwrap_err();
+    assert!(err_budget.to_string().contains("budget"), "{err_budget}");
+    assert!(
+        s2.lock().unwrap().calls.is_empty(),
+        "budget refusal must happen before ANY cloud API call"
+    );
+
+    // 3. --runtime native is refused cleanly until M4 (#5).
+    let mut native_opts = sb_create_opts("native-unsupported");
+    native_opts.runtime = Runtime::Other("native".into());
+    let err_native = sb_budget.create(native_opts).await.unwrap_err();
+    assert!(
+        err_native.to_string().contains("docker") || err_native.to_string().contains("native"),
+        "{err_native}"
+    );
+    assert!(s2.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn cross_zone_capacity_retry_and_total_failure_network_rollback() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+
+    // Case A: Zone cn-hangzhou-h fails RunInstances with OperationDenied.NoStock;
+    // provision cleans up -h's unused VSwitch and retries in cn-hangzhou-i -> succeeds.
+    {
+        let mut f = s.lock().unwrap();
+        f.zones = vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()];
+        f.run_fail_zones
+            .insert("cn-hangzhou-h".into(), "OperationDenied.NoStock".into());
+    }
+    let spec = ProvisionSpec {
+        name: "cua-aliyun-ecs-retry1".into(),
+        family: "linux".into(),
+        image: HERMETIC_LINUX_IMAGE.into(),
+        kind: "container".into(),
+        machine_type: "ecs.e-c1m2.large".into(),
+        disk_gb: 40,
+        user_data: "#cloud-config\n".into(),
+        tags: model::tags("owner1", "sb-retry", "cloud-retry", 0),
+        ttl_secs: 3600,
+        arch: "amd64".into(),
+        runtime: "docker".into(),
+        ..Default::default()
+    };
+    let made = api.provision(&c, &spec).await.unwrap();
+    assert_eq!(made[0].zone, "cn-hangzhou-i");
+    {
+        let f = s.lock().unwrap();
+        let run_zones: Vec<&str> = f
+            .calls
+            .iter()
+            .filter(|call| call.action == "RunInstances")
+            .filter_map(|call| call.params.get("ZoneId").map(String::as_str))
+            .collect();
+        assert_eq!(run_zones, ["cn-hangzhou-h", "cn-hangzhou-i"]);
+        assert_eq!(
+            f.vswitches.len(),
+            1,
+            "unused VSwitch from sold-out zone must be cleaned up"
+        );
+        assert_eq!(f.vswitches[0]["ZoneId"], "cn-hangzhou-i");
+    }
+
+    // Case B: Fresh provision where ALL zones fail with Zone.NotOnSale -> newly created SG & VPC rolled back.
+    let (api2, s2, store2) = start(None).await;
+    store2.save("LTAI_TEST_AK:secret123").unwrap();
+    {
+        let mut f = s2.lock().unwrap();
+        f.zones = vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()];
+        f.sold_out_zones
+            .insert("cn-hangzhou-h".into(), "Zone.NotOnSale".into());
+        f.sold_out_zones
+            .insert("cn-hangzhou-i".into(), "OperationDenied.NoStock".into());
+    }
+    let err = api2.provision(&conn(&api2), &spec).await.unwrap_err();
+    assert!(
+        err.to_string().contains("tried 2 zones"),
+        "expected multi-zone failure summary, got: {err}"
+    );
+    {
+        let f = s2.lock().unwrap();
+        assert!(f.instances.is_empty());
+        assert!(f.vswitches.is_empty());
+        assert!(f.security_groups.is_empty());
+        assert!(f.vpcs.is_empty(), "newly created VPC must be rolled back");
+    }
+}
+
+#[tokio::test]
+async fn failed_boot_redacts_console_output_and_rolls_back_instance_and_relay() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", None);
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let (api, s, _) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        let s_hook = s.clone();
+        f.on_run_instance = Some(Arc::new(move |inst_id, _params| {
+            let mut f = s_hook.lock().unwrap();
+            if let Some(inst) = f.instances.get_mut(inst_id) {
+                inst["Status"] = json!("Stopped");
+            }
+            f.console_outputs.insert(
+                inst_id.to_string(),
+                concat!(
+                    "[    1.23] cloud-init: docker pull failed\n",
+                    "Authorization: Bearer topsecret_bearer_token_12345\n",
+                    "CUA_RELAY_TOKEN=cmt_super_secret_token_999\n",
+                    "CUA_ENV_TOKEN=envtok_never_leak_987654\n",
+                    "[    2.34] systemd: cua-first-boot exited with status 1\n"
+                )
+                .to_string(),
+            );
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut opts = sb_create_opts("boot-fail");
+    opts.env
+        .insert("CUA_ENV_TOKEN".into(), "envtok_never_leak_987654".into());
+    let err = sandboxes.create(opts).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("cua-first-boot exited with status 1"), "{msg}");
+    assert!(!msg.contains("topsecret_bearer_token_12345"), "{msg}");
+    assert!(!msg.contains("cmt_super_secret_token_999"), "{msg}");
+    assert!(!msg.contains("envtok_never_leak_987654"), "{msg}");
+
+    // Saved boot log file is redacted and 0600, instance & relay machine rolled back, shared VPC kept.
+    let log_dir = home.path().join("cloud").join("boot-logs");
+    let logs: Vec<_> = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(logs.len(), 1);
+    let saved_log = std::fs::read_to_string(logs[0].path()).unwrap();
+    assert!(saved_log.contains("cloud-init: docker pull failed"));
+    assert!(!saved_log.contains("topsecret_bearer_token_12345"));
+    assert!(!saved_log.contains("cmt_super_secret_token_999"));
+    assert!(!saved_log.contains("envtok_never_leak_987654"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(logs[0].path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    let f = s.lock().unwrap();
+    assert!(
+        f.instances.is_empty(),
+        "failed instance must be rolled back"
+    );
+    assert_eq!(f.vpcs.len(), 1, "shared VPC remains reusable");
+    assert_eq!(f.security_groups.len(), 1);
+}
+
+#[tokio::test]
+async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", None);
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let (api, s, _) = start(None).await;
+    {
+        let relay_hook = relay.clone();
+        s.lock().unwrap().on_run_instance = Some(Arc::new(move |_inst_id, params| {
+            let ud = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(params.get("UserData").unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let mid = decode_cloud_init_file(&ud, "/etc/cua/relay/machine-id")
+                .trim()
+                .to_string();
+            relay_hook.set_online(&mid, true, "0.1.0");
+        }));
+    }
+    let api = Arc::new(api);
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![api.clone()],
+        access,
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+    clouds
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let owner = cua_byoc::Store::new(home.path()).owner_id().unwrap();
+    let owner_tag = model::label_value(&owner);
+
+    // Pre-seed default VPC (even with forged cua-managed tag!), untagged, and other-owner resources.
+    {
+        let mut f = s.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-default",
+            "VpcName": "default",
+            "CidrBlock": "172.16.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": true,
+            "Status": "Available",
+            "Tags": { "Tag": [
+                { "Key": "cua-managed", "Value": "true" },
+                { "Key": "cua-owner", "Value": owner_tag }
+            ]}
+        }));
+        f.vpcs.push(json!({
+            "VpcId": "vpc-untagged",
+            "CidrBlock": "192.168.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-untagged",
+            "VpcId": "vpc-untagged",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "192.168.0.0/24",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-untagged",
+            "VpcId": "vpc-untagged",
+            "RegionId": "cn-hangzhou",
+            "Tags": { "Tag": [] }
+        }));
+        f.instances.insert(
+            "i-untagged".into(),
+            json!({
+                "InstanceId": "i-untagged",
+                "RegionId": "cn-hangzhou",
+                "Status": "Running",
+                "Tags": { "Tag": [] }
+            }),
+        );
+        f.instances.insert(
+            "i-foreign".into(),
+            json!({
+                "InstanceId": "i-foreign",
+                "RegionId": "cn-hangzhou",
+                "Status": "Running",
+                "Tags": { "Tag": [
+                    { "TagKey": "cua-managed", "TagValue": "true" },
+                    { "TagKey": "cua-owner", "TagValue": "someone-else" }
+                ]}
+            }),
+        );
+    }
+
+    // Tag-guard refusal: stop/start/delete on untagged, foreign, and default VPC must refuse with 0 mutating calls.
+    let c = conn(&api);
+    s.lock().unwrap().calls.clear();
+    for (ty, id) in [
+        ("instance", "i-untagged"),
+        ("instance", "i-foreign"),
+        ("vpc", "vpc-default"),
+        ("vpc", "vpc-untagged"),
+        ("vswitch", "vsw-untagged"),
+        ("security_group", "sg-untagged"),
+    ] {
+        let r = Resource {
+            provider: "aliyun-ecs".into(),
+            id: id.into(),
+            resource_type: ty.into(),
+            region: "cn-hangzhou".into(),
+            ..Default::default()
+        };
+        let err_del = api.delete(&c, &r, &owner).await.unwrap_err();
+        assert!(err_del.to_string().contains("refusing"), "{id}: {err_del}");
+        if ty == "instance" {
+            let err_stop = api.stop(&c, &r, &owner).await.unwrap_err();
+            assert!(
+                err_stop.to_string().contains("refusing"),
+                "{id}: {err_stop}"
+            );
+            let err_start = api.start(&c, &r, &owner).await.unwrap_err();
+            assert!(
+                err_start.to_string().contains("refusing"),
+                "{id}: {err_start}"
+            );
+        }
+    }
+    {
+        let f = s.lock().unwrap();
+        for mutating in [
+            "StopInstance",
+            "StartInstance",
+            "DeleteInstance",
+            "DeleteVpc",
+            "DeleteVSwitch",
+            "DeleteSecurityGroup",
+        ] {
+            assert!(
+                !f.calls.iter().any(|call| call.action == mutating),
+                "tag guard leaked mutating call {mutating}"
+            );
+        }
+    }
+
+    // Create a live sandbox and also seed an expired owned instance.
+    let _sb = sandboxes.create(sb_create_opts("sb-live")).await.unwrap();
+    let expired_at = model::now().saturating_sub(60);
+    s.lock().unwrap().instances.insert(
+        "i-expired".into(),
+        json!({
+            "InstanceId": "i-expired",
+            "InstanceName": "cua-aliyun-ecs-exp",
+            "RegionId": "cn-hangzhou",
+            "Status": "Running",
+            "Tags": { "Tag": [
+                { "TagKey": "cua-managed", "TagValue": "true" },
+                { "TagKey": "cua-owner", "TagValue": owner_tag },
+                { "TagKey": "cua-expires", "TagValue": expired_at.to_string() },
+                { "TagKey": "cua-machine", "TagValue": "cloud-expired-1" }
+            ]}
+        }),
+    );
+
+    // disconnect without --delete refuses while managed instances exist.
+    let refused = clouds.disconnect("aliyun-ecs", false).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("NOT disconnected"),
+        "{refused}"
+    );
+
+    // Regular sweep removes ONLY expired owned instance, keeping live sandbox & shared VPC/VSwitch/SG.
+    let swept = clouds
+        .sweep(Some("aliyun-ecs"), false, false)
+        .await
+        .unwrap();
+    assert!(
+        swept
+            .resources
+            .iter()
+            .any(|i| i.resource.id == "i-expired" && i.action == "deleted"),
+        "{swept:?}"
+    );
+    assert!(!s.lock().unwrap().instances.contains_key("i-expired"));
+    assert_eq!(s.lock().unwrap().instances.len(), 3); // i-untagged, i-foreign, sb-live
+
+    // disconnect --delete sweeps in dependency order (instance -> security_group -> vswitch -> vpc)
+    // and succeeds even with transient DependencyViolation retries!
+    {
+        let mut f = s.lock().unwrap();
+        f.transient_dependency_errors = 1;
+        f.calls.clear();
+    }
+    let disc = clouds.disconnect("aliyun-ecs", true).await.unwrap();
+    assert!(disc.disconnected);
+
+    let f = s.lock().unwrap();
+    let del_order: Vec<&str> = f
+        .calls
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.action.as_str(),
+                "DeleteInstance" | "DeleteSecurityGroup" | "DeleteVSwitch" | "DeleteVpc"
+            )
+        })
+        .map(|c| c.action.as_str())
+        .collect();
+    let pos_inst = del_order
+        .iter()
+        .position(|a| *a == "DeleteInstance")
+        .unwrap();
+    let pos_sg = del_order
+        .iter()
+        .position(|a| *a == "DeleteSecurityGroup")
+        .unwrap();
+    let pos_vsw = del_order
+        .iter()
+        .position(|a| *a == "DeleteVSwitch")
+        .unwrap();
+    let pos_vpc = del_order.iter().position(|a| *a == "DeleteVpc").unwrap();
+    assert!(
+        pos_inst < pos_sg && pos_sg < pos_vsw && pos_vsw < pos_vpc,
+        "{del_order:?}"
+    );
+
+    // Only untagged, foreign, and default resources remain!
+    assert_eq!(f.instances.len(), 2);
+    assert!(f.instances.contains_key("i-untagged"));
+    assert!(f.instances.contains_key("i-foreign"));
+    assert_eq!(f.vpcs.len(), 2);
+    assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-default"));
+    assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-untagged"));
+    assert_eq!(f.vswitches.len(), 1);
+    assert_eq!(f.security_groups.len(), 1);
+}
+
+#[tokio::test]
+async fn spaces_create_linux_on_aliyun_ecs_runs_docker_on_vm() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let token = Arc::new(cua_spaces::relay::StaticToken("acct-tok".into()));
+    let access = RelayAccess::new(relay.url.clone(), token.clone());
+
+    let (api, s, _) = start(None).await;
+    {
+        let relay_hook = relay.clone();
+        s.lock().unwrap().on_run_instance = Some(Arc::new(move |_inst_id, params| {
+            let ud = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(params.get("UserData").unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            let mid = decode_cloud_init_file(&ud, "/etc/cua/relay/machine-id")
+                .trim()
+                .to_string();
+            relay_hook.set_online(&mid, true, "0.1.0");
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let spaces = cua_spaces::Spaces::builder()
+        .home(home.path())
+        .sandboxes(sandboxes)
+        .relay(cua_spaces::relay::RelayAccount::new(
+            relay.url.clone(),
+            token,
+        ))
+        .build();
+    let mut policy = spaces.elastic_policy();
+    policy.autoscale = false;
+    spaces.set_elastic_policy(&policy).unwrap();
+
+    let info = spaces
+        .create(cua_spaces::SpaceCreate {
+            on: Some(cua_sandbox_core::placement::On::Provider(
+                "aliyun-ecs".into(),
+            )),
+            image: Some(HERMETIC_LINUX_IMAGE.into()),
+            name: Some("Aliyun Space".into()),
+            runtime: Runtime::Other("docker".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .ready()
+        .unwrap();
+
+    assert!(info.id.starts_with("relay:cloud-"), "{}", info.id);
+    assert_eq!(info.name, "aliyun-space");
+    assert_eq!(
+        spaces.cloud_sandbox_of(&info.id).unwrap().as_deref(),
+        Some("aliyun-space")
+    );
+    let machine = info.id.trim_start_matches("relay:");
+    assert!(relay.machine(machine).is_some());
+
+    spaces.delete(&info.id).await.unwrap();
+    assert!(s.lock().unwrap().instances.is_empty());
+    assert!(relay.machine(machine).is_none());
+}
+
+#[tokio::test]
+async fn vswitch_skips_used_cidrs_and_linux_slim_enforces_40g_cloud_essd() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+
+    // Pre-create an owned VPC that already has a non-Cua VSwitch occupying 10.77.0.0/20 in another zone.
+    let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
+        .into_iter()
+        .map(|(k, v)| json!({ "Key": k, "Value": v }))
+        .collect();
+    {
+        let mut f = s.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-pre-1",
+            "VpcName": aliyun_net::vpc_name("owner1"),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": vpc_tags }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-other-zone",
+            "VSwitchName": "other",
+            "VpcId": "vpc-pre-1",
+            "ZoneId": "cn-hangzhou-z",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+    }
+
+    assert_eq!(api.default_disk_gb("linux"), 40);
+    assert_eq!(api.default_disk_gb("linux-slim"), 40);
+    assert_eq!(api.runtimes(), vec![Runtime::Other("docker".into())]);
+
+    let spec = ProvisionSpec {
+        name: "cua-aliyun-ecs-slim1".into(),
+        family: "linux-slim".into(),
+        image: HERMETIC_LINUX_IMAGE.into(),
+        kind: "container".into(),
+        machine_type: String::new(),
+        disk_gb: 30, // Must clamp up to 40 GiB minimum for Alibaba Cloud ESSD
+        user_data: "#cloud-config\n".into(),
+        tags: model::tags("owner1", "slim", "cloud-slim", 0),
+        ttl_secs: 0,
+        arch: "amd64".into(),
+        runtime: "docker".into(),
+        ..Default::default()
+    };
+    let made = api.provision(&c, &spec).await.unwrap();
+    assert_eq!(made[0].extra["machine_type"], "ecs.e-c1m1.large");
+
+    let f = s.lock().unwrap();
+    let new_vsw = f
+        .vswitches
+        .iter()
+        .find(|v| v["VSwitchId"] != "vsw-other-zone")
+        .unwrap();
+    assert_eq!(
+        new_vsw["CidrBlock"], "10.77.16.0/20",
+        "must skip occupied 10.77.0.0/20"
+    );
+    let run = f.calls.iter().find(|c| c.action == "RunInstances").unwrap();
+    assert_eq!(
+        run.params.get("SystemDisk.Size").map(String::as_str),
+        Some("40")
+    );
+    assert_eq!(
+        run.params.get("SystemDisk.Category").map(String::as_str),
+        Some("cloud_essd")
+    );
+    assert!(!run.params.contains_key("AutoReleaseTime"));
 }

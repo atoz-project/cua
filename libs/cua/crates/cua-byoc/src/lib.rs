@@ -32,6 +32,8 @@ use std::sync::Arc;
 pub mod alerts;
 #[cfg(feature = "aliyun-ecs")]
 pub mod aliyun_ecs;
+#[cfg(feature = "aliyun-ecs")]
+pub mod aliyun_net;
 pub mod api;
 pub mod audit;
 pub mod autosweep;
