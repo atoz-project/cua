@@ -274,3 +274,13 @@ pub(crate) fn retry_backoff(n: u32) -> Option<std::time::Duration> {
 pub(crate) fn retryable_status(status: u16, idempotent: bool) -> bool {
     matches!(status, 429 | 503) || (idempotent && matches!(status, 500 | 502 | 504))
 }
+
+/// Drops any staged secret on a [`CloudApi`] when the guard leaves scope
+/// (including across early returns or cancelled futures).
+pub(crate) struct UnstageGuard<'a>(pub &'a dyn CloudApi);
+
+impl Drop for UnstageGuard<'_> {
+    fn drop(&mut self) {
+        self.0.unstage_secret();
+    }
+}

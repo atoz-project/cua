@@ -20,6 +20,36 @@ use serde_json::json;
 mod fake_hetzner;
 use fake_hetzner::{S, handle};
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard {
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(val: Option<&str>) -> Self {
+        let prev = std::env::var("HCLOUD_TOKEN").ok();
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("HCLOUD_TOKEN", v),
+                None => std::env::remove_var("HCLOUD_TOKEN"),
+            }
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("HCLOUD_TOKEN", v),
+                None => std::env::remove_var("HCLOUD_TOKEN"),
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct MemStore(Mutex<Option<String>>);
 
@@ -126,6 +156,7 @@ async fn a_read_only_or_rejected_token_fails_the_checks_with_advice() {
         t.checks
     );
     // Without any token the check says how to give one.
+    let _env_lock = ENV_LOCK.lock().await;
     let (h2, _, _) = start().await;
     if std::env::var("HCLOUD_TOKEN").is_err() {
         let t = h2.test(&conn(&h2)).await;
@@ -965,5 +996,40 @@ mod sealed {
             "{:?}",
             c.next
         );
+    }
+
+    #[tokio::test]
+    async fn empty_token_stdin_does_not_fall_back_to_ambient_credentials_when_sealing() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(Some("ambient-hcloud-token"));
+
+        let (url, s) = serve().await;
+        let issuer = Arc::new(FakeIssuer::default());
+        let pool = FakePool::new();
+        let d = device(&url, &issuer, Some(pool.join("laptop")));
+        *d.store.0.lock().unwrap() = Some("saved-hcloud-token".into());
+
+        // Sanity check: omitted token (`None`) still finds ambient credentials.
+        assert!(d.api.local_secret(&target(None)).is_some());
+
+        // Explicit empty/whitespace token (`--token-stdin`) must return None and
+        // fail sealed connect with InvalidArgument without touching Hetzner or sealing.
+        for empty in ["", "   \n"] {
+            assert!(
+                d.api.local_secret(&target(Some(empty))).is_none(),
+                "local_secret fell through for {empty:?}"
+            );
+            let err = d
+                .clouds
+                .connect_with(&ask(Some(empty), Some("sealed")))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+                "expected InvalidArgument for {empty:?}, got {err:?}"
+            );
+        }
+        assert!(bearers(&s).is_empty(), "no call may reach Hetzner");
+        assert!(issuer.conns.lock().unwrap().is_empty(), "nothing sealed");
     }
 }

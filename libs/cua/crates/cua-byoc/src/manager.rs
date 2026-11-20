@@ -16,7 +16,7 @@ use cua_sandbox_core::byoc::{
     CloudTestReport, HostTypeOffer,
 };
 
-use crate::api::{CloudApi, Result};
+use crate::api::{CloudApi, Result, UnstageGuard};
 use crate::audit;
 use crate::model::{self, Connection, Resource};
 use crate::relay::RelayAccess;
@@ -575,12 +575,6 @@ impl CloudManager for Clouds {
 
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
-        struct UnstageGuard<'a>(&'a dyn CloudApi);
-        impl Drop for UnstageGuard<'_> {
-            fn drop(&mut self) {
-                self.0.unstage_secret();
-            }
-        }
         p.stage_secret(target);
         let _unstage = UnstageGuard(p.as_ref());
         let conn = p.resolve(target)?;
@@ -600,12 +594,6 @@ impl CloudManager for Clouds {
         ttl_hours: Option<u32>,
     ) -> Result<CloudConnected> {
         let p = self.api(&target.provider)?;
-        struct UnstageGuard<'a>(&'a dyn CloudApi);
-        impl Drop for UnstageGuard<'_> {
-            fn drop(&mut self) {
-                self.0.unstage_secret();
-            }
-        }
         p.stage_secret(target);
         let _unstage = UnstageGuard(p.as_ref());
         let mut conn = p.resolve(target)?;

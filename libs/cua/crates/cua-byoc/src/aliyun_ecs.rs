@@ -101,8 +101,12 @@ pub struct AliyunCredentials {
 
 impl AliyunCredentials {
     /// Formats as `<access_key_id>:<access_key_secret>` for storage in `TokenStore`.
-    pub fn to_pair(&self) -> String {
-        format!("{}:{}", self.access_key_id, self.access_key_secret.expose())
+    pub fn to_pair(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(format!(
+            "{}:{}",
+            self.access_key_id,
+            self.access_key_secret.expose()
+        ))
     }
 }
 
@@ -758,7 +762,14 @@ fn map_api_error(
                         "{code}: RAM user is missing permission `{perm}` ({msg}); attach the Cua BYOC least-privilege RAM policy"
                     ),
                 ),
-                "" => cloud_err("aliyun-ecs", action, format!("HTTP {status}: {v}")),
+                "" => cloud_err(
+                    "aliyun-ecs",
+                    action,
+                    format!(
+                        "HTTP {status}: {}",
+                        sanitize_snippet(v.to_string().as_bytes())
+                    ),
+                ),
                 _ => cloud_err("aliyun-ecs", action, format!("{code}: {msg}")),
             }
         }
@@ -1480,6 +1491,8 @@ mod tests {
         let creds = parse_token_pair("  LTAI5tTestKey : SuperSecretValue123  ").unwrap();
         assert_eq!(creds.access_key_id, "LTAI5tTestKey");
         assert_eq!(creds.access_key_secret.expose(), "SuperSecretValue123");
+        let pair: zeroize::Zeroizing<String> = creds.to_pair();
+        assert_eq!(pair.as_str(), "LTAI5tTestKey:SuperSecretValue123");
         let dbg = format!("{creds:?}");
         assert!(!dbg.contains("SuperSecretValue123"), "{dbg}");
         assert!(!dbg.contains("LTAI5tTestKey"), "{dbg}");
@@ -1524,5 +1537,23 @@ mod tests {
         assert!(signed.authorization.starts_with(
             "ACS3-HMAC-SHA256 Credential=LTAI_AK,SignedHeaders=host;x-acs-action;x-acs-content-sha256;x-acs-date;x-acs-signature-nonce;x-acs-version,Signature="
         ));
+    }
+
+    #[test]
+    fn map_api_error_sanitizes_empty_code_json() {
+        let long = format!("prefix\n\x07{}", "x".repeat(300));
+        let body = ApiBody::Json(serde_json::json!({ "Message": "", "detail": long }));
+        let err = map_api_error(
+            "DescribeRegions",
+            ECS_API_VERSION,
+            reqwest::StatusCode::BAD_GATEWAY,
+            &body,
+        );
+        let msg = err.to_string();
+        let snippet = msg.split_once("HTTP 502 Bad Gateway: ").unwrap().1;
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(!msg.contains('\x07'), "{msg}");
+        assert!(snippet.ends_with("..."), "{msg}");
+        assert_eq!(snippet.chars().count(), 203, "{msg}");
     }
 }

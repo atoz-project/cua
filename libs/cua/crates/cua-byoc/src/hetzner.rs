@@ -817,12 +817,13 @@ impl CloudApi for Hetzner {
     }
 
     fn local_secret(&self, t: &Target) -> Option<Secret> {
-        t.token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(Secret::new)
-            .or_else(|| self.token_and_source().map(|(t, _)| Secret::new(t)))
+        match t.token.as_deref() {
+            Some(raw) => {
+                let tok = raw.trim();
+                (!tok.is_empty()).then(|| Secret::new(tok))
+            }
+            None => self.token_and_source().map(|(t, _)| Secret::new(t)),
+        }
     }
 
     fn attach_secrets(&self, source: Arc<dyn SecretSource>) {

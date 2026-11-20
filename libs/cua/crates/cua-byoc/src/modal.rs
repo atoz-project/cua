@@ -822,7 +822,7 @@ impl CloudApi for ModalApi {
     }
 
     fn local_secret(&self, t: &Target) -> Option<Secret> {
-        if let Some(tok) = t.token.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(tok) = t.token.as_deref() {
             return ModalToken::parse(tok).map(|m| m.to_secret());
         }
         if let (Ok(id), Ok(secret)) = (

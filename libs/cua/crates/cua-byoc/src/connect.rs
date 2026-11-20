@@ -430,11 +430,12 @@ async fn connect_sealed(
     let mut staged = target.clone();
     staged.token = Some(token.expose().to_string());
     p.stage_secret(&staged);
+    let unstage = crate::api::UnstageGuard(p);
     if let Some(t) = staged.token.as_mut() {
         zeroize::Zeroize::zeroize(t);
     }
     let tested = p.test(&candidate).await;
-    p.unstage_secret();
+    drop(unstage);
     if !tested.ok() {
         return Ok(outcome(
             clouds,
