@@ -690,13 +690,13 @@ async fn verify_and_repair_sg(
     Ok(())
 }
 
-async fn ensure_security_group(
+async fn find_security_group(
     api: &AliyunEcs,
     conn: &Connection,
     region: &str,
     owner: &str,
     vpc_id: &str,
-) -> Result<(String, Option<Resource>)> {
+) -> Result<Option<String>> {
     let profile_hint = api.profile_hint(conn);
     let ecs_ep = api.ecs_endpoint(region);
     let name = sg_name(owner);
@@ -715,20 +715,38 @@ async fn ensure_security_group(
         profile_hint,
     )
     .await?;
+    Ok(sgs
+        .into_iter()
+        .filter(|sg| {
+            sg["VpcId"].as_str() == Some(vpc_id)
+                && sg["SecurityGroupName"].as_str() == Some(name.as_str())
+                && model::is_ours(&tags_of(sg), owner)
+        })
+        .filter_map(|sg| {
+            sg["SecurityGroupId"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .min())
+}
 
-    if let Some(sg) = sgs.into_iter().find(|sg| {
-        sg["VpcId"].as_str() == Some(vpc_id)
-            && sg["SecurityGroupName"].as_str() == Some(name.as_str())
-            && model::is_ours(&tags_of(sg), owner)
-    }) && let Some(id) = sg["SecurityGroupId"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        verify_and_repair_sg(api, conn, region, id).await?;
-        return Ok((id.to_string(), None));
+async fn ensure_security_group(
+    api: &AliyunEcs,
+    conn: &Connection,
+    region: &str,
+    owner: &str,
+    vpc_id: &str,
+) -> Result<(String, Option<Resource>)> {
+    if let Some(id) = find_security_group(api, conn, region, owner, vpc_id).await? {
+        verify_and_repair_sg(api, conn, region, &id).await?;
+        return Ok((id, None));
     }
 
+    let profile_hint = api.profile_hint(conn);
+    let ecs_ep = api.ecs_endpoint(region);
+    let name = sg_name(owner);
     let tags = part_tags(owner);
     let token = format!("cua-sg-{:016x}", rand::random::<u64>());
     let mut params = vec![
@@ -771,6 +789,21 @@ async fn ensure_security_group(
         )
         .await;
         return Err(e);
+    }
+
+    // Race-loser cleanup: if two processes created a security group concurrently,
+    // keep the lowest SecurityGroupId and delete our redundant one.
+    if let Some(winner) = find_security_group(api, conn, region, owner, vpc_id).await?
+        && winner != id
+    {
+        let _ = delete_part(
+            api,
+            conn,
+            &net_resource(region, "", "security_group", &id, &name, &tags, &[]),
+        )
+        .await;
+        verify_and_repair_sg(api, conn, region, &winner).await?;
+        return Ok((winner, None));
     }
 
     Ok((
@@ -877,13 +910,14 @@ pub async fn ensure_vswitch_for_zone(
     )
     .await?;
 
-    if let Some(vsw) = existing
-        .iter()
-        .find(|v| v["ZoneId"].as_str() == Some(zone_id) && model::is_ours(&tags_of(v), owner))
-        && let Some(id) = vsw["VSwitchId"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+    if let Some(vsw) = existing.iter().find(|v| {
+        !v["IsDefault"].as_bool().unwrap_or(false)
+            && v["ZoneId"].as_str() == Some(zone_id)
+            && model::is_ours(&tags_of(v), owner)
+    }) && let Some(id) = vsw["VSwitchId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
         wait_vswitch_available(api, conn, region, id).await?;
         return Ok((id.to_string(), None));
@@ -1015,11 +1049,17 @@ pub async fn describe_part(
             let Some(vsw) = v["VSwitches"]["VSwitch"].as_array().and_then(|a| a.first()) else {
                 return Ok(None);
             };
+            // Default VSwitches are never owned by Cua regardless of tags.
+            let tags = if vsw["IsDefault"].as_bool().unwrap_or(false) {
+                BTreeMap::new()
+            } else {
+                tags_of(vsw)
+            };
             let state = vsw["Status"]
                 .as_str()
                 .unwrap_or("available")
                 .to_ascii_lowercase();
-            Ok(Some((state, tags_of(vsw))))
+            Ok(Some((state, tags)))
         }
         "security_group" => {
             let v = api

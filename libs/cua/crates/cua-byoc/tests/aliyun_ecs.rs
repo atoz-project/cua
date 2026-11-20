@@ -23,7 +23,7 @@ use serde_json::json;
 
 #[path = "support/fake_aliyun.rs"]
 mod fake_aliyun;
-use fake_aliyun::{S, handle};
+use fake_aliyun::{FakeAliyun, S, handle};
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -1918,6 +1918,20 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
                 { "Key": "cua-owner", "Value": owner_tag }
             ]}
         }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-default",
+            "VSwitchName": "default-vsw",
+            "VpcId": "vpc-default",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "172.16.0.0/24",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": true,
+            "Status": "Available",
+            "Tags": { "Tag": [
+                { "Key": "cua-managed", "Value": "true" },
+                { "Key": "cua-owner", "Value": owner_tag }
+            ]}
+        }));
         f.vpcs.push(json!({
             "VpcId": "vpc-untagged",
             "CidrBlock": "192.168.0.0/16",
@@ -1964,14 +1978,20 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         );
     }
 
-    // Tag-guard refusal: stop/start/delete on untagged, foreign, and default VPC must refuse with 0 mutating calls.
+    // Tag-guard refusal: list_owned excludes and stop/start/delete refuse on untagged,
+    // foreign, and default VPC/VSwitch (even with forged tags) with 0 mutating calls.
     let c = conn(&api);
+    assert!(
+        api.list_owned(&c, &owner).await.unwrap().is_empty(),
+        "list_owned must exclude default/untagged/foreign resources"
+    );
     s.lock().unwrap().calls.clear();
     for (ty, id) in [
         ("instance", "i-untagged"),
         ("instance", "i-foreign"),
         ("vpc", "vpc-default"),
         ("vpc", "vpc-untagged"),
+        ("vswitch", "vsw-default"),
         ("vswitch", "vsw-untagged"),
         ("security_group", "sg-untagged"),
     ] {
@@ -1984,7 +2004,7 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         };
         let err_del = api.delete(&c, &r, &owner).await.unwrap_err();
         assert!(err_del.to_string().contains("refusing"), "{id}: {err_del}");
-        if ty == "instance" {
+        if ty == "instance" || id == "vsw-default" || id == "vpc-default" {
             let err_stop = api.stop(&c, &r, &owner).await.unwrap_err();
             assert!(
                 err_stop.to_string().contains("refusing"),
@@ -2102,8 +2122,265 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
     assert_eq!(f.vpcs.len(), 2);
     assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-default"));
     assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-untagged"));
-    assert_eq!(f.vswitches.len(), 1);
+    assert_eq!(f.vswitches.len(), 2);
+    assert!(f.vswitches.iter().any(|v| v["VSwitchId"] == "vsw-default"));
+    assert!(f.vswitches.iter().any(|v| v["VSwitchId"] == "vsw-untagged"));
     assert_eq!(f.security_groups.len(), 1);
+}
+
+#[tokio::test]
+async fn default_vswitch_with_spoofed_cua_tags_is_never_reused() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+
+    let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
+        .into_iter()
+        .map(|(k, v)| json!({ "Key": k, "Value": v }))
+        .collect();
+    {
+        let mut f = s.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-owned-1",
+            "VpcName": aliyun_net::vpc_name("owner1"),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": vpc_tags }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-default-spoofed",
+            "VSwitchName": "default-vsw",
+            "VpcId": "vpc-owned-1",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": true,
+            "Status": "Available",
+            "Tags": { "Tag": vpc_tags }
+        }));
+    }
+
+    let locks = aliyun_net::NetLocks::default();
+    let (chosen_id, made) = aliyun_net::ensure_vswitch_for_zone(
+        &api,
+        &c,
+        "cn-hangzhou",
+        "owner1",
+        "vpc-owned-1",
+        "cn-hangzhou-h",
+        &locks,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        chosen_id, "vsw-default-spoofed",
+        "must never reuse an IsDefault=true VSwitch even with Cua tags"
+    );
+    assert!(
+        made.is_some(),
+        "must create a dedicated non-default VSwitch instead"
+    );
+    let f = s.lock().unwrap();
+    assert!(
+        f.calls.iter().any(|call| call.action == "CreateVSwitch"),
+        "expected CreateVSwitch call"
+    );
+}
+
+#[tokio::test]
+async fn security_group_tie_breaker_and_race_loser_cleanup() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    // 1. Lowest-ID tie-breaker: when multiple Cua SGs exist, prepare_network picks the lowest ID.
+    let (api1, s1, store1) = start(None).await;
+    store1.save("LTAI_TEST_AK:secret123").unwrap();
+    let c1 = conn(&api1);
+    let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
+        .into_iter()
+        .map(|(k, v)| json!({ "Key": k, "Value": v }))
+        .collect();
+    let sg_tags: Vec<_> = aliyun_net::part_tags("owner1")
+        .into_iter()
+        .map(|(k, v)| json!({ "TagKey": k, "TagValue": v }))
+        .collect();
+    {
+        let mut f = s1.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-owned-1",
+            "VpcName": aliyun_net::vpc_name("owner1"),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": vpc_tags.clone() }
+        }));
+        for sg_id in ["sg-zeta", "sg-alpha"] {
+            f.security_groups.push(json!({
+                "SecurityGroupId": sg_id,
+                "SecurityGroupName": aliyun_net::sg_name("owner1"),
+                "VpcId": "vpc-owned-1",
+                "RegionId": "cn-hangzhou",
+                "SecurityGroupType": "enterprise",
+                "InnerAccessPolicy": "Drop",
+                "Tags": { "Tag": sg_tags.clone() }
+            }));
+            f.security_group_rules.insert(
+                sg_id.into(),
+                vec![json!({
+                    "Direction": "egress",
+                    "IpProtocol": "all",
+                    "PortRange": "-1/-1",
+                    "DestCidrIp": "0.0.0.0/0",
+                    "Policy": "accept",
+                    "Priority": "1",
+                })],
+            );
+        }
+    }
+    let cfg = aliyun_net::NetworkConfig::from_connection(&c1).unwrap();
+    let locks1 = aliyun_net::NetLocks::default();
+    let net = aliyun_net::prepare_network(
+        &api1,
+        &c1,
+        "cn-hangzhou",
+        "owner1",
+        "ecs.e-c1m2.large",
+        &cfg,
+        &locks1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        net.security_group_id, "sg-alpha",
+        "must pick lowest SecurityGroupId on tie"
+    );
+
+    // 2. Concurrent race across separate NetLocks: both create SGs behind a barrier,
+    //    both converge on the lowest ID, and the race loser is deleted.
+    let s2: S = Arc::new(Mutex::new(FakeAliyun::default()));
+    {
+        let mut f = s2.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-owned-race",
+            "VpcName": aliyun_net::vpc_name("owner1"),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": vpc_tags }
+        }));
+    }
+    let fake_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let fake_router = axum::Router::new()
+        .route("/", axum::routing::any(handle))
+        .with_state(s2.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(fake_listener, fake_router).await;
+    });
+
+    let create_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let client = reqwest::Client::new();
+    let proxy_router = axum::Router::new().route(
+        "/",
+        axum::routing::any({
+            let create_barrier = create_barrier.clone();
+            let client = client.clone();
+            let target_url = format!("http://{fake_addr}/");
+            move |req: axum::extract::Request| {
+                let create_barrier = create_barrier.clone();
+                let client = client.clone();
+                let target_url = target_url.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let action = parts
+                        .headers
+                        .get("x-acs-action")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    if action == "CreateSecurityGroup" {
+                        create_barrier.wait().await;
+                    }
+                    let mut out_url = target_url;
+                    if let Some(q) = parts.uri.query() {
+                        out_url.push('?');
+                        out_url.push_str(q);
+                    }
+                    let mut fwd = client.request(parts.method, &out_url).body(bytes);
+                    for (k, v) in &parts.headers {
+                        fwd = fwd.header(k, v);
+                    }
+                    let resp = fwd.send().await.unwrap();
+                    let status = resp.status();
+                    let resp_bytes = resp.bytes().await.unwrap();
+                    (
+                        status,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        resp_bytes,
+                    )
+                }
+            }
+        }),
+    );
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(proxy_listener, proxy_router).await;
+    });
+    let proxy_url = format!("http://{proxy_addr}");
+
+    let store_a = Arc::new(MemStore::default());
+    store_a.save("LTAI_TEST_AK:secret123").unwrap();
+    let api_a = AliyunEcs::with_endpoints(&proxy_url, &proxy_url, &proxy_url, store_a, None)
+        .with_poll(std::time::Duration::from_millis(5));
+
+    let store_b = Arc::new(MemStore::default());
+    store_b.save("LTAI_TEST_AK:secret123").unwrap();
+    let api_b = AliyunEcs::with_endpoints(&proxy_url, &proxy_url, &proxy_url, store_b, None)
+        .with_poll(std::time::Duration::from_millis(5));
+
+    let ca = conn(&api_a);
+    let cb = conn(&api_b);
+    let locks_a = aliyun_net::NetLocks::default();
+    let locks_b = aliyun_net::NetLocks::default();
+
+    let (res_a, res_b) = tokio::join!(
+        aliyun_net::prepare_network(
+            &api_a,
+            &ca,
+            "cn-hangzhou",
+            "owner1",
+            "ecs.e-c1m2.large",
+            &cfg,
+            &locks_a
+        ),
+        aliyun_net::prepare_network(
+            &api_b,
+            &cb,
+            "cn-hangzhou",
+            "owner1",
+            "ecs.e-c1m2.large",
+            &cfg,
+            &locks_b
+        ),
+    );
+    let net_a = res_a.unwrap();
+    let net_b = res_b.unwrap();
+    assert_eq!(net_a.security_group_id, net_b.security_group_id);
+    assert_eq!(net_a.security_group_id, "sg-fake-1");
+    assert_eq!(
+        s2.lock().unwrap().security_groups.len(),
+        1,
+        "race-loser security group must be deleted"
+    );
 }
 
 #[tokio::test]
