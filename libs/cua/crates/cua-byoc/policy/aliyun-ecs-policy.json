@@ -1,0 +1,159 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Sid": "CuaIdentityAndRead",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ecs:DescribeRegions",
+        "ecs:DescribeZones",
+        "ecs:DescribeAvailableResource",
+        "ecs:DescribeImages",
+        "ecs:DescribeInstances",
+        "ecs:DescribeSecurityGroups",
+        "ecs:DescribeSecurityGroupAttribute",
+        "vpc:DescribeVpcs",
+        "vpc:DescribeVSwitches"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CuaLaunchTaggedInstancesAndDisks",
+      "Effect": "Allow",
+      "Action": "ecs:RunInstances",
+      "Resource": [
+        "acs:ecs:*:*:instance/*",
+        "acs:ecs:*:*:disk/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaLaunchUsesExistingNetworkAndImages",
+      "Effect": "Allow",
+      "Action": "ecs:RunInstances",
+      "Resource": [
+        "acs:ecs:*:*:image/*",
+        "acs:vpc:*:*:vswitch/*",
+        "acs:ecs:*:*:networkinterface/*",
+        "acs:ecs:*:*:securitygroup/*"
+      ]
+    },
+    {
+      "Sid": "CuaCreateTaggedSecurityGroups",
+      "Effect": "Allow",
+      "Action": "ecs:CreateSecurityGroup",
+      "Resource": "acs:ecs:*:*:securitygroup/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaCreateSecurityGroupsInAVpc",
+      "Effect": "Allow",
+      "Action": "ecs:CreateSecurityGroup",
+      "Resource": "acs:vpc:*:*:vpc/*"
+    },
+    {
+      "Sid": "CuaCreateItsOwnVpcAndVSwitches",
+      "Effect": "Allow",
+      "Action": [
+        "vpc:CreateVpc",
+        "vpc:CreateVSwitch"
+      ],
+      "Resource": [
+        "acs:vpc:*:*:vpc/*",
+        "acs:vpc:*:*:vswitch/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaCreateVSwitchesInItsOwnVpc",
+      "Effect": "Allow",
+      "Action": "vpc:CreateVSwitch",
+      "Resource": "acs:vpc:*:*:vpc/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaTagOnlyWithManagedTag",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:TagResources",
+        "vpc:TagResources"
+      ],
+      "Resource": [
+        "acs:ecs:*:*:instance/*",
+        "acs:ecs:*:*:disk/*",
+        "acs:ecs:*:*:securitygroup/*",
+        "acs:vpc:*:*:vpc/*",
+        "acs:vpc:*:*:vswitch/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaManageItsOwnInstances",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:StartInstance",
+        "ecs:StopInstance",
+        "ecs:DeleteInstance",
+        "ecs:GetInstanceConsoleOutput"
+      ],
+      "Resource": "acs:ecs:*:*:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaManageItsOwnSecurityGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:AuthorizeSecurityGroupEgress",
+        "ecs:DeleteSecurityGroup"
+      ],
+      "Resource": "acs:ecs:*:*:securitygroup/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaDeleteItsOwnNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "vpc:DeleteVpc",
+        "vpc:DeleteVSwitch"
+      ],
+      "Resource": [
+        "acs:vpc:*:*:vpc/*",
+        "acs:vpc:*:*:vswitch/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    }
+  ]
+}

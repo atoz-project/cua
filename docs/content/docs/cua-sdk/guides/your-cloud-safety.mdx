@@ -337,19 +337,215 @@ credential accepts only tokens from your Cua account's issuer with the subject
 needs that they do not allow, then validates a machine deployment without
 creating it. To remove the trust, delete the `cua-spaces` identity.
 
+### Alibaba Cloud ECS
+
+Create a custom RAM policy from this JSON (Alibaba Cloud RAM custom policies
+are limited to 6,144 characters) and attach it to a dedicated RAM sub-account
+user, then connect with that user's AccessKey pair
+(`cua cloud connect aliyun-ecs --profile <name>` or `--token-stdin`):
+
+```json skip="third-party-cli"
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Sid": "CuaIdentityAndRead",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ecs:DescribeRegions",
+        "ecs:DescribeZones",
+        "ecs:DescribeAvailableResource",
+        "ecs:DescribeImages",
+        "ecs:DescribeInstances",
+        "ecs:DescribeSecurityGroups",
+        "ecs:DescribeSecurityGroupAttribute",
+        "vpc:DescribeVpcs",
+        "vpc:DescribeVSwitches"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CuaLaunchTaggedInstancesAndDisks",
+      "Effect": "Allow",
+      "Action": "ecs:RunInstances",
+      "Resource": [
+        "acs:ecs:*:*:instance/*",
+        "acs:ecs:*:*:disk/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaLaunchUsesExistingNetworkAndImages",
+      "Effect": "Allow",
+      "Action": "ecs:RunInstances",
+      "Resource": [
+        "acs:ecs:*:*:image/*",
+        "acs:vpc:*:*:vswitch/*",
+        "acs:ecs:*:*:networkinterface/*",
+        "acs:ecs:*:*:securitygroup/*"
+      ]
+    },
+    {
+      "Sid": "CuaCreateTaggedSecurityGroups",
+      "Effect": "Allow",
+      "Action": "ecs:CreateSecurityGroup",
+      "Resource": "acs:ecs:*:*:securitygroup/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaCreateSecurityGroupsInAVpc",
+      "Effect": "Allow",
+      "Action": "ecs:CreateSecurityGroup",
+      "Resource": "acs:vpc:*:*:vpc/*"
+    },
+    {
+      "Sid": "CuaCreateItsOwnVpcAndVSwitches",
+      "Effect": "Allow",
+      "Action": [
+        "vpc:CreateVpc",
+        "vpc:CreateVSwitch"
+      ],
+      "Resource": [
+        "acs:vpc:*:*:vpc/*",
+        "acs:vpc:*:*:vswitch/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaCreateVSwitchesInItsOwnVpc",
+      "Effect": "Allow",
+      "Action": "vpc:CreateVSwitch",
+      "Resource": "acs:vpc:*:*:vpc/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaTagOnlyWithManagedTag",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:TagResources",
+        "vpc:TagResources"
+      ],
+      "Resource": [
+        "acs:ecs:*:*:instance/*",
+        "acs:ecs:*:*:disk/*",
+        "acs:ecs:*:*:securitygroup/*",
+        "acs:vpc:*:*:vpc/*",
+        "acs:vpc:*:*:vswitch/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:RequestTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaManageItsOwnInstances",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:StartInstance",
+        "ecs:StopInstance",
+        "ecs:DeleteInstance",
+        "ecs:GetInstanceConsoleOutput"
+      ],
+      "Resource": "acs:ecs:*:*:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaManageItsOwnSecurityGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:AuthorizeSecurityGroupEgress",
+        "ecs:DeleteSecurityGroup"
+      ],
+      "Resource": "acs:ecs:*:*:securitygroup/*",
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    },
+    {
+      "Sid": "CuaDeleteItsOwnNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "vpc:DeleteVpc",
+        "vpc:DeleteVSwitch"
+      ],
+      "Resource": [
+        "acs:vpc:*:*:vpc/*",
+        "acs:vpc:*:*:vswitch/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "acs:ResourceTag/cua-managed": "true"
+        }
+      }
+    }
+  ]
+}
+```
+
+Why it is shaped this way:
+
+- **Reads cannot be scoped.** `Describe*` calls and `sts:GetCallerIdentity`
+  use `"Resource": "*"` and change nothing in the account.
+- **Creates require the tag.** `ecs:RunInstances` (on instances and disks),
+  `ecs:CreateSecurityGroup`, `vpc:CreateVpc`, `vpc:CreateVSwitch`,
+  `ecs:TagResources` and `vpc:TagResources` all require
+  `acs:RequestTag/cua-managed: "true"`, so Cua can create and tag only
+  Cua-managed resources.
+- **Changes require the tag on the resource.** `ecs:StartInstance`,
+  `ecs:StopInstance`, `ecs:DeleteInstance`, `ecs:GetInstanceConsoleOutput`,
+  `ecs:AuthorizeSecurityGroupEgress`, `ecs:DeleteSecurityGroup`,
+  `vpc:DeleteVpc`, `vpc:DeleteVSwitch` and adding a VSwitch to a Cua VPC all
+  check `acs:ResourceTag/cua-managed: "true"`, so untagged instances and user
+  VPCs, VSwitches or security groups cannot be touched.
+- **Reference-only resources.** `ecs:RunInstances` references `image/*`,
+  `vswitch/*`, `networkinterface/*` and `securitygroup/*`, and
+  `ecs:CreateSecurityGroup` references `vpc/*`, which allows launching into
+  either Cua's isolated VPC or an existing VPC (`--vpc-id`, `--vswitch-id`)
+  and custom Cloud Image IDs (`--cloud-image-id`).
+- **IMDSv2 only and no `ram:*`.** Cua launches every ECS instance with
+  `HttpTokens=required` (IMDSv2) and never assigns a RAM instance role. The
+  policy includes zero `ram:*` actions and zero wildcard actions.
+
 ## What a Space on a cloud host can reach
 
-A Space is untrusted code, so each computer Cua starts in your cloud blocks its
-containers from the places they should never see. The rules are the computer's
-own firewall, installed on its first boot before any container runs, so a
-Space cannot change them. They apply to every provider.
+A Space is untrusted code, so each computer Cua starts in your cloud blocks
+Docker-on-VM containers and Direct VM guests (`--runtime native`) from the
+places they should never see. The rules are installed in the computer's own OS
+firewall on first boot before a container or guest session runs, so a Space
+cannot change them. They apply to every provider.
 
-A container can reach the public internet and DNS, and nothing else:
+A container or Direct VM guest can reach the public internet and DNS, and nothing else:
 
 - **The cloud's metadata services** (`169.254.169.254`, `169.254.170.2`,
-  `fd00:ec2::254`, `168.63.129.16`, `100.100.100.200`), which hold the
-  host's credentials and start-up data. Only DNS on port 53 to the
-  host's own resolver passes.
+  `fd00:ec2::254`, `168.63.129.16`, `100.100.100.200` on Alibaba Cloud ECS),
+  which hold the host's credentials and start-up data. Both Docker-on-VM
+  containers and Direct VM Sandbox guests (Linux `cloud-init` and Windows
+  PowerShell `UserData`) block `100.100.100.200` on the host firewall. Only DNS
+  on port 53 to the host's own resolver passes.
 - **The computer's own network**: the VPC or virtual network and subnet it
   sits in, read at boot.
 - **Private and reserved ranges**: `10.0.0.0/8`, `172.16.0.0/12`,
@@ -369,7 +565,8 @@ cloud, because the private network there is your VPC.
 ### When a machine does not come online
 
 A create that fails to boot reads the machine's console (AWS
-`GetConsoleOutput`, Google Cloud serial port 1) before it deletes the
+`GetConsoleOutput`, Google Cloud serial port 1, Alibaba Cloud ECS
+`GetInstanceConsoleOutput`) before it deletes the
 machine, keeps the last 200 lines without anything that looks like a token,
 secret or key in `~/.cua/cloud/boot-logs/<id>.log` (mode 0600), and prints the
 path and the last ten lines in the error. The read has 20 seconds and never
