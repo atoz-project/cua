@@ -32589,6 +32589,21 @@ data class CloudProvider (
      * Optional custom `cua-spacesd` binary mirror URL.
      */
     var `spacesdDownloadUrl`: kotlin.String? = null
+    ,
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+     */
+    var `vpcId`: kotlin.String?
+    ,
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+     */
+    var `vswitchId`: kotlin.String?
+    ,
+    /**
+     * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+     */
+    var `noPublicIp`: kotlin.Boolean
 
 ){
 
@@ -32637,6 +32652,9 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -32672,7 +32690,10 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterSequenceString.allocationSize(value.`holders`) +
             FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
             FfiConverterOptionalString.allocationSize(value.`relayMode`) +
-            FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`)
+            FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`vpcId`) +
+            FfiConverterOptionalString.allocationSize(value.`vswitchId`) +
+            FfiConverterBoolean.allocationSize(value.`noPublicIp`)
     )
 
     override fun write(value: CloudProvider, buf: ByteBuffer) {
@@ -32708,6 +32729,9 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterOptionalString.write(value.`relayUrl`, buf)
             FfiConverterOptionalString.write(value.`relayMode`, buf)
             FfiConverterOptionalString.write(value.`spacesdDownloadUrl`, buf)
+            FfiConverterOptionalString.write(value.`vpcId`, buf)
+            FfiConverterOptionalString.write(value.`vswitchId`, buf)
+            FfiConverterBoolean.write(value.`noPublicIp`, buf)
     }
 }
 
@@ -33035,6 +33059,24 @@ data class CloudTarget (
      * `#sha256=<64 hex>` fragment).
      */
     var `spacesdDownloadUrl`: kotlin.String? = null
+    ,
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+     * with `vswitch_id`.
+     */
+    var `vpcId`: kotlin.String? = null
+    ,
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+     * paired with `vpc_id`.
+     */
+    var `vswitchId`: kotlin.String? = null
+    ,
+    /**
+     * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+     * `aliyun-ecs` only).
+     */
+    var `noPublicIp`: kotlin.Boolean = false
 
 ){
 
@@ -33062,6 +33104,9 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -33076,7 +33121,10 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
             FfiConverterOptionalString.allocationSize(value.`relayMode`) +
             FfiConverterOptionalString.allocationSize(value.`relayToken`) +
-            FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`)
+            FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`vpcId`) +
+            FfiConverterOptionalString.allocationSize(value.`vswitchId`) +
+            FfiConverterBoolean.allocationSize(value.`noPublicIp`)
     )
 
     override fun write(value: CloudTarget, buf: ByteBuffer) {
@@ -33091,6 +33139,9 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.write(value.`relayMode`, buf)
             FfiConverterOptionalString.write(value.`relayToken`, buf)
             FfiConverterOptionalString.write(value.`spacesdDownloadUrl`, buf)
+            FfiConverterOptionalString.write(value.`vpcId`, buf)
+            FfiConverterOptionalString.write(value.`vswitchId`, buf)
+            FfiConverterBoolean.write(value.`noPublicIp`, buf)
     }
 }
 

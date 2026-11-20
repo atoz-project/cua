@@ -208,6 +208,9 @@ fn cloud_target(kind: Kind, region: &Option<String>) -> cua_sdk::CloudTarget {
         relay_mode: None,
         relay_token: None,
         spacesd_download_url: None,
+        vpc_id: None,
+        vswitch_id: None,
+        no_public_ip: false,
     }
 }
 

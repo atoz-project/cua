@@ -294,7 +294,11 @@ impl Clouds {
                     there.zone = String::new();
                 }
                 match p.describe(&there, &rec).await {
-                    Ok(Some((state, _))) if state != "terminated" => None,
+                    Ok(Some((state, tags)))
+                        if state != "terminated" && model::is_ours(&tags, &owner) =>
+                    {
+                        None
+                    }
                     Ok(_) => continue,
                     Err(e) => Some(format!(
                         "recorded in {}, could not be checked: {e}",
@@ -521,6 +525,9 @@ impl Clouds {
                     .as_deref()
                     .map(cua_sandbox_core::byoc::redact_url)
             }),
+            vpc_id: conn.and_then(|c| c.vpc_id.clone()),
+            vswitch_id: conn.and_then(|c| c.vswitch_id.clone()),
+            no_public_ip: conn.is_some_and(|c| c.no_public_ip),
             ..Default::default()
         }
     }
@@ -598,6 +605,17 @@ pub(crate) fn resolve_target_spacesd_download_url(
         Some(raw) => Ok(Some(normalize_spacesd_download_url(raw)?)),
         None => Ok(existing.and_then(|c| c.spacesd_download_url.clone())),
     }
+}
+
+pub(crate) fn validate_target_network_flags(provider: &str, target: &CloudTarget) -> Result<()> {
+    if provider != "aliyun-ecs"
+        && (target.vpc_id.is_some() || target.vswitch_id.is_some() || target.no_public_ip)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "--vpc-id, --vswitch-id, and --no-public-ip apply only to aliyun-ecs (not {provider})"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) struct ResolvedTargetRelay {
@@ -774,6 +792,7 @@ impl CloudManager for Clouds {
 
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
+        validate_target_network_flags(p.name(), target)?;
         let existing = self.store.connection(p.name()).map_err(Error::Io)?;
         let relay = resolve_target_relay(
             self.store.home().as_deref(),
@@ -808,6 +827,7 @@ impl CloudManager for Clouds {
         ttl_hours: Option<u32>,
     ) -> Result<CloudConnected> {
         let p = self.api(&target.provider)?;
+        validate_target_network_flags(p.name(), target)?;
         let existing = self.store.connection(p.name()).map_err(Error::Io)?;
         let relay = resolve_target_relay(
             self.store.home().as_deref(),

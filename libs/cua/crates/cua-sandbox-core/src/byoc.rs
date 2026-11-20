@@ -167,6 +167,10 @@ pub fn redact_url(raw: &str) -> String {
     out
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// One cloud as `cloud_status` lists it.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudProvider {
@@ -280,6 +284,18 @@ pub struct CloudProvider {
     /// `#sha256=<64 hex>` fragment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID to attach sandboxes to (`aliyun-ecs`),
+    /// or `None` for Cua's isolated VPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID to attach sandboxes to (`aliyun-ecs`),
+    /// or `None` for Cua's isolated VPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// Whether public IPv4 assignment is disabled (`InternetMaxBandwidthOut=0`)
+    /// on `aliyun-ecs`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
 }
 
 impl std::fmt::Debug for CloudProvider {
@@ -320,6 +336,9 @@ impl std::fmt::Debug for CloudProvider {
                 "spacesd_download_url",
                 &self.spacesd_download_url.as_deref().map(redact_url),
             )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
             .finish()
     }
 }
@@ -823,6 +842,16 @@ pub struct CloudTarget {
     /// `#sha256=<64 hex>` fragment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -845,6 +874,9 @@ impl std::fmt::Debug for CloudTarget {
                 "spacesd_download_url",
                 &self.spacesd_download_url.as_deref().map(redact_url),
             )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
             .finish()
     }
 }
@@ -1220,5 +1252,32 @@ mod tests {
             p_dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
             "{p_dbg}"
         );
+    }
+
+    #[test]
+    fn existing_vpc_fields_default_and_skip_serializing_when_unset() {
+        let t = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
+            ..Default::default()
+        };
+        let dbg = format!("{t:?}");
+        assert!(dbg.contains("vpc-123"), "{dbg}");
+        assert!(dbg.contains("vsw-456"), "{dbg}");
+        assert!(dbg.contains("no_public_ip: true"), "{dbg}");
+
+        let p: CloudProvider = serde_json::from_str(
+            r#"{"name":"aliyun-ecs","title":"Alibaba Cloud ECS","tier":"vm","connected":false}"#,
+        )
+        .unwrap();
+        assert_eq!(p.vpc_id, None);
+        assert_eq!(p.vswitch_id, None);
+        assert!(!p.no_public_ip);
+        let serialized = serde_json::to_string(&p).unwrap();
+        assert!(!serialized.contains("vpc_id"), "{serialized}");
+        assert!(!serialized.contains("vswitch_id"), "{serialized}");
+        assert!(!serialized.contains("no_public_ip"), "{serialized}");
     }
 }

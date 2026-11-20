@@ -182,6 +182,15 @@ pub struct CloudProvider {
     #[serde(default)]
     #[uniffi(default = None)]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+    #[serde(default)]
+    pub vswitch_id: Option<String>,
+    /// Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+    #[serde(default)]
+    pub no_public_ip: bool,
 }
 
 impl std::fmt::Debug for CloudProvider {
@@ -222,6 +231,9 @@ impl std::fmt::Debug for CloudProvider {
                 "spacesd_download_url",
                 &self.spacesd_download_url.as_deref().map(redact_url),
             )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
             .finish()
     }
 }
@@ -500,6 +512,18 @@ pub struct CloudTarget {
     /// `#sha256=<64 hex>` fragment).
     #[uniffi(default = None)]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+    /// with `vswitch_id`.
+    #[uniffi(default = None)]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+    /// paired with `vpc_id`.
+    #[uniffi(default = None)]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[uniffi(default = false)]
+    pub no_public_ip: bool,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -522,6 +546,9 @@ impl std::fmt::Debug for CloudTarget {
                 "spacesd_download_url",
                 &self.spacesd_download_url.as_deref().map(redact_url),
             )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
             .finish()
     }
 }
@@ -540,15 +567,21 @@ impl CloudTarget {
             "relay_mode": self.relay_mode,
             "relay_token": self.relay_token,
             "spacesd_download_url": self.spacesd_download_url,
+            "vpc_id": self.vpc_id,
+            "vswitch_id": self.vswitch_id,
+            "no_public_ip": self.no_public_ip,
         })
     }
 
-    fn relay_fields_asked(&self) -> Vec<&'static str> {
+    fn extra_target_fields_asked(&self) -> Vec<&'static str> {
         [
             ("relay_url", self.relay_url.is_some()),
             ("relay_mode", self.relay_mode.is_some()),
             ("relay_token", self.relay_token.is_some()),
             ("spacesd_download_url", self.spacesd_download_url.is_some()),
+            ("vpc_id", self.vpc_id.is_some()),
+            ("vswitch_id", self.vswitch_id.is_some()),
+            ("no_public_ip", self.no_public_ip),
         ]
         .into_iter()
         .filter_map(|(k, set)| set.then_some(k))
@@ -640,10 +673,10 @@ impl Spaces {
             let mut args = target.args();
             args["make_default"] = json!(make_default);
             args["ttl_hours"] = json!(ttl_hours);
-            let mut asked: Vec<&str> = target.relay_fields_asked();
+            let mut asked: Vec<&str> = target.extra_target_fields_asked();
             if let Some(o) = options {
                 // An older daemon ignores fields it does not know and would
-                // link through the CLI sign-in or default relay instead: refuse first.
+                // link through the CLI sign-in or default relay/VPC instead: refuse first.
                 asked.extend(
                     [
                         ("auth", o.auth.is_some()),
@@ -659,7 +692,7 @@ impl Spaces {
                 host.require_fields(
                     "cloud_connect",
                     &asked,
-                    "link a cloud with OIDC, a budget, a largest machine or a custom relay",
+                    "link a cloud with OIDC, a budget, a largest machine, custom relay, or existing VPC",
                 )
                 .await?;
                 args["auth"] = json!(o.auth);
@@ -679,7 +712,7 @@ impl Spaces {
                 host.require_fields(
                     "cloud_connect",
                     &asked,
-                    "connect a cloud with a custom or static relay",
+                    "connect a cloud with a custom/static relay or existing VPC",
                 )
                 .await?;
             }
@@ -707,12 +740,12 @@ impl Spaces {
     pub async fn cloud_test(&self, target: CloudTarget) -> Result<CloudTestReport> {
         let host = self.tool_caller();
         run(async move {
-            let asked = target.relay_fields_asked();
+            let asked = target.extra_target_fields_asked();
             if !asked.is_empty() {
                 host.require_fields(
                     "cloud_test",
                     &asked,
-                    "test a cloud with a custom or static relay",
+                    "test a cloud with a custom/static relay or existing VPC",
                 )
                 .await?;
             }
@@ -880,13 +913,16 @@ mod tests {
         assert_eq!(r.resources[0].resource.resource_type, "instance");
         assert_eq!(r.resources[0].action, "delete");
 
-        // relay_mode, relay_url, relay_token wire & redaction round-trip.
+        // relay_mode, relay_url, relay_token, vpc_id, vswitch_id, no_public_ip wire & redaction round-trip.
         let target = CloudTarget {
-            provider: "hetzner".into(),
+            provider: "aliyun-ecs".into(),
             relay_url: Some("https://relay.example.com".into()),
             relay_mode: Some("static".into()),
             relay_token: Some("super-secret-relay-token".into()),
             spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
             ..Default::default()
         };
         assert!(!format!("{target:?}").contains("super-secret-relay-token"));
@@ -898,11 +934,17 @@ mod tests {
             args["spacesd_download_url"],
             "https://mirror.example.com/cua-spacesd.exe"
         );
+        assert_eq!(args["vpc_id"], "vpc-123");
+        assert_eq!(args["vswitch_id"], "vsw-456");
+        assert_eq!(args["no_public_ip"], true);
         let p_wire = serde_json::to_value(cua_spaces::cloud::CloudProvider {
-            name: "hetzner".into(),
+            name: "aliyun-ecs".into(),
             relay_url: Some("https://relay.example.com".into()),
             relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
             spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
             ..Default::default()
         })
         .unwrap();
@@ -916,6 +958,9 @@ mod tests {
             p_sdk.spacesd_download_url.as_deref(),
             Some("https://mirror.example.com/cua-spacesd.exe")
         );
+        assert_eq!(p_sdk.vpc_id.as_deref(), Some("vpc-123"));
+        assert_eq!(p_sdk.vswitch_id.as_deref(), Some("vsw-456"));
+        assert!(p_sdk.no_public_ip);
 
         let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab";
         let secret_target = CloudTarget {

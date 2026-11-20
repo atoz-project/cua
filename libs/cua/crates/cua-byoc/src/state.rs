@@ -99,6 +99,19 @@ pub struct Link {
     /// [`Connection::spacesd_download_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacesd_download_url: Option<String>,
+    /// [`Connection::vpc_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// [`Connection::vswitch_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// [`Connection::no_public_ip`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Link {
@@ -110,6 +123,9 @@ impl Link {
             && c.relay_url.is_none()
             && c.relay_mode.is_none()
             && c.spacesd_download_url.is_none()
+            && c.vpc_id.is_none()
+            && c.vswitch_id.is_none()
+            && !c.no_public_ip
         {
             return None;
         }
@@ -123,6 +139,9 @@ impl Link {
             relay_url: c.relay_url.clone(),
             relay_mode: c.relay_mode,
             spacesd_download_url: c.spacesd_download_url.clone(),
+            vpc_id: c.vpc_id.clone(),
+            vswitch_id: c.vswitch_id.clone(),
+            no_public_ip: c.no_public_ip,
         })
     }
 
@@ -135,6 +154,9 @@ impl Link {
             && c.relay_url.is_none()
             && c.relay_mode.is_none()
             && c.spacesd_download_url.is_none()
+            && c.vpc_id.is_none()
+            && c.vswitch_id.is_none()
+            && !c.no_public_ip
             && c.account == self.account
             && c.connected_at == self.connected_at
     }
@@ -329,6 +351,9 @@ impl Store {
                 c.relay_url = l.relay_url.clone();
                 c.relay_mode = l.relay_mode;
                 c.spacesd_download_url = l.spacesd_download_url.clone();
+                c.vpc_id = l.vpc_id.clone();
+                c.vswitch_id = l.vswitch_id.clone();
+                c.no_public_ip = l.no_public_ip;
             }
             if c.profile == FEDERATED_PROFILE {
                 c.profile = String::new();
@@ -555,7 +580,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn same(a: &Resource, b: &Resource) -> bool {
     a.provider == b.provider
         && a.resource_type == b.resource_type
-        && ((!a.id.is_empty() && a.id == b.id) || (!a.name.is_empty() && a.name == b.name))
+        && if !a.id.is_empty() && !b.id.is_empty() {
+            a.id == b.id
+        } else {
+            !a.name.is_empty() && a.name == b.name
+        }
 }
 
 #[cfg(test)]
@@ -864,5 +893,34 @@ mod tests {
         assert_eq!(s.connection("aws").unwrap().unwrap().region, "us-west-2");
         assert!(s.disconnect("aws").unwrap());
         assert!(!s.disconnect("aws").unwrap());
+    }
+
+    #[test]
+    fn distinct_ids_with_same_name_do_not_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::new(dir.path());
+        let sg1 = Resource {
+            provider: "aliyun-ecs".into(),
+            resource_type: "security_group".into(),
+            id: "sg-1".into(),
+            name: "cua-sandboxes-owner1".into(),
+            region: "cn-hangzhou".into(),
+            ..Default::default()
+        };
+        let sg2 = Resource {
+            id: "sg-2".into(),
+            ..sg1.clone()
+        };
+        s.record(sg1.clone()).unwrap();
+        s.record(sg2.clone()).unwrap();
+        let all = s.resources().unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["sg-1", "sg-2"]);
+
+        s.forget(&sg1).unwrap();
+        let left = s.resources().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "sg-2");
     }
 }

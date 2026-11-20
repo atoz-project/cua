@@ -86,6 +86,8 @@ Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
   profile in ~/.aliyun/config.json. Default region: `cn-hangzhou`.
     cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16
     cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
+  Optional existing VPC attachment and private-only networking (--no-public-ip):
+    cua cloud connect aliyun-ecs --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
   Verify: cua cloud status aliyun-ecs
 
 Self-hosted relay (per connection, default https://relay.cua.ai in Account Relay Mode):
@@ -122,7 +124,9 @@ Examples:
   cua cloud connect aws --ttl-hours 4
   # Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile
   cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8
+  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou
   cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou --spacesd-download-url https://mirror.example.com/cua-spacesd.exe
+  cua cloud connect aliyun-ecs --profile oauth --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
   # Self-hosted relay: Account Relay Mode or Static Relay Mode
   cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
   cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1";
@@ -173,6 +177,18 @@ pub struct TargetArgs {
     /// provisioning (with optional `#sha256=<64 hex>` fragment).
     #[arg(long, value_name = "URL")]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+    /// with `--vswitch-id`.
+    #[arg(long, value_name = "VPC_ID")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired
+    /// with `--vpc-id`.
+    #[arg(long, value_name = "VSWITCH_ID")]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[arg(long)]
+    pub no_public_ip: bool,
 }
 
 impl TargetArgs {
@@ -200,6 +216,9 @@ impl TargetArgs {
             relay_mode: self.relay_mode.clone(),
             relay_token,
             spacesd_download_url: self.spacesd_download_url.clone(),
+            vpc_id: self.vpc_id.clone(),
+            vswitch_id: self.vswitch_id.clone(),
+            no_public_ip: self.no_public_ip,
         }
     }
 }
@@ -1396,6 +1415,12 @@ fn limits_line(p: &cua_sdk::CloudProvider) -> Option<String> {
     if let Some(url) = p.spacesd_download_url.as_deref().filter(|u| !u.is_empty()) {
         parts.push(format!("cua-spacesd mirror: {url}."));
     }
+    if let (Some(vpc), Some(vsw)) = (p.vpc_id.as_deref(), p.vswitch_id.as_deref()) {
+        parts.push(format!("Existing VPC {vpc} / {vsw}."));
+    }
+    if p.no_public_ip {
+        parts.push("Private-only (--no-public-ip).".into());
+    }
     match p.approval.as_str() {
         "connection" => parts.push("A person approves it in Cua Spaces.".into()),
         "limits" => parts.push("A person approves the new limits in Cua Spaces.".into()),
@@ -1527,6 +1552,12 @@ fn connect_lines(c: &cua_sdk::CloudConnected) -> Vec<String> {
         if let Some(url) = p.spacesd_download_url.as_deref().filter(|u| !u.is_empty()) {
             out.push(format!("cua-spacesd mirror: {url}"));
         }
+        if let (Some(vpc), Some(vsw)) = (p.vpc_id.as_deref(), p.vswitch_id.as_deref()) {
+            out.push(format!("VPC: {vpc} (VSwitch {vsw})"));
+        }
+        if p.no_public_ip {
+            out.push("Public IP: disabled (--no-public-ip)".into());
+        }
     }
     for ch in &c.checks {
         out.push(check_line(ch));
@@ -1595,6 +1626,9 @@ fn provider_json(p: &cua_sdk::CloudProvider) -> serde_json::Value {
         "relay_url": p.relay_url,
         "relay_mode": p.relay_mode,
         "spacesd_download_url": p.spacesd_download_url,
+        "vpc_id": p.vpc_id,
+        "vswitch_id": p.vswitch_id,
+        "no_public_ip": p.no_public_ip,
         "kinds": p.kinds.iter().map(|k| serde_json::json!({
             "image": k.image, "kind": k.kind, "supported": k.supported, "reason": k.reason,
             "machine_type": k.machine_type, "usd_per_hour": k.usd_per_hour,
@@ -2386,5 +2420,81 @@ mod tests {
         let j = provider_json(&p);
         assert_eq!(j["relay_mode"], "static");
         assert_eq!(j["relay_url"], "https://relay.example.com");
+    }
+
+    #[test]
+    fn aliyun_ecs_existing_vpc_flags_parse_and_render() {
+        match parse(&[
+            "test",
+            "aliyun-ecs",
+            "--vpc-id",
+            "vpc-user-1",
+            "--vswitch-id",
+            "vsw-user-1",
+            "--no-public-ip",
+        ]) {
+            CloudCmd::Test { target } => {
+                let wire = target.target_with_stdin(String::new);
+                assert_eq!(wire.vpc_id.as_deref(), Some("vpc-user-1"));
+                assert_eq!(wire.vswitch_id.as_deref(), Some("vsw-user-1"));
+                assert!(wire.no_public_ip);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&[
+            "connect",
+            "aliyun-ecs",
+            "--vpc-id",
+            "vpc-user-1",
+            "--vswitch-id",
+            "vsw-user-1",
+            "--no-public-ip",
+        ]) {
+            CloudCmd::Connect { target, .. } => {
+                let wire = target.target_with_stdin(String::new);
+                assert_eq!(wire.vpc_id.as_deref(), Some("vpc-user-1"));
+                assert_eq!(wire.vswitch_id.as_deref(), Some("vsw-user-1"));
+                assert!(wire.no_public_ip);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let p = cua_sdk::CloudProvider {
+            name: "aliyun-ecs".into(),
+            title: "Alibaba Cloud ECS".into(),
+            connected: true,
+            status: "connected".into(),
+            vpc_id: Some("vpc-user-1".into()),
+            vswitch_id: Some("vsw-user-1".into()),
+            no_public_ip: true,
+            ..Default::default()
+        };
+        let lim = limits_line(&p).unwrap();
+        assert!(
+            lim.contains("vpc-user-1") && lim.contains("vsw-user-1"),
+            "{lim}"
+        );
+        assert!(lim.contains("--no-public-ip"), "{lim}");
+
+        let lines = connect_lines(&cua_sdk::CloudConnected {
+            provider: p.clone(),
+            verify: "cua cloud status aliyun-ecs".into(),
+            ..Default::default()
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("vpc-user-1") && l.contains("vsw-user-1")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("--no-public-ip")),
+            "{lines:?}"
+        );
+
+        let j = provider_json(&p);
+        assert_eq!(j["vpc_id"], "vpc-user-1");
+        assert_eq!(j["vswitch_id"], "vsw-user-1");
+        assert_eq!(j["no_public_ip"], true);
     }
 }

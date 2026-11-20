@@ -49,12 +49,14 @@ pub enum NetworkMode {
     /// Cua-managed isolated VPC (`cua-sb-<owner>`), per-zone `/20` VSwitches,
     /// and zero-ingress Security Group (`cua-sandboxes-<owner>`).
     Isolated,
+    /// User-supplied existing VPC and VSwitch (`--vpc-id`, `--vswitch-id`).
+    Existing { vpc_id: String, vswitch_id: String },
 }
 
 /// Resolved networking parameters for provisioning.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetworkConfig {
-    /// Isolated Cua VPC vs future user-supplied VPC/VSwitch.
+    /// Isolated Cua VPC vs user-supplied VPC/VSwitch.
     pub mode: NetworkMode,
     /// `> 0` => `PayByTraffic` public IPv4 with `InternetMaxBandwidthOut`;
     /// `0` => no public IPv4.
@@ -63,10 +65,22 @@ pub struct NetworkConfig {
 
 impl NetworkConfig {
     /// Derives the network configuration from `conn`.
-    pub fn from_connection(_conn: &Connection) -> Result<Self> {
+    pub fn from_connection(conn: &Connection) -> Result<Self> {
+        let mode = match crate::aliyun_existing_vpc::normalize_existing_vpc(
+            conn.vpc_id.as_deref(),
+            conn.vswitch_id.as_deref(),
+        )? {
+            Some((vpc_id, vswitch_id)) => NetworkMode::Existing { vpc_id, vswitch_id },
+            None => NetworkMode::Isolated,
+        };
+        let public_ip_mbps = if conn.no_public_ip {
+            0
+        } else {
+            DEFAULT_PUBLIC_BANDWIDTH_MBPS
+        };
         Ok(Self {
-            mode: NetworkMode::Isolated,
-            public_ip_mbps: DEFAULT_PUBLIC_BANDWIDTH_MBPS,
+            mode,
+            public_ip_mbps,
         })
     }
 }
@@ -854,6 +868,22 @@ pub async fn prepare_network(
                 .collect();
             (vpc_id, candidates)
         }
+        NetworkMode::Existing { vpc_id, vswitch_id } => {
+            let profile_hint = api.profile_hint(conn);
+            let info = crate::aliyun_existing_vpc::validate_existing_vpc(
+                api,
+                region,
+                vpc_id,
+                vswitch_id,
+                profile_hint,
+            )
+            .await?;
+            let candidates = vec![ZoneCandidate {
+                zone_id: info.zone_id,
+                vswitch_id: Some(vswitch_id.clone()),
+            }];
+            (vpc_id.clone(), candidates)
+        }
     };
 
     let security_group_id = {
@@ -987,6 +1017,75 @@ pub async fn ensure_vswitch_for_zone(
     ))
 }
 
+fn is_cua_vswitch_name(vsw: &Value, owner: &str) -> bool {
+    let name = vsw["VSwitchName"].as_str().unwrap_or("");
+    let zone = vsw["ZoneId"].as_str().unwrap_or("");
+    if !zone.is_empty() {
+        name == vswitch_name(owner, zone)
+    } else {
+        name.starts_with(&format!("{}-", vpc_name(owner)))
+    }
+}
+
+/// Returns Cua ownership tags for a VPC only when it is safe for Cua to manage.
+/// Default VPCs and the configured `conn.vpc_id` are never Cua-owned; in
+/// existing-VPC mode, only prior Cua-created isolated VPCs (`cua-sb-<owner>`)
+/// distinct from `conn.vpc_id` keep their tags.
+fn vpc_owned_tags(conn: &Connection, vpc: &Value) -> BTreeMap<String, String> {
+    let id = vpc["VpcId"].as_str().map(str::trim).unwrap_or("");
+    if vpc["IsDefault"].as_bool().unwrap_or(false)
+        || (!id.is_empty() && conn.vpc_id.as_deref() == Some(id))
+    {
+        return BTreeMap::new();
+    }
+    let tags = tags_of(vpc);
+    if crate::aliyun_existing_vpc::is_existing_vpc_connection(conn) {
+        let Some(owner) = tags
+            .get(tag::OWNER)
+            .map(String::as_str)
+            .filter(|o| !o.is_empty())
+        else {
+            return BTreeMap::new();
+        };
+        if tags.get(tag::MANAGED).map(String::as_str) != Some("true")
+            || vpc["VpcName"].as_str() != Some(vpc_name(owner).as_str())
+        {
+            return BTreeMap::new();
+        }
+    }
+    tags
+}
+
+/// Returns Cua ownership tags for a VSwitch only when it is safe for Cua to
+/// manage. Default VSwitches, `conn.vswitch_id`, and any VSwitch inside
+/// `conn.vpc_id` are never Cua-owned; in existing-VPC mode, only prior
+/// Cua-created isolated VSwitches (`cua-sb-<owner>-<zone>`) keep their tags.
+fn vswitch_owned_tags(conn: &Connection, vsw: &Value) -> BTreeMap<String, String> {
+    let id = vsw["VSwitchId"].as_str().map(str::trim).unwrap_or("");
+    if vsw["IsDefault"].as_bool().unwrap_or(false)
+        || (!id.is_empty() && conn.vswitch_id.as_deref() == Some(id))
+        || (conn.vpc_id.is_some() && vsw["VpcId"].as_str() == conn.vpc_id.as_deref())
+    {
+        return BTreeMap::new();
+    }
+    let tags = tags_of(vsw);
+    if crate::aliyun_existing_vpc::is_existing_vpc_connection(conn) {
+        let Some(owner) = tags
+            .get(tag::OWNER)
+            .map(String::as_str)
+            .filter(|o| !o.is_empty())
+        else {
+            return BTreeMap::new();
+        };
+        if tags.get(tag::MANAGED).map(String::as_str) != Some("true")
+            || !is_cua_vswitch_name(vsw, owner)
+        {
+            return BTreeMap::new();
+        }
+    }
+    tags
+}
+
 /// Describes one network part (`vpc`, `vswitch`/`subnet`, `security_group`).
 pub async fn describe_part(
     api: &AliyunEcs,
@@ -1020,12 +1119,7 @@ pub async fn describe_part(
             let Some(vpc) = v["Vpcs"]["Vpc"].as_array().and_then(|a| a.first()) else {
                 return Ok(None);
             };
-            // Default VPCs are never owned by Cua regardless of tags.
-            let tags = if vpc["IsDefault"].as_bool().unwrap_or(false) {
-                BTreeMap::new()
-            } else {
-                tags_of(vpc)
-            };
+            let tags = vpc_owned_tags(conn, vpc);
             let state = vpc["Status"]
                 .as_str()
                 .unwrap_or("available")
@@ -1049,12 +1143,7 @@ pub async fn describe_part(
             let Some(vsw) = v["VSwitches"]["VSwitch"].as_array().and_then(|a| a.first()) else {
                 return Ok(None);
             };
-            // Default VSwitches are never owned by Cua regardless of tags.
-            let tags = if vsw["IsDefault"].as_bool().unwrap_or(false) {
-                BTreeMap::new()
-            } else {
-                tags_of(vsw)
-            };
+            let tags = vswitch_owned_tags(conn, vsw);
             let state = vsw["Status"]
                 .as_str()
                 .unwrap_or("available")
@@ -1140,10 +1229,7 @@ pub async fn list_parts(api: &AliyunEcs, conn: &Connection, owner: &str) -> Resu
     )
     .await?
     {
-        if vsw["IsDefault"].as_bool().unwrap_or(false) {
-            continue;
-        }
-        let tags = tags_of(&vsw);
+        let tags = vswitch_owned_tags(conn, &vsw);
         if !model::is_ours(&tags, owner) {
             continue;
         }
@@ -1175,10 +1261,7 @@ pub async fn list_parts(api: &AliyunEcs, conn: &Connection, owner: &str) -> Resu
     )
     .await?
     {
-        if vpc["IsDefault"].as_bool().unwrap_or(false) {
-            continue;
-        }
-        let tags = tags_of(&vpc);
+        let tags = vpc_owned_tags(conn, &vpc);
         if !model::is_ours(&tags, owner) {
             continue;
         }
@@ -1199,8 +1282,25 @@ pub async fn list_parts(api: &AliyunEcs, conn: &Connection, owner: &str) -> Resu
 /// Deletes one network part (`security_group`, `vswitch`/`subnet`, `vpc`),
 /// retrying dependency violations and treating `NotFound` as `Ok(())`.
 pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Result<()> {
+    crate::aliyun_existing_vpc::guard_user_network_untouched(conn, r)?;
     if r.id.is_empty() {
         return Ok(());
+    }
+    if matches!(
+        r.resource_type.as_str(),
+        "vpc" | "vswitch" | "subnet" | "security_group"
+    ) {
+        let Some((_, tags)) = describe_part(api, conn, r).await? else {
+            return Ok(());
+        };
+        let is_cua_tagged = tags.get(tag::MANAGED).map(String::as_str) == Some("true")
+            && tags.get(tag::OWNER).is_some_and(|o| !o.is_empty());
+        if !is_cua_tagged {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: refusing to delete non-Cua-owned {} {}",
+                r.resource_type, r.id
+            )));
+        }
     }
     let region = if r.region.is_empty() {
         conn.region.as_str()
@@ -1343,6 +1443,39 @@ mod tests {
         let cfg = NetworkConfig::from_connection(&Connection::default()).unwrap();
         assert_eq!(cfg.mode, NetworkMode::Isolated);
         assert_eq!(cfg.public_ip_mbps, DEFAULT_PUBLIC_BANDWIDTH_MBPS);
+
+        let existing_cfg = NetworkConfig::from_connection(&Connection {
+            vpc_id: Some("vpc-user-1".into()),
+            vswitch_id: Some("vsw-user-1".into()),
+            no_public_ip: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            existing_cfg.mode,
+            NetworkMode::Existing {
+                vpc_id: "vpc-user-1".into(),
+                vswitch_id: "vsw-user-1".into(),
+            }
+        );
+        assert_eq!(existing_cfg.public_ip_mbps, 0);
+
+        let standalone_no_pub = NetworkConfig::from_connection(&Connection {
+            no_public_ip: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(standalone_no_pub.mode, NetworkMode::Isolated);
+        assert_eq!(standalone_no_pub.public_ip_mbps, 0);
+
+        assert!(
+            NetworkConfig::from_connection(&Connection {
+                vpc_id: Some("vpc-only".into()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+
         assert!(is_network_type("vpc"));
         assert!(is_network_type("vswitch"));
         assert!(is_network_type("subnet"));

@@ -364,6 +364,20 @@ pub struct Connection {
     /// Optional custom `cua-spacesd` binary mirror URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// Disable public IPv4 assignment (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl std::fmt::Debug for Connection {
@@ -390,6 +404,9 @@ impl std::fmt::Debug for Connection {
                     .as_deref()
                     .map(cua_sandbox_core::byoc::redact_url),
             )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
             .finish()
     }
 }

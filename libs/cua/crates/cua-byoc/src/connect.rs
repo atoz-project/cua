@@ -72,6 +72,7 @@ fn limits_of(req: &ConnectRequest) -> Result<Limits> {
 /// `cloud_connect`.
 pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Result<CloudConnected> {
     let p = clouds.api(&req.target.provider)?.clone();
+    crate::manager::validate_target_network_flags(p.name(), &req.target)?;
     let limits = limits_of(req)?;
     let existing = clouds.store().connection(p.name()).map_err(Error::Io)?;
     let relay = crate::manager::resolve_target_relay(

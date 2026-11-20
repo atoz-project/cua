@@ -7145,6 +7145,10 @@
             "description": "The largest machine Cua may create there: `<vCPUs>x<GB>`, for\nexample `4x16`.",
             "type": "string"
           },
+          "no_public_ip": {
+            "description": "Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,\n`aliyun-ecs` only).",
+            "type": "boolean"
+          },
           "profile": {
             "description": "AWS: the profile in `~/.aws/config` (default: `default`, or\n`AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the\nactive one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`.",
             "type": "string"
@@ -7211,6 +7215,14 @@
             "minimum": 0,
             "type": "integer"
           },
+          "vpc_id": {
+            "description": "Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired\nwith `vswitch_id`.",
+            "type": "string"
+          },
+          "vswitch_id": {
+            "description": "Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be\npaired with `vpc_id`.",
+            "type": "string"
+          },
           "zone": {
             "description": "GCP zone in the region (default: its `-a` zone).",
             "type": "string"
@@ -7263,6 +7275,10 @@
             "description": "Modal environment (default: the profile's).",
             "type": "string"
           },
+          "no_public_ip": {
+            "description": "Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,\n`aliyun-ecs` only).",
+            "type": "boolean"
+          },
           "profile": {
             "description": "AWS: the profile in `~/.aws/config` (default: `default`, or\n`AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the\nactive one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`.",
             "type": "string"
@@ -7297,6 +7313,14 @@
           },
           "token": {
             "description": "Hetzner: the project's Read & Write API token (default:\n`HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).\nModal: `<token id>:<token secret>`. Alibaba Cloud ECS:\n`<access_key_id>:<access_key_secret>`. Secret: never logged or\nreturned; sealed to the account's devices on connect (or, Hetzner\nand Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua\ncredential store).",
+            "type": "string"
+          },
+          "vpc_id": {
+            "description": "Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired\nwith `vswitch_id`.",
+            "type": "string"
+          },
+          "vswitch_id": {
+            "description": "Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be\npaired with `vpc_id`.",
             "type": "string"
           },
           "zone": {

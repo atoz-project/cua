@@ -5634,7 +5634,19 @@ export type CloudProvider = {
     /**
      * Optional custom `cua-spacesd` binary mirror URL.
      */
-    spacesdDownloadUrl?: string
+    spacesdDownloadUrl?: string,
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+     */
+    vpcId?: string,
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+     */
+    vswitchId?: string,
+    /**
+     * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+     */
+    noPublicIp: boolean
 }
 
 /**
@@ -5643,7 +5655,7 @@ export type CloudProvider = {
 export const CloudProvider = (() => {
     const defaults = () => ({
         relayMode: undefined,
-        spacesdDownloadUrl: undefined
+        spacesdDownloadUrl: undefined,
     });
     const create = (() => {
         return uniffiCreateRecord<CloudProvider, ReturnType<typeof defaults>>(defaults);
@@ -5691,7 +5703,10 @@ const FfiConverterTypeCloudProvider = (() => {
                 holders: FfiConverterSequenceString.read(from),
                 relayUrl: FfiConverterOptionalString.read(from),
                 relayMode: FfiConverterOptionalString.read(from),
-                spacesdDownloadUrl: FfiConverterOptionalString.read(from)
+                spacesdDownloadUrl: FfiConverterOptionalString.read(from),
+                vpcId: FfiConverterOptionalString.read(from),
+                vswitchId: FfiConverterOptionalString.read(from),
+                noPublicIp: FfiConverterBool.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -5727,6 +5742,9 @@ const FfiConverterTypeCloudProvider = (() => {
             FfiConverterOptionalString.write(value.relayUrl, into);
             FfiConverterOptionalString.write(value.relayMode, into);
             FfiConverterOptionalString.write(value.spacesdDownloadUrl, into);
+            FfiConverterOptionalString.write(value.vpcId, into);
+            FfiConverterOptionalString.write(value.vswitchId, into);
+            FfiConverterBool.write(value.noPublicIp, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.name) +
@@ -5760,7 +5778,10 @@ const FfiConverterTypeCloudProvider = (() => {
              FfiConverterSequenceString.allocationSize(value.holders) +
              FfiConverterOptionalString.allocationSize(value.relayUrl) +
              FfiConverterOptionalString.allocationSize(value.relayMode) +
-             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl);
+             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl) +
+             FfiConverterOptionalString.allocationSize(value.vpcId) +
+             FfiConverterOptionalString.allocationSize(value.vswitchId) +
+             FfiConverterBool.allocationSize(value.noPublicIp);
 
         }
     };
@@ -6395,7 +6416,22 @@ export type CloudTarget = {
      * Optional custom `cua-spacesd` binary mirror URL (with optional
      * `#sha256=<64 hex>` fragment).
      */
-    spacesdDownloadUrl?: string
+    spacesdDownloadUrl?: string,
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+     * with `vswitch_id`.
+     */
+    vpcId?: string,
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+     * paired with `vpc_id`.
+     */
+    vswitchId?: string,
+    /**
+     * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+     * `aliyun-ecs` only).
+     */
+    noPublicIp: boolean
 }
 
 /**
@@ -6412,7 +6448,10 @@ export const CloudTarget = (() => {
         relayUrl: undefined,
         relayMode: undefined,
         relayToken: undefined,
-        spacesdDownloadUrl: undefined
+        spacesdDownloadUrl: undefined,
+        vpcId: undefined,
+        vswitchId: undefined,
+        noPublicIp: false
     });
     const create = (() => {
         return uniffiCreateRecord<CloudTarget, ReturnType<typeof defaults>>(defaults);
@@ -6439,7 +6478,10 @@ const FfiConverterTypeCloudTarget = (() => {
                 relayUrl: FfiConverterOptionalString.read(from),
                 relayMode: FfiConverterOptionalString.read(from),
                 relayToken: FfiConverterOptionalString.read(from),
-                spacesdDownloadUrl: FfiConverterOptionalString.read(from)
+                spacesdDownloadUrl: FfiConverterOptionalString.read(from),
+                vpcId: FfiConverterOptionalString.read(from),
+                vswitchId: FfiConverterOptionalString.read(from),
+                noPublicIp: FfiConverterBool.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -6454,6 +6496,9 @@ const FfiConverterTypeCloudTarget = (() => {
             FfiConverterOptionalString.write(value.relayMode, into);
             FfiConverterOptionalString.write(value.relayToken, into);
             FfiConverterOptionalString.write(value.spacesdDownloadUrl, into);
+            FfiConverterOptionalString.write(value.vpcId, into);
+            FfiConverterOptionalString.write(value.vswitchId, into);
+            FfiConverterBool.write(value.noPublicIp, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.provider) +
@@ -6466,7 +6511,10 @@ const FfiConverterTypeCloudTarget = (() => {
              FfiConverterOptionalString.allocationSize(value.relayUrl) +
              FfiConverterOptionalString.allocationSize(value.relayMode) +
              FfiConverterOptionalString.allocationSize(value.relayToken) +
-             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl);
+             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl) +
+             FfiConverterOptionalString.allocationSize(value.vpcId) +
+             FfiConverterOptionalString.allocationSize(value.vswitchId) +
+             FfiConverterBool.allocationSize(value.noPublicIp);
 
         }
     };
