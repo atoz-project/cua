@@ -3,8 +3,32 @@
 use aliyun_ecs_byoc_e2e::fake_aliyun::{
     BootFailMode, FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc,
 };
-use aliyun_ecs_byoc_e2e::{AliyunWorld, make_tags, repo_root};
+use aliyun_ecs_byoc_e2e::{
+    AliyunWorld, decode_user_data_scripts, make_tags, repo_root, seed_monthly_spend,
+};
+use base64::Engine as _;
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn decode_last_run_instances_userdata(f: &aliyun_ecs_byoc_e2e::fake_aliyun::FakeAliyun) -> String {
+    let call = f
+        .calls_for("RunInstances")
+        .into_iter()
+        .rfind(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+        .expect("expected non-DryRun RunInstances call");
+    let raw = call.params.get("UserData").expect("UserData param");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .expect("valid base64 UserData");
+    String::from_utf8(bytes).expect("utf-8 UserData")
+}
+
+fn non_dry_run_instances_count(f: &aliyun_ecs_byoc_e2e::fake_aliyun::FakeAliyun) -> usize {
+    f.calls_for("RunInstances")
+        .into_iter()
+        .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+        .count()
+}
 
 #[tokio::test]
 async fn t2_f1_01() {
@@ -286,7 +310,13 @@ async fn t2_f2_01() {
         )
         .await;
     assert_ne!(missing_tok.code, 0);
-    assert!(missing_tok.combined().contains("relay-token"));
+    let missing_lower = missing_tok.combined().to_ascii_lowercase();
+    assert!(
+        missing_lower.contains("relay-token")
+            || missing_lower.contains("relay_token")
+            || missing_lower.contains("relay token"),
+        "expected relay-token refusal for missing token, got: {missing_lower}"
+    );
     w.assert_no_secrets_anywhere(&["secret123"]);
 
     let empty_tok = w
@@ -307,6 +337,13 @@ async fn t2_f2_01() {
         )
         .await;
     assert_ne!(empty_tok.code, 0);
+    let empty_lower = empty_tok.combined().to_ascii_lowercase();
+    assert!(
+        empty_lower.contains("relay-token")
+            || empty_lower.contains("relay_token")
+            || empty_lower.contains("relay token"),
+        "expected relay-token refusal for empty token, got: {empty_lower}"
+    );
     w.assert_no_secrets_anywhere(&["secret123"]);
 }
 
@@ -393,6 +430,14 @@ async fn t2_f2_03() {
 
     let exec_out = w.run(&["sb", "exec", "bad-env-tok", "echo", "fail"]).await;
     assert_ne!(exec_out.code, 0);
+    let exec_lower = exec_out.combined().to_ascii_lowercase();
+    assert!(
+        exec_lower.contains("401")
+            || exec_lower.contains("unauthorized")
+            || exec_lower.contains("bearer")
+            || exec_lower.contains("token"),
+        "expected 401/unauthorized/bearer/token refusal, got: {exec_lower}"
+    );
 }
 
 #[tokio::test]
@@ -431,8 +476,18 @@ async fn t2_f2_04() {
         ])
         .await;
     assert_ne!(out.code, 0);
+    let combined = out.combined();
+    assert!(
+        combined.contains("Injected RunInstances failure") || combined.contains("InternalError"),
+        "expected injected RunInstances failure in output, got: {combined}"
+    );
     assert!(w.relay.static_machines().is_empty());
-    assert!(w.aliyun.lock().unwrap().instances.is_empty());
+    let f = w.aliyun.lock().unwrap();
+    assert!(
+        non_dry_run_instances_count(&f) >= 1,
+        "expected RunInstances call before rollback"
+    );
+    assert!(f.instances.is_empty());
 }
 
 #[tokio::test]
@@ -454,6 +509,16 @@ async fn t2_f2_05() {
         )
         .await;
     assert_ne!(bad_mode.code, 0);
+    let mode_err = bad_mode.combined();
+    assert!(
+        !mode_err.contains("unexpected argument"),
+        "clap rejected --relay-mode flag itself: {mode_err}"
+    );
+    let mode_lower = mode_err.to_ascii_lowercase();
+    assert!(
+        mode_lower.contains("account") && mode_lower.contains("static"),
+        "expected refusal listing valid relay modes (account/static), got: {mode_err}"
+    );
     assert!(w.aliyun.lock().unwrap().calls.is_empty());
 
     let bad_url = w
@@ -471,6 +536,16 @@ async fn t2_f2_05() {
         )
         .await;
     assert_ne!(bad_url.code, 0);
+    let url_err = bad_url.combined();
+    assert!(
+        !url_err.contains("unexpected argument"),
+        "clap rejected --relay-url flag itself: {url_err}"
+    );
+    let url_lower = url_err.to_ascii_lowercase();
+    assert!(
+        url_lower.contains("relay") || url_lower.contains("url") || url_lower.contains("http"),
+        "expected invalid --relay-url validation error, got: {url_err}"
+    );
     assert!(w.aliyun.lock().unwrap().calls.is_empty());
 }
 
@@ -508,6 +583,10 @@ async fn t2_f3_01() {
         .await;
     assert_ne!(out.code, 0);
     let combined = out.combined();
+    assert!(
+        combined.contains("stopped") || combined.contains("before its sandbox came online"),
+        "expected boot-failure refusal message, got: {combined}"
+    );
     assert!(!combined.contains("cmt_SECRET_DO_NOT_LEAK_1"), "{combined}");
     assert!(!combined.contains("env_SECRET_DO_NOT_LEAK_2"), "{combined}");
     w.assert_no_secrets_anywhere(&["cmt_SECRET_DO_NOT_LEAK_1", "env_SECRET_DO_NOT_LEAK_2"]);
@@ -518,6 +597,23 @@ async fn t2_f3_01() {
         .flatten()
         .collect();
     assert!(!logs.is_empty(), "expected redacted boot log file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for entry in &logs {
+            let mode = std::fs::metadata(entry.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "boot log {} must have 0600 permissions, got {mode:#o}",
+                entry.path().display()
+            );
+        }
+    }
     let log_text = std::fs::read_to_string(logs[0].path()).unwrap();
     assert!(log_text.contains("apt-get failed"), "{log_text}");
     assert!(
@@ -554,8 +650,22 @@ async fn t2_f3_02() {
         ])
         .await;
     assert_ne!(out.code, 0);
+    let combined = out.combined();
     assert!(
-        w.aliyun.lock().unwrap().instances.is_empty(),
+        combined.contains("stopped") || combined.contains("before its sandbox came online"),
+        "expected boot-failure refusal message, got: {combined}"
+    );
+    let f = w.aliyun.lock().unwrap();
+    assert!(
+        non_dry_run_instances_count(&f) >= 1,
+        "expected RunInstances call before boot failure"
+    );
+    assert!(
+        f.count_calls("GetInstanceConsoleOutput") >= 1,
+        "expected GetInstanceConsoleOutput call before rollback"
+    );
+    assert!(
+        f.instances.is_empty(),
         "rollback must proceed when GetInstanceConsoleOutput fails"
     );
 }
@@ -632,6 +742,119 @@ async fn t2_f3_03() {
     .await
     .ok();
 
+    // Create a Cua-owned instance for sweep to delete, plus a second instance whose live tags
+    // will be stripped/altered to verify suspend/resume/rm refuse on untagged/foreign instances.
+    w.run(&[
+        "sb",
+        "create",
+        "linux",
+        "--on",
+        "aliyun-ecs",
+        "--name",
+        "owned-sweep",
+        "--json",
+    ])
+    .await
+    .ok();
+    w.run(&[
+        "sb",
+        "create",
+        "linux",
+        "--on",
+        "aliyun-ecs",
+        "--name",
+        "tag-tamper",
+        "--json",
+    ])
+    .await
+    .ok();
+
+    let (owned_id, tamper_id) = {
+        let f = w.aliyun.lock().unwrap();
+        let owned = f
+            .instances
+            .values()
+            .find(|i| i.tags.get("cua-space").is_some_and(|s| s == "owned-sweep"))
+            .expect("owned-sweep instance")
+            .instance_id
+            .clone();
+        let tamper = f
+            .instances
+            .values()
+            .find(|i| i.tags.get("cua-space").is_some_and(|s| s == "tag-tamper"))
+            .expect("tag-tamper instance")
+            .instance_id
+            .clone();
+        (owned, tamper)
+    };
+
+    // Strip/alter live tags on tag-tamper -> suspend, resume, and rm must all refuse!
+    {
+        let mut f = w.aliyun.lock().unwrap();
+        f.instances.get_mut(&tamper_id).unwrap().tags.clear();
+        f.calls.clear();
+    }
+    for sub in [
+        &["sb", "suspend", "tag-tamper"][..],
+        &["sb", "resume", "tag-tamper"][..],
+        &["sb", "rm", "tag-tamper", "--force"][..],
+    ] {
+        let out = w.run(sub).await;
+        assert_ne!(out.code, 0, "expected refusal on untagged {sub:?}");
+        let msg = out.combined().to_ascii_lowercase();
+        assert!(
+            msg.contains("cua-managed")
+                || msg.contains("cua-owner")
+                || msg.contains("not tagged")
+                || msg.contains("tag"),
+            "expected tag-ownership refusal for {sub:?}, got: {msg}"
+        );
+    }
+    {
+        let f = w.aliyun.lock().unwrap();
+        assert_eq!(
+            f.count_calls("StopInstance") + f.count_calls("StopInstances"),
+            0
+        );
+        assert_eq!(
+            f.count_calls("StartInstance") + f.count_calls("StartInstances"),
+            0
+        );
+        assert_eq!(
+            f.count_calls("DeleteInstance") + f.count_calls("DeleteInstances"),
+            0
+        );
+        assert!(f.instances.contains_key(&tamper_id));
+    }
+
+    // Also verify foreign cua-owner refuses rm.
+    {
+        let mut f = w.aliyun.lock().unwrap();
+        f.instances.get_mut(&tamper_id).unwrap().tags =
+            make_tags(&[("cua-managed", "true"), ("cua-owner", "other-owner")]);
+        f.calls.clear();
+    }
+    let foreign_rm = w.run(&["sb", "rm", "tag-tamper", "--force"]).await;
+    assert_ne!(foreign_rm.code, 0);
+    let f_msg = foreign_rm.combined().to_ascii_lowercase();
+    assert!(
+        f_msg.contains("cua-managed")
+            || f_msg.contains("cua-owner")
+            || f_msg.contains("not tagged")
+            || f_msg.contains("owner"),
+        "expected foreign-owner refusal, got: {f_msg}"
+    );
+    {
+        let f = w.aliyun.lock().unwrap();
+        assert_eq!(
+            f.count_calls("DeleteInstance") + f.count_calls("DeleteInstances"),
+            0
+        );
+    }
+
+    // Sweep must delete ONLY the Cua-owned instance (`owned-sweep`), never `i-untagged`,
+    // `i-foreign`, or `tag-tamper` (whose live tags belong to `other-owner`).
+    w.aliyun.lock().unwrap().calls.clear();
     w.run(&[
         "cloud",
         "sweep",
@@ -643,16 +866,25 @@ async fn t2_f3_03() {
     .await
     .ok();
     let f = w.aliyun.lock().unwrap();
-    assert_eq!(
-        f.count_calls("StopInstance") + f.count_calls("StopInstances"),
-        0
+    let mut del_calls = f.calls_for("DeleteInstance");
+    del_calls.extend(f.calls_for("DeleteInstances"));
+    let deleted_target = |id: &str| {
+        del_calls
+            .iter()
+            .filter(|c| c.params.values().any(|v| v.contains(id)))
+            .count()
+    };
+    assert!(
+        deleted_target(&owned_id) >= 1,
+        "expected DeleteInstance call for Cua-owned {owned_id}, got: {del_calls:?}"
     );
-    assert_eq!(
-        f.count_calls("DeleteInstance") + f.count_calls("DeleteInstances"),
-        0
-    );
+    assert_eq!(deleted_target("i-untagged"), 0);
+    assert_eq!(deleted_target("i-foreign"), 0);
+    assert_eq!(deleted_target(&tamper_id), 0);
+    assert!(!f.instances.contains_key(&owned_id));
     assert!(f.instances.contains_key("i-untagged"));
     assert!(f.instances.contains_key("i-foreign"));
+    assert!(f.instances.contains_key(&tamper_id));
 }
 
 #[tokio::test]
@@ -734,8 +966,9 @@ async fn t2_f4_01() {
     .ok();
     w.aliyun.lock().unwrap().calls.clear();
 
-    for args in [
-        &[
+    // 1. windows + --runtime docker must be refused specifically for docker/native runtime.
+    let win_docker = w
+        .run(&[
             "sb",
             "create",
             "windows",
@@ -743,19 +976,43 @@ async fn t2_f4_01() {
             "aliyun-ecs",
             "--runtime",
             "docker",
-        ][..],
-        &["sb", "create", "macos", "--on", "aliyun-ecs"][..],
-        &["sb", "create", "omarchy", "--on", "aliyun-ecs"][..],
-    ] {
-        let out = w.run(args).await;
-        assert_ne!(out.code, 0, "expected refusal for {args:?}");
+        ])
+        .await;
+    assert_ne!(win_docker.code, 0);
+    assert!(matches!(win_docker.code, 2 | 4), "{win_docker:?}");
+    let wd_msg = win_docker.combined().to_ascii_lowercase();
+    assert!(
+        wd_msg.contains("docker") && wd_msg.contains("native"),
+        "expected docker/native refusal for windows --runtime docker, got: {wd_msg}"
+    );
+
+    // 2. Unsupported OSes (macos, omarchy) must name the refused OS.
+    for os_img in ["macos", "omarchy"] {
+        let out = w.run(&["sb", "create", os_img, "--on", "aliyun-ecs"]).await;
+        assert_ne!(out.code, 0, "expected refusal for {os_img}");
         assert!(
             matches!(out.code, 2 | 4),
-            "expected exit 2 or 4 for {args:?}, got {}: {}",
+            "expected exit 2 or 4 for {os_img}, got {}: {}",
             out.code,
             out.stderr
         );
+        let msg = out.combined().to_ascii_lowercase();
+        assert!(
+            msg.contains(os_img),
+            "expected refusal naming {os_img}, got: {msg}"
+        );
     }
+
+    // 3. Reserved location --on aliyun-sandbox must be refused (ADR-0001).
+    let reserved = w
+        .run(&["sb", "create", "linux", "--on", "aliyun-sandbox"])
+        .await;
+    assert_eq!(reserved.code, 2, "{reserved:?}");
+    let r_msg = reserved.combined().to_ascii_lowercase();
+    assert!(
+        r_msg.contains("aliyun-sandbox") && r_msg.contains("aliyun-ecs"),
+        "expected reserved-location refusal naming aliyun-sandbox and aliyun-ecs, got: {r_msg}"
+    );
     assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
 }
 
@@ -763,6 +1020,8 @@ async fn t2_f4_01() {
 async fn t2_f4_02() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
+    // FakeAliyun does not execute guest PowerShell; verify generated #ps1_sysnative UserData
+    // enforces SHA-256 verification against the mirror URL and aborts on hash mismatch.
     w.mirror.set_corrupt_bytes(true);
     let mirror_url = w.mirror.windows_url();
     w.run_with_stdin(
@@ -844,6 +1103,8 @@ async fn t2_f4_03() {
 async fn t2_f4_04() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
+    // FakeAliyun does not execute guest PowerShell, so BootFailMode::StopImmediately simulates
+    // a failed guest mirror download/boot while we also inspect UserData for mirror error handling.
     w.mirror.set_status_override(Some(404));
     w.aliyun.lock().unwrap().boot_fail = Some(BootFailMode::StopImmediately);
     let mirror_url = w.mirror.windows_url();
@@ -874,7 +1135,23 @@ async fn t2_f4_04() {
         ])
         .await;
     assert_ne!(out.code, 0);
-    assert!(w.aliyun.lock().unwrap().instances.is_empty());
+    let combined = out.combined();
+    assert!(
+        combined.contains("stopped") || combined.contains("before its sandbox came online"),
+        "expected boot-failure error message, got: {combined}"
+    );
+    let f = w.aliyun.lock().unwrap();
+    assert!(
+        non_dry_run_instances_count(&f) >= 1,
+        "expected RunInstances call before boot failure"
+    );
+    let ud = decode_last_run_instances_userdata(&f);
+    assert!(ud.contains(&mirror_url), "{ud}");
+    assert!(
+        ud.contains("throw") || ud.contains("exit 1") || ud.contains("ErrorActionPreference"),
+        "expected mirror failure-abort handling in Windows UserData: {ud}"
+    );
+    assert!(f.instances.is_empty());
 }
 
 #[tokio::test]
@@ -896,6 +1173,16 @@ async fn t2_f4_05() {
             )
             .await;
         assert_ne!(out.code, 0, "expected rejection for {bad}");
+        let combined = out.combined();
+        assert!(
+            !combined.contains("unexpected argument"),
+            "clap rejected --spacesd-download-url flag itself: {combined}"
+        );
+        let lower = combined.to_ascii_lowercase();
+        assert!(
+            lower.contains("spacesd") || lower.contains("download") || lower.contains("http"),
+            "expected --spacesd-download-url validation error for {bad}, got: {combined}"
+        );
         w.assert_no_secrets_anywhere(&["secret123"]);
     }
 }
@@ -1320,26 +1607,16 @@ async fn t2_f6_04() {
             "aliyun-ecs",
             "--token-stdin",
             "--budget",
-            "0.001",
+            "2.0",
             "--json",
         ],
         "LTAI_TEST_AK:secret123\n",
     )
     .await
     .ok();
-    // Seed a link/audit spend event exceeding budget.
-    let audit_path = w.cua_home().join("cloud/audit.jsonl");
-    if let Some(parent) = audit_path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    let ts = chrono::Utc::now().to_rfc3339();
-    std::fs::write(
-        &audit_path,
-        format!(
-            "{{\"ts\":\"{ts}\",\"action\":\"cost\",\"provider\":\"aliyun-ecs\",\"cost_usd\":5.0}}\n"
-        ),
-    )
-    .unwrap();
+    // Seed closed monthly spend ($5.00 >= $2.00 budget) in cloud/state.json, which
+    // Store::spent_month reads for --budget preflight.
+    seed_monthly_spend(&w.cua_home(), "aliyun-ecs", 5.0);
     w.aliyun.lock().unwrap().calls.clear();
 
     let out = w
@@ -1354,7 +1631,13 @@ async fn t2_f6_04() {
         ])
         .await;
     assert_eq!(out.code, 6, "{out:?}");
-    assert!(out.stderr.contains("budget"), "{}", out.stderr);
+    let err_lower = out.stderr.to_ascii_lowercase();
+    assert!(
+        err_lower.contains("budget")
+            && (err_lower.contains("reached") || err_lower.contains("exceeded")),
+        "expected exact budget refusal in stderr, got: {}",
+        out.stderr
+    );
     assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
 }
 
@@ -1408,13 +1691,45 @@ async fn t2_f7_01() {
         ])
         .await;
     assert_ne!(out.code, 0);
+    let combined = out.combined();
+    let lower = combined.to_ascii_lowercase();
+    assert!(
+        !lower.contains("does not apply"),
+        "refused due to unsupported --runtime native instead of --sidecar: {combined}"
+    );
+    assert!(
+        lower.contains("sidecar") || lower.contains("native"),
+        "expected --sidecar / native refusal, got: {combined}"
+    );
+    assert!(
+        lower.contains("sidecar"),
+        "expected refusal to mention sidecar(s), got: {combined}"
+    );
     assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
+
+    // Without --sidecar, --runtime native succeeds cleanly.
+    w.run(&[
+        "sb",
+        "create",
+        "linux",
+        "--on",
+        "aliyun-ecs",
+        "--runtime",
+        "native",
+        "--name",
+        "nat-no-sidecar",
+        "--json",
+    ])
+    .await
+    .ok();
 }
 
 #[tokio::test]
 async fn t2_f7_02() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
+    // FakeAliyun does not execute guest cloud-init, so BootFailMode::StopImmediately simulates
+    // boot failure while we decode write_files: b64 in UserData to assert sha256sum + abort.
     w.mirror.set_corrupt_bytes(true);
     w.aliyun.lock().unwrap().boot_fail = Some(BootFailMode::StopImmediately);
     let mirror_url = w.mirror.linux_url();
@@ -1447,7 +1762,20 @@ async fn t2_f7_02() {
         ])
         .await;
     assert_ne!(out.code, 0);
-    assert!(w.aliyun.lock().unwrap().instances.is_empty());
+    let f = w.aliyun.lock().unwrap();
+    assert!(
+        non_dry_run_instances_count(&f) >= 1,
+        "expected RunInstances call before boot failure"
+    );
+    let ud_raw = decode_last_run_instances_userdata(&f);
+    let ud = decode_user_data_scripts(&ud_raw);
+    assert!(ud.contains(&mirror_url), "{ud}");
+    assert!(ud.contains("sha256sum"), "expected sha256sum check: {ud}");
+    assert!(
+        ud.contains("exit 1") || ud.contains("set -e") || ud.contains("|| exit"),
+        "expected failure abort on checksum mismatch: {ud}"
+    );
+    assert!(f.instances.is_empty());
 }
 
 #[tokio::test]
@@ -1477,7 +1805,7 @@ async fn t2_f7_03() {
     .await
     .ok();
     let f = w.aliyun.lock().unwrap();
-    let ud = &f.instances.values().next().unwrap().user_data_decoded;
+    let ud = decode_user_data_scripts(&f.instances.values().next().unwrap().user_data_decoded);
     assert!(!ud.contains("xvfb") && !ud.contains("xfce"));
 }
 
@@ -1511,8 +1839,46 @@ async fn t2_f7_04() {
         ])
         .await;
     assert_ne!(out.code, 0);
-    assert!(!out.combined().contains("cmt_SECRET_NAT_123"));
-    assert!(w.aliyun.lock().unwrap().instances.is_empty());
+    let combined = out.combined();
+    assert!(
+        combined.contains("stopped") || combined.contains("before its sandbox came online"),
+        "expected boot-failure refusal, got: {combined}"
+    );
+    assert!(!combined.contains("cmt_SECRET_NAT_123"));
+    w.assert_no_secrets_anywhere(&["cmt_SECRET_NAT_123"]);
+
+    let boot_logs_dir = w.cua_home().join("cloud/boot-logs");
+    let logs: Vec<_> = std::fs::read_dir(&boot_logs_dir)
+        .expect("boot-logs dir")
+        .flatten()
+        .collect();
+    assert!(!logs.is_empty(), "expected redacted boot log file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for entry in &logs {
+            let mode = std::fs::metadata(entry.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "boot log must have 0600 permissions");
+        }
+    }
+    let log_text = std::fs::read_to_string(logs[0].path()).unwrap();
+    assert!(log_text.contains("systemd error"), "{log_text}");
+    assert!(!log_text.contains("cmt_SECRET_NAT_123"), "{log_text}");
+
+    let f = w.aliyun.lock().unwrap();
+    assert!(
+        non_dry_run_instances_count(&f) >= 1,
+        "expected RunInstances call before boot failure"
+    );
+    assert!(
+        f.count_calls("GetInstanceConsoleOutput") >= 1,
+        "expected GetInstanceConsoleOutput call before rollback"
+    );
+    assert!(f.instances.is_empty());
 }
 
 #[tokio::test]
@@ -1540,6 +1906,11 @@ async fn t2_f7_05() {
         ])
         .await;
     assert_eq!(bad_ttl.code, 2);
+    let ttl_err = bad_ttl.combined().to_ascii_lowercase();
+    assert!(
+        ttl_err.contains("ttl") || ttl_err.contains("duration") || ttl_err.contains("invalid"),
+        "expected ttl parse/validation error, got: {ttl_err}"
+    );
 
     w.run(&[
         "sb",
@@ -1652,6 +2023,10 @@ async fn t2_f8_03() {
     let guide =
         std::fs::read_to_string(repo.join("docs/content/docs/cua-sdk/guides/your-cloud.mdx"))
             .expect("read your-cloud.mdx");
+    assert!(
+        guide.contains("aliyun-ecs"),
+        "your-cloud.mdx must document aliyun-ecs"
+    );
     assert!(!guide.contains("bare-metal sandbox"));
     assert!(!guide.contains("tokenless relay"));
     assert!(!guide.contains("--on aliyun-sandbox"));
@@ -1659,6 +2034,7 @@ async fn t2_f8_03() {
     let w = AliyunWorld::start().await;
     let help = w.run(&["cloud", "connect", "--help"]).await;
     help.ok();
+    assert!(help.stdout.contains("aliyun-ecs"), "{}", help.stdout);
     assert!(!help.stdout.contains("aliyun-sandbox"));
 }
 
@@ -1686,10 +2062,41 @@ async fn t2_f8_05() {
     );
 
     let mut w = AliyunWorld::start().await;
-    // Point proxy at non-aliyuncs check: confirm non-aliyuncs.com host fails fast with 502 and is recorded.
+    // 1. Scrubbed `cloud test` without credentials fails without making any external CONNECT.
     w.remove_env("ALIBABA_CLOUD_ACCESS_KEY_ID");
     w.remove_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET");
     let out = w.run(&["cloud", "test", "aliyun-ecs", "--json"]).await;
     assert_ne!(out.code, 0);
+    let combined = out.combined();
+    assert!(
+        combined.contains("no Alibaba Cloud credentials found"),
+        "{combined}"
+    );
     w.assert_no_unexpected_egress();
+
+    // 2. Non-aliyuncs.com CONNECT through w.proxy fails fast with 502 Bad Gateway and is recorded.
+    let proxy_addr = w
+        .proxy
+        .url
+        .strip_prefix("http://")
+        .expect("proxy http:// addr");
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to AliyunConnectProxy");
+    stream
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .expect("send CONNECT");
+    let mut resp_buf = [0u8; 512];
+    let n = stream.read(&mut resp_buf).await.expect("read proxy resp");
+    let resp = String::from_utf8_lossy(&resp_buf[..n]);
+    assert!(
+        resp.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "expected 502 Bad Gateway for non-aliyuncs CONNECT, got: {resp:?}"
+    );
+    let blocked = w.proxy.blocked_egress();
+    assert!(
+        blocked.iter().any(|h| h == "example.com:443"),
+        "expected example.com:443 in blocked_egress, got: {blocked:?}"
+    );
 }

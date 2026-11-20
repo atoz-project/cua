@@ -128,8 +128,149 @@ pub fn resolve_cua_bin() -> PathBuf {
     .clone()
 }
 
-fn extract_env_token(user_data: &str) -> Option<String> {
+/// Decodes `#cloud-config` `write_files:` entries (including `encoding: b64` / `base64`),
+/// returning a map of `path -> decoded_content`.
+pub fn decode_cloud_init_write_files(user_data: &str) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let mut in_write_files = false;
+    let mut cur_path: Option<String> = None;
+    let mut cur_encoding: Option<String> = None;
+    let mut cur_content: Option<String> = None;
+
+    let flush = |files: &mut BTreeMap<String, String>,
+                 path: &mut Option<String>,
+                 encoding: &mut Option<String>,
+                 content: &mut Option<String>| {
+        if let (Some(p), Some(raw)) = (path.take(), content.take()) {
+            let enc = encoding.take().unwrap_or_default();
+            let decoded = if matches!(enc.to_ascii_lowercase().as_str(), "b64" | "base64") {
+                let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(compact)
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or(raw)
+            } else {
+                raw
+            };
+            files.insert(p, decoded);
+        } else {
+            *path = None;
+            *encoding = None;
+            *content = None;
+        }
+    };
+
+    let strip_quotes = |s: &str| -> String {
+        let t = s.trim();
+        if (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+            || (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+        {
+            t[1..t.len() - 1].to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
     for line in user_data.lines() {
+        let trimmed = line.trim_end().trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && !line.starts_with('\t') && !line.starts_with('-') {
+            if trimmed == "write_files:" {
+                in_write_files = true;
+                continue;
+            }
+            if in_write_files {
+                flush(
+                    &mut files,
+                    &mut cur_path,
+                    &mut cur_encoding,
+                    &mut cur_content,
+                );
+                in_write_files = false;
+            }
+            continue;
+        }
+        if !in_write_files {
+            continue;
+        }
+        let field = if let Some(rest) = trimmed.strip_prefix("- ") {
+            flush(
+                &mut files,
+                &mut cur_path,
+                &mut cur_encoding,
+                &mut cur_content,
+            );
+            rest.trim()
+        } else {
+            trimmed
+        };
+        if let Some(v) = field.strip_prefix("path:") {
+            cur_path = Some(strip_quotes(v));
+        } else if let Some(v) = field.strip_prefix("encoding:") {
+            cur_encoding = Some(strip_quotes(v));
+        } else if let Some(v) = field.strip_prefix("content:") {
+            cur_content = Some(strip_quotes(v));
+        }
+    }
+    if in_write_files {
+        flush(
+            &mut files,
+            &mut cur_path,
+            &mut cur_encoding,
+            &mut cur_content,
+        );
+    }
+    files
+}
+
+/// Returns `user_data` combined with all decoded `#cloud-config` `write_files:` payloads.
+/// Keep cleartext-secret absence checks on the raw `user_data` string, and use this helper
+/// when inspecting scripts or env files embedded via `encoding: b64`.
+pub fn decode_user_data_scripts(user_data: &str) -> String {
+    let files = decode_cloud_init_write_files(user_data);
+    if files.is_empty() {
+        return user_data.to_string();
+    }
+    let mut combined = String::from(user_data);
+    for (path, content) in files {
+        combined.push_str("\n# --- write_file: ");
+        combined.push_str(&path);
+        combined.push_str(" ---\n");
+        combined.push_str(&content);
+        combined.push('\n');
+    }
+    combined
+}
+
+/// Seeds closed monthly spend for `provider` in `<cua_home>/cloud/state.json`
+/// (which `cua_byoc::state::Store::spent_month` reads for `--budget` preflight).
+pub fn seed_monthly_spend(cua_home: &Path, provider: &str, usd: f64) {
+    let state_path = cua_home.join("cloud/state.json");
+    let raw = std::fs::read_to_string(&state_path).unwrap_or_else(|e| {
+        panic!(
+            "expected {} to exist before seeding spend: {e}",
+            state_path.display()
+        )
+    });
+    let mut state: Value = serde_json::from_str(&raw).expect("valid cloud/state.json");
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    if !state.get("spent").is_some_and(Value::is_object) {
+        state["spent"] = serde_json::json!({});
+    }
+    state["spent"][provider] = serde_json::json!({
+        "month": month,
+        "usd": usd,
+    });
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap())
+        .expect("write cloud/state.json");
+}
+
+fn extract_env_token(user_data: &str) -> Option<String> {
+    let expanded = decode_user_data_scripts(user_data);
+    for line in expanded.lines() {
         let trimmed = line.trim();
         for marker in ["CUA_ENV_TOKEN=", "env_token=", "--env-token ", "--token "] {
             if let Some(idx) = trimmed.find(marker) {
@@ -430,4 +571,34 @@ pub fn make_tags(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_cloud_config_b64_write_files_and_extracts_env_token() {
+        let env_b64 = base64::engine::general_purpose::STANDARD
+            .encode("CUA_SPACESD_ARGS=join\nCUA_ENV_TOKEN=env_tok_secret_123\n");
+        let boot_b64 = base64::engine::general_purpose::STANDARD.encode(
+            "#!/bin/sh\niptables -A OUTPUT -d 100.100.100.200 -j DROP\ndocker run cua-spacesd\n",
+        );
+        let ud = format!(
+            "#cloud-config\nssh_pwauth: false\nwrite_files:\n\
+             \x20 - path: /etc/cua/sandbox.env\n    permissions: '0600'\n    owner: root:root\n    encoding: b64\n    content: {env_b64}\n\
+             \x20 - path: /usr/local/sbin/cua-first-boot\n    permissions: '0700'\n    owner: root:root\n    encoding: b64\n    content: {boot_b64}\n\
+             runcmd:\n  - [systemctl, enable, --now, cua-expire.timer]\n"
+        );
+        assert!(!ud.contains("env_tok_secret_123"));
+        assert!(!ud.contains("100.100.100.200"));
+        assert_eq!(
+            extract_env_token(&ud).as_deref(),
+            Some("env_tok_secret_123")
+        );
+        let decoded = decode_user_data_scripts(&ud);
+        assert!(decoded.contains("docker"));
+        assert!(decoded.contains("100.100.100.200"));
+        assert!(decoded.contains("cua-spacesd"));
+    }
 }

@@ -3,7 +3,7 @@
 use aliyun_ecs_byoc_e2e::fake_aliyun::{
     BootFailMode, FakeImage, FakeInstance, FakeVSwitch, FakeVpc,
 };
-use aliyun_ecs_byoc_e2e::{AliyunWorld, make_tags};
+use aliyun_ecs_byoc_e2e::{AliyunWorld, decode_user_data_scripts, make_tags};
 use serde_json::json;
 
 #[tokio::test]
@@ -151,7 +151,8 @@ async fn t3_02() {
         assert_eq!(f.count_calls("CreateVSwitch"), 0);
         let inst = f.instances.values().next().unwrap();
         assert_eq!(inst.internet_max_bandwidth_out.as_deref(), Some("0"));
-        assert!(!inst.user_data_decoded.contains("docker run"));
+        let ud = decode_user_data_scripts(&inst.user_data_decoded);
+        assert!(!ud.contains("docker run"));
     }
     w.run(&["sb", "rm", "t3-nat-priv", "--force"]).await.ok();
     w.run(&[
@@ -347,7 +348,8 @@ async fn t3_05() {
 async fn t3_06() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
-    w.run_with_stdin(
+    let (_url, _tok) = w.start_daemon().await;
+    w.run_raw_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
         "LTAI_TEST_AK:secret123\n",
     )
@@ -355,7 +357,7 @@ async fn t3_06() {
     .ok();
 
     let (r1, r2, r3) = tokio::join!(
-        w.run(&[
+        w.run_raw(&[
             "sb",
             "create",
             "windows",
@@ -365,7 +367,7 @@ async fn t3_06() {
             "mix-w",
             "--json"
         ]),
-        w.run(&[
+        w.run_raw(&[
             "sb",
             "create",
             "linux",
@@ -377,7 +379,7 @@ async fn t3_06() {
             "mix-ln",
             "--json",
         ]),
-        w.run(&[
+        w.run_raw(&[
             "sb",
             "create",
             "linux",
@@ -519,7 +521,9 @@ async fn t3_08() {
     }
     w.run(&["spaces", "stop", "sp-slim"]).await.ok();
     w.run(&["spaces", "start", "sp-slim"]).await.ok();
-    w.run(&["spaces", "rm", "sp-slim", "--force"]).await.ok();
+    w.run(&["spaces", "delete", "sp-slim", "--force"])
+        .await
+        .ok();
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@
 use aliyun_ecs_byoc_e2e::fake_aliyun::{
     BootFailMode, FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc,
 };
-use aliyun_ecs_byoc_e2e::{AliyunWorld, make_tags};
+use aliyun_ecs_byoc_e2e::{AliyunWorld, make_tags, seed_monthly_spend};
 use serde_json::json;
 
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn t4_01() {
         assert!(inst.user_data_decoded.contains("tscon.exe"));
     }
 
-    w.run(&["spaces", "exec", "win-corp", "--", "echo", "corp-ok"])
+    w.run(&["sb", "exec", "win-corp", "echo", "corp-ok"])
         .await
         .ok();
     w.run(&["spaces", "stop", "win-corp"]).await.ok();
@@ -320,20 +320,7 @@ async fn t4_04() {
     .await
     .ok();
 
-    let audit_path = w.cua_home().join("cloud/audit.jsonl");
-    let ts = chrono::Utc::now().to_rfc3339();
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&audit_path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(
-                f,
-                "{{\"ts\":\"{ts}\",\"action\":\"cost\",\"provider\":\"aliyun-ecs\",\"cost_usd\":6.0}}"
-            )
-        })
-        .unwrap();
+    seed_monthly_spend(&w.cua_home(), "aliyun-ecs", 6.0);
 
     w.aliyun.lock().unwrap().calls.clear();
     let blocked = w
@@ -347,7 +334,13 @@ async fn t4_04() {
             "over-budget",
         ])
         .await;
-    assert_eq!(blocked.code, 6);
+    assert_eq!(blocked.code, 6, "{blocked:?}");
+    let blocked_msg = blocked.combined().to_ascii_lowercase();
+    assert!(
+        blocked_msg.contains("budget")
+            && (blocked_msg.contains("reached") || blocked_msg.contains("exceeded")),
+        "expected budget reached/exceeded refusal, got: {blocked_msg}"
+    );
     assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
 
     // Lifecycle stop/rm/disconnect STILL allowed while over budget.

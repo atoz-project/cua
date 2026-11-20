@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use aliyun_ecs_byoc_e2e::fake_aliyun::{FakeImage, FakeSg, FakeVSwitch, FakeVpc};
-use aliyun_ecs_byoc_e2e::{AliyunWorld, repo_root};
+use aliyun_ecs_byoc_e2e::fake_aliyun::{BootFailMode, FakeImage, FakeSg, FakeVSwitch, FakeVpc};
+use aliyun_ecs_byoc_e2e::{AliyunWorld, decode_user_data_scripts, repo_root};
 use serde_json::json;
 
 async fn connect_static(w: &AliyunWorld, extra_args: &[&str]) {
@@ -508,7 +508,9 @@ async fn t1_f2_04() {
     ls.ok();
     assert!(ls.stdout.contains("aliyun-ecs"), "{}", ls.stdout);
 
-    w.run(&["spaces", "rm", "static-sp", "--force"]).await.ok();
+    w.run(&["spaces", "delete", "static-sp", "--force"])
+        .await
+        .ok();
     assert!(w.aliyun.lock().unwrap().instances.is_empty());
 }
 
@@ -639,13 +641,14 @@ async fn t1_f3_03() {
     .ok();
     let f = w.aliyun.lock().unwrap();
     let inst = f.instances.values().next().unwrap();
-    let ud = &inst.user_data_decoded;
-    assert!(ud.starts_with("#cloud-config"), "{ud}");
+    let ud_raw = &inst.user_data_decoded;
+    let ud = decode_user_data_scripts(ud_raw);
+    assert!(ud_raw.starts_with("#cloud-config"), "{ud_raw}");
     assert!(ud.contains("docker"), "{ud}");
     assert!(ud.contains("100.100.100.200"), "{ud}");
     assert!(ud.contains("cua-spacesd"), "{ud}");
     assert!(
-        !ud.contains("secret123"),
+        !ud_raw.contains("secret123") && !ud.contains("secret123"),
         "AK secret must never appear in UserData"
     );
 }
@@ -689,9 +692,14 @@ async fn t1_f3_04() {
     let tokens: BTreeSet<_> = run_calls
         .iter()
         .filter_map(|c| c.params.get("ClientToken"))
+        .filter(|t| !t.is_empty())
         .collect();
     assert_eq!(tokens.len(), run_calls.len());
     let inst = f.instances.values().next().unwrap();
+    assert!(
+        inst.client_token.as_deref().is_some_and(|t| !t.is_empty()),
+        "expected non-empty ClientToken on created instance"
+    );
     assert_ne!(inst.zone_id, "cn-hangzhou-h");
 }
 
@@ -745,6 +753,24 @@ async fn t1_f3_05() {
     w.run(&["sb", "rm", "life-box", "--force"]).await.ok();
     assert!(w.aliyun.lock().unwrap().instances.is_empty());
 
+    // Dry-run sweep (without --delete) must report dry_run=true and leave VPC/SG intact.
+    let dry_default = w.run(&["cloud", "sweep", "aliyun-ecs", "--json"]).await;
+    dry_default.ok();
+    assert_eq!(dry_default.json()["dry_run"], true);
+    let dry_all = w
+        .run(&["cloud", "sweep", "aliyun-ecs", "--all", "--json"])
+        .await;
+    dry_all.ok();
+    assert_eq!(dry_all.json()["dry_run"], true);
+    {
+        let f = w.aliyun.lock().unwrap();
+        assert!(!f.vpcs.is_empty(), "dry-run sweep must not delete VPC");
+        assert!(
+            !f.security_groups.is_empty(),
+            "dry-run sweep must not delete SG"
+        );
+    }
+
     w.run(&[
         "cloud",
         "sweep",
@@ -791,6 +817,11 @@ async fn t1_f4_01() {
 
     let f = w.aliyun.lock().unwrap();
     let inst = f.instances.values().next().unwrap();
+    assert!(
+        inst.image_id.contains("win2022") || inst.image_id.contains("win2025"),
+        "expected official Windows Server image from DescribeImages, got: {}",
+        inst.image_id
+    );
     assert_eq!(inst.instance_type, "ecs.c7.xlarge");
     assert_eq!(inst.system_disk_size.as_deref(), Some("60"));
     assert_eq!(inst.system_disk_category.as_deref(), Some("cloud_essd"));
@@ -1365,8 +1396,18 @@ async fn t1_f6_02() {
     let img_of = |name: &str| {
         f.instances
             .values()
-            .find(|i| i.instance_name.contains(name))
-            .unwrap()
+            .find(|i| {
+                i.tags.get("cua-space").is_some_and(|s| s == name) || i.instance_name.contains(name)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "instance for {name} not found in {:?}",
+                    f.instances
+                        .values()
+                        .map(|i| (&i.instance_name, &i.tags))
+                        .collect::<Vec<_>>()
+                )
+            })
             .image_id
             .clone()
     };
@@ -1478,7 +1519,20 @@ async fn t1_f6_04() {
         "aliyun-ecs",
         "--name",
         "custom-size",
-        "--disk",
+        "--json",
+    ])
+    .await
+    .ok();
+
+    w.run(&[
+        "spaces",
+        "create",
+        "linux",
+        "--on",
+        "aliyun-ecs",
+        "--name",
+        "custom-disk",
+        "--disk-gb",
         "80",
         "--json",
     ])
@@ -1486,9 +1540,26 @@ async fn t1_f6_04() {
     .ok();
 
     let f = w.aliyun.lock().unwrap();
-    let inst = f.instances.values().next().unwrap();
-    assert_eq!(inst.instance_type, "ecs.g7.large");
-    assert_eq!(inst.system_disk_size.as_deref(), Some("80"));
+    let sb_inst = f
+        .instances
+        .values()
+        .find(|i| {
+            i.tags.get("cua-space").is_some_and(|s| s == "custom-size")
+                || i.instance_name.contains("custom-size")
+        })
+        .expect("custom-size instance");
+    assert_eq!(sb_inst.instance_type, "ecs.g7.large");
+
+    let sp_inst = f
+        .instances
+        .values()
+        .find(|i| {
+            i.tags.get("cua-space").is_some_and(|s| s == "custom-disk")
+                || i.instance_name.contains("custom-disk")
+        })
+        .expect("custom-disk instance");
+    assert_eq!(sp_inst.instance_type, "ecs.g7.large");
+    assert_eq!(sp_inst.system_disk_size.as_deref(), Some("80"));
 }
 
 #[tokio::test]
@@ -1552,8 +1623,9 @@ async fn t1_f7_01() {
     assert_eq!(out.json()["runtime"], "native");
 
     let f = w.aliyun.lock().unwrap();
-    let ud = &f.instances.values().next().unwrap().user_data_decoded;
-    assert!(ud.starts_with("#cloud-config"), "{ud}");
+    let ud_raw = &f.instances.values().next().unwrap().user_data_decoded;
+    let ud = decode_user_data_scripts(ud_raw);
+    assert!(ud_raw.starts_with("#cloud-config"), "{ud_raw}");
     assert!(
         !ud.contains("docker.io") && !ud.contains("docker run"),
         "{ud}"
@@ -1596,7 +1668,7 @@ async fn t1_f7_02() {
     .await
     .ok();
     let f = w.aliyun.lock().unwrap();
-    let ud = &f.instances.values().next().unwrap().user_data_decoded;
+    let ud = decode_user_data_scripts(&f.instances.values().next().unwrap().user_data_decoded);
     assert!(ud.contains(&mirror_url), "{ud}");
     assert!(ud.contains("sha256sum"), "{ud}");
     assert!(
@@ -1631,7 +1703,7 @@ async fn t1_f7_03() {
     .await
     .ok();
     let f = w.aliyun.lock().unwrap();
-    let ud = &f.instances.values().next().unwrap().user_data_decoded;
+    let ud = decode_user_data_scripts(&f.instances.values().next().unwrap().user_data_decoded);
     assert!(
         !ud.contains("apt-get install -y xfce") && !ud.contains("xvfb"),
         "{ud}"
@@ -1669,8 +1741,25 @@ async fn t1_f7_04() {
     .ok();
     let f = w.aliyun.lock().unwrap();
     let inst = f.instances.values().next().unwrap();
-    assert!(inst.user_data_decoded.contains("100.100.100.200"));
-    assert!(inst.user_data_decoded.contains("cua-expire") || inst.auto_release_time.is_some());
+    let ud_raw = &inst.user_data_decoded;
+    let ud = decode_user_data_scripts(ud_raw);
+    assert!(
+        ud.contains("100.100.100.200"),
+        "decoded cloud-init must block metadata IP 100.100.100.200: {ud}"
+    );
+    assert!(
+        (ud.contains("cua-expire") && (ud.contains("Timer") || ud.contains("timer")))
+            || inst.auto_release_time.is_some(),
+        "expected TTL timer or AutoReleaseTime: {ud}"
+    );
+    assert!(
+        ud.contains("cua-spacesd") && (ud.contains("systemd") || ud.contains("[Service]")),
+        "expected systemd cua-spacesd unit in decoded cloud-init: {ud}"
+    );
+    assert!(!ud_raw.contains("secret123"));
+    assert_eq!(inst.http_tokens.as_deref(), Some("required"));
+    assert!(inst.key_pair_name.is_none());
+    assert!(inst.ram_role_name.is_none());
     assert_eq!(inst.instance_charge_type, "PostPaid");
     assert_eq!(inst.stopped_mode, "StopCharging");
     assert_six_cua_tags(&inst.tags);
@@ -1751,32 +1840,98 @@ async fn t1_f8_01() {
     let stmts = doc["Statement"].as_array().expect("Statement array");
     assert!(!stmts.is_empty());
 
+    let as_strs = |v: &serde_json::Value| -> Vec<String> {
+        match v {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+            _ => vec![],
+        }
+    };
+
+    const MUTATING_VERBS: &[&str] = &[
+        "Run",
+        "Create",
+        "Delete",
+        "Terminate",
+        "Stop",
+        "Start",
+        "Authorize",
+        "Revoke",
+        "Modify",
+        "Attach",
+        "Detach",
+        "Associate",
+        "Disassociate",
+        "Tag",
+        "Allocate",
+        "Release",
+    ];
+    const RUN_REF_ONLY: &[&str] = &[
+        "image/",
+        "vswitch/",
+        "vpc/",
+        "networkinterface/",
+        "eni/",
+        "securitygroup/",
+        "security-group/",
+        "snapshot/",
+    ];
+
     for stmt in stmts {
-        assert_eq!(stmt["Effect"], "Allow");
-        let actions: Vec<&str> = match &stmt["Action"] {
-            serde_json::Value::String(s) => vec![s.as_str()],
-            serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
-            other => panic!("unexpected Action shape: {other}"),
-        };
+        let effect = stmt["Effect"].as_str().unwrap_or("");
+        assert!(
+            matches!(effect, "Allow" | "Deny"),
+            "unexpected Effect {effect:?} in {stmt}"
+        );
+        assert!(stmt.get("NotAction").is_none() && stmt.get("NotResource").is_none());
+
+        let actions = as_strs(&stmt["Action"]);
+        assert!(!actions.is_empty(), "statement missing Action: {stmt}");
+        let resources = as_strs(&stmt["Resource"]);
+        assert!(!resources.is_empty(), "statement missing Resource: {stmt}");
+
         for act in &actions {
             assert!(
                 !act.ends_with(":*") && *act != "*",
                 "wildcard action forbidden: {act}"
             );
             assert!(!act.starts_with("ram:"), "ram:* action forbidden: {act}");
-            let mutating = act.contains(":Run")
-                || act.contains(":Create")
-                || act.contains(":Stop")
-                || act.contains(":Start")
-                || act.contains(":Delete");
-            if mutating {
-                let cond_str = stmt["Condition"].to_string();
-                assert!(
-                    cond_str.contains("cua-managed"),
-                    "mutating action {act} must require cua-managed tag Condition: {stmt}"
-                );
-            }
         }
+
+        if effect != "Allow" {
+            continue;
+        }
+
+        let has_mutating = actions.iter().any(|act| {
+            let op = act.split(':').nth(1).unwrap_or("");
+            MUTATING_VERBS.iter().any(|v| op.starts_with(v))
+        });
+        if !has_mutating {
+            continue;
+        }
+
+        let cond_str = stmt["Condition"].to_string();
+        if cond_str.contains("cua-managed") {
+            continue;
+        }
+
+        // Permit untagged resource-reference statements only for RunInstances (non-instance/disk
+        // reference resources like image/*, vswitch/*, vpc/*, securitygroup/*) and
+        // CreateSecurityGroup (vpc/*), mirroring aws-policy.json / policy.rs.
+        let reference_only = actions.iter().all(|act| match act.as_str() {
+            "ecs:RunInstances" => resources
+                .iter()
+                .all(|r| RUN_REF_ONLY.iter().any(|u| r.contains(u))),
+            "ecs:CreateSecurityGroup" => resources.iter().all(|r| r.contains("vpc/")),
+            _ => false,
+        });
+        assert!(
+            reference_only,
+            "mutating Allow statement must require cua-managed tag Condition (or be an untagged RunInstances/CreateSecurityGroup reference statement): {stmt}"
+        );
     }
 }
 
@@ -1813,6 +1968,9 @@ async fn t1_f8_03() {
     let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid policy JSON");
     let mut allowed: BTreeSet<String> = BTreeSet::new();
     for stmt in doc["Statement"].as_array().unwrap() {
+        if stmt["Effect"] != "Allow" {
+            continue;
+        }
         match &stmt["Action"] {
             serde_json::Value::String(s) => {
                 allowed.insert(s.clone());
@@ -1831,6 +1989,8 @@ async fn t1_f8_03() {
     let mut w = AliyunWorld::start().await;
     w.aliyun.lock().unwrap().enforce_cua_managed_tag_condition = true;
     w.auth_login().await;
+
+    // 1. Linux Docker-on-VM + suspend/resume/rm + sweep + disconnect --delete
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
         "LTAI_TEST_AK:secret123\n",
@@ -1863,6 +2023,76 @@ async fn t1_f8_03() {
     .await
     .ok();
 
+    // 2. Boot-fail path (exercises GetInstanceConsoleOutput + rollback)
+    w.aliyun.lock().unwrap().boot_fail = Some(BootFailMode::StopImmediately);
+    let bf = w
+        .run(&[
+            "sb",
+            "create",
+            "linux",
+            "--on",
+            "aliyun-ecs",
+            "--name",
+            "sync-bf",
+        ])
+        .await;
+    assert_ne!(bf.code, 0);
+    w.aliyun.lock().unwrap().boot_fail = None;
+
+    // 3. Windows Direct VM + rm + disconnect --delete
+    w.run(&[
+        "sb",
+        "create",
+        "windows",
+        "--on",
+        "aliyun-ecs",
+        "--name",
+        "sync-w",
+        "--json",
+    ])
+    .await
+    .ok();
+    w.run(&["sb", "rm", "sync-w", "--force"]).await.ok();
+    w.run(&["cloud", "disconnect", "aliyun-ecs", "--delete", "--json"])
+        .await
+        .ok();
+
+    // 4. Existing VPC/VSwitch + --no-public-ip + rm + disconnect --delete
+    seed_user_vpc(&w, "cn-hangzhou");
+    w.run_with_stdin(
+        &[
+            "cloud",
+            "connect",
+            "aliyun-ecs",
+            "--token-stdin",
+            "--vpc-id",
+            "vpc-user-1",
+            "--vswitch-id",
+            "vsw-user-1",
+            "--no-public-ip",
+            "--json",
+        ],
+        "LTAI_TEST_AK:secret123\n",
+    )
+    .await
+    .ok();
+    w.run(&[
+        "sb",
+        "create",
+        "linux",
+        "--on",
+        "aliyun-ecs",
+        "--name",
+        "sync-vpc",
+        "--json",
+    ])
+    .await
+    .ok();
+    w.run(&["sb", "rm", "sync-vpc", "--force"]).await.ok();
+    w.run(&["cloud", "disconnect", "aliyun-ecs", "--delete", "--json"])
+        .await
+        .ok();
+
     let recorded: BTreeSet<String> = w
         .aliyun
         .lock()
@@ -1872,6 +2102,10 @@ async fn t1_f8_03() {
         .map(|c| action_service(&c.version, &c.action))
         .collect();
     assert!(!recorded.is_empty());
+    assert!(
+        recorded.contains("ecs:GetInstanceConsoleOutput"),
+        "expected GetInstanceConsoleOutput in recorded API calls: {recorded:?}"
+    );
     for act in &recorded {
         assert!(
             allowed.contains(act),

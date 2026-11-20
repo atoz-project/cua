@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SUITE = Path(__file__).resolve().parent
 sys.path.insert(0, str(SUITE))
@@ -169,6 +171,124 @@ class RunnerBehaviorTests(unittest.TestCase):
         leaks = run.check_aliyun_leaks("oauth", "cn-hangzhou", run_id, runner=fake_runner_leaked)
         self.assertEqual(len(leaks), 1)
         self.assertIn("vpc-leaked-1", leaks[0])
+
+    def test_check_aliyun_leaks_paginates_and_matches_cua_owner_shared_resources(self) -> None:
+        run_id = "run99"
+        smoke_owner = "deadbeef12345678"
+        seen_pages: list[int] = []
+
+        def fake_paginated_runner(
+            cmd: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess:
+            action = cmd[2]
+            page = int(cmd[cmd.index("--PageNumber") + 1])
+            page_size = int(cmd[cmd.index("--PageSize") + 1])
+            self.assertEqual(page_size, 50)
+            if action == "DescribeInstances":
+                seen_pages.append(page)
+                if page < 3:
+                    items = [{"InstanceId": f"i-ok-{page}-{i}"} for i in range(50)]
+                else:
+                    items = [
+                        {"InstanceId": "i-ok-3-0"},
+                        {
+                            "InstanceId": "i-leaked-page3",
+                            "Tags": {
+                                "Tag": [
+                                    {"TagKey": "cua-managed", "TagValue": "true"},
+                                    {"TagKey": "cua-space", "TagValue": f"cua-e2e-{run_id}-ld"},
+                                ]
+                            },
+                        },
+                    ]
+                body = json.dumps(
+                    {"TotalCount": 102, "PageSize": 50, "Instances": {"Instance": items}}
+                )
+            elif action == "DescribeVpcs":
+                body = json.dumps(
+                    {
+                        "TotalCount": 2,
+                        "Vpcs": {
+                            "Vpc": [
+                                {
+                                    "VpcId": "vpc-other-owner",
+                                    "Tags": {
+                                        "Tag": [
+                                            {"TagKey": "cua-managed", "TagValue": "true"},
+                                            {"TagKey": "cua-owner", "TagValue": "other999"},
+                                            {"TagKey": "cua-created-by", "TagValue": "0-1-0"},
+                                        ]
+                                    },
+                                },
+                                {
+                                    "VpcId": "vpc-shared-smoke",
+                                    "Tags": {
+                                        "Tag": [
+                                            {"TagKey": "cua-managed", "TagValue": "true"},
+                                            {"TagKey": "cua-owner", "TagValue": smoke_owner},
+                                            {"TagKey": "cua-created-by", "TagValue": "0-1-0"},
+                                        ]
+                                    },
+                                },
+                            ]
+                        },
+                    }
+                )
+            elif action == "DescribeSecurityGroups":
+                body = json.dumps(
+                    {
+                        "TotalCount": 1,
+                        "SecurityGroups": {
+                            "SecurityGroup": [
+                                {
+                                    "SecurityGroupId": "sg-shared-smoke",
+                                    "Tags": {
+                                        "Tag": [
+                                            {"TagKey": "cua-managed", "TagValue": "true"},
+                                            {"TagKey": "cua-owner", "TagValue": smoke_owner},
+                                        ]
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            else:
+                body = json.dumps({"TotalCount": 0})
+            return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
+
+        leaks = run.check_aliyun_leaks(
+            "oauth",
+            "cn-hangzhou",
+            run_id,
+            owner=smoke_owner,
+            runner=fake_paginated_runner,
+        )
+        self.assertEqual(seen_pages, [1, 2, 3])
+        self.assertEqual(len(leaks), 3)
+        joined = "\n".join(leaks)
+        self.assertIn("i-leaked-page3", joined)
+        self.assertIn("vpc-shared-smoke", joined)
+        self.assertIn("sg-shared-smoke", joined)
+        self.assertNotIn("vpc-other-owner", joined)
+
+    def test_live_lane_validates_profile_before_building_cua_cli(self) -> None:
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("CUA_E2E_ALIYUN_PROFILE", "ALIYUN_PROFILE")
+        }
+        with (
+            mock.patch.dict(os.environ, clean_env, clear=True),
+            mock.patch.object(
+                run,
+                "build_cua_cli",
+                side_effect=AssertionError("build_cua_cli must not be called without --profile"),
+            ),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                run.main(["--lanes", "live"])
+            self.assertIn("--profile", str(ctx.exception))
 
 
 if __name__ == "__main__":

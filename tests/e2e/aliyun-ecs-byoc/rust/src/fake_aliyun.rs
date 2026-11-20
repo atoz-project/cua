@@ -650,7 +650,16 @@ fn parse_instance_ids_param(params: &BTreeMap<String, String>) -> Vec<String> {
 }
 
 fn extract_machine_id(user_data: &str) -> Option<String> {
-    for line in user_data.lines() {
+    let files = crate::decode_cloud_init_write_files(user_data);
+    if let Some(mid) = files
+        .get("/etc/cua/relay/machine-id")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(mid.to_string());
+    }
+    let expanded = crate::decode_user_data_scripts(user_data);
+    for line in expanded.lines() {
         let trimmed = line.trim();
         for marker in ["--machine-id ", "CUA_MACHINE_ID=", "machine_id="] {
             if let Some(idx) = trimmed.find(marker) {
@@ -1597,4 +1606,21 @@ pub async fn handle(
         cb(&inst, online);
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_machine_id_decodes_b64_write_files() {
+        let mid_b64 = base64::engine::general_purpose::STANDARD.encode("cloud-0123456789abcdef\n");
+        let ud = format!(
+            "#cloud-config\nwrite_files:\n  - path: /etc/cua/relay/machine-id\n    encoding: b64\n    content: {mid_b64}\n"
+        );
+        assert_eq!(
+            extract_machine_id(&ud).as_deref(),
+            Some("cloud-0123456789abcdef")
+        );
+    }
 }

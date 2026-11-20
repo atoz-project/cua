@@ -96,6 +96,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("CUA_E2E_RUN") or secrets.token_hex(4),
         help="unique run identifier",
     )
+    ap.add_argument(
+        "--owner",
+        default=os.environ.get("CUA_E2E_SMOKE_OWNER"),
+        help="cua-owner tag value for detecting shared VPC/VSwitch/SG leaks in --lanes live",
+    )
     return ap.parse_args(argv)
 
 
@@ -217,20 +222,26 @@ def _extract_tags(item: dict) -> dict[str, str]:
     return tags
 
 
-def _is_e2e_leaked_resource(item: dict, run_id: str) -> bool:
+def _is_e2e_leaked_resource(item: dict, run_id: str, owner: str | None = None) -> bool:
     tags = _extract_tags(item)
     if tags.get("cua-managed") != "true":
         return False
     space = tags.get("cua-space", "")
     created_by = tags.get("cua-created-by", "")
-    return space.startswith(f"cua-e2e-{run_id}-") or created_by == f"cua-e2e-{run_id}"
+    if space.startswith(f"cua-e2e-{run_id}-") or created_by == f"cua-e2e-{run_id}":
+        return True
+    if owner and tags.get("cua-owner") == owner:
+        return True
+    return False
 
 
 def check_aliyun_leaks(
     profile: str,
     region: str,
     run_id: str,
+    owner: str | None = None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    page_size: int = 50,
 ) -> list[str]:
     """Query Alibaba Cloud via aliyun CLI for any leftover E2E-tagged resources."""
     if not shutil.which("aliyun") and runner is subprocess.run:
@@ -271,27 +282,41 @@ def check_aliyun_leaks(
         ),
     ]
     leaks: list[str] = []
-    for kind, cmd, path_keys, id_key in queries:
-        proc = runner(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            leaks.append(
-                f"leak check command failed ({' '.join(cmd)}): "
-                f"{proc.stderr.strip() or proc.stdout.strip()}"
-            )
-            continue
-        try:
-            payload = json.loads(proc.stdout or "{}")
-        except json.JSONDecodeError as exc:
-            leaks.append(f"invalid JSON from {' '.join(cmd)}: {exc}")
-            continue
-        node = payload
-        for k in path_keys:
-            node = node.get(k, {}) if isinstance(node, dict) else {}
-        items = node if isinstance(node, list) else []
-        for item in items:
-            if isinstance(item, dict) and _is_e2e_leaked_resource(item, run_id):
-                rid = item.get(id_key, "<unknown>")
-                leaks.append(f"leaked {kind}: {rid} (run {run_id})")
+    for kind, base_cmd, path_keys, id_key in queries:
+        page = 1
+        seen = 0
+        while page <= 200:
+            cmd = [*base_cmd, "--PageSize", str(page_size), "--PageNumber", str(page)]
+            proc = runner(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                leaks.append(
+                    f"leak check command failed ({' '.join(cmd)}): "
+                    f"{proc.stderr.strip() or proc.stdout.strip()}"
+                )
+                break
+            try:
+                payload = json.loads(proc.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                leaks.append(f"invalid JSON from {' '.join(cmd)}: {exc}")
+                break
+            node = payload
+            for k in path_keys:
+                node = node.get(k, {}) if isinstance(node, dict) else {}
+            items = node if isinstance(node, list) else []
+            for item in items:
+                if isinstance(item, dict) and _is_e2e_leaked_resource(item, run_id, owner):
+                    rid = item.get(id_key, "<unknown>")
+                    leaks.append(f"leaked {kind}: {rid} (run {run_id})")
+            seen += len(items)
+            total_count = payload.get("TotalCount") if isinstance(payload, dict) else None
+            if not items:
+                break
+            if isinstance(total_count, int):
+                if seen >= total_count:
+                    break
+            elif len(items) < page_size:
+                break
+            page += 1
     return leaks
 
 
@@ -357,18 +382,25 @@ def run_hermetic_lane(
 
 
 def run_live_lane(
-    profile: str | None, region: str, run_id: str, env: dict[str, str]
+    profile: str | None,
+    region: str,
+    run_id: str,
+    env: dict[str, str],
+    owner: str | None = None,
+    out: Path | None = None,
 ) -> tuple[int, dict[str, str], list[str]]:
     if not profile:
         raise SystemExit(
             "--lanes live requires --profile <aliyun-ak-profile> (or CUA_E2E_ALIYUN_PROFILE)"
         )
+    owner_file = (out / "smoke-owner.txt") if out else (Path("/tmp") / f"cua-owner-{run_id}.txt")
     live_env = dict(
         env,
         CUA_E2E_ALIYUN_LIVE="1",
         CUA_E2E_ALIYUN_PROFILE=profile,
         CUA_E2E_ALIYUN_REGION=region,
         CUA_E2E_RUN=run_id,
+        CUA_E2E_OWNER_FILE=str(owner_file),
     )
     rc = 1
     observed: dict[str, str] = {}
@@ -379,7 +411,10 @@ def run_live_lane(
             live_env,
         )
     finally:
-        leaks = check_aliyun_leaks(profile, region, run_id)
+        smoke_owner = owner
+        if not smoke_owner and owner_file.exists():
+            smoke_owner = owner_file.read_text(encoding="utf-8").strip() or None
+        leaks = check_aliyun_leaks(profile, region, run_id, owner=smoke_owner)
         if leaks:
             print("POST-TEARDOWN LEAK CHECK FAILED:", file=sys.stderr)
             for leak in leaks:
@@ -395,6 +430,10 @@ def main(argv: list[str] | None = None) -> int:
     unknown = [lane for lane in lanes if lane not in valid_lanes]
     if not lanes or unknown:
         raise SystemExit(f"invalid --lanes {args.lanes!r}; expected baseline|hermetic|live")
+    if "live" in lanes and not args.profile:
+        raise SystemExit(
+            "--lanes live requires --profile <aliyun-ak-profile> (or CUA_E2E_ALIYUN_PROFILE)"
+        )
 
     reg = load_scenarios()
     out = (
@@ -430,7 +469,9 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = exit_code or rc
 
     if "live" in lanes:
-        rc, obs, live_leaks = run_live_lane(args.profile, args.region, args.run, env)
+        rc, obs, live_leaks = run_live_lane(
+            args.profile, args.region, args.run, env, owner=args.owner, out=out
+        )
         observed.update(obs)
         exit_code = exit_code or rc
 

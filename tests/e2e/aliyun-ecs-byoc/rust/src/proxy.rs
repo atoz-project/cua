@@ -36,7 +36,6 @@ fn is_allowed_aliyun_host(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
     h == "sts.aliyuncs.com"
         || (h.ends_with(".aliyuncs.com") && (h.starts_with("ecs.") || h.starts_with("vpc.")))
-        || h.ends_with(".aliyuncs.com")
 }
 
 impl AliyunConnectProxy {
@@ -208,4 +207,22 @@ async fn handle_client(
         .serve_connection(TokioIo::new(tls_stream), svc)
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_aliyun_host;
+
+    #[test]
+    fn host_allowlist_permits_only_sts_ecs_vpc() {
+        assert!(is_allowed_aliyun_host("sts.aliyuncs.com"));
+        assert!(is_allowed_aliyun_host("STS.ALIYUNCS.COM"));
+        assert!(is_allowed_aliyun_host("ecs.cn-hangzhou.aliyuncs.com"));
+        assert!(is_allowed_aliyun_host("vpc.ap-southeast-1.aliyuncs.com"));
+
+        assert!(!is_allowed_aliyun_host("ram.aliyuncs.com"));
+        assert!(!is_allowed_aliyun_host("evil.aliyuncs.com"));
+        assert!(!is_allowed_aliyun_host("example.com"));
+        assert!(!is_allowed_aliyun_host("aliyuncs.com"));
+    }
 }
