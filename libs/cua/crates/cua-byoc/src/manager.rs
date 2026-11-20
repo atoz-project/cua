@@ -16,7 +16,7 @@ use cua_sandbox_core::byoc::{
     CloudTestReport, HostTypeOffer,
 };
 
-use crate::api::{CloudApi, Result};
+use crate::api::{CloudApi, Result, UnstageGuard};
 use crate::audit;
 use crate::model::{self, Connection, Resource};
 use crate::relay::RelayAccess;
@@ -576,6 +576,7 @@ impl CloudManager for Clouds {
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
         p.stage_secret(target);
+        let _unstage = UnstageGuard(p.as_ref());
         let conn = p.resolve(target)?;
         let t = p.test(&conn).await;
         Ok(CloudTestReport {
@@ -594,6 +595,7 @@ impl CloudManager for Clouds {
     ) -> Result<CloudConnected> {
         let p = self.api(&target.provider)?;
         p.stage_secret(target);
+        let _unstage = UnstageGuard(p.as_ref());
         let mut conn = p.resolve(target)?;
         let tested = p.test(&conn).await;
         if !tested.ok() {

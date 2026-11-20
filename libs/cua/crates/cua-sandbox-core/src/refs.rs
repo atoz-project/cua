@@ -422,6 +422,7 @@ mod tests {
             "direct:h.example:443",
             "relay:0123abcd4567ef89",
             "hetzner:box",
+            "aliyun-ecs:box",
             "box",
         ] {
             assert_eq!(p(s).to_string(), s);
@@ -465,6 +466,8 @@ mod tests {
             "direct:",
             "direct:h:p0rt",
             "moon:x",
+            "aliyun-sandbox:box",
+            "aliyun-agent-sandbox:box",
             "a b",
             "a/b",
         ] {

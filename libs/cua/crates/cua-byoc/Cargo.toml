@@ -23,10 +23,12 @@ gcp = ["dep:reqwest", "federation"]
 azure = ["dep:reqwest", "federation"]
 # Hetzner Cloud over its REST API with a project API token.
 hetzner = ["dep:reqwest"]
+# Alibaba Cloud ECS over OpenAPI V3 HTTPS (ACS3-HMAC-SHA256) with RAM AccessKeys.
+aliyun-ecs = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex", "dep:url"]
 # Modal Sandboxes through the cua-modal-helper (Modal's official Go SDK).
 modal = ["dep:cua-contrib"]
 # Every provider.
-all = ["aws", "azure", "gcp", "hetzner", "modal"]
+all = ["aws", "azure", "gcp", "hetzner", "modal", "aliyun-ecs"]
 # Test doubles (a scripted cloud) for this crate's and the daemon's tests.
 testing = []
 
@@ -54,6 +56,9 @@ aws-sdk-sts = { version = "1", default-features = false, features = ["behavior-v
 aws-types = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
 sha2 = { workspace = true, optional = true }
+hmac = { version = "0.12", optional = true }
+hex = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"], optional = true }
 # Image configs (the start command) from the registry, shared with the
 # contrib providers.
@@ -62,6 +67,9 @@ cua-contrib = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum.workspace = true
+hmac = "0.12"
+sha2.workspace = true
+hex.workspace = true
 url.workspace = true
 # The NoCloud seed writer of the opt-in QEMU boot test (tests/boot_qemu.rs).
 ring = "0.17"

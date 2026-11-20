@@ -37,6 +37,7 @@ pub fn cloud_title(provider: &str) -> String {
         "azure" => "Azure".into(),
         "hetzner" => "Hetzner".into(),
         "modal" => "Modal".into(),
+        "aliyun-ecs" => "Alibaba Cloud".into(),
         other => other.to_owned(),
     }
 }

@@ -154,7 +154,7 @@ pub struct Hetzner {
     api: String,
     store: Arc<dyn TokenStore>,
     /// A token from a connect or test in flight (not saved yet).
-    staged: Mutex<Option<Secret>>,
+    staged: Mutex<Option<std::result::Result<Secret, String>>>,
     hcloud_config: Option<std::path::PathBuf>,
     poll: Duration,
     /// Held while the shared firewall is found or created.
@@ -206,7 +206,7 @@ impl Hetzner {
     /// The token on this device: the one given now, the saved one, the
     /// environment's or the hcloud CLI's (not a sealed one).
     fn token_and_source(&self) -> Option<(String, Source)> {
-        if let Some(t) = self.staged.lock().unwrap().clone() {
+        if let Some(Ok(t)) = self.staged.lock().unwrap().as_ref() {
             return Some((t.expose().to_string(), Source::Given));
         }
         self.saved_token()
@@ -237,8 +237,10 @@ impl Hetzner {
     /// sealed one when the connection is sealed (and nothing else then),
     /// else this device's.
     async fn token_with_source(&self) -> Result<Option<(Secret, Source)>> {
-        if let Some(t) = self.staged.lock().unwrap().clone() {
-            return Ok(Some((t, Source::Given)));
+        if let Some(res) = self.staged.lock().unwrap().clone() {
+            return res
+                .map(|t| Some((t, Source::Given)))
+                .map_err(Error::InvalidArgument);
         }
         if let Some(src) = self.sealed_source()
             && let Some(t) = src.secret("hetzner").await
@@ -769,9 +771,20 @@ impl CloudApi for Hetzner {
 
     fn stage_secret(&self, t: &Target) {
         // Held for the checks; saved only when they pass.
-        if let Some(tok) = t.token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            *self.staged.lock().unwrap() = Some(Secret::new(tok));
-        }
+        let mut guard = self.staged.lock().unwrap();
+        *guard = match t.token.as_deref() {
+            Some(raw) => {
+                let tok = raw.trim();
+                if tok.is_empty() {
+                    Some(Err(
+                        "hetzner: --token-stdin was empty; expected an API token".into(),
+                    ))
+                } else {
+                    Some(Ok(Secret::new(tok)))
+                }
+            }
+            None => None,
+        };
     }
 
     fn persist_secret(&self) -> Result<()> {
@@ -779,7 +792,8 @@ impl CloudApi for Hetzner {
         // saved so the daemon (another process) finds it later.
         let staged = self.staged.lock().unwrap().take();
         let token = match (staged, self.token_and_source()) {
-            (Some(t), _) => Some(t),
+            (Some(Ok(t)), _) => Some(t),
+            (Some(Err(e)), _) => return Err(Error::InvalidArgument(e)),
             (None, Some((t, Source::Env))) => Some(Secret::new(t)),
             _ => None,
         };
@@ -803,12 +817,13 @@ impl CloudApi for Hetzner {
     }
 
     fn local_secret(&self, t: &Target) -> Option<Secret> {
-        t.token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(Secret::new)
-            .or_else(|| self.token_and_source().map(|(t, _)| Secret::new(t)))
+        match t.token.as_deref() {
+            Some(raw) => {
+                let tok = raw.trim();
+                (!tok.is_empty()).then(|| Secret::new(tok))
+            }
+            None => self.token_and_source().map(|(t, _)| Secret::new(t)),
+        }
     }
 
     fn attach_secrets(&self, source: Arc<dyn SecretSource>) {

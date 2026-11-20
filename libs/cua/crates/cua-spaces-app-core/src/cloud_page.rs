@@ -437,6 +437,7 @@ pub fn cloud_name(id: &str) -> &'static str {
         "azure" => "Microsoft Azure",
         "hetzner" => "Hetzner",
         "modal" => "Modal",
+        "aliyun-ecs" => "Alibaba Cloud ECS",
         _ => "",
     }
 }
@@ -538,6 +539,10 @@ pub fn region_label(region: &str) -> String {
         "hel1" => "Helsinki",
         "ash" => "Ashburn",
         "hil" => "Hillsboro",
+        "cn-hangzhou" => "Hangzhou",
+        "cn-shanghai" => "Shanghai",
+        "cn-beijing" => "Beijing",
+        "cn-shenzhen" => "Shenzhen",
         _ => "",
     };
     if place.is_empty() {
@@ -656,6 +661,17 @@ fn console_url(c: &CloudInput) -> Option<(String, String)> {
             "https://console.cloud.google.com/compute/instances".into(),
         )),
         "modal" => Some(("Open Modal".into(), "https://modal.com/apps".into())),
+        "aliyun-ecs" => {
+            let region = if c.region.is_empty() {
+                "cn-hangzhou"
+            } else {
+                &c.region
+            };
+            Some((
+                "Open Alibaba Cloud ECS".into(),
+                format!("https://ecs.console.aliyun.com/server/region/{region}"),
+            ))
+        }
         _ => None,
     }
 }

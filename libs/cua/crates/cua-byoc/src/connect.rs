@@ -388,11 +388,7 @@ async fn connect_sealed(
 
     // 2. The token: given now; else the account's (sealed already); else
     // the one this device has (`--sealed` seals it).
-    let given = req
-        .target
-        .token
-        .as_deref()
-        .is_some_and(|t| !t.trim().is_empty());
+    let given = req.target.token.is_some();
     let (token, fresh) = if given {
         match p.local_secret(&req.target) {
             Some(t) => (t, true),
@@ -434,11 +430,12 @@ async fn connect_sealed(
     let mut staged = target.clone();
     staged.token = Some(token.expose().to_string());
     p.stage_secret(&staged);
+    let unstage = crate::api::UnstageGuard(p);
     if let Some(t) = staged.token.as_mut() {
         zeroize::Zeroize::zeroize(t);
     }
     let tested = p.test(&candidate).await;
-    p.unstage_secret();
+    drop(unstage);
     if !tested.ok() {
         return Ok(outcome(
             clouds,

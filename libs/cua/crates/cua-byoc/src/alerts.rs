@@ -46,6 +46,7 @@ pub fn title_of(provider: &str) -> &str {
         "azure" => "Microsoft Azure",
         "hetzner" => "Hetzner",
         "modal" => "Modal",
+        "aliyun-ecs" => "Alibaba Cloud ECS",
         other => other,
     }
 }
@@ -225,6 +226,19 @@ mod tests {
         assert_eq!(
             percents(due(dir.path(), &conn(Some(200.0)), 100.0, OCT).unwrap()),
             vec![50]
+        );
+    }
+
+    #[test]
+    fn aliyun_ecs_title_is_human_readable() {
+        assert_eq!(title_of("aliyun-ecs"), "Alibaba Cloud ECS");
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = conn(Some(100.0));
+        c.provider = "aliyun-ecs".into();
+        let a = due(dir.path(), &c, 100.0, OCT).unwrap();
+        assert_eq!(
+            a[0].title_line(),
+            "Alibaba Cloud ECS reached its monthly budget"
         );
     }
 }

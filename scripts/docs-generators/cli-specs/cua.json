@@ -16693,7 +16693,7 @@
      "arguments": [
       {
        "default_value": null,
-       "help": "Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`)",
+       "help": "Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`)",
        "hidden": false,
        "is_optional": true,
        "name": "PROVIDER",
@@ -16713,12 +16713,12 @@
     },
     {
      "abstract": "Connect a cloud account Spaces can be created in. Never prompts and is safe to run again: every run ends with a status, the next step and the command that verifies it. With --oidc, AWS and Google Cloud are linked without any key: Cua signs short-lived tokens that your account trusts. Azure is always linked that way. Without it, the cloud's own CLI sign-in on this device is used (Cua stores only the profile, region, project or environment names; Hetzner's API token goes to the Cua credential store)",
-     "after_help": "How it ends (every run, also with --json):\n  status   connected | needs-trust | checking | waiting-for-approval | failed\n  next     run: the exact command to run next, or\n           open: a page a person opens (paste: what they paste there)\n           why: what it is for, in plain words\n  verify   the command that confirms it: cua cloud status <cloud>\n  checks   what the check found\nExit code: 0 connected, 10 the next step is yours (run it), 11 it waits on a\nperson (send them `next`), 1 error.\n\nAWS without a stored key (for agents: follow `next` until connected):\n  1. Ask the person for a monthly budget (US dollars), the region and the\n     largest machine, then run:\n       cua cloud connect aws --oidc --region us-west-2 --budget 200 --max-size 4x16\n  2. status needs-trust: send the person `next.open` (AWS CloudShell, or the\n     CloudFormation quick-create link) and `next.paste`. It creates one\n     stack, cua-spaces: an OIDC provider and the cua-spaces role, scoped to\n     what Cua tags cua-managed=true. No keys. Ask them for the 12-digit AWS\n     account id when it shows CREATE_COMPLETE.\n  3. Run `next.run` (the same command with --account-id <ID> --check). It\n     gets a check token, exchanges it with AWS STS and dry-runs a machine.\n     Nothing is created.\n  4. status connected: done. status waiting-for-approval: an agent made the\n     link (or raised a limit), so a person approves it in the Cua Spaces\n     app; then `cua cloud status aws` says connected.\n  Verify: cua cloud status aws\n\nHetzner and Modal: the API token is sealed to your devices (only devices of\nyour account open it; Cua's servers keep ciphertext). Ask the person for a\nbudget and the token (Hetzner: Read & Write, Cloud Console, Security, API\ntokens; Modal: `modal token new`, given as <token id>:<token secret>), then:\n  cua cloud connect hetzner --token-stdin --region fsn1 --budget 50 --max-size 4x8\n  It seals by default on a device with the account's pool keys when a\n  budget is given; --sealed insists on it, --no-sealed keeps the token on\n  this device only (as before). --sealed without a token seals the one this\n  device already has.\n  Verify: cua cloud status hetzner (its line says which devices can open it)\n\nGoogle Cloud without a stored key:\n  1. cua cloud connect gcp --oidc --project my-project --region us-central1 --budget 200 --max-size 4x16\n  2. status needs-trust: a person opens `next.open` (Google Cloud Shell with\n     Cua's trust script) and pastes `next.paste`: it creates the workload\n     identity pool cua, its provider, the role cuaSpaces and one binding. No\n     keys, no service accounts. It prints the project number. An agent on a\n     machine signed in to gcloud gets `next.run` instead (the same script).\n  3. Run `next.run` (with --project-number <N> --check): Google's STS\n     exchanges a check token and the role's permissions are checked.\n  Verify: cua cloud status gcp\n\nAzure (always without a stored key):\n  1. cua cloud connect azure --region westus2 --budget 200 --max-size 4x16\n  2. status needs-trust: a person opens `next.open` (Deploy to Azure) and\n     deploys into resource group cua-spaces: the cua-spaces managed identity\n     trusting Cua's tokens, with Virtual Machine Contributor and Network\n     Contributor on that group only. No keys. Ask for the outputs\n     subscriptionId, tenantId and clientId. An agent on a machine signed in\n     to the az CLI gets `next.run` instead.\n  3. Run `next.run` (with --subscription --tenant --client-id --check):\n     Microsoft Entra exchanges a check token, the resource group is read\n     and a machine is validated.\n  Verify: cua cloud status azure\n\nOther clouds use their own CLI sign-in on this device.\n`cua cloud trust <cloud>` prints the trust setup file (aws, gcp, azure).\nDocs for agents: https://cua.ai/docs/spaces/guides/connect-a-cloud\n\nExamples:\n  # AWS without a stored key: start, then check with the account id\n  cua cloud connect aws --oidc --region us-west-2 --budget 200 --max-size 4x16\n  cua cloud connect aws --oidc --region us-west-2 --budget 200 --max-size 4x16 --account-id 123456789012 --check\n  # Google Cloud without a stored key: start, then check with the project number\n  cua cloud connect gcp --oidc --project my-project --region us-central1 --budget 200\n  cua cloud connect gcp --oidc --project my-project --region us-central1 --budget 200 --project-number 123456789012 --check\n  # Azure: start, then check with the template's outputs\n  cua cloud connect azure --region westus2 --budget 200 --max-size 4x16\n  cua cloud connect azure --region westus2 --budget 200 --subscription 00000000-0000-0000-0000-000000000000 --tenant 11111111-1111-1111-1111-111111111111 --client-id 22222222-2222-2222-2222-222222222222 --check\n  # The cloud CLI's sign-in on this device, with the same limits\n  cua cloud connect aws --profile sandbox --region us-west-2 --budget 50 --default\n  cua cloud connect gcp --project my-project --region us-central1\n  cua cloud connect modal --environment spaces\n  # Hetzner: the project's API token on standard input, sealed to your devices\n  cua cloud connect hetzner --token-stdin --region fsn1 --budget 50 --max-size 4x8\n  # Modal: <token id>:<token secret> on standard input, sealed to your devices\n  cua cloud connect modal --token-stdin --budget 50\n  # Seal the Hetzner token this device already has\n  cua cloud connect hetzner --sealed --budget 50\n  # Spaces there delete themselves after 4 hours (default 8; 0: never)\n  cua cloud connect aws --ttl-hours 4",
+     "after_help": "How it ends (every run, also with --json):\n  status   connected | needs-trust | checking | waiting-for-approval | failed\n  next     run: the exact command to run next, or\n           open: a page a person opens (paste: what they paste there)\n           why: what it is for, in plain words\n  verify   the command that confirms it: cua cloud status <cloud>\n  checks   what the check found\nExit code: 0 connected, 10 the next step is yours (run it), 11 it waits on a\nperson (send them `next`), 1 error.\n\nAWS without a stored key (for agents: follow `next` until connected):\n  1. Ask the person for a monthly budget (US dollars), the region and the\n     largest machine, then run:\n       cua cloud connect aws --oidc --region us-west-2 --budget 200 --max-size 4x16\n  2. status needs-trust: send the person `next.open` (AWS CloudShell, or the\n     CloudFormation quick-create link) and `next.paste`. It creates one\n     stack, cua-spaces: an OIDC provider and the cua-spaces role, scoped to\n     what Cua tags cua-managed=true. No keys. Ask them for the 12-digit AWS\n     account id when it shows CREATE_COMPLETE.\n  3. Run `next.run` (the same command with --account-id <ID> --check). It\n     gets a check token, exchanges it with AWS STS and dry-runs a machine.\n     Nothing is created.\n  4. status connected: done. status waiting-for-approval: an agent made the\n     link (or raised a limit), so a person approves it in the Cua Spaces\n     app; then `cua cloud status aws` says connected.\n  Verify: cua cloud status aws\n\nHetzner and Modal: the API token is sealed to your devices (only devices of\nyour account open it; Cua's servers keep ciphertext). Ask the person for a\nbudget and the token (Hetzner: Read & Write, Cloud Console, Security, API\ntokens; Modal: `modal token new`, given as <token id>:<token secret>), then:\n  cua cloud connect hetzner --token-stdin --region fsn1 --budget 50 --max-size 4x8\n  It seals by default on a device with the account's pool keys when a\n  budget is given; --sealed insists on it, --no-sealed keeps the token on\n  this device only (as before). --sealed without a token seals the one this\n  device already has.\n  Verify: cua cloud status hetzner (its line says which devices can open it)\n\nGoogle Cloud without a stored key:\n  1. cua cloud connect gcp --oidc --project my-project --region us-central1 --budget 200 --max-size 4x16\n  2. status needs-trust: a person opens `next.open` (Google Cloud Shell with\n     Cua's trust script) and pastes `next.paste`: it creates the workload\n     identity pool cua, its provider, the role cuaSpaces and one binding. No\n     keys, no service accounts. It prints the project number. An agent on a\n     machine signed in to gcloud gets `next.run` instead (the same script).\n  3. Run `next.run` (with --project-number <N> --check): Google's STS\n     exchanges a check token and the role's permissions are checked.\n  Verify: cua cloud status gcp\n\nAzure (always without a stored key):\n  1. cua cloud connect azure --region westus2 --budget 200 --max-size 4x16\n  2. status needs-trust: a person opens `next.open` (Deploy to Azure) and\n     deploys into resource group cua-spaces: the cua-spaces managed identity\n     trusting Cua's tokens, with Virtual Machine Contributor and Network\n     Contributor on that group only. No keys. Ask for the outputs\n     subscriptionId, tenantId and clientId. An agent on a machine signed in\n     to the az CLI gets `next.run` instead.\n  3. Run `next.run` (with --subscription --tenant --client-id --check):\n     Microsoft Entra exchanges a check token, the resource group is read\n     and a machine is validated.\n  Verify: cua cloud status azure\n\nAlibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):\n  Resolves credentials in order: --token-stdin (<access_key_id>:<access_key_secret>),\n  ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET, --profile <name>\n  in ~/.aliyun/config.json, saved credential store, or the active `current`\n  profile in ~/.aliyun/config.json. Default region: `cn-hangzhou`.\n    cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16\n    cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai\n  Verify: cua cloud status aliyun-ecs\n\nOther clouds use their own CLI sign-in on this device.\n`cua cloud trust <cloud>` prints the trust setup file (aws, gcp, azure).\nDocs for agents: https://cua.ai/docs/spaces/guides/connect-a-cloud\n\nExamples:\n  # AWS without a stored key: start, then check with the account id\n  cua cloud connect aws --oidc --region us-west-2 --budget 200 --max-size 4x16\n  cua cloud connect aws --oidc --region us-west-2 --budget 200 --max-size 4x16 --account-id 123456789012 --check\n  # Google Cloud without a stored key: start, then check with the project number\n  cua cloud connect gcp --oidc --project my-project --region us-central1 --budget 200\n  cua cloud connect gcp --oidc --project my-project --region us-central1 --budget 200 --project-number 123456789012 --check\n  # Azure: start, then check with the template's outputs\n  cua cloud connect azure --region westus2 --budget 200 --max-size 4x16\n  cua cloud connect azure --region westus2 --budget 200 --subscription 00000000-0000-0000-0000-000000000000 --tenant 11111111-1111-1111-1111-111111111111 --client-id 22222222-2222-2222-2222-222222222222 --check\n  # The cloud CLI's sign-in on this device, with the same limits\n  cua cloud connect aws --profile sandbox --region us-west-2 --budget 50 --default\n  cua cloud connect gcp --project my-project --region us-central1\n  cua cloud connect modal --environment spaces\n  # Hetzner: the project's API token on standard input, sealed to your devices\n  cua cloud connect hetzner --token-stdin --region fsn1 --budget 50 --max-size 4x8\n  # Modal: <token id>:<token secret> on standard input, sealed to your devices\n  cua cloud connect modal --token-stdin --budget 50\n  # Seal the Hetzner token this device already has\n  cua cloud connect hetzner --sealed --budget 50\n  # Spaces there delete themselves after 4 hours (default 8; 0: never)\n  cua cloud connect aws --ttl-hours 4\n  # Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile\n  cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8\n  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou",
      "aliases": [],
      "arguments": [
       {
        "default_value": null,
-       "help": "`aws`, `azure`, `gcp`, `hetzner` or `modal`",
+       "help": "`aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`",
        "hidden": false,
        "is_optional": false,
        "name": "PROVIDER",
@@ -16732,7 +16732,7 @@
        "aliases": [],
        "default_value": false,
        "env": null,
-       "help": "Hetzner or Modal: read the API token from stdin (Hetzner: a Read & Write project token, otherwise `HCLOUD_TOKEN`, the saved token or the hcloud CLI's context; Modal: `<token id>:<token secret>`). Once the checks pass it is sealed to your devices, or with --no-sealed saved in this device's Cua credential store (Hetzner)",
+       "help": "Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store",
        "hidden": false,
        "name": "token-stdin",
        "repeatable": false,
@@ -16803,7 +16803,7 @@
        "aliases": [],
        "default_value": null,
        "env": null,
-       "help": "AWS profile (`~/.aws/config`) or Modal profile (`~/.modal.toml`)",
+       "help": "AWS profile (`~/.aws/config`), Modal profile (`~/.modal.toml`), or Alibaba Cloud CLI profile (`~/.aliyun/config.json`)",
        "hidden": false,
        "is_optional": true,
        "multiple_values": false,
@@ -16819,7 +16819,7 @@
        "aliases": [],
        "default_value": null,
        "env": null,
-       "help": "AWS, Google Cloud or Azure region, or Hetzner location (default `fsn1`)",
+       "help": "AWS, Google Cloud, Azure or Alibaba Cloud region, or Hetzner location (default `fsn1` for Hetzner, `cn-hangzhou` for `aliyun-ecs`)",
        "hidden": false,
        "is_optional": true,
        "multiple_values": false,
@@ -17129,7 +17129,7 @@
      "arguments": [
       {
        "default_value": null,
-       "help": "`aws`, `azure`, `gcp`, `hetzner` or `modal`",
+       "help": "`aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`",
        "hidden": false,
        "is_optional": false,
        "name": "PROVIDER",
@@ -17143,7 +17143,7 @@
        "aliases": [],
        "default_value": false,
        "env": null,
-       "help": "Hetzner or Modal: read the API token from stdin (Hetzner: a Read & Write project token, otherwise `HCLOUD_TOKEN`, the saved token or the hcloud CLI's context; Modal: `<token id>:<token secret>`). Once the checks pass it is sealed to your devices, or with --no-sealed saved in this device's Cua credential store (Hetzner)",
+       "help": "Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store",
        "hidden": false,
        "name": "token-stdin",
        "repeatable": false,
@@ -17159,7 +17159,7 @@
        "aliases": [],
        "default_value": null,
        "env": null,
-       "help": "AWS profile (`~/.aws/config`) or Modal profile (`~/.modal.toml`)",
+       "help": "AWS profile (`~/.aws/config`), Modal profile (`~/.modal.toml`), or Alibaba Cloud CLI profile (`~/.aliyun/config.json`)",
        "hidden": false,
        "is_optional": true,
        "multiple_values": false,
@@ -17175,7 +17175,7 @@
        "aliases": [],
        "default_value": null,
        "env": null,
-       "help": "AWS, Google Cloud or Azure region, or Hetzner location (default `fsn1`)",
+       "help": "AWS, Google Cloud, Azure or Alibaba Cloud region, or Hetzner location (default `fsn1` for Hetzner, `cn-hangzhou` for `aliyun-ecs`)",
        "hidden": false,
        "is_optional": true,
        "multiple_values": false,
@@ -17247,7 +17247,7 @@
      "arguments": [
       {
        "default_value": null,
-       "help": "`aws`, `azure`, `gcp`, `hetzner` or `modal`",
+       "help": "`aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`",
        "hidden": false,
        "is_optional": false,
        "name": "PROVIDER",

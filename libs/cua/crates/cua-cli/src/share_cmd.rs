@@ -680,6 +680,7 @@ fn cloud_title(cloud: &str) -> String {
         "gcp" => "Google Cloud".into(),
         "azure" => "Azure".into(),
         "hetzner" => "Hetzner".into(),
+        "aliyun-ecs" => "Alibaba Cloud".into(),
         other => other.to_owned(),
     }
 }

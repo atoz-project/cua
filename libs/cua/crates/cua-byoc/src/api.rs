@@ -247,7 +247,12 @@ pub trait CloudApi: Send + Sync + 'static {
 /// How long to wait before retry `n` (1-based) of a rate-limited or
 /// briefly unavailable cloud call: 0.25 s doubling, at most 3 retries.
 #[cfg_attr(
-    not(any(feature = "gcp", feature = "azure", feature = "modal")),
+    not(any(
+        feature = "gcp",
+        feature = "azure",
+        feature = "modal",
+        feature = "aliyun-ecs"
+    )),
     allow(dead_code)
 )]
 pub(crate) fn retry_backoff(n: u32) -> Option<std::time::Duration> {
@@ -258,9 +263,24 @@ pub(crate) fn retry_backoff(n: u32) -> Option<std::time::Duration> {
 /// did not act on the call), 500, 502 and 504 only for reads and deletes
 /// (a create that may have happened is never repeated).
 #[cfg_attr(
-    not(any(feature = "gcp", feature = "azure", feature = "modal")),
+    not(any(
+        feature = "gcp",
+        feature = "azure",
+        feature = "modal",
+        feature = "aliyun-ecs"
+    )),
     allow(dead_code)
 )]
 pub(crate) fn retryable_status(status: u16, idempotent: bool) -> bool {
     matches!(status, 429 | 503) || (idempotent && matches!(status, 500 | 502 | 504))
+}
+
+/// Drops any staged secret on a [`CloudApi`] when the guard leaves scope
+/// (including across early returns or cancelled futures).
+pub(crate) struct UnstageGuard<'a>(pub &'a dyn CloudApi);
+
+impl Drop for UnstageGuard<'_> {
+    fn drop(&mut self) {
+        self.0.unstage_secret();
+    }
 }
