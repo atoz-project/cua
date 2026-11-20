@@ -49,6 +49,9 @@ pub fn target_of(c: &Connection) -> Target {
         project: some(&c.project),
         environment: some(&c.environment),
         token: None,
+        relay_url: c.relay_url.clone(),
+        relay_mode: c.relay_mode,
+        relay_token: None,
     }
 }
 

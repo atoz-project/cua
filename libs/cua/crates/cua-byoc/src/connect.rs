@@ -73,6 +73,13 @@ fn limits_of(req: &ConnectRequest) -> Result<Limits> {
 pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Result<CloudConnected> {
     let p = clouds.api(&req.target.provider)?.clone();
     let limits = limits_of(req)?;
+    let existing = clouds.store().connection(p.name()).map_err(Error::Io)?;
+    let relay = crate::manager::resolve_target_relay(
+        clouds.store().home().as_deref(),
+        p.name(),
+        &req.target,
+        existing.as_ref(),
+    )?;
     // Asked, or implied (Azure; Google Cloud with a project number), else
     // how it is linked already or the default for the cloud.
     let explicit = req
@@ -83,9 +90,16 @@ pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Resul
     let implied = req.auth_word();
     let auth = if explicit || implied != "cli" {
         implied
+    } else if relay.mode == cua_sandbox_core::byoc::RelayMode::Static {
+        "cli".into()
     } else {
         default_auth(clouds, p.as_ref(), &limits).await.into()
     };
+    if relay.mode == cua_sandbox_core::byoc::RelayMode::Static && auth != "cli" {
+        return Err(Error::InvalidArgument(
+            "--relay-mode static cannot be combined with --oidc or --sealed".into(),
+        ));
+    }
     match auth.as_str() {
         // Azure is linked through Cua's issuer only.
         "cli" if p.name() == "azure" => connect_oidc(clouds, p.as_ref(), req, &limits).await,
@@ -509,6 +523,20 @@ async fn connect_sealed(
     drop(token);
 
     // 5. Linked on this device (no token stored here).
+    let relay = crate::manager::resolve_target_relay(
+        store.home().as_deref(),
+        name,
+        &req.target,
+        local.as_ref(),
+    )?;
+    if let Some(url) = relay.probe_url.as_deref() {
+        let check = crate::relay::probe_relay_check(url, relay.mode).await;
+        if !check.ok {
+            return Ok(failed(check.detail, Some(line(budget))));
+        }
+    }
+    candidate.relay_url = relay.url;
+    candidate.relay_mode = relay.stored_mode;
     candidate.account = tested.account.clone();
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
@@ -524,6 +552,7 @@ async fn connect_sealed(
             mem_gib: m.memory_gib,
         })
         .or(max_size);
+    crate::relay::clear_static_relay_token(store.home().as_deref(), name);
     store.connect(candidate.clone()).map_err(Error::Io)?;
     tokens.forget(name);
     let mut a = crate::audit::entry("connect", name, agent.unwrap_or("user"));
@@ -1471,6 +1500,14 @@ async fn connect_oidc(
         })
         .or(max_size);
     let mut candidate = fed.candidate(&server.id, &recorded, &region, req, local.as_ref());
+    let relay = crate::manager::resolve_target_relay(
+        store.home().as_deref(),
+        p.name(),
+        &req.target,
+        local.as_ref().or(cli_link.as_ref()),
+    )?;
+    candidate.relay_url = relay.url;
+    candidate.relay_mode = relay.stored_mode;
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
     candidate.budget_usd_month = budget;
@@ -1515,7 +1552,7 @@ async fn connect_oidc(
         out.provider.approval = approval.into();
         return Ok(out);
     }
-    let tested: Tested = if req.check || !proven {
+    let mut tested: Tested = if req.check || !proven {
         p.test(&candidate).await
     } else {
         let mut t = Tested {
@@ -1529,6 +1566,11 @@ async fn connect_oidc(
         );
         t
     };
+    if let Some(url) = relay.probe_url.as_deref() {
+        tested
+            .checks
+            .push(crate::relay::probe_relay_check(url, relay.mode).await);
+    }
     if !tested.ok() {
         let untrusted = tested
             .checks
@@ -1577,6 +1619,7 @@ async fn connect_oidc(
     }
 
     // 5. Proven: saved on this device (replacing a CLI sign-in link).
+    crate::relay::clear_static_relay_token(store.home().as_deref(), p.name());
     store.connect(candidate.clone()).map_err(Error::Io)?;
     let mut a = crate::audit::entry("connect", p.name(), agent.unwrap_or("user"));
     a.detail = format!(

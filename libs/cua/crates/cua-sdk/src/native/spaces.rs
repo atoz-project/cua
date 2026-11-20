@@ -3862,8 +3862,19 @@ mod require_fields_tests {
             "role_arn",
             "check",
             "agent",
+            "relay_url",
+            "relay_mode",
+            "relay_token",
         ];
         assert!(missing_fields(&ours, "cloud_connect", &all).is_empty());
+        assert!(
+            missing_fields(
+                &ours,
+                "cloud_test",
+                &["relay_url", "relay_mode", "relay_token"]
+            )
+            .is_empty()
+        );
     }
 
     struct Nothing;

@@ -88,6 +88,12 @@ Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
     cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
   Verify: cua cloud status aliyun-ecs
 
+Self-hosted relay (per connection, default https://relay.cua.ai in Account Relay Mode):
+  Account Relay Mode on a custom relay keeps dynamic machine registration and JWKS:
+    cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
+  Static Relay Mode uses a shared relay token and per-sandbox env tokens (no cua auth login):
+    cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1
+
 Other clouds use their own CLI sign-in on this device.
 `cua cloud trust <cloud>` prints the trust setup file (aws, gcp, azure).
 Docs for agents: https://cua.ai/docs/spaces/guides/connect-a-cloud
@@ -116,7 +122,10 @@ Examples:
   cua cloud connect aws --ttl-hours 4
   # Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile
   cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8
-  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou";
+  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou
+  # Self-hosted relay: Account Relay Mode or Static Relay Mode
+  cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
+  cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1";
 
 /// Where in a cloud account Spaces go.
 #[derive(Args, Debug, Clone, Default)]
@@ -148,6 +157,18 @@ pub struct TargetArgs {
     /// device's Cua credential store.
     #[arg(long)]
     pub token_stdin: bool,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[arg(long, value_name = "URL")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to
+    /// `account`).
+    #[arg(long, value_parser = ["account", "static"])]
+    pub relay_mode: Option<String>,
+    /// Static Relay Mode: read the shared static relay registration token
+    /// from stdin (never pass tokens in argv).
+    #[arg(long, conflicts_with = "token_stdin")]
+    pub relay_token_stdin: bool,
 }
 
 impl TargetArgs {
@@ -156,10 +177,13 @@ impl TargetArgs {
     }
 
     fn target_with_stdin(&self, read_stdin: impl FnOnce() -> String) -> CloudTarget {
-        let token = self
-            .token_stdin
-            .then(read_stdin)
-            .map(|t| t.trim().to_string());
+        let (token, relay_token) = if self.token_stdin {
+            (Some(read_stdin().trim().to_string()), None)
+        } else if self.relay_token_stdin {
+            (None, Some(read_stdin().trim().to_string()))
+        } else {
+            (None, None)
+        };
         CloudTarget {
             token,
             provider: self.provider.trim().to_ascii_lowercase(),
@@ -168,12 +192,16 @@ impl TargetArgs {
             zone: self.zone.clone(),
             project: self.project.clone(),
             environment: self.environment.clone(),
+            relay_url: self.relay_url.clone(),
+            relay_mode: self.relay_mode.clone(),
+            relay_token,
         }
     }
 }
 
 /// `cua cloud`.
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CloudCmd {
     /// Your clouds: found credentials, the connected account and region,
     /// what each runs at what hourly cost, and what Cua created there.
@@ -1350,6 +1378,16 @@ fn limits_line(p: &cua_sdk::CloudProvider) -> Option<String> {
             format!("Token sealed; can open it: {}.", p.holders.join(", "))
         });
     }
+    if p.relay_mode.as_deref() == Some("static") {
+        let url = p.relay_url.as_deref().unwrap_or_default();
+        parts.push(format!("Static Relay Mode ({url})."));
+    } else if let Some(url) = p
+        .relay_url
+        .as_deref()
+        .filter(|u| !u.is_empty() && *u != "https://relay.cua.ai")
+    {
+        parts.push(format!("Relay: {url}."));
+    }
     match p.approval.as_str() {
         "connection" => parts.push("A person approves it in Cua Spaces.".into()),
         "limits" => parts.push("A person approves the new limits in Cua Spaces.".into()),
@@ -1468,6 +1506,16 @@ fn connect_lines(c: &cua_sdk::CloudConnected) -> Vec<String> {
         if p.auth == "oidc" {
             out.push("Signs in through Cua (no stored key)".into());
         }
+        if p.relay_mode.as_deref() == Some("static") {
+            let url = p.relay_url.as_deref().unwrap_or_default();
+            out.push(format!("Relay: {url} (static)"));
+        } else if let Some(url) = p
+            .relay_url
+            .as_deref()
+            .filter(|u| !u.is_empty() && *u != "https://relay.cua.ai")
+        {
+            out.push(format!("Relay: {url} (account)"));
+        }
     }
     for ch in &c.checks {
         out.push(check_line(ch));
@@ -1533,6 +1581,8 @@ fn provider_json(p: &cua_sdk::CloudProvider) -> serde_json::Value {
         "suggest_auth": p.suggest_auth,
         "issue": p.issue,
         "holders": p.holders,
+        "relay_url": p.relay_url,
+        "relay_mode": p.relay_mode,
         "kinds": p.kinds.iter().map(|k| serde_json::json!({
             "image": k.image, "kind": k.kind, "supported": k.supported, "reason": k.reason,
             "machine_type": k.machine_type, "usd_per_hour": k.usd_per_hour,
@@ -2236,5 +2286,83 @@ mod tests {
         };
         assert_eq!(cost_table(&empty), vec!["Nothing ran since 2026-10-01."]);
         assert_eq!(cost_json(&r)["rows"][0]["key"], "research");
+    }
+
+    #[test]
+    fn relay_flags_parse_conflict_preserve_empty_stdin_and_redact_output() {
+        match parse(&[
+            "connect",
+            "hetzner",
+            "--relay-url",
+            "https://relay.example.com/",
+            "--relay-mode",
+            "static",
+            "--relay-token-stdin",
+        ]) {
+            CloudCmd::Connect { target, .. } => {
+                assert_eq!(
+                    target.relay_url.as_deref(),
+                    Some("https://relay.example.com/")
+                );
+                assert_eq!(target.relay_mode.as_deref(), Some("static"));
+                assert!(target.relay_token_stdin);
+                let wire = target.target_with_stdin(|| "  static-tok \n".into());
+                assert_eq!(wire.relay_token.as_deref(), Some("static-tok"));
+                assert_eq!(wire.relay_mode.as_deref(), Some("static"));
+                assert!(!format!("{wire:?}").contains("static-tok"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Empty stdin for --relay-token-stdin produces Some("") so backend rejects it cleanly.
+        let empty = TargetArgs {
+            provider: "hetzner".into(),
+            relay_token_stdin: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            empty
+                .target_with_stdin(|| " \t\n ".into())
+                .relay_token
+                .as_deref(),
+            Some("")
+        );
+
+        // --relay-token-stdin conflicts with --token-stdin.
+        parse_err(&["connect", "hetzner", "--token-stdin", "--relay-token-stdin"]);
+
+        // connect_lines / limits_line / provider_json show relay mode & URL without tokens.
+        let p = cua_sdk::CloudProvider {
+            name: "hetzner".into(),
+            title: "Hetzner Cloud".into(),
+            connected: true,
+            status: "connected".into(),
+            auth: "token".into(),
+            relay_url: Some("https://relay.example.com".into()),
+            relay_mode: Some("static".into()),
+            ..Default::default()
+        };
+        let lines = connect_lines(&cua_sdk::CloudConnected {
+            provider: p.clone(),
+            verify: "cua cloud status hetzner".into(),
+            ..Default::default()
+        });
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "Relay: https://relay.example.com (static)"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("https://relay.example.com"))
+        );
+        let lim = limits_line(&p).unwrap();
+        assert!(lim.contains("https://relay.example.com"), "{lim}");
+        assert!(lim.contains("Static Relay Mode"), "{lim}");
+        let j = provider_json(&p);
+        assert_eq!(j["relay_mode"], "static");
+        assert_eq!(j["relay_url"], "https://relay.example.com");
     }
 }

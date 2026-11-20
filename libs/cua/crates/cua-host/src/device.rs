@@ -399,6 +399,23 @@ impl DeviceAuth {
         self
     }
 
+    /// Creates a `DeviceAuth` for another `relay_url`, keeping the same
+    /// account tokens, device key slot, and device name.
+    pub fn rebind(&self, relay_url: &str) -> Result<Self> {
+        Ok(Self {
+            relay: RelayClient::new(relay_url)?,
+            tokens: self.tokens.clone(),
+            slot: self.slot.clone(),
+            name: self.name.clone(),
+            machine_id: std::sync::OnceLock::new(),
+            session: tokio::sync::Mutex::new(None),
+            session_key: std::sync::atomic::AtomicU64::new(0),
+            key_checked_ms: std::sync::atomic::AtomicU64::new(0),
+            key_recheck_ms: self.key_recheck_ms,
+            pending_file: self.pending_file.clone(),
+        })
+    }
+
     /// Whether the key in the slot is no longer the one the cached session
     /// was opened with: another process (the app, the CLI) enrolled this
     /// device again, for instance after a sign-in as another account. The

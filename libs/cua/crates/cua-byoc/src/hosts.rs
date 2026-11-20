@@ -569,7 +569,12 @@ impl Hosts {
             .apis
             .iter()
             .filter_map(|a| self.store.connection(a.name()).ok().flatten())
-            .map(|c| format!("{}/{}/{}/{:?};", c.provider, c.region, c.zone, c.max_size))
+            .map(|c| {
+                format!(
+                    "{}/{}/{}/{:?}/{:?};",
+                    c.provider, c.region, c.zone, c.max_size, c.relay_mode
+                )
+            })
             .collect();
         if let Some((at, sig, v)) = self.offers.lock().unwrap().as_ref()
             && at.elapsed() < OFFERS_TTL
@@ -585,6 +590,9 @@ impl Hosts {
             let Ok(Some(conn)) = self.store.connection(api.name()) else {
                 continue;
             };
+            if conn.is_static_relay() {
+                continue;
+            }
             let caps = api.capabilities(&conn);
             if caps.supplies == Supplies::Nothing {
                 continue;

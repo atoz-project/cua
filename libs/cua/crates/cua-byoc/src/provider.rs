@@ -69,6 +69,14 @@ pub struct CloudSandboxes {
     relay: RelayAccess,
 }
 
+enum ResolvedConnectionRelay {
+    Account(RelayAccess),
+    Static {
+        relay_url: String,
+        relay_token: crate::api::Secret,
+    },
+}
+
 impl CloudSandboxes {
     /// `api`, recording into `store`, joining its sandboxes to `relay`.
     pub fn new(api: Arc<dyn CloudApi>, store: Arc<Store>, relay: RelayAccess) -> Self {
@@ -96,6 +104,48 @@ impl CloudSandboxes {
                     self.api.name()
                 ))
             })
+    }
+
+    fn relay_url_for(&self, conn: &Connection) -> String {
+        conn.effective_relay_url(&self.relay.url).to_string()
+    }
+
+    fn relay_for(&self, conn: &Connection) -> Result<ResolvedConnectionRelay> {
+        if conn.is_static_relay() {
+            let relay_url = conn
+                .relay_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    Error::Cloud(format!(
+                        "{} is connected in Static Relay Mode, but no relay URL is recorded; \
+                         reconnect with `cua cloud connect {} --relay-mode static --relay-url <URL> --relay-token-stdin`",
+                        self.api.title(),
+                        self.api.name()
+                    ))
+                })?
+                .to_string();
+            let relay_token = crate::relay::load_static_relay_token(
+                self.store.home().as_deref(),
+                self.api.name(),
+            )?
+            .ok_or_else(|| {
+                Error::Cloud(format!(
+                    "{} is connected in Static Relay Mode, but its relay token is missing \
+                             from the credential store; reconnect with `cua cloud connect {} \
+                             --relay-mode static --relay-url {relay_url} --relay-token-stdin`",
+                    self.api.title(),
+                    self.api.name()
+                ))
+            })?;
+            return Ok(ResolvedConnectionRelay::Static {
+                relay_url,
+                relay_token,
+            });
+        }
+        let url = self.relay_url_for(conn);
+        Ok(ResolvedConnectionRelay::Account(self.relay.rebind(&url)?))
     }
 
     /// What the sandbox's relay machine says about it (no secrets): every
@@ -227,7 +277,7 @@ impl CloudSandboxes {
             }
         }
         if !machine.is_empty() {
-            self.forget_machine(machine).await;
+            self.forget_machine(conn, machine).await;
         }
     }
 
@@ -271,10 +321,22 @@ impl CloudSandboxes {
         Some(bootlog::summary(path.as_deref(), &lines))
     }
 
-    /// Removes a relay machine; when the relay cannot be reached it is
-    /// recorded for the sweeper instead of leaking.
-    async fn forget_machine(&self, machine: &str) {
-        if let Err(e) = self.relay.forget(machine).await {
+    /// Removes a relay machine; in Static Relay Mode there is no account
+    /// directory entry, so only the per-sandbox `env_token` is removed.
+    async fn forget_machine(&self, conn: &Connection, machine: &str) {
+        if conn.is_static_relay() {
+            let _ = crate::relay::remove_env_token(
+                self.store.home().as_deref(),
+                self.api.name(),
+                machine,
+            );
+            return;
+        }
+        let relay = self
+            .relay
+            .rebind(&self.relay_url_for(conn))
+            .unwrap_or_else(|_| self.relay.clone());
+        if let Err(e) = relay.forget(machine).await {
             tracing::warn!(machine, "relay machine left for the sweeper: {e}");
             let _ = self.store.record(Resource {
                 provider: self.api.name().into(),
@@ -455,12 +517,19 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         let machine = format!("cloud-{suffix}");
         let resource_name = format!("cua-{}-{}", self.api.name(), &suffix[..12]);
         let sandbox = format!("{}:{}", self.api.name(), spec.name);
+        let resolved_relay = self.relay_for(&conn)?;
+        let effective_relay_url = self.relay_url_for(&conn);
         // The network rules the Space asked for: kept by the cloud itself or
         // refused, before anything is made (never created without them).
         let network = if spec.egress.is_empty() && !spec.no_network && !spec.protect {
             None
         } else if self.api.takes_network_rules() {
-            crate::modal_net::request(&spec.egress, spec.no_network, spec.protect, &self.relay.url)?
+            crate::modal_net::request(
+                &spec.egress,
+                spec.no_network,
+                spec.protect,
+                &effective_relay_url,
+            )?
         } else if spec.egress.is_empty() && !spec.no_network && matches!(self.api.tier(), Tier::Vm)
         {
             // Internet only, kept by the computer's own firewall.
@@ -473,19 +542,59 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 self.api.title()
             )));
         };
-        // 1. The relay machine the sandbox joins as.
-        let join = self
-            .relay
-            .register_with(&machine, &spec.name, self.meta(&conn, &spec.name, &owner))
-            .await?;
-        // The relay must be readable by this device before anything is
-        // created: a sign-in or enrollment problem found after the cloud
-        // call would bill a machine for nothing.
-        if let Err(e) = self.relay.online(&machine).await
-            && crate::relay::is_fatal(&e)
-        {
-            self.forget_machine(&machine).await;
-            return Err(e);
+        // 1. The relay machine the sandbox joins as (account registration or static token).
+        let (join, static_env_token) = match &resolved_relay {
+            ResolvedConnectionRelay::Account(relay) => {
+                let join = relay
+                    .register_with(&machine, &spec.name, self.meta(&conn, &spec.name, &owner))
+                    .await?;
+                // The relay must be readable by this device before anything is
+                // created: a sign-in or enrollment problem found after the cloud
+                // call would bill a machine for nothing.
+                if let Err(e) = relay.online(&machine).await
+                    && crate::relay::is_fatal(&e)
+                {
+                    self.forget_machine(&conn, &machine).await;
+                    return Err(e);
+                }
+                (join, None)
+            }
+            ResolvedConnectionRelay::Static {
+                relay_url,
+                relay_token,
+            } => {
+                let env_token = spec
+                    .env
+                    .get("CUA_ENV_TOKEN")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{:016x}{:016x}",
+                            rand::random::<u64>(),
+                            rand::random::<u64>()
+                        )
+                    });
+                crate::relay::save_env_token(
+                    self.store.home().as_deref(),
+                    self.api.name(),
+                    &machine,
+                    &env_token,
+                )?;
+                let join = crate::relay::Join {
+                    relay_url: relay_url.clone(),
+                    machine_id: machine.clone(),
+                    machine_token: relay_token.expose().to_string(),
+                    jwks_json: String::new(),
+                    owner: String::new(),
+                    owner_email: String::new(),
+                };
+                (join, Some(env_token))
+            }
+        };
+        let mut guest_env = spec.env.clone();
+        if let Some(tok) = &static_env_token {
+            guest_env.insert("CUA_ENV_TOKEN".into(), tok.clone());
         }
         let mut rec = Resource {
             provider: self.api.name().into(),
@@ -546,7 +655,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 provision.user_data = cloud_init(&VmBoot {
                     join: &join,
                     image: &spec.image.pinned_ref,
-                    env: &spec.env,
+                    env: &guest_env,
                     expires,
                     ttl_secs,
                     shm_mb: 2048,
@@ -556,7 +665,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 });
             }
             Tier::Sandbox => {
-                let mut env = spec.env.clone();
+                let mut env = guest_env.clone();
                 env.extend(join.guest_env());
                 provision.env = env;
                 provision.command = spec.command.clone();
@@ -599,15 +708,31 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         }
         // 4. The guest boots and joins the relay.
         let budget = spec.timeout.max(ONLINE_WAIT);
-        let joined = self
-            .relay
-            .wait_online(&machine, budget, || self.alive(&conn, &rec))
-            .await;
+        let joined = match (&resolved_relay, &static_env_token) {
+            (ResolvedConnectionRelay::Account(relay), _) => {
+                relay
+                    .wait_online(&machine, budget, || self.alive(&conn, &rec))
+                    .await
+            }
+            (ResolvedConnectionRelay::Static { relay_url, .. }, Some(env_tok)) => {
+                let machine_url = format!("{}/m/{machine}", relay_url.trim_end_matches('/'));
+                crate::relay::wait_static_online(&machine_url, env_tok, budget, || {
+                    self.alive(&conn, &rec)
+                })
+                .await
+            }
+            (ResolvedConnectionRelay::Static { .. }, None) => {
+                unreachable!("static relay always mints or uses an env token")
+            }
+        };
         if let Err(e) = joined {
             // The evidence first: the rollback deletes the machine and its
             // log with it.
-            let mut secrets: Vec<&str> = vec![&join.machine_token, &join.jwks_json];
-            secrets.extend(spec.env.values().map(String::as_str));
+            let mut secrets: Vec<&str> = vec![&join.machine_token];
+            if !join.jwks_json.is_empty() {
+                secrets.push(&join.jwks_json);
+            }
+            secrets.extend(guest_env.values().map(String::as_str));
             let evidence = self.keep_boot_log(&conn, &all[0], &secrets).await;
             self.rollback(&conn, &owner, &all[..1], &machine).await;
             return Err(with_evidence(e, evidence));
@@ -691,7 +816,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             "deleted with its sandbox",
         ));
         if !rec.machine.is_empty() {
-            self.forget_machine(&rec.machine).await;
+            self.forget_machine(&conn, &rec.machine).await;
         }
         Ok(())
     }
@@ -701,8 +826,12 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .details
             .get(DETAIL_RELAY_MACHINE)
             .ok_or_else(|| Error::NotFound(format!("the relay computer of {}", instance.id)))?;
+        let base = match self.connection() {
+            Ok(conn) => self.relay_url_for(&conn),
+            Err(_) => self.relay.url.clone(),
+        };
         Ok(ServiceEndpoint {
-            url: self.relay.machine_url(machine),
+            url: format!("{}/m/{machine}", base.trim_end_matches('/')),
             headers: vec![],
         })
     }
@@ -713,7 +842,35 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         _port: u16,
     ) -> Option<Result<cua_spacesd_client::ConnectOptions>> {
         let machine = instance.details.get(DETAIL_RELAY_MACHINE)?;
-        Some(self.relay.connect_options(machine))
+        let conn = match self.connection() {
+            Ok(c) => c,
+            Err(_) => return Some(self.relay.connect_options(machine)),
+        };
+        if conn.is_static_relay() {
+            let url = format!(
+                "{}/m/{machine}",
+                self.relay_url_for(&conn).trim_end_matches('/')
+            );
+            let mut opts = match cua_spacesd_client::ConnectOptions::parse(&url) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(Error::InvalidArgument(e.to_string()))),
+            };
+            opts.gateway = None;
+            opts.token = match crate::relay::load_env_token(
+                self.store.home().as_deref(),
+                self.api.name(),
+                machine,
+            ) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            return Some(Ok(opts));
+        }
+        let relay = match self.relay.rebind(&self.relay_url_for(&conn)) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(relay.connect_options(machine))
     }
 
     // A cloud VM stops (compute billing stops, its disk stays) and starts
@@ -749,9 +906,34 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .ok_or_else(|| Error::NotFound(format!("{}:{id}", self.api.name())))?;
         self.api.start(&conn, &rec, &owner).await?;
         if !rec.machine.is_empty() {
-            self.relay
-                .wait_online(&rec.machine, ONLINE_WAIT, || self.alive(&conn, &rec))
-                .await?;
+            match self.relay_for(&conn)? {
+                ResolvedConnectionRelay::Account(relay) => {
+                    relay
+                        .wait_online(&rec.machine, ONLINE_WAIT, || self.alive(&conn, &rec))
+                        .await?;
+                }
+                ResolvedConnectionRelay::Static { relay_url, .. } => {
+                    let env_token = crate::relay::load_env_token(
+                        self.store.home().as_deref(),
+                        self.api.name(),
+                        &rec.machine,
+                    )?
+                    .ok_or_else(|| {
+                        Error::Cloud(format!(
+                            "{}: environment token for static relay machine {} is missing from the \
+                             credential store",
+                            self.api.name(),
+                            rec.machine
+                        ))
+                    })?;
+                    let machine_url =
+                        format!("{}/m/{}", relay_url.trim_end_matches('/'), rec.machine);
+                    crate::relay::wait_static_online(&machine_url, &env_token, ONLINE_WAIT, || {
+                        self.alive(&conn, &rec)
+                    })
+                    .await?;
+                }
+            }
         }
         rec.state = "running".into();
         self.store.record(rec.clone()).map_err(Self::io)?;

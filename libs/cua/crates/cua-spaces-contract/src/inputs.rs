@@ -1952,16 +1952,16 @@ fn drop_null_option(schema: &mut serde_json::Value) {
     }
 }
 
-/// Which cloud a `cloud_*` tool acts on: `aws`, `azure`, `gcp`, `hetzner` or
-/// `modal`.
+/// Which cloud a `cloud_*` tool acts on: `aws`, `azure`, `gcp`, `hetzner`,
+/// `modal`, or `aliyun-ecs`.
 pub type CloudArg = String;
 
 /// `cloud_status`: the clouds Spaces can be created in, and what Cua
 /// created in them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudStatus {
-    /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`). Default:
-    /// every one.
+    /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
+    /// Default: every one.
     #[serde(default)]
     pub provider: Option<CloudArg>,
 }
@@ -2094,16 +2094,16 @@ pub struct CloudReconcile {}
 /// store.
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudTarget {
-    /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: CloudArg,
     /// AWS: the profile in `~/.aws/config` (default: `default`, or
     /// `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the
-    /// active one).
+    /// active one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`.
     #[serde(default)]
     pub profile: Option<String>,
     /// AWS region (default: the profile's, else `us-west-2`), Hetzner location
-    /// (default `fsn1`), GCP region (default `us-central1`) or Azure region
-    /// (default `westus2`).
+    /// (default `fsn1`), GCP region (default `us-central1`), Azure region
+    /// (default `westus2`), or Alibaba Cloud region (default `cn-hangzhou`).
     #[serde(default)]
     pub region: Option<String>,
     /// GCP zone in the region (default: its `-a` zone).
@@ -2119,11 +2119,25 @@ pub struct CloudTarget {
     pub environment: Option<String>,
     /// Hetzner: the project's Read & Write API token (default:
     /// `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).
-    /// Modal: `<token id>:<token secret>`. Secret: never logged or
+    /// Modal: `<token id>:<token secret>`. Alibaba Cloud ECS:
+    /// `<access_key_id>:<access_key_secret>`. Secret: never logged or
     /// returned; sealed to the account's devices on connect (or, Hetzner
-    /// with `auth: cli`, saved in this device's Cua credential store).
+    /// and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua
+    /// credential store).
     #[serde(default)]
     pub token: Option<String>,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to
+    /// `account`).
+    #[serde(default)]
+    pub relay_mode: Option<String>,
+    /// Shared static relay registration token for Static Relay Mode.
+    /// Secret: never logged, returned, or stored in plaintext config.
+    #[serde(default)]
+    pub relay_token: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -2136,6 +2150,12 @@ impl std::fmt::Debug for CloudTarget {
             .field("project", &self.project)
             .field("environment", &self.environment)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "relay_token",
+                &self.relay_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -2227,7 +2247,7 @@ pub struct CloudTest {
 /// `cloud_disconnect`: forget a connected cloud.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudDisconnect {
-    /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: CloudArg,
     /// Delete everything Cua created in that cloud first, and disconnect
     /// only once the cloud confirms nothing is left. Default false: the
@@ -2240,7 +2260,7 @@ pub struct CloudDisconnect {
 /// on a cloud: its link, or a raise of its limits.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudApprove {
-    /// `aws`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: CloudArg,
     /// Decline instead: an agent's raise is dropped (the limits in force
     /// stay), an agent's link that was never approved is disconnected.
@@ -2255,7 +2275,8 @@ pub struct CloudAudit {
     /// How many of the newest entries (default 50, at most 1000).
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one.
+    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
+    /// Default: every one.
     #[serde(default)]
     pub provider: Option<CloudArg>,
 }
@@ -2264,7 +2285,8 @@ pub struct CloudAudit {
 /// estimated from list price times runtime.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudCost {
-    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one.
+    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
+    /// Default: every one.
     #[serde(default)]
     pub provider: Option<CloudArg>,
     /// One row per `space`, `agent`, `day` (UTC) or `cloud`. Default `space`.

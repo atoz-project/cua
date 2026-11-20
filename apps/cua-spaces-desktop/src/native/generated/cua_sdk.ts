@@ -5626,7 +5626,17 @@ export type CloudProvider = {
      * `sealed`: the devices that can open the account's API token
      * ("Can open it").
      */
-    holders: Array<string>
+    holders: Array<string>,
+    /**
+     * Per-connection relay base URL (`https://relay.cua.ai` by default),
+     * or `None` when not connected.
+     */
+    relayUrl?: string,
+    /**
+     * Relay authentication mode (`account` or `static`), or `None` when
+     * not connected.
+     */
+    relayMode?: string
 }
 
 /**
@@ -5678,7 +5688,9 @@ const FfiConverterTypeCloudProvider = (() => {
                 canApprove: FfiConverterBool.read(from),
                 suggestAuth: FfiConverterString.read(from),
                 issue: FfiConverterString.read(from),
-                holders: FfiConverterSequenceString.read(from)
+                holders: FfiConverterSequenceString.read(from),
+                relayUrl: FfiConverterOptionalString.read(from),
+                relayMode: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -5711,6 +5723,8 @@ const FfiConverterTypeCloudProvider = (() => {
             FfiConverterString.write(value.suggestAuth, into);
             FfiConverterString.write(value.issue, into);
             FfiConverterSequenceString.write(value.holders, into);
+            FfiConverterOptionalString.write(value.relayUrl, into);
+            FfiConverterOptionalString.write(value.relayMode, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.name) +
@@ -5741,7 +5755,9 @@ const FfiConverterTypeCloudProvider = (() => {
              FfiConverterBool.allocationSize(value.canApprove) +
              FfiConverterString.allocationSize(value.suggestAuth) +
              FfiConverterString.allocationSize(value.issue) +
-             FfiConverterSequenceString.allocationSize(value.holders);
+             FfiConverterSequenceString.allocationSize(value.holders) +
+             FfiConverterOptionalString.allocationSize(value.relayUrl) +
+             FfiConverterOptionalString.allocationSize(value.relayMode);
 
         }
     };
@@ -6329,15 +6345,15 @@ const FfiConverterTypeCloudSweepReport = (() => {
  */
 export type CloudTarget = {
     /**
-     * `aws`, `gcp`, `hetzner` or `modal`.
+     * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
      */
     provider: string,
     /**
-     * AWS or Modal profile.
+     * AWS, Modal, or Alibaba Cloud CLI profile.
      */
     profile?: string,
     /**
-     * AWS or GCP region, or Hetzner location (`fsn1`).
+     * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
      */
     region?: string,
     /**
@@ -6353,11 +6369,25 @@ export type CloudTarget = {
      */
     environment?: string,
     /**
-     * Hetzner: the project's Read & Write API token. Secret: used for the
-     * checks, saved in the Cua credential store when they pass, never
-     * printed.
+     * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+     * Secret: used for the checks, saved in the Cua credential store when
+     * they pass, never printed.
      */
-    token?: string
+    token?: string,
+    /**
+     * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+     * in Account Relay Mode).
+     */
+    relayUrl?: string,
+    /**
+     * Relay authentication mode (`account` or `static`; defaults to `account`).
+     */
+    relayMode?: string,
+    /**
+     * Shared static relay registration token for Static Relay Mode. Secret:
+     * never printed or stored in plaintext config.
+     */
+    relayToken?: string
 }
 
 /**
@@ -6370,7 +6400,10 @@ export const CloudTarget = (() => {
         zone: undefined,
         project: undefined,
         environment: undefined,
-        token: undefined
+        token: undefined,
+        relayUrl: undefined,
+        relayMode: undefined,
+        relayToken: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<CloudTarget, ReturnType<typeof defaults>>(defaults);
@@ -6393,7 +6426,10 @@ const FfiConverterTypeCloudTarget = (() => {
                 zone: FfiConverterOptionalString.read(from),
                 project: FfiConverterOptionalString.read(from),
                 environment: FfiConverterOptionalString.read(from),
-                token: FfiConverterOptionalString.read(from)
+                token: FfiConverterOptionalString.read(from),
+                relayUrl: FfiConverterOptionalString.read(from),
+                relayMode: FfiConverterOptionalString.read(from),
+                relayToken: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -6404,6 +6440,9 @@ const FfiConverterTypeCloudTarget = (() => {
             FfiConverterOptionalString.write(value.project, into);
             FfiConverterOptionalString.write(value.environment, into);
             FfiConverterOptionalString.write(value.token, into);
+            FfiConverterOptionalString.write(value.relayUrl, into);
+            FfiConverterOptionalString.write(value.relayMode, into);
+            FfiConverterOptionalString.write(value.relayToken, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.provider) +
@@ -6412,7 +6451,10 @@ const FfiConverterTypeCloudTarget = (() => {
              FfiConverterOptionalString.allocationSize(value.zone) +
              FfiConverterOptionalString.allocationSize(value.project) +
              FfiConverterOptionalString.allocationSize(value.environment) +
-             FfiConverterOptionalString.allocationSize(value.token);
+             FfiConverterOptionalString.allocationSize(value.token) +
+             FfiConverterOptionalString.allocationSize(value.relayUrl) +
+             FfiConverterOptionalString.allocationSize(value.relayMode) +
+             FfiConverterOptionalString.allocationSize(value.relayToken);
 
         }
     };

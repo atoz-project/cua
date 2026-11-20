@@ -22431,6 +22431,16 @@ public struct CloudProvider: Equatable, Hashable {
      * ("Can open it").
      */
     public var holders: [String]
+    /**
+     * Per-connection relay base URL (`https://relay.cua.ai` by default),
+     * or `None` when not connected.
+     */
+    public var relayUrl: String?
+    /**
+     * Relay authentication mode (`account` or `static`), or `None` when
+     * not connected.
+     */
+    public var relayMode: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -22503,7 +22513,15 @@ public struct CloudProvider: Equatable, Hashable {
         /**
          * `sealed`: the devices that can open the account's API token
          * ("Can open it").
-         */holders: [String]) {
+         */holders: [String],
+        /**
+         * Per-connection relay base URL (`https://relay.cua.ai` by default),
+         * or `None` when not connected.
+         */relayUrl: String?,
+        /**
+         * Relay authentication mode (`account` or `static`), or `None` when
+         * not connected.
+         */relayMode: String?) {
         self.name = name
         self.title = title
         self.tier = tier
@@ -22533,6 +22551,8 @@ public struct CloudProvider: Equatable, Hashable {
         self.suggestAuth = suggestAuth
         self.issue = issue
         self.holders = holders
+        self.relayUrl = relayUrl
+        self.relayMode = relayMode
     }
 
 
@@ -22579,7 +22599,9 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
                 canApprove: FfiConverterBool.read(from: &buf),
                 suggestAuth: FfiConverterString.read(from: &buf),
                 issue: FfiConverterString.read(from: &buf),
-                holders: FfiConverterSequenceString.read(from: &buf)
+                holders: FfiConverterSequenceString.read(from: &buf),
+                relayUrl: FfiConverterOptionString.read(from: &buf),
+                relayMode: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -22613,6 +22635,8 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
         FfiConverterString.write(value.suggestAuth, into: &buf)
         FfiConverterString.write(value.issue, into: &buf)
         FfiConverterSequenceString.write(value.holders, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayMode, into: &buf)
     }
 }
 
@@ -22981,15 +23005,15 @@ public func FfiConverterTypeCloudSweepReport_lower(_ value: CloudSweepReport) ->
  */
 public struct CloudTarget: Equatable, Hashable {
     /**
-     * `aws`, `gcp`, `hetzner` or `modal`.
+     * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
      */
     public var provider: String
     /**
-     * AWS or Modal profile.
+     * AWS, Modal, or Alibaba Cloud CLI profile.
      */
     public var profile: String?
     /**
-     * AWS or GCP region, or Hetzner location (`fsn1`).
+     * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
      */
     public var region: String?
     /**
@@ -23005,23 +23029,37 @@ public struct CloudTarget: Equatable, Hashable {
      */
     public var environment: String?
     /**
-     * Hetzner: the project's Read & Write API token. Secret: used for the
-     * checks, saved in the Cua credential store when they pass, never
-     * printed.
+     * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+     * Secret: used for the checks, saved in the Cua credential store when
+     * they pass, never printed.
      */
     public var token: String?
+    /**
+     * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+     * in Account Relay Mode).
+     */
+    public var relayUrl: String?
+    /**
+     * Relay authentication mode (`account` or `static`; defaults to `account`).
+     */
+    public var relayMode: String?
+    /**
+     * Shared static relay registration token for Static Relay Mode. Secret:
+     * never printed or stored in plaintext config.
+     */
+    public var relayToken: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * `aws`, `gcp`, `hetzner` or `modal`.
+         * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
          */provider: String,
         /**
-         * AWS or Modal profile.
+         * AWS, Modal, or Alibaba Cloud CLI profile.
          */profile: String? = nil,
         /**
-         * AWS or GCP region, or Hetzner location (`fsn1`).
+         * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
          */region: String? = nil,
         /**
          * GCP zone.
@@ -23033,10 +23071,21 @@ public struct CloudTarget: Equatable, Hashable {
          * Modal environment.
          */environment: String? = nil,
         /**
-         * Hetzner: the project's Read & Write API token. Secret: used for the
-         * checks, saved in the Cua credential store when they pass, never
-         * printed.
-         */token: String? = nil) {
+         * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+         * Secret: used for the checks, saved in the Cua credential store when
+         * they pass, never printed.
+         */token: String? = nil,
+        /**
+         * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+         * in Account Relay Mode).
+         */relayUrl: String? = nil,
+        /**
+         * Relay authentication mode (`account` or `static`; defaults to `account`).
+         */relayMode: String? = nil,
+        /**
+         * Shared static relay registration token for Static Relay Mode. Secret:
+         * never printed or stored in plaintext config.
+         */relayToken: String? = nil) {
         self.provider = provider
         self.profile = profile
         self.region = region
@@ -23044,6 +23093,9 @@ public struct CloudTarget: Equatable, Hashable {
         self.project = project
         self.environment = environment
         self.token = token
+        self.relayUrl = relayUrl
+        self.relayMode = relayMode
+        self.relayToken = relayToken
     }
 
 
@@ -23068,7 +23120,10 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
                 zone: FfiConverterOptionString.read(from: &buf),
                 project: FfiConverterOptionString.read(from: &buf),
                 environment: FfiConverterOptionString.read(from: &buf),
-                token: FfiConverterOptionString.read(from: &buf)
+                token: FfiConverterOptionString.read(from: &buf),
+                relayUrl: FfiConverterOptionString.read(from: &buf),
+                relayMode: FfiConverterOptionString.read(from: &buf),
+                relayToken: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -23080,6 +23135,9 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.project, into: &buf)
         FfiConverterOptionString.write(value.environment, into: &buf)
         FfiConverterOptionString.write(value.token, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayMode, into: &buf)
+        FfiConverterOptionString.write(value.relayToken, into: &buf)
     }
 }
 

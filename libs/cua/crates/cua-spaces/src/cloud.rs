@@ -113,7 +113,16 @@ impl Spaces {
             provider.as_ref().is_some_and(|p| p.keeps_internet_only()),
             crate::network::Mode::from_env(),
         )?;
-        self.relay()?;
+        let static_relay = self
+            .inner
+            .sandboxes
+            .clouds()
+            .ok()
+            .and_then(|c| c.relay_mode(word))
+            == Some(cua_sandbox_core::byoc::RelayMode::Static);
+        if !static_relay {
+            self.relay()?;
+        }
         let image = opts
             .image
             .clone()
@@ -168,6 +177,53 @@ impl Spaces {
                 ))
             })?;
         let id = format!("relay:{machine}");
+        if static_relay {
+            let endpoint_url = match sandbox.service("env") {
+                Ok(svc) => svc.endpoint().await.ok().map(|e| e.url),
+                Err(_) => None,
+            }
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "{word} sandbox {} has no relay endpoint",
+                    sandbox.name()
+                ))
+            })?;
+            let env_token = sandbox.env_token();
+            let (image, image_digest) = sandbox
+                .image_info()
+                .map(|i| (i.reference.clone(), i.digest.clone()))
+                .unwrap_or_default();
+            let kind = sandbox
+                .image_info()
+                .map(|i| i.variant.clone())
+                .unwrap_or_else(|| "linux".into());
+            let arch = sandbox
+                .image_info()
+                .and_then(|i| i.arch.clone())
+                .unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let record = cua_proto::daemon::v1::Space {
+                id: id.clone(),
+                name: sandbox.name().to_string(),
+                kind,
+                arch,
+                image,
+                image_digest,
+                added_at: Some(pbjson_types::Timestamp {
+                    seconds: now.as_secs() as i64,
+                    nanos: now.subsec_nanos() as i32,
+                }),
+                ..Default::default()
+            };
+            let cred = crate::registry::Credential {
+                url: Some(endpoint_url),
+                token: env_token,
+                service_urls: Default::default(),
+            };
+            self.inner.registry.upsert(record, cred)?;
+        }
         // Connect it once, as a local create does: the handshake records its
         // capabilities, and extensions start what a connected Space gets
         // (the Cua Volume mount in its guest).

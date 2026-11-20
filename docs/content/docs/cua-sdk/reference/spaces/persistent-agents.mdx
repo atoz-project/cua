@@ -1570,13 +1570,16 @@ their own CLI sign-in; Hetzner takes its API token in `token` (or
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `provider` | `String` |  | `aws`, `gcp`, `hetzner` or `modal`. |
-| `profile` | `Option<String>` | `None` | AWS or Modal profile. |
-| `region` | `Option<String>` | `None` | AWS or GCP region, or Hetzner location (`fsn1`). |
+| `provider` | `String` |  | `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`. |
+| `profile` | `Option<String>` | `None` | AWS, Modal, or Alibaba Cloud CLI profile. |
+| `region` | `Option<String>` | `None` | AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`). |
 | `zone` | `Option<String>` | `None` | GCP zone. |
 | `project` | `Option<String>` | `None` | GCP project. |
 | `environment` | `Option<String>` | `None` | Modal environment. |
-| `token` | `Option<String>` | `None` | Hetzner: the project's Read & Write API token. Secret: used for the checks, saved in the Cua credential store when they pass, never printed. |
+| `token` | `Option<String>` | `None` | Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair. Secret: used for the checks, saved in the Cua credential store when they pass, never printed. |
+| `relay_url` / `relayUrl` | `Option<String>` | `None` | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
+| `relay_mode` / `relayMode` | `Option<String>` | `None` | Relay authentication mode (`account` or `static`; defaults to `account`). |
+| `relay_token` / `relayToken` | `Option<String>` | `None` | Shared static relay registration token for Static Relay Mode. Secret: never printed or stored in plaintext config. |
 
 ## `CloudStatus` record
 
@@ -1627,6 +1630,8 @@ Returned by [`Spaces.cloud_approve`](#spacescloud_approve).
 | `suggest_auth` / `suggestAuth` | `String` |  | `oidc` when this link could switch to linking without a stored key (an AWS link through the CLI sign-in), else empty. |
 | `issue` | `String` |  | What is wrong with the link and what to do, one sentence, or empty. |
 | `holders` | `Vec<String>` |  | `sealed`: the devices that can open the account's API token ("Can open it"). |
+| `relay_url` / `relayUrl` | `Option<String>` |  | Per-connection relay base URL (`https://relay.cua.ai` by default), or `None` when not connected. |
+| `relay_mode` / `relayMode` | `Option<String>` |  | Relay authentication mode (`account` or `static`), or `None` when not connected. |
 
 ## `CloudKind` record
 

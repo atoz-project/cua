@@ -3160,3 +3160,129 @@ async fn an_old_service_name_moves_to_the_home_own_one() {
         ["retire", "install", "start"]
     );
 }
+
+#[tokio::test]
+async fn fake_relay_supports_static_tokens_and_env_token_proxy() {
+    let relay = FakeRelay::start().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // Default: static_tokens is false.
+    let info: serde_json::Value = client
+        .get(format!("{}/v1/info", relay.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["static_tokens"], false);
+    assert_eq!(info["account_auth"], true);
+
+    // Enable static tokens + pure static mode.
+    relay.add_static_token("static-relay-tok");
+    relay.set_account_auth(false);
+    let info: serde_json::Value = client
+        .get(format!("{}/v1/info", relay.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["static_tokens"], true);
+    assert_eq!(info["account_auth"], false);
+
+    // /relay/v1/connect rejects invalid token (401) and accepts valid static token without owner/jwks headers.
+    let unauth = client
+        .get(format!("{}/relay/v1/connect", relay.url))
+        .header("x-cua-machine-id", "cloud-12345678")
+        .header("authorization", "Bearer wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let ok = client
+        .get(format!("{}/relay/v1/connect", relay.url))
+        .header("x-cua-machine-id", "cloud-12345678")
+        .header("authorization", "Bearer static-relay-tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+    assert!(!ok.headers().contains_key("x-cua-relay-owner"));
+    assert!(!ok.headers().contains_key("x-cua-relay-jwks"));
+    assert!(relay.static_machine_online("cloud-12345678"));
+
+    // Account machine id collision returns 409.
+    relay.add_account("acct-tok", "u1", None);
+    let access = crate::RelayClient::new(&relay.url).unwrap();
+    access
+        .register(
+            "acct-tok",
+            &crate::relay::RegisterRequest {
+                id: "cloud-acct-001".into(),
+                name: "acct".into(),
+                allow: vec![],
+                host: None,
+                meta: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let conflict = client
+        .get(format!("{}/relay/v1/connect", relay.url))
+        .header("x-cua-machine-id", "cloud-acct-001")
+        .header("authorization", "Bearer static-relay-tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+
+    // Static /m/<id> proxy: offline -> 502, wrong env token -> grpc-status 16, valid -> 200 OK.
+    relay.set_static_online("cloud-static-1", false, Some("env-secret-1"));
+    let off = client
+        .post(format!(
+            "{}/m/cloud-static-1/cua.env.v1.SystemService/GetCapabilities",
+            relay.url
+        ))
+        .header("content-type", "application/grpc-web")
+        .header("authorization", "Bearer env-secret-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(off.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    relay.set_static_online("cloud-static-1", true, Some("env-secret-1"));
+    let bad_tok = client
+        .post(format!(
+            "{}/m/cloud-static-1/cua.env.v1.SystemService/GetCapabilities",
+            relay.url
+        ))
+        .header("content-type", "application/grpc-web")
+        .header("authorization", "Bearer wrong-env")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_tok
+            .headers()
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok()),
+        Some("16")
+    );
+
+    let good = client
+        .post(format!(
+            "{}/m/cloud-static-1/cua.env.v1.SystemService/GetCapabilities",
+            relay.url
+        ))
+        .header("content-type", "application/grpc-web")
+        .header("authorization", "Bearer env-secret-1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(good.status(), reqwest::StatusCode::OK);
+    let body = good.bytes().await.unwrap();
+    assert!(body.windows(15).any(|w| w == b"grpc-status:0\r\n"));
+}

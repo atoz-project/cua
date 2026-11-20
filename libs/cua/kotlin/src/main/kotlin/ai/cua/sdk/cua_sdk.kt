@@ -32572,6 +32572,18 @@ data class CloudProvider (
      * ("Can open it").
      */
     var `holders`: List<kotlin.String>
+    ,
+    /**
+     * Per-connection relay base URL (`https://relay.cua.ai` by default),
+     * or `None` when not connected.
+     */
+    var `relayUrl`: kotlin.String?
+    ,
+    /**
+     * Relay authentication mode (`account` or `static`), or `None` when
+     * not connected.
+     */
+    var `relayMode`: kotlin.String?
 
 ){
 
@@ -32617,6 +32629,8 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterSequenceString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -32649,7 +32663,9 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterBoolean.allocationSize(value.`canApprove`) +
             FfiConverterString.allocationSize(value.`suggestAuth`) +
             FfiConverterString.allocationSize(value.`issue`) +
-            FfiConverterSequenceString.allocationSize(value.`holders`)
+            FfiConverterSequenceString.allocationSize(value.`holders`) +
+            FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`relayMode`)
     )
 
     override fun write(value: CloudProvider, buf: ByteBuffer) {
@@ -32682,6 +32698,8 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterString.write(value.`suggestAuth`, buf)
             FfiConverterString.write(value.`issue`, buf)
             FfiConverterSequenceString.write(value.`holders`, buf)
+            FfiConverterOptionalString.write(value.`relayUrl`, buf)
+            FfiConverterOptionalString.write(value.`relayMode`, buf)
     }
 }
 
@@ -32951,17 +32969,17 @@ public object FfiConverterTypeCloudSweepReport: FfiConverterRustBuffer<CloudSwee
  */
 data class CloudTarget (
     /**
-     * `aws`, `gcp`, `hetzner` or `modal`.
+     * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
      */
     var `provider`: kotlin.String
     ,
     /**
-     * AWS or Modal profile.
+     * AWS, Modal, or Alibaba Cloud CLI profile.
      */
     var `profile`: kotlin.String? = null
     ,
     /**
-     * AWS or GCP region, or Hetzner location (`fsn1`).
+     * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
      */
     var `region`: kotlin.String? = null
     ,
@@ -32981,11 +32999,28 @@ data class CloudTarget (
     var `environment`: kotlin.String? = null
     ,
     /**
-     * Hetzner: the project's Read & Write API token. Secret: used for the
-     * checks, saved in the Cua credential store when they pass, never
-     * printed.
+     * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+     * Secret: used for the checks, saved in the Cua credential store when
+     * they pass, never printed.
      */
     var `token`: kotlin.String? = null
+    ,
+    /**
+     * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+     * in Account Relay Mode).
+     */
+    var `relayUrl`: kotlin.String? = null
+    ,
+    /**
+     * Relay authentication mode (`account` or `static`; defaults to `account`).
+     */
+    var `relayMode`: kotlin.String? = null
+    ,
+    /**
+     * Shared static relay registration token for Static Relay Mode. Secret:
+     * never printed or stored in plaintext config.
+     */
+    var `relayToken`: kotlin.String? = null
 
 ){
 
@@ -33009,6 +33044,9 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -33019,7 +33057,10 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.allocationSize(value.`zone`) +
             FfiConverterOptionalString.allocationSize(value.`project`) +
             FfiConverterOptionalString.allocationSize(value.`environment`) +
-            FfiConverterOptionalString.allocationSize(value.`token`)
+            FfiConverterOptionalString.allocationSize(value.`token`) +
+            FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`relayMode`) +
+            FfiConverterOptionalString.allocationSize(value.`relayToken`)
     )
 
     override fun write(value: CloudTarget, buf: ByteBuffer) {
@@ -33030,6 +33071,9 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.write(value.`project`, buf)
             FfiConverterOptionalString.write(value.`environment`, buf)
             FfiConverterOptionalString.write(value.`token`, buf)
+            FfiConverterOptionalString.write(value.`relayUrl`, buf)
+            FfiConverterOptionalString.write(value.`relayMode`, buf)
+            FfiConverterOptionalString.write(value.`relayToken`, buf)
     }
 }
 

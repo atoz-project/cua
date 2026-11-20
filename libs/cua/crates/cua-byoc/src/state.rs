@@ -90,12 +90,23 @@ pub struct Link {
     /// [`Connection::max_size`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size: Option<MaxSize>,
+    /// [`Connection::relay_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// [`Connection::relay_mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<cua_sandbox_core::byoc::RelayMode>,
 }
 
 impl Link {
     /// What `c` has that an older cua would drop, if anything.
     fn of(c: &Connection) -> Option<Link> {
-        if c.auth.is_cli() && c.budget_usd_month.is_none() && c.max_size.is_none() {
+        if c.auth.is_cli()
+            && c.budget_usd_month.is_none()
+            && c.max_size.is_none()
+            && c.relay_url.is_none()
+            && c.relay_mode.is_none()
+        {
             return None;
         }
         Some(Link {
@@ -105,6 +116,8 @@ impl Link {
             auth: c.auth.clone(),
             budget_usd_month: c.budget_usd_month,
             max_size: c.max_size,
+            relay_url: c.relay_url.clone(),
+            relay_mode: c.relay_mode,
         })
     }
 
@@ -114,6 +127,8 @@ impl Link {
         c.auth.is_cli()
             && c.budget_usd_month.is_none()
             && c.max_size.is_none()
+            && c.relay_url.is_none()
+            && c.relay_mode.is_none()
             && c.account == self.account
             && c.connected_at == self.connected_at
     }
@@ -305,6 +320,8 @@ impl Store {
                 c.auth = l.auth.clone();
                 c.budget_usd_month = l.budget_usd_month;
                 c.max_size = l.max_size;
+                c.relay_url = l.relay_url.clone();
+                c.relay_mode = l.relay_mode;
             }
             if c.profile == FEDERATED_PROFILE {
                 c.profile = String::new();

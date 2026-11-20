@@ -79,6 +79,50 @@ pub struct CloudKind {
     pub usd_per_hour: f64,
 }
 
+/// How a cloud connection authenticates with its relay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMode {
+    /// Backed by user account authentication and a machine directory, where
+    /// each cloud sandbox is registered dynamically under the signed-in
+    /// account.
+    #[default]
+    Account,
+    /// Self-hosted relay authenticated by a shared registration token and
+    /// per-sandbox environment tokens, requiring no account sign-in.
+    Static,
+}
+
+impl RelayMode {
+    /// Wire word (`account` or `static`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayMode::Account => "account",
+            RelayMode::Static => "static",
+        }
+    }
+
+    /// Parses `account` or `static` (case-insensitive, trimmed).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "account" => Ok(RelayMode::Account),
+            "static" => Ok(RelayMode::Static),
+            other => Err(crate::Error::InvalidArgument(format!(
+                "relay_mode {other:?} is not account or static"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for RelayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The default official Cua relay URL.
+pub const DEFAULT_RELAY_URL: &str = "https://relay.cua.ai";
+
 /// One cloud as `cloud_status` lists it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudProvider {
@@ -180,6 +224,14 @@ pub struct CloudProvider {
     /// made there unattended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holders: Vec<String>,
+    /// Per-connection relay base URL (`https://relay.cua.ai` by default),
+    /// or `None` when not connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`), or `None` when
+    /// not connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<RelayMode>,
 }
 
 /// The words of [`CloudProvider::status`] and [`CloudConnected`]'s outcome.
@@ -667,6 +719,16 @@ pub struct CloudTarget {
     /// The API token of a cloud that has no CLI sign-in (Hetzner). Secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to `account`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<RelayMode>,
+    /// Shared static relay registration token for Static Relay Mode. Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_token: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -679,6 +741,12 @@ impl std::fmt::Debug for CloudTarget {
             .field("project", &self.project)
             .field("environment", &self.environment)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "relay_token",
+                &self.relay_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -813,6 +881,11 @@ pub struct AddHost {
 pub trait CloudManager: Send + Sync + 'static {
     /// `cloud_status`: `provider` narrows it to one cloud.
     async fn status(&self, provider: Option<&str>) -> Result<CloudStatusReport>;
+
+    /// The configured relay mode for `provider`, if connected.
+    fn relay_mode(&self, _provider: &str) -> Option<RelayMode> {
+        None
+    }
 
     /// `cloud_test`: creates nothing.
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport>;
@@ -977,5 +1050,35 @@ mod tests {
             req("azure", &|r| r.auth = Some("sealed".into())).auth_word(),
             "sealed"
         );
+    }
+
+    #[test]
+    fn relay_mode_defaults_serializes_and_target_redacts_relay_token() {
+        assert_eq!(RelayMode::default(), RelayMode::Account);
+        assert_eq!(RelayMode::Account.as_str(), "account");
+        assert_eq!(RelayMode::Static.as_str(), "static");
+        assert_eq!(RelayMode::parse("ACCOUNT").unwrap(), RelayMode::Account);
+        assert_eq!(RelayMode::parse(" static ").unwrap(), RelayMode::Static);
+        assert!(RelayMode::parse("bogus").is_err());
+
+        let t = CloudTarget {
+            provider: "hetzner".into(),
+            relay_url: Some("https://relay.example".into()),
+            relay_mode: Some(RelayMode::Static),
+            relay_token: Some("super-secret-relay-token".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains("super-secret-relay-token"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+
+        let p: CloudProvider =
+            serde_json::from_str(r#"{"name":"aws","title":"AWS","tier":"vm","connected":false}"#)
+                .unwrap();
+        assert_eq!(p.relay_url, None);
+        assert_eq!(p.relay_mode, None);
+        let serialized = serde_json::to_string(&p).unwrap();
+        assert!(!serialized.contains("relay_url"));
+        assert!(!serialized.contains("relay_mode"));
     }
 }
