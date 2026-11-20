@@ -1068,7 +1068,8 @@ fn cloud_target(t: i::CloudTarget) -> cua_sandbox_core::byoc::CloudTarget {
         zone: some(t.zone),
         project: some(t.project),
         environment: some(t.environment),
-        token: some(t.token),
+        // Keep `Some("")` distinct from `None` so empty `--token-stdin` does not fall through.
+        token: t.token.map(|v| v.trim().to_string()),
     }
 }
 
@@ -1657,4 +1658,26 @@ async fn tool_stream_space_window(spaces: &Spaces, tool: &str, a: Value) -> Resu
         window.window_id,
         s.id()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_target_preserves_empty_explicit_token() {
+        let out = cloud_target(i::CloudTarget {
+            provider: "aliyun-ecs".into(),
+            token: Some("  \n".into()),
+            ..Default::default()
+        });
+        assert_eq!(out.token.as_deref(), Some(""));
+
+        let omitted = cloud_target(i::CloudTarget {
+            provider: "aliyun-ecs".into(),
+            token: None,
+            ..Default::default()
+        });
+        assert_eq!(omitted.token, None);
+    }
 }

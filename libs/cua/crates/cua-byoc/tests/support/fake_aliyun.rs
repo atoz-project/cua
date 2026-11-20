@@ -36,6 +36,8 @@ pub struct FakeAliyun {
     pub instances: BTreeMap<String, Value>,
     /// Optional VSwitches for `DescribeVSwitches`.
     pub vswitches: Vec<Value>,
+    /// Optional SecurityGroups for `DescribeSecurityGroups`.
+    pub security_groups: Vec<Value>,
     /// Recorded verified calls.
     pub calls: Vec<RecordedCall>,
     /// Number of upcoming calls to reject with HTTP 429 `Throttling.User`.
@@ -44,6 +46,8 @@ pub struct FakeAliyun {
     pub forbidden_actions: BTreeSet<String>,
     /// Simulate VPC-only region returning `InvalidVSwitchId.NotFound` on `DryRun=true` when `VSwitchId` is omitted.
     pub run_instances_missing_vswitch: bool,
+    /// Optional forced error `(http_status, code, message)` for `RunInstances DryRun=true`.
+    pub run_instances_dry_run_error: Option<(u16, String, String)>,
     /// Optional forced auth failure code (e.g. `"InvalidAccessKeyId.NotFound"`).
     pub force_auth_error: Option<(String, String)>,
 }
@@ -67,10 +71,12 @@ impl Default for FakeAliyun {
             ],
             instances: BTreeMap::new(),
             vswitches: Vec::new(),
+            security_groups: Vec::new(),
             calls: Vec::new(),
             throttle: 0,
             forbidden_actions: BTreeSet::new(),
             run_instances_missing_vswitch: false,
+            run_instances_dry_run_error: None,
             force_auth_error: None,
         }
     }
@@ -544,15 +550,28 @@ pub async fn handle(
             )
                 .into_response()
         }
-        ("2014-05-26", "DescribeSecurityGroups") => (
-            StatusCode::OK,
-            axum::Json(json!({
-                "SecurityGroups": { "SecurityGroup": [] },
-                "TotalCount": 0,
-                "RequestId": "req-sg-1"
-            })),
-        )
-            .into_response(),
+        ("2014-05-26", "DescribeSecurityGroups") => {
+            let vpc_filter = params.get("VpcId").cloned();
+            let sgs: Vec<Value> = f
+                .security_groups
+                .iter()
+                .filter(|sg| match &vpc_filter {
+                    Some(v) => sg["VpcId"].as_str() == Some(v.as_str()),
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            let total = sgs.len();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "SecurityGroups": { "SecurityGroup": sgs },
+                    "TotalCount": total,
+                    "RequestId": "req-sg-1"
+                })),
+            )
+                .into_response()
+        }
         ("2016-04-28", "DescribeVpcs") => (
             StatusCode::OK,
             axum::Json(json!({
@@ -577,6 +596,10 @@ pub async fn handle(
         }
         ("2014-05-26", "RunInstances") => {
             if params.get("DryRun").map(String::as_str) == Some("true") {
+                if let Some((status_u16, ref code, ref msg)) = f.run_instances_dry_run_error {
+                    let st = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_REQUEST);
+                    return err(st, code, msg);
+                }
                 if f.run_instances_missing_vswitch && !params.contains_key("VSwitchId") {
                     return err(
                         StatusCode::BAD_REQUEST,

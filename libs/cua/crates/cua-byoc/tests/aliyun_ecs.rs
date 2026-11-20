@@ -693,3 +693,476 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
 
     let _ = BTreeMap::<String, String>::new();
 }
+
+#[tokio::test]
+async fn token_stdin_or_env_with_profile_clears_connection_profile_post_connect() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let cfg_path = write_aliyun_config(cfg_dir.path(), "oauth");
+    let (api, s, _store) = start(Some(cfg_path.clone())).await;
+    {
+        let mut f = s.lock().unwrap();
+        f.keys
+            .insert("LTAI_STDIN_AK".into(), "stdin_secret_xyz".into());
+        f.keys.insert("LTAI_WH_AK".into(), "wh_secret_456".into());
+        f.keys.insert("LTAI_ENV_AK".into(), "env_secret_abc".into());
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::from_env(),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+
+    // Connect with BOTH --token-stdin AND --profile webhook_manager.
+    let connected = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                profile: Some("webhook_manager".into()),
+                token: Some("LTAI_STDIN_AK:stdin_secret_xyz".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(connected.provider.profile, "");
+
+    // Subsequent disconnect (calls list_owned) must authenticate with LTAI_STDIN_AK from TokenStore,
+    // NEVER switching to webhook_manager (LTAI_WH_AK).
+    s.lock().unwrap().calls.clear();
+    let disc = clouds.disconnect("aliyun-ecs", false).await.unwrap();
+    assert!(disc.disconnected);
+    let calls = s.lock().unwrap().calls.clone();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(|c| c.access_key_id == "LTAI_STDIN_AK"),
+        "post-connect calls must use saved TokenStore AK, got: {calls:?}"
+    );
+
+    // Same check when connecting via env vars + --profile webhook_manager.
+    let (api_env, s_env, _store_env) = start(Some(cfg_path)).await;
+    {
+        let mut f = s_env.lock().unwrap();
+        f.keys.insert("LTAI_ENV_AK".into(), "env_secret_abc".into());
+        f.keys.insert("LTAI_WH_AK".into(), "wh_secret_456".into());
+    }
+    let home_env = tempfile::tempdir().unwrap();
+    let sandboxes_env = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home_env.path().join("sandboxes")),
+        home_env.path(),
+        vec![Arc::new(api_env)],
+        RelayAccess::from_env(),
+    )
+    .build();
+    let clouds_env = sandboxes_env.clouds().unwrap();
+    {
+        let _env2 = EnvGuard::set(Some("LTAI_ENV_AK"), Some("env_secret_abc"));
+        let conn_env = clouds_env
+            .connect_with(&ConnectRequest {
+                target: Target {
+                    provider: "aliyun-ecs".into(),
+                    profile: Some("webhook_manager".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(conn_env.provider.profile, "");
+    }
+    // Env vars dropped now; disconnect must still use saved LTAI_ENV_AK from TokenStore.
+    s_env.lock().unwrap().calls.clear();
+    let disc_env = clouds_env.disconnect("aliyun-ecs", false).await.unwrap();
+    assert!(disc_env.disconnected);
+    let env_calls = s_env.lock().unwrap().calls.clone();
+    assert!(!env_calls.is_empty());
+    assert!(
+        env_calls.iter().all(|c| c.access_key_id == "LTAI_ENV_AK"),
+        "post-connect calls must use saved TokenStore env AK, got: {env_calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn clouds_test_and_failed_connect_unstage_secret() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    // 1. In a clean environment (no env/saved/profile), test(--token-stdin) and failed connect(--token-stdin)
+    //    must unstage the secret so subsequent status() reports credentials.found == false.
+    let home_clean = tempfile::tempdir().unwrap();
+    let (api_clean, s_clean, _store_clean) = start(None).await;
+    let sandboxes_clean = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home_clean.path().join("sandboxes")),
+        home_clean.path(),
+        vec![Arc::new(api_clean)],
+        RelayAccess::from_env(),
+    )
+    .build();
+    let clouds_clean = sandboxes_clean.clouds().unwrap();
+
+    let test_ok = clouds_clean
+        .test(&target(Some("LTAI_TEST_AK:secret123")))
+        .await
+        .unwrap();
+    assert!(test_ok.ok);
+    let st_after_test = clouds_clean.status(Some("aliyun-ecs")).await.unwrap();
+    assert!(
+        !st_after_test.providers[0].credentials.found,
+        "status after test(--token-stdin) must not see stale staged secret: {:?}",
+        st_after_test.providers[0].credentials
+    );
+
+    // Failed connect via invalid region (early `?` in resolve) must also unstage.
+    let err_region = clouds_clean
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("bad region!".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err_region.to_string().contains("invalid region"),
+        "{err_region}"
+    );
+    let st_after_bad_region = clouds_clean.status(Some("aliyun-ecs")).await.unwrap();
+    assert!(
+        !st_after_bad_region.providers[0].credentials.found,
+        "status after failed resolve() in connect must not see stale staged secret: {:?}",
+        st_after_bad_region.providers[0].credentials
+    );
+
+    // Failed connect via failed API check must also unstage.
+    s_clean
+        .lock()
+        .unwrap()
+        .forbidden_actions
+        .insert("ecs:RunInstances".into());
+    let err_perm = clouds_clean
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err_perm.to_string().contains("ecs:RunInstances"),
+        "{err_perm}"
+    );
+    let st_after_perm = clouds_clean.status(Some("aliyun-ecs")).await.unwrap();
+    assert!(
+        !st_after_perm.providers[0].credentials.found,
+        "status after failed test() in connect must not see stale staged secret: {:?}",
+        st_after_perm.providers[0].credentials
+    );
+
+    // 2. connect -> test(wrong --token-stdin) -> disconnect(false) must succeed without SignatureDoesNotMatch.
+    let home = tempfile::tempdir().unwrap();
+    let (api, _s, _store) = start(None).await;
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::from_env(),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+
+    clouds
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let bad_test = clouds
+        .test(&target(Some("LTAI_TEST_AK:WRONG_ULTRA_SECRET_XYZ")))
+        .await
+        .unwrap();
+    assert!(!bad_test.ok);
+
+    let disc = clouds.disconnect("aliyun-ecs", false).await.unwrap();
+    assert!(disc.disconnected);
+}
+
+async fn serve_raw(raw_response: Vec<u8>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let resp = raw_response.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn call_raw_rejects_malformed_truncated_json_and_empty_account_id() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    // 1. 200 OK malformed JSON on GetCallerIdentity, list_owned, and describe must return Err (and fail test).
+    let malformed_resp =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<html>not json</html>"
+            .to_vec();
+    let bad_url = serve_raw(malformed_resp).await;
+    let store = Arc::new(MemStore::default());
+    let api = AliyunEcs::with_endpoints(&bad_url, &bad_url, &bad_url, store, None);
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+    let c = conn(&api);
+
+    let t = api.test(&c).await;
+    assert!(!t.ok(), "200 malformed JSON must fail test: {:?}", t.checks);
+    assert!(!t.checks[0].ok, "{:?}", t.checks);
+
+    assert!(
+        api.list_owned(&c, "owner1").await.is_err(),
+        "200 malformed JSON on list_owned must return Err, never Ok(vec![])"
+    );
+    let r = cua_byoc::model::Resource {
+        provider: "aliyun-ecs".into(),
+        id: "i-1".into(),
+        resource_type: "instance".into(),
+        region: "cn-hangzhou".into(),
+        ..Default::default()
+    };
+    assert!(
+        api.describe(&c, &r).await.is_err(),
+        "200 malformed JSON on describe must return Err, never Ok(None)"
+    );
+
+    // 2. 200 OK truncated HTTP body (Content-Length mismatch / early EOF) must fail GetCallerIdentity, list_owned, describe.
+    let truncated_resp =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"AccountId\":\"123"
+            .to_vec();
+    let trunc_url = serve_raw(truncated_resp).await;
+    let api_trunc = AliyunEcs::with_endpoints(
+        &trunc_url,
+        &trunc_url,
+        &trunc_url,
+        Arc::new(MemStore::default()),
+        None,
+    );
+    api_trunc.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+    let c_trunc = conn(&api_trunc);
+    let t_trunc = api_trunc.test(&c_trunc).await;
+    assert!(
+        !t_trunc.ok(),
+        "200 truncated body must fail test: {:?}",
+        t_trunc.checks
+    );
+    assert!(!t_trunc.checks[0].ok, "{:?}", t_trunc.checks);
+    assert!(
+        api_trunc.list_owned(&c_trunc, "owner1").await.is_err(),
+        "200 truncated body on list_owned must return Err"
+    );
+    assert!(
+        api_trunc.describe(&c_trunc, &r).await.is_err(),
+        "200 truncated body on describe must return Err"
+    );
+
+    // 3. 200 OK JSON with empty AccountId must fail credentials check.
+    let empty_acct_body = r#"{"AccountId":""}"#;
+    let empty_acct_resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{empty_acct_body}",
+        empty_acct_body.len()
+    )
+    .into_bytes();
+    let empty_acct_url = serve_raw(empty_acct_resp).await;
+    let api_empty = AliyunEcs::with_endpoints(
+        &empty_acct_url,
+        &empty_acct_url,
+        &empty_acct_url,
+        Arc::new(MemStore::default()),
+        None,
+    );
+    api_empty.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+    let t_empty = api_empty.test(&conn(&api_empty)).await;
+    assert!(
+        !t_empty.ok(),
+        "empty AccountId must fail test: {:?}",
+        t_empty.checks
+    );
+    assert!(!t_empty.checks[0].ok, "{:?}", t_empty.checks);
+
+    // 4. 502 HTML error body must preserve a snippet (never "null").
+    let html_502 = "<html><body>502 Bad Gateway</body></html>";
+    let resp_502 = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html_502}",
+        html_502.len()
+    )
+    .into_bytes();
+    let url_502 = serve_raw(resp_502).await;
+    let api_502 = AliyunEcs::with_endpoints(
+        &url_502,
+        &url_502,
+        &url_502,
+        Arc::new(MemStore::default()),
+        None,
+    );
+    api_502.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+    let t_502 = api_502.test(&conn(&api_502)).await;
+    assert!(!t_502.ok());
+    let detail = &t_502.checks[0].detail;
+    assert!(
+        detail.contains("502 Bad Gateway") && !detail.ends_with(": null"),
+        "502 error must preserve body snippet, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+
+    // 1. DescribeVSwitches returning Forbidden.RAM must fail permissions (never swallowed).
+    s.lock()
+        .unwrap()
+        .forbidden_actions
+        .insert("vpc:DescribeVSwitches".into());
+    let t = api.test(&conn(&api)).await;
+    assert!(!t.ok(), "{:?}", t.checks);
+    let perm = t.checks.iter().find(|c| c.name == "permissions").unwrap();
+    assert!(!perm.ok, "{perm:?}");
+    assert!(
+        perm.detail.contains("Forbidden.RAM") && perm.detail.contains("vpc:DescribeVSwitches"),
+        "{perm:?}"
+    );
+    s.lock().unwrap().forbidden_actions.clear();
+
+    // 2. When VSwitchId (with VpcId) and matching-VPC SecurityGroupId exist, both are attached to RunInstances DryRun=true.
+    {
+        let mut f = s.lock().unwrap();
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-match-1",
+            "VpcId": "vpc-match-1",
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-other-vpc",
+            "VpcId": "vpc-other",
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-match-1",
+            "VpcId": "vpc-match-1",
+        }));
+        f.calls.clear();
+    }
+    let t = api.test(&conn(&api)).await;
+    assert!(t.ok(), "{:?}", t.checks);
+    {
+        let f = s.lock().unwrap();
+        let run = f
+            .calls
+            .iter()
+            .rev()
+            .find(|c| c.action == "RunInstances")
+            .unwrap();
+        assert_eq!(
+            run.params.get("VSwitchId").map(String::as_str),
+            Some("vsw-match-1")
+        );
+        assert_eq!(
+            run.params.get("SecurityGroupId").map(String::as_str),
+            Some("sg-match-1")
+        );
+    }
+
+    // 3. When VSwitchId IS supplied, InvalidVSwitchId.NotFound must FAIL permissions.
+    s.lock().unwrap().run_instances_dry_run_error = Some((
+        400,
+        "InvalidVSwitchId.NotFound".into(),
+        "bad vswitch".into(),
+    ));
+    let t = api.test(&conn(&api)).await;
+    assert!(!t.ok(), "{:?}", t.checks);
+    let perm = t.checks.iter().find(|c| c.name == "permissions").unwrap();
+    assert!(
+        !perm.ok && perm.detail.contains("InvalidVSwitchId.NotFound"),
+        "{perm:?}"
+    );
+
+    // 4. MissingParameter must FAIL permissions both WITH VSwitchId and WITHOUT VSwitchId.
+    s.lock().unwrap().run_instances_dry_run_error = Some((
+        400,
+        "MissingParameter".into(),
+        "missing required param".into(),
+    ));
+    let t_with_vsw = api.test(&conn(&api)).await;
+    assert!(!t_with_vsw.ok(), "{:?}", t_with_vsw.checks);
+    assert!(
+        !t_with_vsw
+            .checks
+            .iter()
+            .find(|c| c.name == "permissions")
+            .unwrap()
+            .ok
+    );
+
+    {
+        let mut f = s.lock().unwrap();
+        f.vswitches.clear();
+        f.security_groups.clear();
+    }
+    let t_no_vsw = api.test(&conn(&api)).await;
+    assert!(!t_no_vsw.ok(), "{:?}", t_no_vsw.checks);
+    assert!(
+        !t_no_vsw
+            .checks
+            .iter()
+            .find(|c| c.name == "permissions")
+            .unwrap()
+            .ok
+    );
+    s.lock().unwrap().run_instances_dry_run_error = None;
+
+    // 5. Fallback cleanly when VSwitchId exists but no SecurityGroup exists in that VPC.
+    {
+        let mut f = s.lock().unwrap();
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-only-1",
+            "VpcId": "vpc-no-sg",
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-wrong-vpc",
+            "VpcId": "vpc-other",
+        }));
+        f.calls.clear();
+    }
+    let t = api.test(&conn(&api)).await;
+    assert!(t.ok(), "{:?}", t.checks);
+    let f = s.lock().unwrap();
+    let run = f
+        .calls
+        .iter()
+        .rev()
+        .find(|c| c.action == "RunInstances")
+        .unwrap();
+    assert_eq!(
+        run.params.get("VSwitchId").map(String::as_str),
+        Some("vsw-only-1")
+    );
+    assert!(!run.params.contains_key("SecurityGroupId"));
+}

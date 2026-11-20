@@ -152,11 +152,14 @@ pub struct TargetArgs {
 
 impl TargetArgs {
     fn target(&self) -> CloudTarget {
+        self.target_with_stdin(|| std::io::read_to_string(std::io::stdin()).unwrap_or_default())
+    }
+
+    fn target_with_stdin(&self, read_stdin: impl FnOnce() -> String) -> CloudTarget {
         let token = self
             .token_stdin
-            .then(|| std::io::read_to_string(std::io::stdin()).unwrap_or_default())
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
+            .then(read_stdin)
+            .map(|t| t.trim().to_string());
         CloudTarget {
             token,
             provider: self.provider.trim().to_ascii_lowercase(),
@@ -2153,6 +2156,39 @@ mod tests {
         ] {
             assert!(CONNECT_HELP.contains(needle), "{needle}");
         }
+    }
+
+    #[test]
+    fn token_stdin_preserves_empty_or_whitespace_input() {
+        let empty = TargetArgs {
+            provider: "aliyun-ecs".into(),
+            token_stdin: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            empty.target_with_stdin(String::new).token.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            empty
+                .target_with_stdin(|| "  \n\t ".into())
+                .token
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            empty
+                .target_with_stdin(|| " ak:sk \n".into())
+                .token
+                .as_deref(),
+            Some("ak:sk")
+        );
+        let no_stdin = TargetArgs {
+            provider: "aliyun-ecs".into(),
+            token_stdin: false,
+            ..Default::default()
+        };
+        assert_eq!(no_stdin.target_with_stdin(|| "ignored".into()).token, None);
     }
 
     #[test]

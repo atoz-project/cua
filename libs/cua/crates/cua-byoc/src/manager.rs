@@ -575,7 +575,14 @@ impl CloudManager for Clouds {
 
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
+        struct UnstageGuard<'a>(&'a dyn CloudApi);
+        impl Drop for UnstageGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unstage_secret();
+            }
+        }
         p.stage_secret(target);
+        let _unstage = UnstageGuard(p.as_ref());
         let conn = p.resolve(target)?;
         let t = p.test(&conn).await;
         Ok(CloudTestReport {
@@ -593,7 +600,14 @@ impl CloudManager for Clouds {
         ttl_hours: Option<u32>,
     ) -> Result<CloudConnected> {
         let p = self.api(&target.provider)?;
+        struct UnstageGuard<'a>(&'a dyn CloudApi);
+        impl Drop for UnstageGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unstage_secret();
+            }
+        }
         p.stage_secret(target);
+        let _unstage = UnstageGuard(p.as_ref());
         let mut conn = p.resolve(target)?;
         let tested = p.test(&conn).await;
         if !tested.ok() {

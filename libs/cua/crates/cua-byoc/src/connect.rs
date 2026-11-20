@@ -388,11 +388,7 @@ async fn connect_sealed(
 
     // 2. The token: given now; else the account's (sealed already); else
     // the one this device has (`--sealed` seals it).
-    let given = req
-        .target
-        .token
-        .as_deref()
-        .is_some_and(|t| !t.trim().is_empty());
+    let given = req.target.token.is_some();
     let (token, fresh) = if given {
         match p.local_secret(&req.target) {
             Some(t) => (t, true),

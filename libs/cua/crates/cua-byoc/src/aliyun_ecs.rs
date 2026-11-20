@@ -544,7 +544,7 @@ impl AliyunEcs {
         version: &str,
         params: &[(String, String)],
         profile_hint: Option<&str>,
-    ) -> Result<(reqwest::StatusCode, Value)> {
+    ) -> Result<(reqwest::StatusCode, ApiBody)> {
         let idempotent = method.eq_ignore_ascii_case("GET");
         let (creds, _) = self.resolve_credentials(profile_hint)?;
         let base = endpoint.trim_end_matches('/');
@@ -568,7 +568,7 @@ impl AliyunEcs {
                 "POST" => reqwest::Method::POST,
                 _ => reqwest::Method::GET,
             };
-            let resp = self
+            let resp = match self
                 .http
                 .request(req_method, parsed.as_str())
                 .header("host", &signed.host)
@@ -580,10 +580,39 @@ impl AliyunEcs {
                 .header("authorization", &signed.authorization)
                 .send()
                 .await
-                .map_err(|e| cloud_err("aliyun-ecs", action, e))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if idempotent {
+                        tries += 1;
+                        if let Some(wait) = retry_backoff(tries) {
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                    }
+                    return Err(cloud_err("aliyun-ecs", action, e));
+                }
+            };
 
             let status = resp.status();
-            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    if idempotent {
+                        tries += 1;
+                        if let Some(wait) = retry_backoff(tries) {
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                    }
+                    return Err(cloud_err(
+                        "aliyun-ecs",
+                        action,
+                        format!("failed to read HTTP {status} response body: {e}"),
+                    ));
+                }
+            };
+
             if retryable_status(status.as_u16(), idempotent) {
                 tries += 1;
                 if let Some(wait) = retry_backoff(tries) {
@@ -591,7 +620,39 @@ impl AliyunEcs {
                     continue;
                 }
             }
-            return Ok((status, v));
+
+            if status.is_success() {
+                if bytes.is_empty() {
+                    return Err(cloud_err(
+                        "aliyun-ecs",
+                        action,
+                        format!("empty response body on HTTP {status}"),
+                    ));
+                }
+                let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    let snippet = sanitize_snippet(&bytes);
+                    cloud_err(
+                        "aliyun-ecs",
+                        action,
+                        format!("invalid JSON response on HTTP {status}: {e} (body: {snippet})"),
+                    )
+                })?;
+                if !v.is_object() {
+                    let snippet = sanitize_snippet(&bytes);
+                    return Err(cloud_err(
+                        "aliyun-ecs",
+                        action,
+                        format!("unexpected non-object JSON response on HTTP {status}: {snippet}"),
+                    ));
+                }
+                return Ok((status, ApiBody::Json(v)));
+            }
+
+            let body = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) if v.is_object() => ApiBody::Json(v),
+                _ => ApiBody::Text(sanitize_snippet(&bytes)),
+            };
+            return Ok((status, body));
         }
     }
 
@@ -604,14 +665,48 @@ impl AliyunEcs {
         params: &[(String, String)],
         profile_hint: Option<&str>,
     ) -> Result<Value> {
-        let (status, v) = self
+        let (status, body) = self
             .call_raw(endpoint, method, action, version, params, profile_hint)
             .await?;
         if !status.is_success() {
-            return Err(map_api_error(action, version, status, &v));
+            return Err(map_api_error(action, version, status, &body));
         }
-        Ok(v)
+        match body {
+            ApiBody::Json(v) => Ok(v),
+            ApiBody::Text(s) => Err(cloud_err(
+                "aliyun-ecs",
+                action,
+                format!("unexpected non-JSON response on HTTP {status}: {s}"),
+            )),
+        }
     }
+}
+
+enum ApiBody {
+    Json(Value),
+    Text(String),
+}
+
+fn sanitize_snippet(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let mut out = String::new();
+    let mut last_ws = false;
+    for ch in raw.chars() {
+        if out.chars().count() >= 200 {
+            out.push_str("...");
+            break;
+        }
+        if ch.is_control() || ch.is_whitespace() {
+            if !last_ws && !out.is_empty() {
+                out.push(' ');
+                last_ws = true;
+            }
+        } else {
+            out.push(ch);
+            last_ws = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 fn api_error_code_message(v: &Value) -> (&str, &str) {
@@ -620,36 +715,53 @@ fn api_error_code_message(v: &Value) -> (&str, &str) {
     (code, msg)
 }
 
-fn map_api_error(action: &str, version: &str, status: reqwest::StatusCode, v: &Value) -> Error {
-    let (code, msg) = api_error_code_message(v);
+fn map_api_error(
+    action: &str,
+    version: &str,
+    status: reqwest::StatusCode,
+    body: &ApiBody,
+) -> Error {
     let svc = match version {
         STS_API_VERSION => "sts",
         VPC_API_VERSION => "vpc",
         _ => "ecs",
     };
     let perm = format!("{svc}:{action}");
-    match code {
-        "InvalidAccessKeyId.NotFound"
-        | "SignatureDoesNotMatch"
-        | "IncompleteSignature"
-        | "InvalidSecurityToken" => cloud_err(
-            "aliyun-ecs",
-            action,
-            format!(
-                "{code}: {msg} (check your AccessKey ID and Secret via --token-stdin, ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET, or ~/.aliyun/config.json)"
-            ),
-        ),
-        "Forbidden.RAM" | "Forbidden.Unauthorized" | "UnauthorizedOperation" | "NoPermission" => {
-            cloud_err(
-                "aliyun-ecs",
-                action,
-                format!(
-                    "{code}: RAM user is missing permission `{perm}` ({msg}); attach the Cua BYOC least-privilege RAM policy"
-                ),
-            )
+    match body {
+        ApiBody::Text(snippet) => {
+            if snippet.is_empty() {
+                cloud_err("aliyun-ecs", action, format!("HTTP {status} (empty body)"))
+            } else {
+                cloud_err("aliyun-ecs", action, format!("HTTP {status}: {snippet}"))
+            }
         }
-        "" => cloud_err("aliyun-ecs", action, format!("HTTP {status}: {v}")),
-        _ => cloud_err("aliyun-ecs", action, format!("{code}: {msg}")),
+        ApiBody::Json(v) => {
+            let (code, msg) = api_error_code_message(v);
+            match code {
+                "InvalidAccessKeyId.NotFound"
+                | "SignatureDoesNotMatch"
+                | "IncompleteSignature"
+                | "InvalidSecurityToken" => cloud_err(
+                    "aliyun-ecs",
+                    action,
+                    format!(
+                        "{code}: {msg} (check your AccessKey ID and Secret via --token-stdin, ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET, or ~/.aliyun/config.json)"
+                    ),
+                ),
+                "Forbidden.RAM"
+                | "Forbidden.Unauthorized"
+                | "UnauthorizedOperation"
+                | "NoPermission" => cloud_err(
+                    "aliyun-ecs",
+                    action,
+                    format!(
+                        "{code}: RAM user is missing permission `{perm}` ({msg}); attach the Cua BYOC least-privilege RAM policy"
+                    ),
+                ),
+                "" => cloud_err("aliyun-ecs", action, format!("HTTP {status}: {v}")),
+                _ => cloud_err("aliyun-ecs", action, format!("{code}: {msg}")),
+            }
+        }
     }
 }
 
@@ -727,16 +839,20 @@ impl CloudApi for AliyunEcs {
     }
 
     fn resolve(&self, t: &Target) -> Result<Connection> {
-        let using_inline_or_env =
-            t.token.is_some() || matches!(Self::env_credentials(), Ok(Some(_)));
+        let using_inline_or_env = t.token.is_some()
+            || self.staged.lock().unwrap().is_some()
+            || matches!(Self::env_credentials(), Ok(Some(_)));
 
-        let mut profile = t
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_default();
+        let mut profile = if using_inline_or_env {
+            String::new()
+        } else {
+            t.profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
 
         let cli_profile =
             if !using_inline_or_env && (!profile.is_empty() || self.store.load().is_none()) {
@@ -882,8 +998,17 @@ impl CloudApi for AliyunEcs {
         };
         let account_id = identity["AccountId"]
             .as_str()
+            .map(str::trim)
             .unwrap_or_default()
             .to_string();
+        if account_id.is_empty() {
+            t.check(
+                "credentials",
+                false,
+                "sts:GetCallerIdentity returned an empty AccountId",
+            );
+            return t;
+        }
         t.account = account_id.clone();
         t.check(
             "credentials",
@@ -1050,10 +1175,9 @@ impl CloudApi for AliyunEcs {
             }
         };
 
-        // 5. Permissions: DescribeInstances, DescribeSecurityGroups, DescribeVpcs, RunInstances DryRun=true
+        // 5. Permissions: DescribeInstances, DescribeVpcs, DescribeVSwitches, DescribeSecurityGroups, RunInstances DryRun=true
         for (ep, action, ver) in [
             (&ecs, "DescribeInstances", ECS_API_VERSION),
-            (&ecs, "DescribeSecurityGroups", ECS_API_VERSION),
             (&vpc, "DescribeVpcs", VPC_API_VERSION),
         ] {
             if let Err(e) = self
@@ -1075,13 +1199,7 @@ impl CloudApi for AliyunEcs {
             }
         }
 
-        let mut run_params = vec![
-            ("RegionId".into(), conn.region.clone()),
-            ("ImageId".into(), discovered_image),
-            ("InstanceType".into(), discovered_type),
-            ("DryRun".into(), "true".into()),
-        ];
-        if let Ok(vsw) = self
+        let vsw = match self
             .call_ok(
                 &vpc,
                 "GET",
@@ -1094,13 +1212,80 @@ impl CloudApi for AliyunEcs {
                 profile_hint,
             )
             .await
-            && let Some(vsw_id) = vsw["VSwitches"]["VSwitch"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|x| x["VSwitchId"].as_str())
         {
-            run_params.push(("VSwitchId".into(), vsw_id.to_string()));
+            Ok(v) => v,
+            Err(e) => {
+                t.check("permissions", false, e.to_string());
+                return t;
+            }
+        };
+
+        let first_vsw = vsw["VSwitches"]["VSwitch"]
+            .as_array()
+            .and_then(|a| a.first());
+        let vsw_id = first_vsw
+            .and_then(|x| x["VSwitchId"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let vsw_vpc_id = first_vsw
+            .and_then(|x| x["VpcId"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let mut sg_params = vec![
+            ("RegionId".into(), conn.region.clone()),
+            ("PageSize".into(), "10".into()),
+        ];
+        if let Some(ref vpc_id) = vsw_vpc_id {
+            sg_params.push(("VpcId".into(), vpc_id.clone()));
         }
+        let sgs = match self
+            .call_ok(
+                &ecs,
+                "GET",
+                "DescribeSecurityGroups",
+                ECS_API_VERSION,
+                &sg_params,
+                profile_hint,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                t.check("permissions", false, e.to_string());
+                return t;
+            }
+        };
+
+        let matching_sg_id = vsw_vpc_id.as_deref().and_then(|vpc_id| {
+            sgs["SecurityGroups"]["SecurityGroup"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|sg| sg["VpcId"].as_str() == Some(vpc_id))
+                .and_then(|sg| sg["SecurityGroupId"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+
+        let mut run_params = vec![
+            ("RegionId".into(), conn.region.clone()),
+            ("ImageId".into(), discovered_image),
+            ("InstanceType".into(), discovered_type),
+            ("DryRun".into(), "true".into()),
+        ];
+        let has_vswitch = if let Some(id) = vsw_id {
+            run_params.push(("VSwitchId".into(), id));
+            if let Some(sg_id) = matching_sg_id {
+                run_params.push(("SecurityGroupId".into(), sg_id));
+            }
+            true
+        } else {
+            false
+        };
 
         match self
             .call_raw(
@@ -1113,19 +1298,23 @@ impl CloudApi for AliyunEcs {
             )
             .await
         {
-            Ok((status, v)) => {
-                let (code, _) = api_error_code_message(&v);
-                if code == "DryRunOperation" {
+            Ok((status, body)) => {
+                let code = match &body {
+                    ApiBody::Json(v) => api_error_code_message(v).0,
+                    ApiBody::Text(_) => "",
+                };
+                if !status.is_success() && code == "DryRunOperation" {
                     t.check(
                         "permissions",
                         true,
                         "RAM permissions verified (RunInstances DryRun passed)",
                     );
-                } else if matches!(
-                    code,
-                    "InvalidVSwitchId.NotFound" | "MissingParameter" | "InvalidVSwitchId.Mismatch"
-                ) {
-                    // Alibaba Cloud checks RAM authorization before VPC parameter checks.
+                } else if !has_vswitch
+                    && !status.is_success()
+                    && code == "InvalidVSwitchId.NotFound"
+                {
+                    // Account has zero VSwitches in this region; Alibaba Cloud checked RAM
+                    // authorization before reporting the missing VSwitchId.
                     t.check(
                         "permissions",
                         true,
@@ -1135,7 +1324,7 @@ impl CloudApi for AliyunEcs {
                     t.check(
                         "permissions",
                         false,
-                        map_api_error("RunInstances", ECS_API_VERSION, status, &v).to_string(),
+                        map_api_error("RunInstances", ECS_API_VERSION, status, &body).to_string(),
                     );
                 }
             }

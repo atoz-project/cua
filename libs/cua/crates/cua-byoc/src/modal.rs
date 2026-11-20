@@ -172,7 +172,7 @@ pub struct ModalApi {
     /// `~/.modal.toml` (tests point it elsewhere).
     config_file: Option<PathBuf>,
     /// A token from a connect or test in flight.
-    staged: Mutex<Option<ModalToken>>,
+    staged: Mutex<Option<std::result::Result<ModalToken, String>>>,
     /// Sealed connections' tokens.
     secrets: Mutex<Option<Arc<dyn SecretSource>>>,
 }
@@ -241,8 +241,8 @@ impl ModalApi {
     /// sealed one when the connection is sealed (`None`: the CLI's own
     /// sign-in).
     async fn token(&self) -> Result<Option<ModalToken>> {
-        if let Some(t) = self.staged.lock().unwrap().clone() {
-            return Ok(Some(t));
+        if let Some(res) = self.staged.lock().unwrap().clone() {
+            return res.map(Some).map_err(Error::InvalidArgument);
         }
         let Some(src) = self.sealed_source() else {
             return Ok(None);
@@ -790,9 +790,17 @@ impl CloudApi for ModalApi {
 
     fn stage_secret(&self, t: &Target) {
         // Held for the checks of a connect that seals it.
-        if let Some(tok) = t.token.as_deref().and_then(ModalToken::parse) {
-            *self.staged.lock().unwrap() = Some(tok);
-        }
+        let mut guard = self.staged.lock().unwrap();
+        *guard = match t.token.as_deref() {
+            Some(raw) => match ModalToken::parse(raw) {
+                Some(tok) => Some(Ok(tok)),
+                None => Some(Err(
+                    "modal: --token-stdin was empty or invalid; expected <token id>:<token secret>"
+                        .into(),
+                )),
+            },
+            None => None,
+        };
     }
 
     fn persist_secret(&self) -> Result<()> {
@@ -834,7 +842,7 @@ impl CloudApi for ModalApi {
 
     async fn test(&self, conn: &Connection) -> Tested {
         let mut t = Tested::default();
-        let staged = self.staged.lock().unwrap().is_some();
+        let staged = matches!(self.staged.lock().unwrap().as_ref(), Some(Ok(_)));
         let sealed = !staged && self.sealed_source().is_some_and(|s| s.sealed("modal"));
         let who = if staged {
             "the token you gave".to_string()
