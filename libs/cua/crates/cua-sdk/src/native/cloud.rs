@@ -44,8 +44,49 @@ pub struct CloudKind {
     pub usd_per_hour: f64,
 }
 
+fn redact_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some(scheme_pos) = trimmed.find("://") else {
+        return "<redacted>".into();
+    };
+    let scheme = &trimmed[..scheme_pos];
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return "<redacted>".into();
+    }
+    let after_scheme = &trimmed[scheme_pos + 3..];
+    let (before_frag, frag) = match after_scheme.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (after_scheme, None),
+    };
+    let before_query = before_frag.split('?').next().unwrap_or(before_frag);
+    let (authority, path) = match before_query.find('/') {
+        Some(i) => (&before_query[..i], &before_query[i..]),
+        None => (before_query, ""),
+    };
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return "<redacted>".into();
+    }
+    let mut out = format!("{scheme}://{host_port}{path}");
+    if let Some(f) = frag
+        && let Some(hex) = f.strip_prefix("sha256=")
+        && !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
 /// One cloud as `cloud_status` lists it.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, uniffi::Record)]
+#[derive(Clone, PartialEq, Default, Deserialize, uniffi::Record)]
 pub struct CloudProvider {
     /// `aws`, `gcp`, `hetzner`, `modal`.
     pub name: String,
@@ -135,7 +176,54 @@ pub struct CloudProvider {
     /// Relay authentication mode (`account` or `static`), or `None` when
     /// not connected.
     #[serde(default)]
+    #[uniffi(default = None)]
     pub relay_mode: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub spacesd_download_url: Option<String>,
+}
+
+impl std::fmt::Debug for CloudProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudProvider")
+            .field("name", &self.name)
+            .field("title", &self.title)
+            .field("tier", &self.tier)
+            .field("connected", &self.connected)
+            .field("default", &self.default)
+            .field("credentials", &self.credentials)
+            .field("account", &self.account)
+            .field("profile", &self.profile)
+            .field("region", &self.region)
+            .field("zone", &self.zone)
+            .field("project", &self.project)
+            .field("environment", &self.environment)
+            .field("label", &self.label)
+            .field("ttl_hours", &self.ttl_hours)
+            .field("kinds", &self.kinds)
+            .field("auth", &self.auth)
+            .field("status", &self.status)
+            .field("budget_usd_month", &self.budget_usd_month)
+            .field("max_size", &self.max_size)
+            .field("spent_month", &self.spent_month)
+            .field("running", &self.running)
+            .field("approval", &self.approval)
+            .field("approval_agent", &self.approval_agent)
+            .field("pending_budget_usd_month", &self.pending_budget_usd_month)
+            .field("pending_max_size", &self.pending_max_size)
+            .field("can_approve", &self.can_approve)
+            .field("suggest_auth", &self.suggest_auth)
+            .field("issue", &self.issue)
+            .field("holders", &self.holders)
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "spacesd_download_url",
+                &self.spacesd_download_url.as_deref().map(redact_url),
+            )
+            .finish()
+    }
 }
 
 /// The next step of a `cloud_connect`: a command for the agent, or a page
@@ -408,6 +496,10 @@ pub struct CloudTarget {
     /// never printed or stored in plaintext config.
     #[uniffi(default = None)]
     pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[uniffi(default = None)]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -426,6 +518,10 @@ impl std::fmt::Debug for CloudTarget {
                 "relay_token",
                 &self.relay_token.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "spacesd_download_url",
+                &self.spacesd_download_url.as_deref().map(redact_url),
+            )
             .finish()
     }
 }
@@ -443,6 +539,7 @@ impl CloudTarget {
             "relay_url": self.relay_url,
             "relay_mode": self.relay_mode,
             "relay_token": self.relay_token,
+            "spacesd_download_url": self.spacesd_download_url,
         })
     }
 
@@ -451,6 +548,7 @@ impl CloudTarget {
             ("relay_url", self.relay_url.is_some()),
             ("relay_mode", self.relay_mode.is_some()),
             ("relay_token", self.relay_token.is_some()),
+            ("spacesd_download_url", self.spacesd_download_url.is_some()),
         ]
         .into_iter()
         .filter_map(|(k, set)| set.then_some(k))
@@ -788,6 +886,7 @@ mod tests {
             relay_url: Some("https://relay.example.com".into()),
             relay_mode: Some("static".into()),
             relay_token: Some("super-secret-relay-token".into()),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
             ..Default::default()
         };
         assert!(!format!("{target:?}").contains("super-secret-relay-token"));
@@ -795,10 +894,15 @@ mod tests {
         assert_eq!(args["relay_url"], "https://relay.example.com");
         assert_eq!(args["relay_mode"], "static");
         assert_eq!(args["relay_token"], "super-secret-relay-token");
+        assert_eq!(
+            args["spacesd_download_url"],
+            "https://mirror.example.com/cua-spacesd.exe"
+        );
         let p_wire = serde_json::to_value(cua_spaces::cloud::CloudProvider {
             name: "hetzner".into(),
             relay_url: Some("https://relay.example.com".into()),
             relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
             ..Default::default()
         })
         .unwrap();
@@ -808,5 +912,28 @@ mod tests {
             p_sdk.relay_url.as_deref(),
             Some("https://relay.example.com")
         );
+        assert_eq!(
+            p_sdk.spacesd_download_url.as_deref(),
+            Some("https://mirror.example.com/cua-spacesd.exe")
+        );
+
+        let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab";
+        let secret_target = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let t_dbg = format!("{secret_target:?}");
+        assert!(!t_dbg.contains("MyPass998877"), "{t_dbg}");
+        assert!(!t_dbg.contains("DeadBeefCafe9988"), "{t_dbg}");
+
+        let secret_provider = CloudProvider {
+            name: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let p_dbg = format!("{secret_provider:?}");
+        assert!(!p_dbg.contains("MyPass998877"), "{p_dbg}");
+        assert!(!p_dbg.contains("DeadBeefCafe9988"), "{p_dbg}");
     }
 }

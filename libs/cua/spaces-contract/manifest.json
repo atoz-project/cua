@@ -7189,6 +7189,10 @@
             "description": "Google Cloud `oidc`: a service account to act as. Default: none,\nthe federated identity calls Google directly.",
             "type": "string"
           },
+          "spacesd_download_url": {
+            "description": "Optional custom `cua-spacesd` binary mirror URL (with optional\n`#sha256=<64 hex>` fragment).",
+            "type": "string"
+          },
           "subscription_id": {
             "description": "Azure: the subscription id (the trust template's\n`subscriptionId` output).",
             "type": "string"
@@ -7285,6 +7289,10 @@
           },
           "relay_url": {
             "description": "Per-connection relay base URL (defaults to `https://relay.cua.ai`\nin Account Relay Mode).",
+            "type": "string"
+          },
+          "spacesd_download_url": {
+            "description": "Optional custom `cua-spacesd` binary mirror URL (with optional\n`#sha256=<64 hex>` fragment).",
             "type": "string"
           },
           "token": {

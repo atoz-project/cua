@@ -22,7 +22,7 @@ use cua_sandbox_core::{Error, ServiceEndpoint, Status};
 use crate::api::{CloudApi, Result};
 use crate::audit;
 use crate::bootlog;
-use crate::bootstrap::{VmBoot, cloud_init};
+use crate::bootstrap::{VmBoot, WindowsVmBoot, cloud_init, windows_user_data};
 use crate::model::{self, Connection, ProvisionSpec, Resource, Tier, now};
 use crate::relay::RelayAccess;
 use crate::state::Store;
@@ -425,9 +425,17 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         self.api.name()
     }
 
+    fn supported_oses(&self) -> &'static [&'static str] {
+        self.api.supported_oses()
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
+        let mut kinds = vec![RunKind::Container];
+        if self.api.runtimes().iter().any(|r| r.as_str() == "native") {
+            kinds.push(RunKind::Vm);
+        }
         ProviderCapabilities {
-            kinds: vec![RunKind::Container],
+            kinds,
             // The default engine (`--runtime` picks another where offered).
             runtime: match (self.api.tier(), self.api.runtimes().first()) {
                 (_, Some(cua_sandbox_core::placement::Runtime::Gvisor)) => "gvisor",
@@ -493,13 +501,62 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 offer.reason
             )));
         }
+        let asked_runtime = runtime_word(self.api.as_ref(), &spec.runtime)?;
+        let offered_runtimes = self.api.runtimes();
+        let (effective_kind, effective_runtime): (&str, String) = if family == "windows" {
+            if !self
+                .api
+                .supported_oses()
+                .iter()
+                .any(|os| os.eq_ignore_ascii_case("windows"))
+            {
+                return Err(Error::UnsupportedImage(format!(
+                    "{} does not run windows sandboxes",
+                    self.api.title()
+                )));
+            }
+            if asked_runtime == "docker" || (!asked_runtime.is_empty() && asked_runtime != "native")
+            {
+                return Err(Error::UnsupportedImage(format!(
+                    "windows on {} requires --runtime native (Docker-on-VM does not support Windows guests)",
+                    self.api.title()
+                )));
+            }
+            let rt = if asked_runtime.is_empty()
+                && offered_runtimes.iter().any(|r| r.as_str() == "native")
+            {
+                "native".to_string()
+            } else {
+                asked_runtime
+            };
+            ("vm", rt)
+        } else {
+            if asked_runtime == "native" {
+                return Err(Error::Unsupported {
+                    provider: cua_sandbox_core::ProviderKind::Contrib,
+                    op: format!(
+                        "Linux Direct VM (--runtime native) on {} awaits #7; use --runtime docker",
+                        self.api.name()
+                    ),
+                });
+            }
+            let rt = if asked_runtime.is_empty()
+                && offered_runtimes.iter().any(|r| r.as_str() == "docker")
+            {
+                "docker".to_string()
+            } else {
+                asked_runtime
+            };
+            ("container", rt)
+        };
         // Say a budget share passed before a new machine adds to it.
         crate::alerts::check_all(&self.store, now());
+        let (check_cpus, check_mem) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
         crate::limits::check_new_machine(
             &conn,
             self.api.title(),
-            Some(spec.cpus).filter(|c| *c > 0),
-            Some(spec.memory_mb).filter(|m| *m > 0),
+            check_cpus,
+            check_mem,
             offer.usd_per_hour,
             self.store
                 .spent_for_limits(&conn, now())
@@ -624,6 +681,17 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             detail::USD_PER_HOUR.into(),
             format!("{:.4}", offer.usd_per_hour),
         );
+        if matches!(self.api.tier(), Tier::Vm) {
+            let detail_rt = if effective_runtime == "native" {
+                "native"
+            } else {
+                "docker-on-vm"
+            };
+            rec.extra.insert(detail::RUNTIME.into(), detail_rt.into());
+        } else if !effective_runtime.is_empty() {
+            rec.extra
+                .insert(detail::RUNTIME.into(), effective_runtime.clone());
+        }
         // 2. Recorded before the cloud call.
         self.store.record(rec.clone()).map_err(Self::io)?;
         self.store.audit(audit::of_resource(
@@ -633,11 +701,16 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             "ok",
             "recorded before the cloud call",
         ));
+        let desktop_password = if family == "windows" {
+            Some(crate::bootstrap_win::generate_desktop_password())
+        } else {
+            None
+        };
         let mut provision = ProvisionSpec {
             name: resource_name,
             family: family.into(),
             image: spec.image.pinned_ref.clone(),
-            kind: "container".into(),
+            kind: effective_kind.into(),
             machine_type: offer.machine_type.clone(),
             disk_gb: self.api.default_disk_gb(family),
             cpus: Some(spec.cpus),
@@ -645,11 +718,25 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             tags: rec.tags.clone(),
             ttl_secs,
             arch: spec.image.arch.clone(),
-            runtime: runtime_word(self.api.as_ref(), &spec.runtime)?,
+            runtime: effective_runtime,
             network,
+            spacesd_download_url: conn.spacesd_download_url.clone(),
+            desktop_password: desktop_password.clone(),
             ..Default::default()
         };
         match self.api.tier() {
+            Tier::Vm if family == "windows" => {
+                provision.user_data = windows_user_data(&WindowsVmBoot {
+                    join: &join,
+                    env: &guest_env,
+                    expires,
+                    ttl_secs,
+                    provider: self.api.name(),
+                    spacesd_download_url: conn.spacesd_download_url.as_deref(),
+                    desktop_user: "Administrator",
+                    desktop_password: desktop_password.as_deref().unwrap_or_default(),
+                });
+            }
             Tier::Vm => {
                 let (net_guard, share_slots) = VmBoot::switches();
                 provision.user_data = cloud_init(&VmBoot {
@@ -728,11 +815,37 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         if let Err(e) = joined {
             // The evidence first: the rollback deletes the machine and its
             // log with it.
+            let mut owned_secrets = Vec::new();
+            if let Some(raw_url) = conn.spacesd_download_url.as_deref() {
+                let no_frag = raw_url.split('#').next().unwrap_or(raw_url);
+                if let Ok(u) = url::Url::parse(no_frag)
+                    && (!u.username().is_empty() || u.password().is_some() || u.query().is_some())
+                {
+                    owned_secrets.push(raw_url.to_string());
+                    owned_secrets.push(no_frag.to_string());
+                    if !u.username().is_empty() {
+                        owned_secrets.push(u.username().to_string());
+                    }
+                    if let Some(pw) = u.password() {
+                        owned_secrets.push(pw.to_string());
+                    }
+                    if let Some(q) = u.query() {
+                        owned_secrets.push(q.to_string());
+                        for (_, v) in u.query_pairs() {
+                            owned_secrets.push(v.into_owned());
+                        }
+                    }
+                }
+            }
             let mut secrets: Vec<&str> = vec![&join.machine_token];
             if !join.jwks_json.is_empty() {
                 secrets.push(&join.jwks_json);
             }
+            if let Some(pw) = desktop_password.as_deref() {
+                secrets.push(pw);
+            }
             secrets.extend(guest_env.values().map(String::as_str));
+            secrets.extend(owned_secrets.iter().map(String::as_str));
             let evidence = self.keep_boot_log(&conn, &all[0], &secrets).await;
             self.rollback(&conn, &owner, &all[..1], &machine).await;
             return Err(with_evidence(e, evidence));

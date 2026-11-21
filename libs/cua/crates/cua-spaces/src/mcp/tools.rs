@@ -1081,6 +1081,7 @@ fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget
         relay_mode,
         // Keep `Some("")` distinct from `None` so empty `--relay-token-stdin` does not fall through.
         relay_token: t.relay_token.map(|v| v.trim().to_string()),
+        spacesd_download_url: t.spacesd_download_url.map(|v| v.trim().to_string()),
     })
 }
 
@@ -1681,11 +1682,16 @@ mod tests {
             provider: "aliyun-ecs".into(),
             token: Some("  \n".into()),
             relay_token: Some(" \t ".into()),
+            spacesd_download_url: Some(" https://mirror.example/cua-spacesd.exe ".into()),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(out.token.as_deref(), Some(""));
         assert_eq!(out.relay_token.as_deref(), Some(""));
+        assert_eq!(
+            out.spacesd_download_url.as_deref(),
+            Some("https://mirror.example/cua-spacesd.exe")
+        );
 
         let omitted = cloud_target(i::CloudTarget {
             provider: "aliyun-ecs".into(),

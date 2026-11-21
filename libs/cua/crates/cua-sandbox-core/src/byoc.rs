@@ -123,8 +123,52 @@ impl std::fmt::Display for RelayMode {
 /// The default official Cua relay URL.
 pub const DEFAULT_RELAY_URL: &str = "https://relay.cua.ai";
 
+/// Strips URL userinfo (`user:pass@`), `?query` parameters, and non-`#sha256=`
+/// fragments from `raw` so credentials and signed tokens never appear in logs,
+/// error messages, or `Debug` output.
+pub fn redact_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some(scheme_pos) = trimmed.find("://") else {
+        return "<redacted>".into();
+    };
+    let scheme = &trimmed[..scheme_pos];
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return "<redacted>".into();
+    }
+    let after_scheme = &trimmed[scheme_pos + 3..];
+    let (before_frag, frag) = match after_scheme.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (after_scheme, None),
+    };
+    let before_query = before_frag.split('?').next().unwrap_or(before_frag);
+    let (authority, path) = match before_query.find('/') {
+        Some(i) => (&before_query[..i], &before_query[i..]),
+        None => (before_query, ""),
+    };
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return "<redacted>".into();
+    }
+    let mut out = format!("{scheme}://{host_port}{path}");
+    if let Some(f) = frag
+        && let Some(hex) = f.strip_prefix("sha256=")
+        && !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
 /// One cloud as `cloud_status` lists it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudProvider {
     /// `aws`, `gcp`, `hetzner`, `modal`.
     pub name: String,
@@ -232,6 +276,52 @@ pub struct CloudProvider {
     /// not connected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mode: Option<RelayMode>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
+}
+
+impl std::fmt::Debug for CloudProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudProvider")
+            .field("name", &self.name)
+            .field("title", &self.title)
+            .field("tier", &self.tier)
+            .field("connected", &self.connected)
+            .field("default", &self.default)
+            .field("credentials", &self.credentials)
+            .field("account", &self.account)
+            .field("profile", &self.profile)
+            .field("region", &self.region)
+            .field("zone", &self.zone)
+            .field("project", &self.project)
+            .field("environment", &self.environment)
+            .field("label", &self.label)
+            .field("ttl_hours", &self.ttl_hours)
+            .field("kinds", &self.kinds)
+            .field("auth", &self.auth)
+            .field("status", &self.status)
+            .field("budget_usd_month", &self.budget_usd_month)
+            .field("max_size", &self.max_size)
+            .field("spent_month", &self.spent_month)
+            .field("running", &self.running)
+            .field("approval", &self.approval)
+            .field("approval_agent", &self.approval_agent)
+            .field("pending_budget_usd_month", &self.pending_budget_usd_month)
+            .field("pending_max_size", &self.pending_max_size)
+            .field("can_approve", &self.can_approve)
+            .field("suggest_auth", &self.suggest_auth)
+            .field("issue", &self.issue)
+            .field("holders", &self.holders)
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "spacesd_download_url",
+                &self.spacesd_download_url.as_deref().map(redact_url),
+            )
+            .finish()
+    }
 }
 
 /// The words of [`CloudProvider::status`] and [`CloudConnected`]'s outcome.
@@ -729,6 +819,10 @@ pub struct CloudTarget {
     /// Shared static relay registration token for Static Relay Mode. Secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -746,6 +840,10 @@ impl std::fmt::Debug for CloudTarget {
             .field(
                 "relay_token",
                 &self.relay_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "spacesd_download_url",
+                &self.spacesd_download_url.as_deref().map(redact_url),
             )
             .finish()
     }
@@ -1080,5 +1178,47 @@ mod tests {
         let serialized = serde_json::to_string(&p).unwrap();
         assert!(!serialized.contains("relay_url"));
         assert!(!serialized.contains("relay_mode"));
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_query_and_non_sha_fragments() {
+        assert_eq!(
+            redact_url(
+                "https://dluser:MyPass998877@mirror.example.com:8443/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab"
+            ),
+            "https://mirror.example.com:8443/cua-spacesd.exe#sha256=abab"
+        );
+        assert_eq!(
+            redact_url("https://mirror.example.com/cua.exe#token=secret"),
+            "https://mirror.example.com/cua.exe"
+        );
+        assert_eq!(redact_url("https://user:pass@/cua.exe"), "<redacted>");
+
+        let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua.exe?sig=DeadBeefCafe9988#sha256=abab";
+        let t = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let t_dbg = format!("{t:?}");
+        assert!(!t_dbg.contains("MyPass998877"), "{t_dbg}");
+        assert!(!t_dbg.contains("DeadBeefCafe9988"), "{t_dbg}");
+        assert!(
+            t_dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
+            "{t_dbg}"
+        );
+
+        let p = CloudProvider {
+            name: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let p_dbg = format!("{p:?}");
+        assert!(!p_dbg.contains("MyPass998877"), "{p_dbg}");
+        assert!(!p_dbg.contains("DeadBeefCafe9988"), "{p_dbg}");
+        assert!(
+            p_dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
+            "{p_dbg}"
+        );
     }
 }

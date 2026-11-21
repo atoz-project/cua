@@ -44,6 +44,42 @@ const SECRET_WORDS: &[&str] = &[
 /// hide ordinary words).
 const MIN_SECRET_LEN: usize = 8;
 
+/// URL query parameters that commonly carry pre-signed credentials or tokens.
+const URL_QUERY_SECRET_PARAMS: &[&str] = &[
+    "?sig=",
+    "&sig=",
+    "?signature=",
+    "&signature=",
+    "x-amz-signature=",
+    "x-amz-credential=",
+    "x-amz-security-token=",
+    "ossaccesskeyid=",
+    "x-oss-signature=",
+    "?sas=",
+    "&sas=",
+];
+
+fn contains_url_secret(low: &str) -> bool {
+    if URL_QUERY_SECRET_PARAMS.iter().any(|p| low.contains(p)) {
+        return true;
+    }
+    for scheme in ["https://", "http://"] {
+        let mut rest = low;
+        while let Some(idx) = rest.find(scheme) {
+            let after = &rest[idx + scheme.len()..];
+            let authority = after
+                .split(['/', '?', '#', ' ', '\t', '"', '\''])
+                .next()
+                .unwrap_or("");
+            if authority.contains('@') {
+                return true;
+            }
+            rest = after;
+        }
+    }
+    false
+}
+
 fn strip_escapes(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -78,7 +114,9 @@ pub fn filter(raw: &str, secrets: &[&str]) -> Vec<String> {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| {
             let low = l.to_ascii_lowercase();
-            !SECRET_WORDS.iter().any(|w| low.contains(w)) && !secrets.iter().any(|s| l.contains(s))
+            !SECRET_WORDS.iter().any(|w| low.contains(w))
+                && !contains_url_secret(&low)
+                && !secrets.iter().any(|s| l.contains(s))
         })
         .collect();
     let drop = lines.len().saturating_sub(KEEP_LINES);
@@ -160,6 +198,8 @@ mod tests {
         raw.push_str("relay token cmt_abcdef0123 joined\n");
         raw.push_str("Authorization: Bearer abc\n");
         raw.push_str("value hunter2hunter2 leaked\n");
+        raw.push_str("downloading https://u:p@mirror.example.com/cua.exe\n");
+        raw.push_str("GET https://bucket.example.com/cua.exe?sig=Short1&other=1\n");
         raw.push_str("last ok line\n\n");
         let out = filter(&raw, &["hunter2hunter2", "x"]);
         assert_eq!(out.len(), KEEP_LINES);
@@ -167,6 +207,8 @@ mod tests {
         assert!(out.iter().all(|l| !l.contains("cmt_")
             && !l.contains("Bearer")
             && !l.contains("hunter2")
+            && !l.contains("u:p@")
+            && !l.contains("sig=Short1")
             && !l.contains('\u{1b}')));
         assert!(out.contains(&"line 299".to_string()));
     }

@@ -24,7 +24,7 @@ azure = ["dep:reqwest", "federation"]
 # Hetzner Cloud over its REST API with a project API token.
 hetzner = ["dep:reqwest"]
 # Alibaba Cloud ECS over OpenAPI V3 HTTPS (ACS3-HMAC-SHA256) with RAM AccessKeys.
-aliyun-ecs = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex", "dep:url"]
+aliyun-ecs = ["dep:reqwest", "dep:hmac", "dep:sha2", "dep:hex"]
 # Modal Sandboxes through the cua-modal-helper (Modal's official Go SDK).
 modal = ["dep:cua-contrib"]
 # Every provider.
@@ -58,7 +58,7 @@ aws-credential-types = { version = "1", optional = true }
 sha2 = { workspace = true, optional = true }
 hmac = { version = "0.12", optional = true }
 hex = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
+url = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"], optional = true }
 # Image configs (the start command) from the registry, shared with the
 # contrib providers.

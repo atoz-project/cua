@@ -949,6 +949,93 @@ fn is_instance_not_found(code: &str) -> bool {
     )
 }
 
+/// Resolves the ECS instance type for `spec` (modular helper for `#5` / `#6`).
+pub fn instance_type_for(spec: &ProvisionSpec) -> &str {
+    let explicit = spec.machine_type.trim();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    match spec.family.as_str() {
+        "windows" => WINDOWS_INSTANCE_TYPE,
+        "linux-slim" => SLIM_INSTANCE_TYPE,
+        _ => LINUX_INSTANCE_TYPE,
+    }
+}
+
+/// Resolves the `(size_gib, category)` system disk parameters for `spec`.
+pub fn system_disk_for(spec: &ProvisionSpec) -> (u32, &'static str) {
+    let min_gb = if spec.family == "windows" { 60 } else { 40 };
+    (spec.disk_gb.max(min_gb), "cloud_essd")
+}
+
+impl AliyunEcs {
+    async fn discover_windows_image(
+        &self,
+        ecs: &str,
+        region: &str,
+        profile_hint: Option<&str>,
+    ) -> Result<String> {
+        let v = self
+            .call_ok(
+                ecs,
+                "GET",
+                "DescribeImages",
+                ECS_API_VERSION,
+                &[
+                    ("RegionId".into(), region.into()),
+                    ("ImageOwnerAlias".into(), "system".into()),
+                    ("OSType".into(), "windows".into()),
+                    ("Status".into(), "Available".into()),
+                    ("Architecture".into(), "x86_64".into()),
+                    ("PageSize".into(), "50".into()),
+                ],
+                profile_hint,
+            )
+            .await?;
+        let imgs = v["Images"]["Image"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let score = |img: &Value| -> u8 {
+            let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
+            let en = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
+            let is_2022 = name.contains("2022") || en.contains("2022");
+            let is_en = name.contains("en-us") || name.contains("_en_") || en.contains("english");
+            match (is_2022, is_en) {
+                (true, true) => 3,
+                (true, false) => 2,
+                (false, true) => 1,
+                (false, false) => 0,
+            }
+        };
+        imgs.iter()
+            .filter(|img| {
+                img["Status"]
+                    .as_str()
+                    .is_none_or(|s| s.eq_ignore_ascii_case("Available"))
+            })
+            .filter(|img| {
+                img["ImageId"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty())
+            })
+            .max_by(|a, b| {
+                score(a).cmp(&score(b)).then_with(|| {
+                    let ca = a["CreationTime"].as_str().unwrap_or("");
+                    let cb = b["CreationTime"].as_str().unwrap_or("");
+                    ca.cmp(cb)
+                })
+            })
+            .and_then(|img| img["ImageId"].as_str())
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| {
+                Error::Cloud(format!(
+                    "aliyun-ecs: no official Windows Server x86_64 image found in {region}"
+                ))
+            })
+    }
+}
+
 #[async_trait]
 impl CloudApi for AliyunEcs {
     fn name(&self) -> &'static str {
@@ -968,7 +1055,14 @@ impl CloudApi for AliyunEcs {
     }
 
     fn runtimes(&self) -> Vec<Runtime> {
-        vec![Runtime::Other("docker".into())]
+        vec![
+            Runtime::Other("docker".into()),
+            Runtime::Other("native".into()),
+        ]
+    }
+
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux", "windows"]
     }
 
     fn default_disk_gb(&self, family: &str) -> u32 {
@@ -976,6 +1070,22 @@ impl CloudApi for AliyunEcs {
             "windows" => 60,
             "linux" | "linux-slim" => 40,
             _ => crate::provider::disk_for(family),
+        }
+    }
+
+    fn check_size_for(
+        &self,
+        family: &str,
+        cpus: u32,
+        memory_mb: u64,
+    ) -> (Option<u32>, Option<u64>) {
+        if family == "windows" {
+            (Some(cpus.max(4)), Some(memory_mb.max(8192)))
+        } else {
+            (
+                Some(cpus).filter(|c| *c > 0),
+                Some(memory_mb).filter(|m| *m > 0),
+            )
         }
     }
 
@@ -1598,20 +1708,35 @@ impl CloudApi for AliyunEcs {
     }
 
     async fn provision(&self, conn: &Connection, spec: &ProvisionSpec) -> Result<Vec<Resource>> {
-        if !matches!(spec.family.as_str(), "linux" | "linux-slim") {
-            return Err(Error::Unsupported {
-                provider: cua_sandbox_core::ProviderKind::Contrib,
-                op: format!(
-                    "aliyun-ecs does not yet support {} sandboxes (only linux Docker-on-VM)",
-                    spec.family
-                ),
-            });
-        }
-        if !spec.runtime.is_empty() && spec.runtime != "docker" {
-            return Err(Error::Unsupported {
-                provider: cua_sandbox_core::ProviderKind::Contrib,
-                op: format!("aliyun-ecs does not yet support --runtime {}", spec.runtime),
-            });
+        match spec.family.as_str() {
+            "windows" => {
+                if !spec.runtime.is_empty() && spec.runtime != "native" {
+                    return Err(Error::Unsupported {
+                        provider: cua_sandbox_core::ProviderKind::Contrib,
+                        op: format!(
+                            "aliyun-ecs Windows sandboxes use --runtime native (got --runtime {})",
+                            spec.runtime
+                        ),
+                    });
+                }
+            }
+            "linux" | "linux-slim" => {
+                if !spec.runtime.is_empty() && spec.runtime != "docker" {
+                    return Err(Error::Unsupported {
+                        provider: cua_sandbox_core::ProviderKind::Contrib,
+                        op: format!(
+                            "aliyun-ecs does not yet support --runtime {} on {} (Direct VM for Linux is tracked in #7)",
+                            spec.runtime, spec.family
+                        ),
+                    });
+                }
+            }
+            _ => {
+                return Err(Error::Unsupported {
+                    provider: cua_sandbox_core::ProviderKind::Contrib,
+                    op: format!("aliyun-ecs does not support {} sandboxes", spec.family),
+                });
+            }
         }
         let owner = spec
             .tags
@@ -1623,15 +1748,13 @@ impl CloudApi for AliyunEcs {
         let profile_hint = self.profile_hint(conn);
         let ecs_ep = self.ecs_endpoint(&region);
 
-        let instance_type = if !spec.machine_type.is_empty() {
-            spec.machine_type.clone()
-        } else if spec.family == "linux-slim" {
-            SLIM_INSTANCE_TYPE.into()
+        let instance_type = instance_type_for(spec).to_string();
+        let image_id = if spec.family == "windows" {
+            self.discover_windows_image(&ecs_ep, &region, profile_hint)
+                .await?
         } else {
-            LINUX_INSTANCE_TYPE.into()
+            self.resolve_ubuntu_image(conn, &region).await?
         };
-
-        let image_id = self.resolve_ubuntu_image(conn, &region).await?;
         let net_cfg = NetworkConfig::from_connection(conn)?;
         let net = aliyun_net::prepare_network(
             self,
@@ -1651,7 +1774,7 @@ impl CloudApi for AliyunEcs {
             )));
         }
 
-        let disk_gb = spec.disk_gb.max(40);
+        let (disk_gb, disk_category) = system_disk_for(spec);
         let host_name = sanitize_hostname(&spec.name);
         let auto_release =
             (spec.ttl_secs > 0).then(|| model::rfc3339(model::now() + spec.ttl_secs.max(1860)));
@@ -1703,7 +1826,7 @@ impl CloudApi for AliyunEcs {
                 ("DeletionProtection".into(), "false".into()),
                 ("HttpEndpoint".into(), "enabled".into()),
                 ("HttpTokens".into(), "required".into()),
-                ("SystemDisk.Category".into(), "cloud_essd".into()),
+                ("SystemDisk.Category".into(), disk_category.into()),
                 ("SystemDisk.Size".into(), disk_gb.to_string()),
                 ("ClientToken".into(), client_token),
             ];
@@ -1718,6 +1841,9 @@ impl CloudApi for AliyunEcs {
             }
             if let Some(ref release) = auto_release {
                 params.push(("AutoReleaseTime".into(), release.clone()));
+            }
+            if let Some(pw) = spec.desktop_password.as_deref().filter(|p| !p.is_empty()) {
+                params.push(("Password".into(), pw.into()));
             }
             if let Some(ref ud) = user_data_b64 {
                 params.push(("UserData".into(), ud.clone()));

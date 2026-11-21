@@ -2325,6 +2325,26 @@ impl Spaces {
             // Cua Cloud has ended: a legacy `cloud:` Space cannot connect.
             SpaceId::Cloud { .. } => return Err(cua_sandbox_core::Error::CloudEnded.into()),
             SpaceId::Relay { machine_id } => {
+                if let Ok(Some(sb_name)) = self.inner.sandboxes.by_relay_machine(machine_id)
+                    && let Ok(sandbox) = self.inner.sandboxes.connect(&sb_name).await
+                {
+                    let kind = sandbox
+                        .image_info()
+                        .map(|i| i.variant.clone())
+                        .unwrap_or_else(|| match sandbox.placement().0 {
+                            cua_sandbox_core::placement::Kind::Vm => "vm".into(),
+                            cua_sandbox_core::placement::Kind::MicroVm => "microvm".into(),
+                            _ => "container".into(),
+                        });
+                    let arch = sandbox
+                        .image_info()
+                        .and_then(|i| i.arch.clone())
+                        .unwrap_or_default();
+                    platform = Some((kind, arch));
+                    if let Some(i) = sandbox.image_info() {
+                        image = Some((i.reference.clone(), i.digest.clone()));
+                    }
+                }
                 if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
                     let mut o = ConnectOptions::parse(url)?;
                     o.token = credential.token.clone();

@@ -32583,7 +32583,12 @@ data class CloudProvider (
      * Relay authentication mode (`account` or `static`), or `None` when
      * not connected.
      */
-    var `relayMode`: kotlin.String?
+    var `relayMode`: kotlin.String? = null
+    ,
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL.
+     */
+    var `spacesdDownloadUrl`: kotlin.String? = null
 
 ){
 
@@ -32631,6 +32636,7 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterSequenceString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -32665,7 +32671,8 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterString.allocationSize(value.`issue`) +
             FfiConverterSequenceString.allocationSize(value.`holders`) +
             FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
-            FfiConverterOptionalString.allocationSize(value.`relayMode`)
+            FfiConverterOptionalString.allocationSize(value.`relayMode`) +
+            FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`)
     )
 
     override fun write(value: CloudProvider, buf: ByteBuffer) {
@@ -32700,6 +32707,7 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterSequenceString.write(value.`holders`, buf)
             FfiConverterOptionalString.write(value.`relayUrl`, buf)
             FfiConverterOptionalString.write(value.`relayMode`, buf)
+            FfiConverterOptionalString.write(value.`spacesdDownloadUrl`, buf)
     }
 }
 
@@ -33021,6 +33029,12 @@ data class CloudTarget (
      * never printed or stored in plaintext config.
      */
     var `relayToken`: kotlin.String? = null
+    ,
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL (with optional
+     * `#sha256=<64 hex>` fragment).
+     */
+    var `spacesdDownloadUrl`: kotlin.String? = null
 
 ){
 
@@ -33047,6 +33061,7 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -33060,7 +33075,8 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.allocationSize(value.`token`) +
             FfiConverterOptionalString.allocationSize(value.`relayUrl`) +
             FfiConverterOptionalString.allocationSize(value.`relayMode`) +
-            FfiConverterOptionalString.allocationSize(value.`relayToken`)
+            FfiConverterOptionalString.allocationSize(value.`relayToken`) +
+            FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`)
     )
 
     override fun write(value: CloudTarget, buf: ByteBuffer) {
@@ -33074,6 +33090,7 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.write(value.`relayUrl`, buf)
             FfiConverterOptionalString.write(value.`relayMode`, buf)
             FfiConverterOptionalString.write(value.`relayToken`, buf)
+            FfiConverterOptionalString.write(value.`spacesdDownloadUrl`, buf)
     }
 }
 

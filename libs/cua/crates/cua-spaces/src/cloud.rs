@@ -128,7 +128,19 @@ impl Spaces {
             .clone()
             .filter(|i| !i.trim().is_empty())
             .unwrap_or_else(|| "linux".to_string());
-        let mut create = CreateOptions::new(ProviderKind::Contrib, image);
+        let mut create = CreateOptions::new(ProviderKind::Contrib, &image);
+        let raw_ref = image
+            .trim()
+            .strip_prefix("vm:")
+            .or_else(|| image.trim().strip_prefix("container:"))
+            .or_else(|| image.trim().strip_prefix("docker:"))
+            .unwrap_or(image.trim());
+        if let Some((_, os)) = cua_image::canonical::alias_with(raw_ref, &|n| std::env::var(n).ok())
+        {
+            create.os = os.as_str().to_string();
+        } else if let Some(os) = cua_image::catalog::catalog_os(raw_ref) {
+            create.os = os;
+        }
         create.contrib = Some(word.to_string());
         create.name = Some(
             opts.name
@@ -196,7 +208,11 @@ impl Spaces {
             let kind = sandbox
                 .image_info()
                 .map(|i| i.variant.clone())
-                .unwrap_or_else(|| "linux".into());
+                .unwrap_or_else(|| match sandbox.placement().0 {
+                    Kind::Vm => "vm".into(),
+                    Kind::MicroVm => "microvm".into(),
+                    _ => "container".into(),
+                });
             let arch = sandbox
                 .image_info()
                 .and_then(|i| i.arch.clone())

@@ -2508,7 +2508,15 @@ async fn vswitch_skips_used_cidrs_and_linux_slim_enforces_40g_cloud_essd() {
 
     assert_eq!(api.default_disk_gb("linux"), 40);
     assert_eq!(api.default_disk_gb("linux-slim"), 40);
-    assert_eq!(api.runtimes(), vec![Runtime::Other("docker".into())]);
+    assert_eq!(api.default_disk_gb("windows"), 60);
+    assert_eq!(
+        api.runtimes(),
+        vec![
+            Runtime::Other("docker".into()),
+            Runtime::Other("native".into()),
+        ]
+    );
+    assert_eq!(api.supported_oses(), &["linux", "windows"]);
 
     let spec = ProvisionSpec {
         name: "cua-aliyun-ecs-slim1".into(),
@@ -2547,4 +2555,601 @@ async fn vswitch_skips_used_cidrs_and_linux_slim_enforces_40g_cloud_essd() {
         Some("cloud_essd")
     );
     assert!(!run.params.contains_key("AutoReleaseTime"));
+}
+
+fn decode_b64_str(raw: &str) -> String {
+    String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(raw.trim())
+            .expect("valid base64"),
+    )
+    .expect("valid utf8")
+}
+
+fn decode_ps_put(script: &str, name: &str) -> Option<String> {
+    let needle = format!("'{name}') '");
+    let idx = script.find(&needle)? + needle.len();
+    let rest = &script[idx..];
+    let end = rest.find('\'')?;
+    Some(decode_b64_str(&rest[..end]))
+}
+
+#[tokio::test]
+async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
+    use cua_sandbox_core::placement::Kind;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-win", Some("win@example.com"));
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    let api = Arc::new(api);
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![api.clone()],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+        ),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+
+    let mirror_sha = "cd".repeat(32);
+    let mirror_url = format!("https://mirror.example.com/cua-spacesd.exe#sha256={mirror_sha}");
+
+    // 1. Connect with --max-size 2x4 -> Windows (4 vCPU / 8 GiB) must be refused before any cloud call.
+    clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                spacesd_download_url: Some(mirror_url.clone()),
+                ..Default::default()
+            },
+            max_size: Some("2x4".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut o_small = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o_small.contrib = Some("aliyun-ecs".into());
+    o_small.name = Some("win-too-big".into());
+    o_small.os = "windows".into();
+    let err = sandboxes.create(o_small).await.unwrap_err();
+    assert!(err.to_string().contains("2 vCPU"), "{err}");
+    assert!(s.lock().unwrap().instances.is_empty());
+
+    // 2. Reconnect with --max-size 4x16 (and omit spacesd_download_url -> preserved!).
+    let connected = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                ..Default::default()
+            },
+            max_size: Some("4x16".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        connected.provider.spacesd_download_url.as_deref(),
+        Some(mirror_url.as_str())
+    );
+
+    // 3. Explicit --runtime docker on Windows is refused cleanly.
+    let mut o_docker = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o_docker.contrib = Some("aliyun-ecs".into());
+    o_docker.name = Some("win-docker-nope".into());
+    o_docker.os = "windows".into();
+    o_docker.runtime = Runtime::Other("docker".into());
+    let err = sandboxes.create(o_docker).await.unwrap_err();
+    assert!(
+        err.to_string().contains("native") || err.to_string().contains("VM"),
+        "{err}"
+    );
+
+    // 4. Hook FakeAliyun RunInstances to simulate guest joining FakeRelay.
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    // 5. Create Windows Direct VM Sandbox.
+    let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o.contrib = Some("aliyun-ecs".into());
+    o.name = Some("win-acct-1".into());
+    o.os = "windows".into();
+    let sb = sandboxes.create(o).await.unwrap();
+    assert_eq!(sb.placement(), (Kind::Vm, Runtime::Other("native".into())));
+
+    // Inspect RunInstances call parameters & decoded #ps1_sysnative UserData.
+    let run_call = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run_call.params.get("InstanceType").map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    assert_eq!(
+        run_call.params.get("SystemDisk.Size").map(String::as_str),
+        Some("60")
+    );
+    assert_eq!(
+        run_call
+            .params
+            .get("SystemDisk.Category")
+            .map(String::as_str),
+        Some("cloud_essd")
+    );
+    assert_eq!(
+        run_call
+            .params
+            .get("InstanceChargeType")
+            .map(String::as_str),
+        Some("PostPaid")
+    );
+    assert_eq!(
+        run_call.params.get("StoppedMode").map(String::as_str),
+        Some("StopCharging")
+    );
+    assert_eq!(
+        run_call.params.get("HttpTokens").map(String::as_str),
+        Some("required")
+    );
+    assert!(run_call.params.contains_key("AutoReleaseTime"));
+    let img_id = run_call.params.get("ImageId").unwrap();
+    assert!(img_id.starts_with("win2022_"), "{img_id}");
+    let ecs_pw = run_call.params.get("Password").unwrap();
+    assert!(ecs_pw.len() >= 16);
+
+    // All 6 Cua tags attached at creation time.
+    let mut run_tags = BTreeMap::new();
+    for i in 1..=10 {
+        if let (Some(k), Some(v)) = (
+            run_call.params.get(&format!("Tag.{i}.Key")),
+            run_call.params.get(&format!("Tag.{i}.Value")),
+        ) {
+            run_tags.insert(k.clone(), v.clone());
+        }
+    }
+    for req_key in [
+        model::tag::MANAGED,
+        model::tag::OWNER,
+        model::tag::SPACE,
+        model::tag::MACHINE,
+        model::tag::CREATED_BY,
+        model::tag::EXPIRES,
+    ] {
+        assert!(run_tags.contains_key(req_key), "missing tag {req_key}");
+    }
+
+    let user_data = decode_b64_str(run_call.params.get("UserData").unwrap());
+    assert!(user_data.starts_with("#ps1_sysnative\n"));
+    assert!(user_data.len() < 16 * 1024);
+    assert!(!user_data.contains(ecs_pw));
+    assert!(user_data.contains("*S-1-5-18:(OI)(CI)F"));
+    assert!(user_data.contains("*S-1-5-32-544:(OI)(CI)F"));
+    assert!(user_data.contains("https://mirror.example.com/cua-spacesd.exe"));
+    assert!(user_data.contains(&mirror_sha));
+    assert!(user_data.contains("100.100.100.200"));
+    assert!(user_data.contains("AutoAdminLogon"));
+    assert!(user_data.contains("-AtLogOn"));
+    assert!(user_data.contains("EventID=24"));
+    let tscon = decode_ps_put(&user_data, "tscon-recover.ps1").unwrap();
+    assert!(tscon.contains("tscon.exe") && tscon.contains("/dest:console"));
+    let launcher = decode_ps_put(&user_data, "launch-spacesd.ps1").unwrap();
+    assert!(launcher.contains("--relay-jwks"));
+    assert!(decode_ps_put(&user_data, "jwks.json").is_some());
+
+    // Connect spacesd over FakeRelay.
+    let client = sb.spacesd().await.unwrap();
+    client.health().await.unwrap();
+
+    // Stop / Start / Tag-guarded Delete.
+    sandboxes.suspend("win-acct-1").await.unwrap();
+    {
+        let f = s.lock().unwrap();
+        let stop_call = f
+            .calls
+            .iter()
+            .rfind(|c| c.action == "StopInstance")
+            .unwrap();
+        assert_eq!(
+            stop_call.params.get("StoppedMode").map(String::as_str),
+            Some("StopCharging")
+        );
+    }
+    sandboxes.resume("win-acct-1").await.unwrap();
+    assert_eq!(
+        sandboxes.get("win-acct-1").await.unwrap().status,
+        cua_sandbox_core::Status::Running
+    );
+
+    // Wrong owner cannot delete the instance.
+    let inst_id = sb.provider_details()["id"].clone();
+    let inst_res = model::Resource {
+        provider: "aliyun-ecs".into(),
+        id: inst_id.clone(),
+        resource_type: "instance".into(),
+        region: "cn-hangzhou".into(),
+        ..Default::default()
+    };
+    assert!(
+        api.delete(&conn(&api), &inst_res, "wrong-owner")
+            .await
+            .is_err()
+    );
+    assert!(s.lock().unwrap().instances.contains_key(&inst_id));
+
+    sandboxes.delete("win-acct-1").await.unwrap();
+    assert!(!s.lock().unwrap().instances.contains_key(&inst_id));
+}
+
+#[tokio::test]
+async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    let static_tok = "static-win-secret-token-xyz";
+    relay.add_static_token(static_tok);
+    relay.set_account_auth(false);
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("unused".into())),
+        ),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+
+    clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+                relay_token: Some(static_tok.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Successful Static Relay Mode Windows Direct VM create.
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            let mut mid = None;
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                {
+                    mid = params.get(&format!("Tag.{i}.Value")).cloned();
+                }
+            }
+            if let Some(mid) = mid {
+                let ud = decode_b64_str(params.get("UserData").unwrap());
+                let env_tok = decode_ps_put(&ud, "env-token").unwrap();
+                relay.tunnel(&mid, &mock_url);
+                relay.set_static_online(&mid, true, Some(&env_tok));
+            }
+        }));
+    }
+
+    let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o.contrib = Some("aliyun-ecs".into());
+    o.name = Some("win-static-1".into());
+    o.os = "windows".into();
+    let sb = sandboxes.create(o).await.unwrap();
+    let run_call = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    let ud = decode_b64_str(run_call.params.get("UserData").unwrap());
+    assert!(decode_ps_put(&ud, "jwks.json").is_none());
+    assert!(decode_ps_put(&ud, "env-token").is_some());
+    let policy: serde_json::Value =
+        serde_json::from_str(&decode_ps_put(&ud, "host-policy.json").unwrap()).unwrap();
+    assert!(policy.get("owner").is_none());
+    let launcher = decode_ps_put(&ud, "launch-spacesd.ps1").unwrap();
+    assert!(!launcher.contains("--relay-jwks"));
+    assert!(launcher.contains("--token-file"));
+
+    let client = sb.spacesd().await.unwrap();
+    client.health().await.unwrap();
+    sandboxes.delete("win-static-1").await.unwrap();
+
+    // 2. Failed boot: instance stops/dies before joining -> boot log fetched, secrets redacted, rolled back.
+    {
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(|_id, _| {}));
+    }
+    let s_clone = s.clone();
+    let (fail_tx, mut fail_rx) = tokio::sync::oneshot::channel::<()>();
+    let fail_tx = Arc::new(Mutex::new(Some(fail_tx)));
+    let captured_pw: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mirror_url = format!(
+        "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
+        "ef".repeat(32)
+    );
+    let conn_res = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+                relay_token: Some(static_tok.into()),
+                spacesd_download_url: Some(mirror_url.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let conn_dbg = format!("{conn_res:?}");
+    assert!(!conn_dbg.contains("MyPass998877"), "{conn_dbg}");
+    assert!(!conn_dbg.contains("DeadBeefCafe9988"), "{conn_dbg}");
+    {
+        let mut f = s.lock().unwrap();
+        let s_inner = s_clone.clone();
+        let fail_tx = fail_tx.clone();
+        let captured_pw = captured_pw.clone();
+        let mirror_url = mirror_url.clone();
+        f.on_run_instance = Some(Arc::new(move |id, params| {
+            let id_owned = id.to_string();
+            let pw = params.get("Password").cloned().unwrap_or_default();
+            *captured_pw.lock().unwrap() = Some(pw.clone());
+            let s2 = s_inner.clone();
+            let tx = fail_tx.clone();
+            let mirror_url = mirror_url.clone();
+            tokio::spawn(async move {
+                let mut f = s2.lock().unwrap();
+                f.console_outputs.insert(
+                    id_owned.clone(),
+                    format!(
+                        "cloudbase-init starting\nCUA_RELAY_TOKEN={static_tok}\nWinlogonPassword={pw}\nInvoke-WebRequest failed: {mirror_url}\nfatal: mirror download 404\n"
+                    ),
+                );
+                if let Some(inst) = f.instances.get_mut(&id_owned) {
+                    inst["Status"] = json!("Stopped");
+                }
+                if let Some(ch) = tx.lock().unwrap().take() {
+                    let _ = ch.send(());
+                }
+            });
+        }));
+    }
+
+    let mut o_fail = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o_fail.contrib = Some("aliyun-ecs".into());
+    o_fail.name = Some("win-boot-fail".into());
+    o_fail.os = "windows".into();
+    let err = sandboxes.create(o_fail).await.unwrap_err();
+    let _ = fail_rx.try_recv();
+    let pw = captured_pw.lock().unwrap().clone().unwrap();
+    assert!(
+        err.to_string()
+            .contains("stopped before its sandbox came online"),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("fatal: mirror download 404"),
+        "{err}"
+    );
+    assert!(!err.to_string().contains(static_tok), "{err}");
+    assert!(!err.to_string().contains(&pw), "{err}");
+    assert!(!err.to_string().contains("MyPass998877"), "{err}");
+    assert!(!err.to_string().contains("DeadBeefCafe9988"), "{err}");
+    assert!(
+        s.lock().unwrap().instances.is_empty(),
+        "failed boot instance must be rolled back"
+    );
+
+    let boot_logs_dir = home.path().join("cloud/boot-logs");
+    let logs: Vec<String> = std::fs::read_dir(&boot_logs_dir)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert!(!logs.is_empty());
+    for log in &logs {
+        assert!(!log.contains(static_tok), "{log}");
+        assert!(!log.contains(&pw), "{log}");
+        assert!(!log.contains("MyPass998877"), "{log}");
+        assert!(!log.contains("DeadBeefCafe9988"), "{log}");
+        assert!(log.contains("fatal: mirror download 404"), "{log}");
+    }
+}
+
+#[tokio::test]
+async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind() {
+    use cua_sandbox_core::placement::On;
+    use cua_spaces::{SpaceCreate, Spaces};
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    let static_tok = "static-spaces-win-tok";
+    relay.add_static_token(static_tok);
+    relay.set_account_auth(false);
+    let mock_holder: Arc<Mutex<Option<MockServer>>> = Arc::new(Mutex::new(None));
+    let expected_env_tok: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_holder = mock_holder.clone();
+        let expected_env_tok = expected_env_tok.clone();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            let mut mid = None;
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                {
+                    mid = params.get(&format!("Tag.{i}.Value")).cloned();
+                }
+            }
+            if let Some(mid) = mid {
+                let ud = decode_b64_str(params.get("UserData").unwrap());
+                let env_tok = decode_ps_put(&ud, "env-token").unwrap();
+                *expected_env_tok.lock().unwrap() = Some(env_tok.clone());
+                let relay = relay.clone();
+                let mock_holder = mock_holder.clone();
+                tokio::spawn(async move {
+                    let mock = MockServer::start(MockAuth {
+                        token: Some(env_tok.clone()),
+                        ..Default::default()
+                    })
+                    .await;
+                    let mock_url = mock.url();
+                    *mock_holder.lock().unwrap() = Some(mock);
+                    relay.tunnel(&mid, &mock_url);
+                    relay.set_static_online(&mid, true, Some(&env_tok));
+                });
+            }
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("unused".into())),
+        ),
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+                relay_token: Some(static_tok.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .sandboxes(sandboxes.clone())
+        .build();
+
+    let created = spaces
+        .create(SpaceCreate {
+            on: Some(On::Provider("aliyun-ecs".into())),
+            image: Some("windows".into()),
+            name: Some("Win Space".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .ready()
+        .unwrap();
+
+    assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
+    assert_eq!(created.kind, "vm");
+
+    // Static Relay Mode must propagate & persist env_token so spaces.space() and
+    // sandbox.service("env").endpoint() authenticate against cua-spacesd.exe.
+    let expected_tok = expected_env_tok.lock().unwrap().clone().unwrap();
+    let space = spaces.space(&created.id).await.unwrap();
+    space.spacesd().unwrap().health().await.unwrap();
+    let sb_name = spaces.cloud_sandbox_of(&created.id).unwrap().unwrap();
+    let sb = sandboxes.connect(&sb_name).await.unwrap();
+    assert_eq!(sb.env_token().as_deref(), Some(expected_tok.as_str()));
+    let ep = sb.service("env").unwrap().endpoint().await.unwrap();
+    assert!(
+        ep.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case(cua_spacesd_client::transport::ENV_TOKEN_HEADER)
+                && v == &format!("Bearer {expected_tok}")
+        }),
+        "missing/wrong env token header in {:?}",
+        ep.headers
+    );
+
+    let run_call = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run_call.params.get("InstanceType").map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    assert_eq!(
+        run_call.params.get("SystemDisk.Size").map(String::as_str),
+        Some("60")
+    );
+
+    let off = spaces.stop(&created.id).await.unwrap();
+    assert_eq!(off.state, "stopped");
+    let on = spaces.start(&created.id).await.unwrap();
+    assert_eq!(on.state, "running");
+    spaces.delete(&created.id).await.unwrap();
+    assert!(s.lock().unwrap().instances.is_empty());
+    drop(mock_holder);
 }

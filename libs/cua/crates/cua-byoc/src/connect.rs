@@ -537,6 +537,8 @@ async fn connect_sealed(
     }
     candidate.relay_url = relay.url;
     candidate.relay_mode = relay.stored_mode;
+    candidate.spacesd_download_url =
+        crate::manager::resolve_target_spacesd_download_url(&req.target, local.as_ref())?;
     candidate.account = tested.account.clone();
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
@@ -1508,6 +1510,10 @@ async fn connect_oidc(
     )?;
     candidate.relay_url = relay.url;
     candidate.relay_mode = relay.stored_mode;
+    candidate.spacesd_download_url = crate::manager::resolve_target_spacesd_download_url(
+        &req.target,
+        local.as_ref().or(cli_link.as_ref()),
+    )?;
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
     candidate.budget_usd_month = budget;

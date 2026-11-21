@@ -22441,6 +22441,10 @@ public struct CloudProvider: Equatable, Hashable {
      * not connected.
      */
     public var relayMode: String?
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL.
+     */
+    public var spacesdDownloadUrl: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -22521,7 +22525,10 @@ public struct CloudProvider: Equatable, Hashable {
         /**
          * Relay authentication mode (`account` or `static`), or `None` when
          * not connected.
-         */relayMode: String?) {
+         */relayMode: String? = nil,
+        /**
+         * Optional custom `cua-spacesd` binary mirror URL.
+         */spacesdDownloadUrl: String? = nil) {
         self.name = name
         self.title = title
         self.tier = tier
@@ -22553,6 +22560,7 @@ public struct CloudProvider: Equatable, Hashable {
         self.holders = holders
         self.relayUrl = relayUrl
         self.relayMode = relayMode
+        self.spacesdDownloadUrl = spacesdDownloadUrl
     }
 
 
@@ -22601,7 +22609,8 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
                 issue: FfiConverterString.read(from: &buf),
                 holders: FfiConverterSequenceString.read(from: &buf),
                 relayUrl: FfiConverterOptionString.read(from: &buf),
-                relayMode: FfiConverterOptionString.read(from: &buf)
+                relayMode: FfiConverterOptionString.read(from: &buf),
+                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -22637,6 +22646,7 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.holders, into: &buf)
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayMode, into: &buf)
+        FfiConverterOptionString.write(value.spacesdDownloadUrl, into: &buf)
     }
 }
 
@@ -23048,6 +23058,11 @@ public struct CloudTarget: Equatable, Hashable {
      * never printed or stored in plaintext config.
      */
     public var relayToken: String?
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL (with optional
+     * `#sha256=<64 hex>` fragment).
+     */
+    public var spacesdDownloadUrl: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -23085,7 +23100,11 @@ public struct CloudTarget: Equatable, Hashable {
         /**
          * Shared static relay registration token for Static Relay Mode. Secret:
          * never printed or stored in plaintext config.
-         */relayToken: String? = nil) {
+         */relayToken: String? = nil,
+        /**
+         * Optional custom `cua-spacesd` binary mirror URL (with optional
+         * `#sha256=<64 hex>` fragment).
+         */spacesdDownloadUrl: String? = nil) {
         self.provider = provider
         self.profile = profile
         self.region = region
@@ -23096,6 +23115,7 @@ public struct CloudTarget: Equatable, Hashable {
         self.relayUrl = relayUrl
         self.relayMode = relayMode
         self.relayToken = relayToken
+        self.spacesdDownloadUrl = spacesdDownloadUrl
     }
 
 
@@ -23123,7 +23143,8 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
                 token: FfiConverterOptionString.read(from: &buf),
                 relayUrl: FfiConverterOptionString.read(from: &buf),
                 relayMode: FfiConverterOptionString.read(from: &buf),
-                relayToken: FfiConverterOptionString.read(from: &buf)
+                relayToken: FfiConverterOptionString.read(from: &buf),
+                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -23138,6 +23159,7 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayMode, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterOptionString.write(value.spacesdDownloadUrl, into: &buf)
     }
 }
 

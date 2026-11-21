@@ -231,6 +231,11 @@ pub trait Provider: Send + Sync + 'static {
     /// of [`CONTRIB_LOCATIONS`].
     fn name(&self) -> &'static str;
 
+    /// Guest operating systems this provider runs (`"linux"`, `"windows"`, ...).
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux"]
+    }
+
     /// What it can do.
     fn capabilities(&self) -> ProviderCapabilities;
 

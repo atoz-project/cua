@@ -2776,16 +2776,26 @@ impl Sandbox {
             Target::Direct { .. } => (Kind::Auto, Runtime::Auto),
             Target::Contrib { provider, instance } => {
                 let caps = provider.0.capabilities();
-                let kind = match caps.kinds.first() {
-                    Some(crate::RunKind::Container) => Kind::Container,
-                    Some(crate::RunKind::Vm) => Kind::Vm,
-                    None => Kind::Auto,
-                };
                 let runtime = instance
                     .details
                     .get("runtime")
                     .map(String::as_str)
                     .unwrap_or(caps.runtime);
+                let kind = match instance
+                    .details
+                    .get("kind")
+                    .map(String::as_str)
+                    .or_else(|| instance.details.get("runtime").map(String::as_str))
+                {
+                    Some("native" | "vm") => Kind::Vm,
+                    Some("docker" | "container" | "docker-on-vm") => Kind::Container,
+                    Some("microvm") => Kind::MicroVm,
+                    _ => match caps.kinds.first() {
+                        Some(crate::RunKind::Container) => Kind::Container,
+                        Some(crate::RunKind::Vm) => Kind::Vm,
+                        None => Kind::Auto,
+                    },
+                };
                 (kind, Runtime::parse(runtime).unwrap_or(Runtime::Auto))
             }
         }
@@ -2914,7 +2924,9 @@ impl Sandbox {
             Ok(caps) if !caps.initialized => {}
             _ => return Ok(client),
         }
-        let token = held.unwrap_or_else(mint_env_token);
+        let token = held
+            .or_else(|| client.token().map(str::to_string))
+            .unwrap_or_else(mint_env_token);
         // A driver's first token makes it this Space's machine: it renews
         // its per-machine secrets with fresh entropy. That matters when the
         // guest was resumed from a memory snapshot other Spaces share (a
@@ -4039,15 +4051,25 @@ fn local_env_token_keeping(o: &CreateOptions, recorded: Option<String>) -> Optio
     }
 }
 
-fn local_env_token(o: &CreateOptions) -> Option<String> {
-    let given = o
-        .env
+fn given_env_token(o: &CreateOptions) -> Option<String> {
+    o.env
         .get("CUA_SPACESD_TOKEN")
         .or_else(|| o.env.get("CUA_ENV_TOKEN"))
         .or(o.env_token.as_ref())
         .filter(|t| !t.is_empty())
-        .cloned();
-    given.or_else(|| (!o.os.eq_ignore_ascii_case("windows")).then(mint_env_token))
+        .cloned()
+}
+
+fn local_env_token(o: &CreateOptions) -> Option<String> {
+    given_env_token(o).or_else(|| (!o.os.eq_ignore_ascii_case("windows")).then(mint_env_token))
+}
+
+fn contrib_env_token(o: &CreateOptions, env_to_entrypoint: bool) -> Option<String> {
+    if env_to_entrypoint {
+        given_env_token(o).or_else(|| Some(mint_env_token()))
+    } else {
+        o.env_token.clone().filter(|t| !t.is_empty())
+    }
 }
 
 #[cfg(test)]

@@ -793,7 +793,17 @@ impl SandboxCreateOptions {
             image: self.image.clone(),
             token: self.token.clone(),
             pool,
-            os: self.os.clone(),
+            os: self.os.clone().or_else(|| {
+                let raw = self.image.trim();
+                let raw = raw
+                    .strip_prefix("vm:")
+                    .or_else(|| raw.strip_prefix("container:"))
+                    .or_else(|| raw.strip_prefix("docker:"))
+                    .unwrap_or(raw);
+                cua_image::canonical::alias_with(raw, &|n| std::env::var(n).ok())
+                    .map(|(_, os)| os.as_str().to_string())
+                    .or_else(|| cua_image::catalog::catalog_os(raw))
+            }),
             cpus: self.cpus,
             memory_mb: self.memory_mb,
             ports: self.ports.clone(),
@@ -2617,6 +2627,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(by_port.resolve(&services).unwrap(), Probe::Tcp(22));
+    }
+
+    #[test]
+    fn to_request_infers_windows_os_from_canonical_alias_or_catalog() {
+        let _env = super::super::test_env::EnvGuard::isolated();
+        let o = SandboxCreateOptions::new("aliyun-ecs", "windows");
+        assert_eq!(o.to_request().unwrap().os.as_deref(), Some("windows"));
+        let o2 = SandboxCreateOptions::new("aliyun-ecs", "ghcr.io/trycua/windows:2022");
+        assert_eq!(o2.to_request().unwrap().os.as_deref(), Some("windows"));
+        let o3 = SandboxCreateOptions::new("aliyun-ecs", "linux");
+        assert_eq!(o3.to_request().unwrap().os.as_deref(), Some("linux"));
     }
 
     /// With no `on`, the location is the user default (local unless

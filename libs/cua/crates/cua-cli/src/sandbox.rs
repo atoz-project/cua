@@ -1558,6 +1558,23 @@ pub const MAX_BARE_MEMORY_GB: f64 = 512.0;
 /// Largest memory a sandbox can ask for: 1 TiB.
 pub const MAX_MEMORY_MIB: u64 = 1024 * 1024;
 
+fn check_windows_build_note(
+    on: &On,
+    resolved: &str,
+    iso: Option<&std::path::Path>,
+    sha256: Option<&str>,
+) -> Result<(), CuaError> {
+    if *on == On::Local {
+        windows_build_note(resolved, iso, sha256)
+    } else if iso.is_some() {
+        Err(CuaError::InvalidArgument(
+            "--iso applies only to local Windows VMs (`--on local`)".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// For a Windows image built on this computer (`windows:11`): checks and
 /// remembers `--iso` (the daemon that builds reads it back), or says what the
 /// first create will download. `--iso` on any other image is an error.
@@ -1975,7 +1992,7 @@ async fn create(
             {
                 return Err(CuaError::InvalidArgument(EMBEDDED_VM_REFUSED.into()));
             }
-            windows_build_note(&resolved, a.iso.as_deref(), a.iso_sha256.as_deref())?;
+            check_windows_build_note(&on, &resolved, a.iso.as_deref(), a.iso_sha256.as_deref())?;
             o.image = resolved;
             o.os = os;
         }
@@ -4178,6 +4195,15 @@ mod tests {
         assert_eq!(r, "ghcr.io/trycua/windows:11");
         assert_eq!(os.as_deref(), Some("windows"));
         assert!(cua_image::windows::build::local_build_target(&r).is_some());
+        // Non-local cloud creates skip the local-ISO note, while still rejecting --iso.
+        assert!(
+            check_windows_build_note(&On::Provider("aliyun-ecs".into()), &r, None, None).is_ok()
+        );
+        let cloud_iso =
+            check_windows_build_note(&On::Provider("aliyun-ecs".into()), &r, Some(iso), None)
+                .unwrap_err()
+                .to_string();
+        assert!(cloud_iso.contains("--on local"), "{cloud_iso}");
     }
 
     #[tokio::test]

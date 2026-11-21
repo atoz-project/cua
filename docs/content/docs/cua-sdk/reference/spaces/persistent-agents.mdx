@@ -1580,6 +1580,7 @@ their own CLI sign-in; Hetzner takes its API token in `token` (or
 | `relay_url` / `relayUrl` | `Option<String>` | `None` | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
 | `relay_mode` / `relayMode` | `Option<String>` | `None` | Relay authentication mode (`account` or `static`; defaults to `account`). |
 | `relay_token` / `relayToken` | `Option<String>` | `None` | Shared static relay registration token for Static Relay Mode. Secret: never printed or stored in plaintext config. |
+| `spacesd_download_url` / `spacesdDownloadUrl` | `Option<String>` | `None` | Optional custom `cua-spacesd` binary mirror URL (with optional `#sha256=<64 hex>` fragment). |
 
 ## `CloudStatus` record
 
@@ -1631,7 +1632,8 @@ Returned by [`Spaces.cloud_approve`](#spacescloud_approve).
 | `issue` | `String` |  | What is wrong with the link and what to do, one sentence, or empty. |
 | `holders` | `Vec<String>` |  | `sealed`: the devices that can open the account's API token ("Can open it"). |
 | `relay_url` / `relayUrl` | `Option<String>` |  | Per-connection relay base URL (`https://relay.cua.ai` by default), or `None` when not connected. |
-| `relay_mode` / `relayMode` | `Option<String>` |  | Relay authentication mode (`account` or `static`), or `None` when not connected. |
+| `relay_mode` / `relayMode` | `Option<String>` | `None` | Relay authentication mode (`account` or `static`), or `None` when not connected. |
+| `spacesd_download_url` / `spacesdDownloadUrl` | `Option<String>` | `None` | Optional custom `cua-spacesd` binary mirror URL. |
 
 ## `CloudKind` record
 
