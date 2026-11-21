@@ -375,6 +375,7 @@ Without auth it keeps how the cloud is linked already (an OIDC or sealed link st
 | `resource_group` | `string` | none | Azure: the resource group Cua works in, and the only one its roles reach (default `cua-spaces`). |
 | `role_arn` | `string` | none | AWS `oidc`: the role ARN, only when it is not named `cua-spaces`. |
 | `service_account` | `string` | none | Google Cloud `oidc`: a service account to act as. Default: none, the federated identity calls Google directly. |
+| `spacesd_download_url` | `string` | none | Optional custom `cua-spacesd` binary mirror URL (with optional `#sha256=<64 hex>` fragment). |
 | `subscription_id` | `string` | none | Azure: the subscription id (the trust template's `subscriptionId` output). |
 | `tenant_id` | `string` | none | Azure: the Microsoft Entra tenant id (its `tenantId` output). |
 | `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua credential store). |
@@ -416,6 +417,7 @@ Creates nothing: it signs in with the cloud's own CLI credentials (or, for a lin
 | `relay_mode` | `string` | none | Relay authentication mode (`account` or `static`; defaults to `account`). |
 | `relay_token` | `string` | none | Shared static relay registration token for Static Relay Mode. Secret: never logged, returned, or stored in plaintext config. |
 | `relay_url` | `string` | none | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
+| `spacesd_download_url` | `string` | none | Optional custom `cua-spacesd` binary mirror URL (with optional `#sha256=<64 hex>` fragment). |
 | `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua credential store). |
 | `zone` | `string` | none | GCP zone in the region (default: its `-a` zone). |
 

@@ -122,7 +122,7 @@ Examples:
   cua cloud connect aws --ttl-hours 4
   # Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile
   cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8
-  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou
+  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou --spacesd-download-url https://mirror.example.com/cua-spacesd.exe
   # Self-hosted relay: Account Relay Mode or Static Relay Mode
   cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
   cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1";
@@ -169,6 +169,10 @@ pub struct TargetArgs {
     /// from stdin (never pass tokens in argv).
     #[arg(long, conflicts_with = "token_stdin")]
     pub relay_token_stdin: bool,
+    /// Optional custom `cua-spacesd` binary mirror URL for Windows Direct VM
+    /// provisioning (with optional `#sha256=<64 hex>` fragment).
+    #[arg(long, value_name = "URL")]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl TargetArgs {
@@ -195,6 +199,7 @@ impl TargetArgs {
             relay_url: self.relay_url.clone(),
             relay_mode: self.relay_mode.clone(),
             relay_token,
+            spacesd_download_url: self.spacesd_download_url.clone(),
         }
     }
 }
@@ -1388,6 +1393,9 @@ fn limits_line(p: &cua_sdk::CloudProvider) -> Option<String> {
     {
         parts.push(format!("Relay: {url}."));
     }
+    if let Some(url) = p.spacesd_download_url.as_deref().filter(|u| !u.is_empty()) {
+        parts.push(format!("cua-spacesd mirror: {url}."));
+    }
     match p.approval.as_str() {
         "connection" => parts.push("A person approves it in Cua Spaces.".into()),
         "limits" => parts.push("A person approves the new limits in Cua Spaces.".into()),
@@ -1516,6 +1524,9 @@ fn connect_lines(c: &cua_sdk::CloudConnected) -> Vec<String> {
         {
             out.push(format!("Relay: {url} (account)"));
         }
+        if let Some(url) = p.spacesd_download_url.as_deref().filter(|u| !u.is_empty()) {
+            out.push(format!("cua-spacesd mirror: {url}"));
+        }
     }
     for ch in &c.checks {
         out.push(check_line(ch));
@@ -1583,6 +1594,7 @@ fn provider_json(p: &cua_sdk::CloudProvider) -> serde_json::Value {
         "holders": p.holders,
         "relay_url": p.relay_url,
         "relay_mode": p.relay_mode,
+        "spacesd_download_url": p.spacesd_download_url,
         "kinds": p.kinds.iter().map(|k| serde_json::json!({
             "image": k.image, "kind": k.kind, "supported": k.supported, "reason": k.reason,
             "machine_type": k.machine_type, "usd_per_hour": k.usd_per_hour,
@@ -2298,6 +2310,8 @@ mod tests {
             "--relay-mode",
             "static",
             "--relay-token-stdin",
+            "--spacesd-download-url",
+            "https://mirror.example.com/cua-spacesd.exe",
         ]) {
             CloudCmd::Connect { target, .. } => {
                 assert_eq!(
@@ -2306,9 +2320,17 @@ mod tests {
                 );
                 assert_eq!(target.relay_mode.as_deref(), Some("static"));
                 assert!(target.relay_token_stdin);
+                assert_eq!(
+                    target.spacesd_download_url.as_deref(),
+                    Some("https://mirror.example.com/cua-spacesd.exe")
+                );
                 let wire = target.target_with_stdin(|| "  static-tok \n".into());
                 assert_eq!(wire.relay_token.as_deref(), Some("static-tok"));
                 assert_eq!(wire.relay_mode.as_deref(), Some("static"));
+                assert_eq!(
+                    wire.spacesd_download_url.as_deref(),
+                    Some("https://mirror.example.com/cua-spacesd.exe")
+                );
                 assert!(!format!("{wire:?}").contains("static-tok"));
             }
             other => panic!("{other:?}"),

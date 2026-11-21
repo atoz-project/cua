@@ -164,6 +164,7 @@ fn every_new_link_key_is_kept_in_links_json() {
         }),
         relay_url: Some("https://relay.example.com".into()),
         relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+        spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
     };
     let link = Link {
         account: "a".into(),
@@ -174,6 +175,7 @@ fn every_new_link_key_is_kept_in_links_json() {
         max_size: full.max_size,
         relay_url: full.relay_url.clone(),
         relay_mode: full.relay_mode,
+        spacesd_download_url: full.spacesd_download_url.clone(),
     };
     let link_keys = keys(&serde_json::to_value(&link).unwrap());
     let now = keys(&serde_json::to_value(&full).unwrap());

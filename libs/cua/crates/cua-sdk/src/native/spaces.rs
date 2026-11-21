@@ -3865,13 +3865,19 @@ mod require_fields_tests {
             "relay_url",
             "relay_mode",
             "relay_token",
+            "spacesd_download_url",
         ];
         assert!(missing_fields(&ours, "cloud_connect", &all).is_empty());
         assert!(
             missing_fields(
                 &ours,
                 "cloud_test",
-                &["relay_url", "relay_mode", "relay_token"]
+                &[
+                    "relay_url",
+                    "relay_mode",
+                    "relay_token",
+                    "spacesd_download_url"
+                ]
             )
             .is_empty()
         );

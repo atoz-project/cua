@@ -516,8 +516,69 @@ impl Clouds {
                     .to_string()
             }),
             relay_mode: conn.map(|c| c.effective_relay_mode()),
+            spacesd_download_url: conn.and_then(|c| c.spacesd_download_url.clone()),
             ..Default::default()
         }
+    }
+}
+
+pub(crate) fn normalize_spacesd_download_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidArgument(
+            "--spacesd-download-url must not be empty".into(),
+        ));
+    }
+    if trimmed.contains('\'')
+        || trimmed.contains('"')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(Error::InvalidArgument(
+            "--spacesd-download-url must not contain whitespace or quotes".into(),
+        ));
+    }
+    let (url_part, frag) = match trimmed.split_once('#') {
+        Some((u, f)) => (u, Some(f)),
+        None => (trimmed, None),
+    };
+    let rest = url_part
+        .strip_prefix("https://")
+        .or_else(|| url_part.strip_prefix("http://"))
+        .ok_or_else(|| {
+            Error::InvalidArgument(
+                "--spacesd-download-url must start with https:// or http://".into(),
+            )
+        })?;
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return Err(Error::InvalidArgument(
+            "--spacesd-download-url must include a host".into(),
+        ));
+    }
+    if let Some(f) = frag {
+        let Some(hex) = f.strip_prefix("sha256=") else {
+            return Err(Error::InvalidArgument(
+                "--spacesd-download-url fragment must be `#sha256=<64 hex>`".into(),
+            ));
+        };
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::InvalidArgument(
+                "--spacesd-download-url `#sha256=` must be 64 hex characters".into(),
+            ));
+        }
+        return Ok(format!("{url_part}#sha256={}", hex.to_ascii_lowercase()));
+    }
+    Ok(url_part.to_string())
+}
+
+pub(crate) fn resolve_target_spacesd_download_url(
+    target: &CloudTarget,
+    existing: Option<&Connection>,
+) -> Result<Option<String>> {
+    match target.spacesd_download_url.as_deref() {
+        Some(raw) => Ok(Some(normalize_spacesd_download_url(raw)?)),
+        None => Ok(existing.and_then(|c| c.spacesd_download_url.clone())),
     }
 }
 
@@ -702,11 +763,13 @@ impl CloudManager for Clouds {
             target,
             existing.as_ref(),
         )?;
+        let spacesd_download_url = resolve_target_spacesd_download_url(target, existing.as_ref())?;
         p.stage_secret(target);
         let _unstage = UnstageGuard(p.as_ref());
         let mut conn = p.resolve(target)?;
         conn.relay_url = relay.url;
         conn.relay_mode = relay.stored_mode;
+        conn.spacesd_download_url = spacesd_download_url;
         let mut t = p.test(&conn).await;
         if let Some(url) = relay.probe_url.as_deref() {
             t.checks
@@ -734,11 +797,13 @@ impl CloudManager for Clouds {
             target,
             existing.as_ref(),
         )?;
+        let spacesd_download_url = resolve_target_spacesd_download_url(target, existing.as_ref())?;
         p.stage_secret(target);
         let _unstage = UnstageGuard(p.as_ref());
         let mut conn = p.resolve(target)?;
         conn.relay_url = relay.url;
         conn.relay_mode = relay.stored_mode;
+        conn.spacesd_download_url = spacesd_download_url;
         let mut tested = p.test(&conn).await;
         if let Some(url) = relay.probe_url.as_deref() {
             tested
@@ -1078,4 +1143,67 @@ fn describe(rs: &[Live]) -> String {
         s.push_str(&format!(" and {} more", rs.len() - SHOWN));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spacesd_download_url_validation_and_preservation() {
+        assert_eq!(
+            normalize_spacesd_download_url("  https://mirror.example.com/cua-spacesd.exe  ")
+                .unwrap(),
+            "https://mirror.example.com/cua-spacesd.exe"
+        );
+        assert_eq!(
+            normalize_spacesd_download_url("http://10.0.0.5:8080/cua-spacesd.exe").unwrap(),
+            "http://10.0.0.5:8080/cua-spacesd.exe"
+        );
+        let hex = "A".repeat(64);
+        assert_eq!(
+            normalize_spacesd_download_url(&format!(
+                "https://mirror.example.com/cua-spacesd.exe#sha256={hex}"
+            ))
+            .unwrap(),
+            format!(
+                "https://mirror.example.com/cua-spacesd.exe#sha256={}",
+                "a".repeat(64)
+            )
+        );
+        for bad in [
+            "",
+            "   ",
+            "ftp://mirror.example/a.exe",
+            "https:///no-host.exe",
+            "https://mirror.example/with space.exe",
+            "https://mirror.example/with'quote.exe",
+            "https://mirror.example/a.exe#sha256=short",
+            "https://mirror.example/a.exe#other=123",
+        ] {
+            assert!(normalize_spacesd_download_url(bad).is_err(), "{bad:?}");
+        }
+
+        let existing = Connection {
+            spacesd_download_url: Some("https://old.example/cua-spacesd.exe".into()),
+            ..Default::default()
+        };
+        let omitted = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_target_spacesd_download_url(&omitted, Some(&existing)).unwrap(),
+            Some("https://old.example/cua-spacesd.exe".into())
+        );
+        let updated = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some("https://new.example/cua-spacesd.exe".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_target_spacesd_download_url(&updated, Some(&existing)).unwrap(),
+            Some("https://new.example/cua-spacesd.exe".into())
+        );
+    }
 }

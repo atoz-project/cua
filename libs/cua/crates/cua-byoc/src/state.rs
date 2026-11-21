@@ -96,6 +96,9 @@ pub struct Link {
     /// [`Connection::relay_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mode: Option<cua_sandbox_core::byoc::RelayMode>,
+    /// [`Connection::spacesd_download_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl Link {
@@ -106,6 +109,7 @@ impl Link {
             && c.max_size.is_none()
             && c.relay_url.is_none()
             && c.relay_mode.is_none()
+            && c.spacesd_download_url.is_none()
         {
             return None;
         }
@@ -118,6 +122,7 @@ impl Link {
             max_size: c.max_size,
             relay_url: c.relay_url.clone(),
             relay_mode: c.relay_mode,
+            spacesd_download_url: c.spacesd_download_url.clone(),
         })
     }
 
@@ -129,6 +134,7 @@ impl Link {
             && c.max_size.is_none()
             && c.relay_url.is_none()
             && c.relay_mode.is_none()
+            && c.spacesd_download_url.is_none()
             && c.account == self.account
             && c.connected_at == self.connected_at
     }
@@ -322,6 +328,7 @@ impl Store {
                 c.max_size = l.max_size;
                 c.relay_url = l.relay_url.clone();
                 c.relay_mode = l.relay_mode;
+                c.spacesd_download_url = l.spacesd_download_url.clone();
             }
             if c.profile == FEDERATED_PROFILE {
                 c.profile = String::new();

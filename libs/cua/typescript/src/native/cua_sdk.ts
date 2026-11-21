@@ -5630,7 +5630,11 @@ export type CloudProvider = {
      * Relay authentication mode (`account` or `static`), or `None` when
      * not connected.
      */
-    relayMode?: string
+    relayMode?: string,
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL.
+     */
+    spacesdDownloadUrl?: string
 }
 
 /**
@@ -5638,6 +5642,8 @@ export type CloudProvider = {
  */
 export const CloudProvider = (() => {
     const defaults = () => ({
+        relayMode: undefined,
+        spacesdDownloadUrl: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<CloudProvider, ReturnType<typeof defaults>>(defaults);
@@ -5684,7 +5690,8 @@ const FfiConverterTypeCloudProvider = (() => {
                 issue: FfiConverterString.read(from),
                 holders: FfiConverterSequenceString.read(from),
                 relayUrl: FfiConverterOptionalString.read(from),
-                relayMode: FfiConverterOptionalString.read(from)
+                relayMode: FfiConverterOptionalString.read(from),
+                spacesdDownloadUrl: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -5719,6 +5726,7 @@ const FfiConverterTypeCloudProvider = (() => {
             FfiConverterSequenceString.write(value.holders, into);
             FfiConverterOptionalString.write(value.relayUrl, into);
             FfiConverterOptionalString.write(value.relayMode, into);
+            FfiConverterOptionalString.write(value.spacesdDownloadUrl, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.name) +
@@ -5751,7 +5759,8 @@ const FfiConverterTypeCloudProvider = (() => {
              FfiConverterString.allocationSize(value.issue) +
              FfiConverterSequenceString.allocationSize(value.holders) +
              FfiConverterOptionalString.allocationSize(value.relayUrl) +
-             FfiConverterOptionalString.allocationSize(value.relayMode);
+             FfiConverterOptionalString.allocationSize(value.relayMode) +
+             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl);
 
         }
     };
@@ -6381,7 +6390,12 @@ export type CloudTarget = {
      * Shared static relay registration token for Static Relay Mode. Secret:
      * never printed or stored in plaintext config.
      */
-    relayToken?: string
+    relayToken?: string,
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL (with optional
+     * `#sha256=<64 hex>` fragment).
+     */
+    spacesdDownloadUrl?: string
 }
 
 /**
@@ -6397,7 +6411,8 @@ export const CloudTarget = (() => {
         token: undefined,
         relayUrl: undefined,
         relayMode: undefined,
-        relayToken: undefined
+        relayToken: undefined,
+        spacesdDownloadUrl: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<CloudTarget, ReturnType<typeof defaults>>(defaults);
@@ -6423,7 +6438,8 @@ const FfiConverterTypeCloudTarget = (() => {
                 token: FfiConverterOptionalString.read(from),
                 relayUrl: FfiConverterOptionalString.read(from),
                 relayMode: FfiConverterOptionalString.read(from),
-                relayToken: FfiConverterOptionalString.read(from)
+                relayToken: FfiConverterOptionalString.read(from),
+                spacesdDownloadUrl: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -6437,6 +6453,7 @@ const FfiConverterTypeCloudTarget = (() => {
             FfiConverterOptionalString.write(value.relayUrl, into);
             FfiConverterOptionalString.write(value.relayMode, into);
             FfiConverterOptionalString.write(value.relayToken, into);
+            FfiConverterOptionalString.write(value.spacesdDownloadUrl, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.provider) +
@@ -6448,7 +6465,8 @@ const FfiConverterTypeCloudTarget = (() => {
              FfiConverterOptionalString.allocationSize(value.token) +
              FfiConverterOptionalString.allocationSize(value.relayUrl) +
              FfiConverterOptionalString.allocationSize(value.relayMode) +
-             FfiConverterOptionalString.allocationSize(value.relayToken);
+             FfiConverterOptionalString.allocationSize(value.relayToken) +
+             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl);
 
         }
     };

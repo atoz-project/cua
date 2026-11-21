@@ -232,6 +232,10 @@ pub struct CloudProvider {
     /// not connected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mode: Option<RelayMode>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
 }
 
 /// The words of [`CloudProvider::status`] and [`CloudConnected`]'s outcome.
@@ -729,6 +733,10 @@ pub struct CloudTarget {
     /// Shared static relay registration token for Static Relay Mode. Secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -747,6 +755,7 @@ impl std::fmt::Debug for CloudTarget {
                 "relay_token",
                 &self.relay_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("spacesd_download_url", &self.spacesd_download_url)
             .finish()
     }
 }

@@ -2138,6 +2138,10 @@ pub struct CloudTarget {
     /// Secret: never logged, returned, or stored in plaintext config.
     #[serde(default)]
     pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default)]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -2156,6 +2160,7 @@ impl std::fmt::Debug for CloudTarget {
                 "relay_token",
                 &self.relay_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("spacesd_download_url", &self.spacesd_download_url)
             .finish()
     }
 }

@@ -52,6 +52,7 @@ pub fn target_of(c: &Connection) -> Target {
         relay_url: c.relay_url.clone(),
         relay_mode: c.relay_mode,
         relay_token: None,
+        spacesd_download_url: c.spacesd_download_url.clone(),
     }
 }
 
@@ -139,11 +140,29 @@ pub trait CloudApi: Send + Sync + 'static {
         vec![]
     }
 
+    /// Guest operating systems this cloud runs (`"linux"`, `"windows"`).
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux"]
+    }
+
     /// Default boot disk size in GiB for `family`.
     fn default_disk_gb(&self, family: &str) -> u32 {
         crate::provider::disk_for(family)
     }
 
+    /// Effective `(vcpus, memory_mb)` checked against `--max-size` when
+    /// creating `family`.
+    fn check_size_for(
+        &self,
+        _family: &str,
+        cpus: u32,
+        memory_mb: u64,
+    ) -> (Option<u32>, Option<u64>) {
+        (
+            Some(cpus).filter(|c| *c > 0),
+            Some(memory_mb).filter(|m| *m > 0),
+        )
+    }
     /// Whether the cloud enforces a Space's network rules itself, outside
     /// the guest ([`crate::modal_net`]). Otherwise a Space that asks for
     /// rules is refused here, never created without them.

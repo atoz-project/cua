@@ -47,6 +47,7 @@ pub mod awsnet;
 pub mod azure;
 pub mod bootlog;
 pub mod bootstrap;
+pub mod bootstrap_win;
 pub mod cloud_shares;
 #[cfg(any(test, feature = "testing"))]
 pub mod conformance;
@@ -174,20 +175,35 @@ pub fn install_with(
 }
 
 /// A cloud's engines by kind: a microVM engine (Modal's VM runtime, wire
-/// word `microvm`, or Firecracker) runs `--kind microvm`; the rest run
-/// containers.
+/// word `microvm`, or Firecracker) runs `--kind microvm`; `native` runs
+/// Direct VM Sandboxes (`--kind vm`); the rest run containers.
 pub fn cloud_kinds(
     runtimes: Vec<cua_sandbox_core::placement::Runtime>,
 ) -> Vec<cua_sandbox_core::placement::KindSupport> {
     use cua_sandbox_core::placement::{Kind, KindSupport, Runtime};
-    let (micro, containers): (Vec<Runtime>, Vec<Runtime>) = runtimes
-        .into_iter()
-        .partition(|r| r.as_str() == "microvm" || *r == Runtime::Firecracker);
+    let mut containers = Vec::new();
+    let mut vms = Vec::new();
+    let mut micro = Vec::new();
+    for r in runtimes {
+        if r.as_str() == "microvm" || r == Runtime::Firecracker {
+            micro.push(r);
+        } else if r.as_str() == "native" {
+            vms.push(r);
+        } else {
+            containers.push(r);
+        }
+    }
     let mut kinds = Vec::new();
     if !containers.is_empty() {
         kinds.push(KindSupport {
             kind: Kind::Container,
             runtimes: containers,
+        });
+    }
+    if !vms.is_empty() {
+        kinds.push(KindSupport {
+            kind: Kind::Vm,
+            runtimes: vms,
         });
     }
     if !micro.is_empty() {
@@ -197,4 +213,28 @@ pub fn cloud_kinds(
         });
     }
     kinds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cloud_kinds;
+    use cua_sandbox_core::placement::{Kind, Runtime};
+
+    #[test]
+    fn cloud_kinds_partitions_native_docker_and_microvm() {
+        let kinds = cloud_kinds(vec![
+            Runtime::Other("docker".into()),
+            Runtime::Other("native".into()),
+        ]);
+        assert_eq!(kinds.len(), 2);
+        assert_eq!(kinds[0].kind, Kind::Container);
+        assert_eq!(kinds[0].runtimes, vec![Runtime::Other("docker".into())]);
+        assert_eq!(kinds[1].kind, Kind::Vm);
+        assert_eq!(kinds[1].runtimes, vec![Runtime::Other("native".into())]);
+
+        let modal = cloud_kinds(vec![Runtime::Gvisor, Runtime::Other("microvm".into())]);
+        assert_eq!(modal.len(), 2);
+        assert_eq!(modal[0].kind, Kind::Container);
+        assert_eq!(modal[1].kind, Kind::MicroVm);
+    }
 }

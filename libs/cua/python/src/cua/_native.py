@@ -11164,7 +11164,7 @@ class CloudProvider:
     """
     One cloud as `cloud_status` lists it.
 """
-    def __init__(self, *, name:str, title:str, tier:str, connected:bool, default:bool, credentials:CloudCredentials, account:str, profile:str, region:str, zone:str, project:str, environment:str, label:str, ttl_hours:int, kinds:typing.List[CloudKind], auth:str, status:str, budget_usd_month:typing.Optional[float], max_size:str, spent_month:float, running:int, approval:str, approval_agent:str, pending_budget_usd_month:typing.Optional[float], pending_max_size:str, can_approve:bool, suggest_auth:str, issue:str, holders:typing.List[str], relay_url:typing.Optional[str], relay_mode:typing.Optional[str]):
+    def __init__(self, *, name:str, title:str, tier:str, connected:bool, default:bool, credentials:CloudCredentials, account:str, profile:str, region:str, zone:str, project:str, environment:str, label:str, ttl_hours:int, kinds:typing.List[CloudKind], auth:str, status:str, budget_usd_month:typing.Optional[float], max_size:str, spent_month:float, running:int, approval:str, approval_agent:str, pending_budget_usd_month:typing.Optional[float], pending_max_size:str, can_approve:bool, suggest_auth:str, issue:str, holders:typing.List[str], relay_url:typing.Optional[str], relay_mode:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT):
         self.name = name
         self.title = title
         self.tier = tier
@@ -11195,13 +11195,20 @@ class CloudProvider:
         self.issue = issue
         self.holders = holders
         self.relay_url = relay_url
-        self.relay_mode = relay_mode
+        if relay_mode is _DEFAULT:
+            self.relay_mode = None
+        else:
+            self.relay_mode = relay_mode
+        if spacesd_download_url is _DEFAULT:
+            self.spacesd_download_url = None
+        else:
+            self.spacesd_download_url = spacesd_download_url
 
 
 
 
     def __str__(self):
-        return "CloudProvider(name={}, title={}, tier={}, connected={}, default={}, credentials={}, account={}, profile={}, region={}, zone={}, project={}, environment={}, label={}, ttl_hours={}, kinds={}, auth={}, status={}, budget_usd_month={}, max_size={}, spent_month={}, running={}, approval={}, approval_agent={}, pending_budget_usd_month={}, pending_max_size={}, can_approve={}, suggest_auth={}, issue={}, holders={}, relay_url={}, relay_mode={})".format(self.name, self.title, self.tier, self.connected, self.default, self.credentials, self.account, self.profile, self.region, self.zone, self.project, self.environment, self.label, self.ttl_hours, self.kinds, self.auth, self.status, self.budget_usd_month, self.max_size, self.spent_month, self.running, self.approval, self.approval_agent, self.pending_budget_usd_month, self.pending_max_size, self.can_approve, self.suggest_auth, self.issue, self.holders, self.relay_url, self.relay_mode)
+        return "CloudProvider(name={}, title={}, tier={}, connected={}, default={}, credentials={}, account={}, profile={}, region={}, zone={}, project={}, environment={}, label={}, ttl_hours={}, kinds={}, auth={}, status={}, budget_usd_month={}, max_size={}, spent_month={}, running={}, approval={}, approval_agent={}, pending_budget_usd_month={}, pending_max_size={}, can_approve={}, suggest_auth={}, issue={}, holders={}, relay_url={}, relay_mode={}, spacesd_download_url={})".format(self.name, self.title, self.tier, self.connected, self.default, self.credentials, self.account, self.profile, self.region, self.zone, self.project, self.environment, self.label, self.ttl_hours, self.kinds, self.auth, self.status, self.budget_usd_month, self.max_size, self.spent_month, self.running, self.approval, self.approval_agent, self.pending_budget_usd_month, self.pending_max_size, self.can_approve, self.suggest_auth, self.issue, self.holders, self.relay_url, self.relay_mode, self.spacesd_download_url)
     def __eq__(self, other):
         if self.name != other.name:
             return False
@@ -11265,6 +11272,8 @@ class CloudProvider:
             return False
         if self.relay_mode != other.relay_mode:
             return False
+        if self.spacesd_download_url != other.spacesd_download_url:
+            return False
         return True
 
 class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
@@ -11302,6 +11311,7 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
             holders=_UniffiFfiConverterSequenceString.read(buf),
             relay_url=_UniffiFfiConverterOptionalString.read(buf),
             relay_mode=_UniffiFfiConverterOptionalString.read(buf),
+            spacesd_download_url=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -11337,6 +11347,7 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceString.check_lower(value.holders)
         _UniffiFfiConverterOptionalString.check_lower(value.relay_url)
         _UniffiFfiConverterOptionalString.check_lower(value.relay_mode)
+        _UniffiFfiConverterOptionalString.check_lower(value.spacesd_download_url)
 
     @staticmethod
     def write(value, buf):
@@ -11371,6 +11382,7 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
         _UniffiFfiConverterSequenceString.write(value.holders, buf)
         _UniffiFfiConverterOptionalString.write(value.relay_url, buf)
         _UniffiFfiConverterOptionalString.write(value.relay_mode, buf)
+        _UniffiFfiConverterOptionalString.write(value.spacesd_download_url, buf)
 
 class _UniffiFfiConverterSequenceTypeCloudCheck(_UniffiConverterRustBuffer):
     @classmethod
@@ -12010,7 +12022,7 @@ class CloudTarget:
     their own CLI sign-in; Hetzner takes its API token in `token` (or
     `HCLOUD_TOKEN`).
 """
-    def __init__(self, *, provider:str, profile:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, zone:typing.Optional[str] = _DEFAULT, project:typing.Optional[str] = _DEFAULT, environment:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, relay_url:typing.Optional[str] = _DEFAULT, relay_mode:typing.Optional[str] = _DEFAULT, relay_token:typing.Optional[str] = _DEFAULT):
+    def __init__(self, *, provider:str, profile:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, zone:typing.Optional[str] = _DEFAULT, project:typing.Optional[str] = _DEFAULT, environment:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, relay_url:typing.Optional[str] = _DEFAULT, relay_mode:typing.Optional[str] = _DEFAULT, relay_token:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT):
         self.provider = provider
         if profile is _DEFAULT:
             self.profile = None
@@ -12048,12 +12060,16 @@ class CloudTarget:
             self.relay_token = None
         else:
             self.relay_token = relay_token
+        if spacesd_download_url is _DEFAULT:
+            self.spacesd_download_url = None
+        else:
+            self.spacesd_download_url = spacesd_download_url
 
 
 
 
     def __str__(self):
-        return "CloudTarget(provider={}, profile={}, region={}, zone={}, project={}, environment={}, token={}, relay_url={}, relay_mode={}, relay_token={})".format(self.provider, self.profile, self.region, self.zone, self.project, self.environment, self.token, self.relay_url, self.relay_mode, self.relay_token)
+        return "CloudTarget(provider={}, profile={}, region={}, zone={}, project={}, environment={}, token={}, relay_url={}, relay_mode={}, relay_token={}, spacesd_download_url={})".format(self.provider, self.profile, self.region, self.zone, self.project, self.environment, self.token, self.relay_url, self.relay_mode, self.relay_token, self.spacesd_download_url)
     def __eq__(self, other):
         if self.provider != other.provider:
             return False
@@ -12075,6 +12091,8 @@ class CloudTarget:
             return False
         if self.relay_token != other.relay_token:
             return False
+        if self.spacesd_download_url != other.spacesd_download_url:
+            return False
         return True
 
 class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
@@ -12091,6 +12109,7 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
             relay_url=_UniffiFfiConverterOptionalString.read(buf),
             relay_mode=_UniffiFfiConverterOptionalString.read(buf),
             relay_token=_UniffiFfiConverterOptionalString.read(buf),
+            spacesd_download_url=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -12105,6 +12124,7 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.relay_url)
         _UniffiFfiConverterOptionalString.check_lower(value.relay_mode)
         _UniffiFfiConverterOptionalString.check_lower(value.relay_token)
+        _UniffiFfiConverterOptionalString.check_lower(value.spacesd_download_url)
 
     @staticmethod
     def write(value, buf):
@@ -12118,6 +12138,7 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.relay_url, buf)
         _UniffiFfiConverterOptionalString.write(value.relay_mode, buf)
         _UniffiFfiConverterOptionalString.write(value.relay_token, buf)
+        _UniffiFfiConverterOptionalString.write(value.spacesd_download_url, buf)
 
 @dataclass
 class CloudTestReport:

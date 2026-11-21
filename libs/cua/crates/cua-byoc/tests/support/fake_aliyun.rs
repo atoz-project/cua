@@ -652,34 +652,62 @@ pub async fn handle(
                 )
                     .into_response()
             }
-            ("2014-05-26", "DescribeImages") => (
-                StatusCode::OK,
-                axum::Json(json!({
-                    "Images": {
-                        "Image": [
-                            {
-                                "ImageId": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
-                                "ImageName": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
-                                "OSType": "linux",
-                                "Architecture": "x86_64",
-                                "Status": "Available",
-                                "CreationTime": "2024-06-01T00:00:00Z"
-                            },
-                            {
-                                "ImageId": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
-                                "ImageName": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
-                                "OSType": "linux",
-                                "Architecture": "x86_64",
-                                "Status": "Available",
-                                "CreationTime": "2025-01-01T00:00:00Z"
-                            }
-                        ]
-                    },
-                    "TotalCount": 2,
-                    "RequestId": "req-images-1"
-                })),
-            )
-                .into_response(),
+            ("2014-05-26", "DescribeImages") => {
+                let os = params
+                    .get("OSType")
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_else(|| "linux".into());
+                let images = if os == "windows" {
+                    vec![
+                        json!({
+                            "ImageId": "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
+                            "ImageName": "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
+                            "OSNameEn": "Windows Server 2019 Datacenter Edition 64bit Chinese",
+                            "OSType": "windows",
+                            "Architecture": "x86_64",
+                            "Status": "Available",
+                            "CreationTime": "2024-06-01T00:00:00Z"
+                        }),
+                        json!({
+                            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250101.vhd",
+                            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250101.vhd",
+                            "OSNameEn": "Windows Server 2022 Datacenter Edition 64bit",
+                            "OSType": "windows",
+                            "Architecture": "x86_64",
+                            "Status": "Available",
+                            "CreationTime": "2025-01-01T00:00:00Z"
+                        }),
+                    ]
+                } else {
+                    vec![
+                        json!({
+                            "ImageId": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
+                            "ImageName": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
+                            "OSType": "linux",
+                            "Architecture": "x86_64",
+                            "Status": "Available",
+                            "CreationTime": "2024-06-01T00:00:00Z"
+                        }),
+                        json!({
+                            "ImageId": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
+                            "ImageName": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
+                            "OSType": "linux",
+                            "Architecture": "x86_64",
+                            "Status": "Available",
+                            "CreationTime": "2025-01-01T00:00:00Z"
+                        }),
+                    ]
+                };
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "Images": { "Image": images },
+                        "TotalCount": images.len(),
+                        "RequestId": "req-images-1"
+                    })),
+                )
+                    .into_response()
+            }
             ("2014-05-26", "DescribeInstances") => {
                 let tag_filters = extract_tag_filters(&params);
                 let id_filter: Option<Vec<String>> = params

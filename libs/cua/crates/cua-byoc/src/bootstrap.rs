@@ -21,6 +21,8 @@ use base64::Engine as _;
 
 use crate::relay::Join;
 
+pub use crate::bootstrap_win::{WindowsVmBoot, windows_user_data};
+
 /// The container the VM runs the sandbox in.
 pub const CONTAINER: &str = "cua-sandbox";
 

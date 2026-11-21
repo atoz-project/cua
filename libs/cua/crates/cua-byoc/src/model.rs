@@ -361,6 +361,9 @@ pub struct Connection {
     /// Relay authentication mode (`None`: Account Relay Mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mode: Option<cua_sandbox_core::byoc::RelayMode>,
+    /// Optional custom `cua-spacesd` binary mirror URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
 }
 
 fn default_ttl() -> u32 {
@@ -505,7 +508,7 @@ pub const STARTED_BY: &str = "started_by";
 pub const DEFAULT_VPC: &str = "default_vpc";
 
 /// What one Space asks a provider for.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ProvisionSpec {
     /// The resource name Cua chose (`cua-space-<hex>`), unique per create.
     pub name: String,
@@ -562,6 +565,36 @@ pub struct ProvisionSpec {
     /// Network rules the Space asked for, for a cloud that enforces them
     /// on its own side (Modal; [`crate::CloudApi::takes_network_rules`]).
     pub network: Option<crate::modal_net::NetworkRequest>,
+    /// Direct VM (`windows`): optional custom `cua-spacesd` binary mirror URL.
+    pub spacesd_download_url: Option<String>,
+    /// Direct VM (`windows`): generated Administrator password for AutoLogon
+    /// and ECS `RunInstances` `Password`. Secret: never printed or logged.
+    pub desktop_password: Option<String>,
+}
+
+impl std::fmt::Debug for ProvisionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionSpec")
+            .field("name", &self.name)
+            .field("family", &self.family)
+            .field("image", &self.image)
+            .field("kind", &self.kind)
+            .field("machine_type", &self.machine_type)
+            .field("disk_gb", &self.disk_gb)
+            .field("arch", &self.arch)
+            .field("runtime", &self.runtime)
+            .field("cpus", &self.cpus)
+            .field("memory_mb", &self.memory_mb)
+            .field("ttl_secs", &self.ttl_secs)
+            .field("role", &self.role)
+            .field("region", &self.region)
+            .field("spacesd_download_url", &self.spacesd_download_url)
+            .field(
+                "desktop_password",
+                &self.desktop_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProvisionSpec {

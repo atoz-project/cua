@@ -33,6 +33,7 @@ fn check_request(
     word: &str,
     caps: &ProviderCapabilities,
     takes_network_rules: bool,
+    supported_oses: &[&str],
     o: &CreateOptions,
 ) -> Result<()> {
     let unsupported = |op: String| crate::provider::unsupported(word, op);
@@ -47,10 +48,33 @@ fn check_request(
     if !o.sidecars.is_empty() {
         return Err(unsupported("sidecars".into()));
     }
-    if !o.os.eq_ignore_ascii_case("linux") {
+    if !supported_oses
+        .iter()
+        .any(|os| os.eq_ignore_ascii_case(&o.os))
+    {
+        if supported_oses == ["linux"] {
+            return Err(Error::UnsupportedImage(format!(
+                "{word} runs Linux sandboxes only (asked for {}); run {} guests with --on local",
+                o.os, o.os
+            )));
+        }
         return Err(Error::UnsupportedImage(format!(
-            "{word} runs Linux sandboxes only (asked for {}); run {} guests with --on local",
-            o.os, o.os
+            "{word} runs {} sandboxes only (asked for {}); run {} guests with --on local",
+            supported_oses.join(", "),
+            o.os,
+            o.os
+        )));
+    }
+    if o.os.eq_ignore_ascii_case("windows")
+        && (o.runtime.as_str() == "docker" || o.kind == Kind::Container)
+    {
+        return Err(Error::UnsupportedImage(format!(
+            "Windows sandboxes on {word} run with --runtime native (--kind vm) only, not {}",
+            if o.runtime.as_str() == "docker" {
+                "--runtime docker"
+            } else {
+                "--kind container"
+            }
         )));
     }
     if o.command.as_ref().is_some_and(|c| !c.is_empty()) && !caps.command {
@@ -109,12 +133,18 @@ fn split_kind(image: &str) -> (Option<RunKind>, &str) {
 pub(super) async fn resolve_image(
     word: &str,
     caps: &ProviderCapabilities,
+    supported_oses: &[&str],
     o: &CreateOptions,
 ) -> Result<(ProviderImage, Option<ImageInfo>)> {
     let (asked, reference) = split_kind(&o.image);
     let reference = cua_image::canonical::alias(reference).unwrap_or_else(|| reference.to_string());
     if reference.is_empty() {
         return Err(Error::InvalidArgument("image is required".into()));
+    }
+    if o.os.eq_ignore_ascii_case("windows") && asked == Some(RunKind::Container) {
+        return Err(Error::UnsupportedImage(format!(
+            "Windows sandboxes on {word} run as VM (--runtime native), not container"
+        )));
     }
     let kinds: Vec<RunKind> = match asked {
         Some(k) if caps.kinds.contains(&k) => vec![k],
@@ -129,14 +159,28 @@ pub(super) async fn resolve_image(
                     .join(", ")
             )));
         }
+        None if o.kind == Kind::Vm && caps.kinds.contains(&RunKind::Vm) => vec![RunKind::Vm],
+        None if o.kind == Kind::Container && caps.kinds.contains(&RunKind::Container) => {
+            vec![RunKind::Container]
+        }
         None => caps.kinds.clone(),
     };
+    let arch = caps.arches.first().copied().unwrap_or("amd64");
+    // Direct VM (--runtime native or Windows on a VM-capable provider) boots a
+    // cloud OS image rather than a GHCR OCI containerdisk.
+    if caps.kinds.contains(&RunKind::Vm)
+        && supported_oses
+            .iter()
+            .any(|os| os.eq_ignore_ascii_case(&o.os))
+        && (o.runtime.as_str() == "native" || o.os.eq_ignore_ascii_case("windows"))
+    {
+        return Ok((unpinned(&reference, RunKind::Vm, arch), None));
+    }
     let backend = match kinds.as_slice() {
         [RunKind::Container] => cua_image::Backend::Container,
         [RunKind::Vm] => cua_image::Backend::Vm,
         _ => cua_image::Backend::Provider,
     };
-    let arch = caps.arches.first().copied().unwrap_or("amd64");
     let creds = o.scoped_credentials();
     let resolved = tokio::time::timeout(
         RESOLVE_TIMEOUT,
@@ -198,10 +242,20 @@ pub(super) async fn resolve_image(
                 .join(", ")
         )));
     }
-    if r.os != "linux" {
+    if !supported_oses
+        .iter()
+        .any(|os| os.eq_ignore_ascii_case(&r.os))
+    {
+        if supported_oses == ["linux"] {
+            return Err(Error::UnsupportedImage(format!(
+                "{reference} is a {} image; {word} runs Linux sandboxes only",
+                r.os
+            )));
+        }
         return Err(Error::UnsupportedImage(format!(
-            "{reference} is a {} image; {word} runs Linux sandboxes only",
-            r.os
+            "{reference} is a {} image; {word} runs {} sandboxes only",
+            r.os,
+            supported_oses.join(", ")
         )));
     }
     let run_arch = r.arch.clone().unwrap_or_else(|| arch.to_string());
@@ -251,9 +305,17 @@ impl Sandboxes {
             })?;
         let provider = self.contrib_provider(word)?.clone();
         let caps = provider.capabilities();
-        check_request(word, &caps, provider.takes_network_rules(), o)?;
+        let supported_oses = provider.supported_oses();
+        check_request(
+            word,
+            &caps,
+            provider.takes_network_rules(),
+            supported_oses,
+            o,
+        )?;
         provider.check_configured()?;
-        let (image, image_info) = resolve_image(word, &caps, o).await?;
+        let (image, image_info) = resolve_image(word, &caps, supported_oses, o).await?;
+        let image_kind = image.kind;
         let mut services = o.all_services();
         // `env` (3211) only for images that carry cua-spacesd (or might).
         if !o.services.contains_key("env") && image.spacesd == Some(false) {
@@ -347,6 +409,7 @@ impl Sandboxes {
                 word,
                 &instance,
                 o,
+                image_kind,
                 &services,
                 env_token.as_deref(),
                 image_info.as_ref(),
@@ -358,11 +421,13 @@ impl Sandboxes {
         Ok(sandbox)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_contrib_state(
         &self,
         word: &str,
         instance: &crate::ProviderInstance,
         o: &CreateOptions,
+        image_kind: RunKind,
         services: &BTreeMap<String, u16>,
         env_token: Option<&str>,
         image_info: Option<&ImageInfo>,
@@ -396,7 +461,15 @@ impl Sandboxes {
         self.inner.state.save(&SandboxState::Local(LocalState {
             name: instance_name(instance, &o.name),
             runtime_type: word.into(),
-            image: registry_image_dict(&o.image, &o.os, Some("container")),
+            image: registry_image_dict(
+                &o.image,
+                &o.os,
+                Some(if o.kind == Kind::Vm || image_kind == RunKind::Vm {
+                    "vm"
+                } else {
+                    "container"
+                }),
+            ),
             host: String::new(),
             api_port: ENV_PORT,
             os_type: Some(o.os.clone()),

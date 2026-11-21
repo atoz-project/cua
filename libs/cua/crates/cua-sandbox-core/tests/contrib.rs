@@ -419,3 +419,266 @@ async fn a_gpu_type_reaches_the_provider() {
         "refused before a call"
     );
 }
+
+struct MultiOsFake {
+    spacesd: String,
+    created: Mutex<Vec<ProviderCreate>>,
+    live: Mutex<BTreeMap<String, ProviderInstance>>,
+}
+
+impl MultiOsFake {
+    fn new(spacesd: String) -> Arc<Self> {
+        Arc::new(Self {
+            spacesd,
+            created: Mutex::default(),
+            live: Mutex::default(),
+        })
+    }
+}
+
+#[async_trait]
+impl Provider for MultiOsFake {
+    fn name(&self) -> &'static str {
+        "aliyun-ecs"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            kinds: vec![RunKind::Container, RunKind::Vm],
+            runtime: "docker",
+            arches: vec!["amd64"],
+            image_mode: ImageMode::Direct,
+            ports: PortExposure::Https,
+            command: false,
+            env_to_entrypoint: true,
+            private_registry: false,
+            suspend: true,
+            max_cpus: None,
+            max_memory_mb: None,
+            credential_env: &[],
+            gpus: vec![],
+        }
+    }
+
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux", "windows"]
+    }
+
+    fn check_configured(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
+        self.created.lock().unwrap().push(spec.clone());
+        let id = format!("i-win-{}", self.created.lock().unwrap().len());
+        let mut i = ProviderInstance::new(&id, &spec.name, Status::Running);
+        i.details.insert(
+            "runtime".into(),
+            if spec.runtime == cua_sandbox_core::placement::Runtime::Auto {
+                "native".into()
+            } else {
+                spec.runtime.as_str().into()
+            },
+        );
+        self.live.lock().unwrap().insert(id, i.clone());
+        Ok(i)
+    }
+
+    async fn get(&self, id: &str) -> Result<ProviderInstance> {
+        self.live
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(id.into()))
+    }
+
+    async fn list(&self) -> Result<Vec<ProviderInstance>> {
+        Ok(self.live.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        self.live.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn endpoint(&self, _: &ProviderInstance, port: u16) -> Result<ServiceEndpoint> {
+        Ok(ServiceEndpoint {
+            url: if port == 3211 {
+                self.spacesd.clone()
+            } else {
+                format!("http://127.0.0.1:9/{port}")
+            },
+            headers: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn windows_direct_vm_bypasses_oci_and_rejects_docker_or_container_kind() {
+    cua_image::resolve::set_source(Some(Arc::new(registry())));
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start(MockAuth::default()).await;
+    let fake = MultiOsFake::new(mock.url());
+    let sbx = Sandboxes::builder()
+        .provider(fake.clone())
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    // 1. Windows with --runtime native succeeds even when no Windows OCI manifest exists in FakeRegistry.
+    let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o.contrib = Some("aliyun-ecs".into());
+    o.name = Some("win-direct-a".into());
+    o.os = "windows".into();
+    o.kind = cua_sandbox_core::placement::Kind::Vm;
+    o.runtime = cua_sandbox_core::placement::Runtime::Other("native".into());
+    let sb = sbx.create(o).await.unwrap();
+    assert_eq!(
+        sb.placement(),
+        (
+            cua_sandbox_core::placement::Kind::Vm,
+            cua_sandbox_core::placement::Runtime::Other("native".into())
+        )
+    );
+    let spec = fake.created.lock().unwrap()[0].clone();
+    assert_eq!(spec.image.kind, RunKind::Vm);
+
+    // Persisted state records kind "vm" (not hardcoded "container").
+    let raw_state =
+        std::fs::read_to_string(dir.path().join("sandboxes/win-direct-a.json")).unwrap();
+    let state_json: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
+    assert_eq!(state_json["image"]["kind"], "vm");
+
+    // 2. Windows + --runtime docker or --kind container is rejected before provider create.
+    let mut bad_rt = CreateOptions::new(ProviderKind::Contrib, "windows");
+    bad_rt.contrib = Some("aliyun-ecs".into());
+    bad_rt.os = "windows".into();
+    bad_rt.runtime = cua_sandbox_core::placement::Runtime::Other("docker".into());
+    let err = sbx.create(bad_rt).await.unwrap_err();
+    assert!(matches!(err, Error::UnsupportedImage(_)), "{err:?}");
+
+    let mut bad_kind = CreateOptions::new(ProviderKind::Contrib, "windows");
+    bad_kind.contrib = Some("aliyun-ecs".into());
+    bad_kind.os = "windows".into();
+    bad_kind.kind = cua_sandbox_core::placement::Kind::Container;
+    let err = sbx.create(bad_kind).await.unwrap_err();
+    assert!(matches!(err, Error::UnsupportedImage(_)), "{err:?}");
+    assert_eq!(fake.created.lock().unwrap().len(), 1);
+}
+
+struct ConnectOptsTokenFake {
+    spacesd: String,
+    expected_token: String,
+    live: Mutex<BTreeMap<String, ProviderInstance>>,
+}
+
+#[async_trait]
+impl Provider for ConnectOptsTokenFake {
+    fn name(&self) -> &'static str {
+        "e2b"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            kinds: vec![RunKind::Vm],
+            runtime: "native",
+            arches: vec!["amd64"],
+            image_mode: ImageMode::Direct,
+            ports: PortExposure::Https,
+            command: false,
+            // Provider supplies ConnectOptions token on its own (`held == None`).
+            env_to_entrypoint: false,
+            private_registry: false,
+            suspend: false,
+            max_cpus: None,
+            max_memory_mb: None,
+            credential_env: &[],
+            gpus: vec![],
+        }
+    }
+
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux", "windows"]
+    }
+
+    fn check_configured(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
+        let i = ProviderInstance::new("i-tok-1", &spec.name, Status::Running);
+        self.live.lock().unwrap().insert(i.id.clone(), i.clone());
+        Ok(i)
+    }
+
+    async fn get(&self, id: &str) -> Result<ProviderInstance> {
+        self.live
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(id.into()))
+    }
+
+    async fn list(&self) -> Result<Vec<ProviderInstance>> {
+        Ok(self.live.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        self.live.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn endpoint(&self, _: &ProviderInstance, _port: u16) -> Result<ServiceEndpoint> {
+        Ok(ServiceEndpoint {
+            url: self.spacesd.clone(),
+            headers: vec![],
+        })
+    }
+
+    fn connect_options(
+        &self,
+        _instance: &ProviderInstance,
+        _port: u16,
+    ) -> Option<Result<cua_spacesd_client::ConnectOptions>> {
+        let mut opts = match cua_spacesd_client::ConnectOptions::parse(&self.spacesd) {
+            Ok(o) => o,
+            Err(e) => return Some(Err(Error::InvalidArgument(e.to_string()))),
+        };
+        opts.token = Some(self.expected_token.clone());
+        Some(Ok(opts))
+    }
+}
+
+#[tokio::test]
+async fn spacesd_with_preserves_connect_options_token_when_caps_uninitialized() {
+    cua_image::resolve::set_source(Some(Arc::new(registry())));
+    let dir = tempfile::tempdir().unwrap();
+    let expected = "static-env-token-preserved-1234";
+    let mock = MockServer::start(MockAuth {
+        token: Some(expected.into()),
+        ..Default::default()
+    })
+    .await;
+    let fake = Arc::new(ConnectOptsTokenFake {
+        spacesd: mock.url(),
+        expected_token: expected.into(),
+        live: Mutex::default(),
+    });
+    let sbx = Sandboxes::builder()
+        .provider(fake)
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o.contrib = Some("e2b".into());
+    o.name = Some("win-static-tok".into());
+    o.os = "windows".into();
+    let sb = sbx.create(o).await.unwrap();
+    assert!(sb.env_token().is_none());
+
+    let client = sb.spacesd().await.unwrap();
+    assert_eq!(client.token(), Some(expected));
+    assert_eq!(sb.env_token().as_deref(), Some(expected));
+    client.health().await.unwrap();
+}

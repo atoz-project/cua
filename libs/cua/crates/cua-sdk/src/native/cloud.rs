@@ -135,7 +135,12 @@ pub struct CloudProvider {
     /// Relay authentication mode (`account` or `static`), or `None` when
     /// not connected.
     #[serde(default)]
+    #[uniffi(default = None)]
     pub relay_mode: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub spacesd_download_url: Option<String>,
 }
 
 /// The next step of a `cloud_connect`: a command for the agent, or a page
@@ -408,6 +413,10 @@ pub struct CloudTarget {
     /// never printed or stored in plaintext config.
     #[uniffi(default = None)]
     pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[uniffi(default = None)]
+    pub spacesd_download_url: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -426,6 +435,7 @@ impl std::fmt::Debug for CloudTarget {
                 "relay_token",
                 &self.relay_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("spacesd_download_url", &self.spacesd_download_url)
             .finish()
     }
 }
@@ -443,6 +453,7 @@ impl CloudTarget {
             "relay_url": self.relay_url,
             "relay_mode": self.relay_mode,
             "relay_token": self.relay_token,
+            "spacesd_download_url": self.spacesd_download_url,
         })
     }
 
@@ -451,6 +462,7 @@ impl CloudTarget {
             ("relay_url", self.relay_url.is_some()),
             ("relay_mode", self.relay_mode.is_some()),
             ("relay_token", self.relay_token.is_some()),
+            ("spacesd_download_url", self.spacesd_download_url.is_some()),
         ]
         .into_iter()
         .filter_map(|(k, set)| set.then_some(k))
@@ -788,6 +800,7 @@ mod tests {
             relay_url: Some("https://relay.example.com".into()),
             relay_mode: Some("static".into()),
             relay_token: Some("super-secret-relay-token".into()),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
             ..Default::default()
         };
         assert!(!format!("{target:?}").contains("super-secret-relay-token"));
@@ -795,10 +808,15 @@ mod tests {
         assert_eq!(args["relay_url"], "https://relay.example.com");
         assert_eq!(args["relay_mode"], "static");
         assert_eq!(args["relay_token"], "super-secret-relay-token");
+        assert_eq!(
+            args["spacesd_download_url"],
+            "https://mirror.example.com/cua-spacesd.exe"
+        );
         let p_wire = serde_json::to_value(cua_spaces::cloud::CloudProvider {
             name: "hetzner".into(),
             relay_url: Some("https://relay.example.com".into()),
             relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
             ..Default::default()
         })
         .unwrap();
@@ -807,6 +825,10 @@ mod tests {
         assert_eq!(
             p_sdk.relay_url.as_deref(),
             Some("https://relay.example.com")
+        );
+        assert_eq!(
+            p_sdk.spacesd_download_url.as_deref(),
+            Some("https://mirror.example.com/cua-spacesd.exe")
         );
     }
 }
