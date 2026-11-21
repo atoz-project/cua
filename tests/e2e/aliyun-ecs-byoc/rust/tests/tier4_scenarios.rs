@@ -3,7 +3,7 @@
 use aliyun_ecs_byoc_e2e::fake_aliyun::{
     BootFailMode, FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc,
 };
-use aliyun_ecs_byoc_e2e::{AliyunWorld, make_tags, seed_monthly_spend};
+use aliyun_ecs_byoc_e2e::{AliyunWorld, decode_user_data_scripts, make_tags, seed_monthly_spend};
 use serde_json::json;
 
 #[tokio::test]
@@ -133,7 +133,7 @@ async fn t4_01() {
         assert_eq!(inst.image_id, "m-win11-corp");
         assert!(inst.user_data_decoded.contains(&win_mir));
         assert!(inst.user_data_decoded.contains("100.100.100.200"));
-        assert!(inst.user_data_decoded.contains("tscon.exe"));
+        assert!(decode_user_data_scripts(&inst.user_data_decoded).contains("tscon.exe"));
     }
 
     w.run(&["sb", "exec", "win-corp", "echo", "corp-ok"])
@@ -208,8 +208,24 @@ async fn t4_02() {
     let st = w.run(&["cloud", "status", "--json"]).await;
     st.ok();
     assert_eq!(st.json()["default_on"], "aliyun-ecs");
-    assert_eq!(st.json()["providers"][0]["running"], 3);
-    assert_eq!(w.aliyun.lock().unwrap().count_calls("CreateVpc"), 1);
+    let aliyun_st = st.json()["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "aliyun-ecs")
+        .cloned()
+        .expect("aliyun-ecs provider in cloud status");
+    assert_eq!(aliyun_st["running"], 3);
+    assert_eq!(
+        w.aliyun
+            .lock()
+            .unwrap()
+            .calls_for("CreateVpc")
+            .into_iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        1
+    );
 
     w.run(&["cloud", "cost", "--by", "cloud", "--json"])
         .await

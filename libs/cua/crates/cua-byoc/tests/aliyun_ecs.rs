@@ -1643,6 +1643,43 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
         "max-size refusal must happen before ANY cloud API call"
     );
 
+    // 1b. --max-size 4x16 rejects explicit 8 vCPU / 32 GiB override BEFORE any cloud API call.
+    let home1b = tempfile::tempdir().unwrap();
+    let (api1b, s1b, _) = start(None).await;
+    let sb_max_4x16 = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home1b.path().join("sandboxes")),
+        home1b.path(),
+        vec![Arc::new(api1b)],
+        access.clone(),
+    )
+    .build();
+    sb_max_4x16
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("4x16".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s1b.lock().unwrap().calls.clear();
+
+    let mut opts_8x32 = sb_create_opts("too-big-4x16");
+    opts_8x32.cpus = 8;
+    opts_8x32.memory_mb = 32768;
+    let err_size_4x16 = sb_max_4x16.create(opts_8x32).await.unwrap_err();
+    assert!(
+        err_size_4x16
+            .to_string()
+            .contains("allows machines up to 4 vCPU"),
+        "{err_size_4x16}"
+    );
+    assert!(
+        s1b.lock().unwrap().calls.is_empty(),
+        "4x16 max-size refusal must happen before ANY cloud API call"
+    );
+
     // 2. --budget 0.01 rejects 0.043/h machine BEFORE any cloud provisioning call.
     let home2 = tempfile::tempdir().unwrap();
     let (api2, s2, _) = start(None).await;
@@ -4963,4 +5000,97 @@ async fn linux_native_supports_custom_linux_image_id_cloud_image_id_instance_typ
     assert!(ud2.starts_with("#cloud-config\n"));
     let boot2 = decode_native_cloud_init_file(&ud2, "/usr/local/sbin/cua-first-boot").unwrap();
     assert!(!boot2.contains("docker.io") && !boot2.contains("docker run"));
+}
+
+#[tokio::test]
+async fn create_options_ttl_zero_disables_connection_default_auto_release_time() {
+    use std::time::Duration;
+
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+        ),
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ttl_hours: Some(8),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Default CreateOptions.ttl (None) inherits conn.ttl_hours == 8 -> AutoReleaseTime set.
+    let _sb_default = sandboxes
+        .create(sb_create_opts("ttl-default"))
+        .await
+        .unwrap();
+    sandboxes.delete("ttl-default").await.unwrap();
+    let run_default = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        run_default.params.contains_key("AutoReleaseTime"),
+        "expected AutoReleaseTime when CreateOptions.ttl is None: {:?}",
+        run_default.params
+    );
+
+    // Explicit CreateOptions.ttl = Some(Duration::ZERO) disables AutoReleaseTime.
+    let mut o_zero = sb_create_opts("ttl-zero");
+    o_zero.ttl = Some(Duration::ZERO);
+    let _sb_zero = sandboxes.create(o_zero).await.unwrap();
+    sandboxes.delete("ttl-zero").await.unwrap();
+    let run_zero = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        !run_zero.params.contains_key("AutoReleaseTime"),
+        "expected no AutoReleaseTime when CreateOptions.ttl is Some(ZERO): {:?}",
+        run_zero.params
+    );
 }

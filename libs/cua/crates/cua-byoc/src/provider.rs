@@ -692,7 +692,11 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         crate::alerts::check_all(&self.store, now());
         let sizing = self.api.resolve_machine_sizing(&conn, &provision).await?;
         let (eff_cpus, eff_mem_mb, eff_usd) = match sizing {
-            Some(s) => (Some(s.vcpus), Some(s.memory_mb), s.usd_per_hour),
+            Some(s) => (
+                Some(s.vcpus.max(spec.cpus)),
+                Some(s.memory_mb.max(spec.memory_mb)),
+                s.usd_per_hour,
+            ),
             None => {
                 let (c, m) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
                 (c, m, offer.usd_per_hour)

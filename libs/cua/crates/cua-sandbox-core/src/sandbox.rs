@@ -327,6 +327,8 @@ pub struct CreateOptions {
     pub cloud_image_id: Option<String>,
     /// Per-create cloud instance type override (`aliyun-ecs`: `ecs.g7.xlarge`).
     pub instance_type: Option<String>,
+    /// Lifetime backstop (`cua sb create --ttl`). `None` uses the provider default.
+    pub ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for CreateOptions {
@@ -372,6 +374,7 @@ impl std::fmt::Debug for CreateOptions {
             .field("forkable", &self.forkable)
             .field("cloud_image_id", &self.cloud_image_id)
             .field("instance_type", &self.instance_type)
+            .field("ttl", &self.ttl)
             .finish()
     }
 }
@@ -417,6 +420,7 @@ impl CreateOptions {
             forkable: false,
             cloud_image_id: None,
             instance_type: None,
+            ttl: None,
         }
     }
 

@@ -375,6 +375,8 @@ message CreateSandboxRequest {
   string cloud_image_id = 44;
   // Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
   string instance_type = 45;
+  // Lifetime backstop (`cua sb create --ttl`). Unset uses the provider default.
+  google.protobuf.Duration ttl = 46;
   // Removed with Cua Cloud (Fleets), which ended on 18 Oct 2026: the cloud
   // runtime, the pool replicas, claim TTL, warm and size options, and
   // apply. Their numbers and names are never reused.

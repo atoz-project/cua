@@ -423,11 +423,23 @@ async fn t1_f2_02() {
     let machines = w.relay.static_machines();
     assert_eq!(machines.len(), 1);
     assert!(!machines[0].env_token.is_empty());
-    w.assert_no_secrets_in_non_secret_files(&[
-        "secret123",
-        "static-relay-secret",
-        &machines[0].env_token,
-    ]);
+    w.assert_no_secrets_in_non_secret_files(&["secret123", "static-relay-secret"]);
+    // env_token lives in `byoc-env-tokens-aliyun-ecs` (0600) and sandbox state for `sb exec`,
+    // never in `cloud/*` or `config.toml`.
+    for rel in [
+        "cloud/state.json",
+        "cloud/links.json",
+        "cloud/audit.jsonl",
+        "config.toml",
+    ] {
+        let p = w.cua_home().join(rel);
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            assert!(
+                !text.contains(&machines[0].env_token),
+                "env_token leaked into {rel}: {text}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -603,8 +615,21 @@ async fn t1_f3_02() {
     .ok();
 
     let f = w.aliyun.lock().unwrap();
-    assert_eq!(f.count_calls("CreateVpc"), 1);
-    assert_eq!(f.count_calls("CreateSecurityGroup"), 1);
+    assert_eq!(
+        f.calls_for("CreateVpc")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        1
+    );
+    assert_eq!(f.vpcs.len(), 1);
+    assert_eq!(
+        f.calls_for("CreateSecurityGroup")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        1
+    );
     assert_eq!(f.authorize_sg_calls, 0);
     let vpc = f.vpcs.values().next().unwrap();
     assert!(vpc.vpc_name.starts_with("cua-sb-"));
@@ -660,7 +685,7 @@ async fn t1_f3_04() {
     w.aliyun
         .lock()
         .unwrap()
-        .sold_out_zones
+        .run_fail_zones
         .insert("cn-hangzhou-h".into());
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
@@ -886,7 +911,7 @@ async fn t1_f4_03() {
     .await
     .ok();
     let f = w.aliyun.lock().unwrap();
-    let ud = &f.instances.values().next().unwrap().user_data_decoded;
+    let ud = decode_user_data_scripts(&f.instances.values().next().unwrap().user_data_decoded);
     assert!(ud.contains("AutoAdminLogon"), "{ud}");
     assert!(ud.contains("Interactive"), "{ud}");
     assert!(ud.contains("100.100.100.200"), "{ud}");
@@ -1058,7 +1083,15 @@ async fn t1_f5_01() {
     let f = w.aliyun.lock().unwrap();
     assert_eq!(f.count_calls("CreateVpc"), 0);
     assert_eq!(f.count_calls("CreateVSwitch"), 0);
-    assert_eq!(f.count_calls("CreateSecurityGroup"), 0);
+    assert_eq!(
+        f.calls_for("CreateSecurityGroup")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        0
+    );
+    assert!(f.security_groups.contains_key("sg-user-1"));
+    assert_eq!(f.security_groups.len(), 1);
 }
 
 #[tokio::test]
@@ -1099,7 +1132,14 @@ async fn t1_f5_02() {
     let f = w.aliyun.lock().unwrap();
     assert_eq!(f.count_calls("CreateVpc"), 0);
     assert_eq!(f.count_calls("CreateVSwitch"), 0);
-    assert_eq!(f.count_calls("CreateSecurityGroup"), 1);
+    assert_eq!(
+        f.calls_for("CreateSecurityGroup")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        1
+    );
+    assert_eq!(f.security_groups.len(), 2);
     assert_eq!(f.authorize_sg_calls, 0);
     let inst = f.instances.values().next().unwrap();
     assert_eq!(inst.vpc_id, "vpc-user-1");

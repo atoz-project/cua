@@ -49,6 +49,7 @@ const SCRUB_ENV: &[&str] = &[
     "CUA_DEFAULT_RUNTIME",
     "CUA_AGENT",
     "CUA_AGENT_RUN_ID",
+    "CUA_IMAGE_RESOLVE",
     "CLAUDECODE",
     "CURSOR_AGENT",
     "GEMINI_CLI",
@@ -226,18 +227,56 @@ pub fn decode_cloud_init_write_files(user_data: &str) -> BTreeMap<String, String
     files
 }
 
-/// Returns `user_data` combined with all decoded `#cloud-config` `write_files:` payloads.
+/// Decodes PowerShell `Put (Join-Path $sd '<name>') '<b64>'` payloads from
+/// `#ps1_sysnative` Windows `UserData`, returning a map of `name -> decoded_content`.
+pub fn decode_ps_puts(user_data: &str) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let marker = "Put (Join-Path $sd '";
+    for line in user_data.lines() {
+        let Some(idx) = line.find(marker) else {
+            continue;
+        };
+        let rest = &line[idx + marker.len()..];
+        let Some((name, after_name)) = rest.split_once("')") else {
+            continue;
+        };
+        let after_name = after_name.trim();
+        let Some(b64_inner) = after_name
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+        else {
+            continue;
+        };
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_inner)
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            files.insert(name.to_string(), text);
+        }
+    }
+    files
+}
+
+/// Returns `user_data` combined with all decoded `#cloud-config` `write_files:` payloads
+/// and Windows `#ps1_sysnative` `Put` payloads.
 /// Keep cleartext-secret absence checks on the raw `user_data` string, and use this helper
 /// when inspecting scripts or env files embedded via `encoding: b64`.
 pub fn decode_user_data_scripts(user_data: &str) -> String {
     let files = decode_cloud_init_write_files(user_data);
-    if files.is_empty() {
+    let ps_files = decode_ps_puts(user_data);
+    if files.is_empty() && ps_files.is_empty() {
         return user_data.to_string();
     }
     let mut combined = String::from(user_data);
     for (path, content) in files {
         combined.push_str("\n# --- write_file: ");
         combined.push_str(&path);
+        combined.push_str(" ---\n");
+        combined.push_str(&content);
+        combined.push('\n');
+    }
+    for (name, content) in ps_files {
+        combined.push_str("\n# --- ps_put: ");
+        combined.push_str(&name);
         combined.push_str(" ---\n");
         combined.push_str(&content);
         combined.push('\n');
@@ -269,6 +308,14 @@ pub fn seed_monthly_spend(cua_home: &Path, provider: &str, usd: f64) {
 }
 
 fn extract_env_token(user_data: &str) -> Option<String> {
+    let ps_files = decode_ps_puts(user_data);
+    if let Some(tok) = ps_files
+        .get("env-token")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.starts_with("cmt_"))
+    {
+        return Some(tok.to_string());
+    }
     let expanded = decode_user_data_scripts(user_data);
     for line in expanded.lines() {
         let trimmed = line.trim();
@@ -320,7 +367,9 @@ impl AliyunWorld {
             let mut f = aliyun.lock().unwrap();
             f.on_boot = Some(Arc::new(move |inst, _params| {
                 if let Some(ref mid) = inst.machine_id {
-                    if let Some(env_tok) = extract_env_token(&inst.user_data_decoded) {
+                    if relay_boot.machine(mid).is_none()
+                        && let Some(env_tok) = extract_env_token(&inst.user_data_decoded)
+                    {
                         relay_boot.register_static_machine(mid, &inst.instance_name, &env_tok);
                     }
                     relay_boot.set_online(mid, true, "0.1.0");
@@ -358,6 +407,7 @@ impl AliyunWorld {
         );
         env.insert("CUA_RELAY_URL".into(), "http://127.0.0.1:9".into());
         env.insert("CUA_OIDC_POLL_UNIT_MS".into(), "5".into());
+        env.insert("CUA_IMAGE_RESOLVE".into(), "0".into());
         env.insert("HTTPS_PROXY".into(), proxy.url.clone());
         env.insert("SSL_CERT_FILE".into(), ca_path.display().to_string());
         env.insert("NO_PROXY".into(), "127.0.0.1,localhost".into());
@@ -511,7 +561,23 @@ impl AliyunWorld {
                 .strip_prefix(self.cua_home())
                 .unwrap_or(&path)
                 .to_string_lossy();
-            if rel.starts_with("secrets") {
+            let is_secret_store_file = rel.starts_with("secrets")
+                || rel.starts_with("byoc-relay-token-")
+                || rel.starts_with("byoc-env-tokens-")
+                || rel == "byoc-aliyun-ecs-token";
+            if is_secret_store_file {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        assert_eq!(
+                            meta.permissions().mode() & 0o077,
+                            0,
+                            "secret store file {} must be 0600 (no group/other perms)",
+                            path.display()
+                        );
+                    }
+                }
                 continue;
             }
             if let Ok(text) = std::fs::read_to_string(&path) {

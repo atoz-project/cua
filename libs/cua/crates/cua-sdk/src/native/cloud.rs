@@ -44,47 +44,6 @@ pub struct CloudKind {
     pub usd_per_hour: f64,
 }
 
-fn redact_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let Some(scheme_pos) = trimmed.find("://") else {
-        return "<redacted>".into();
-    };
-    let scheme = &trimmed[..scheme_pos];
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return "<redacted>".into();
-    }
-    let after_scheme = &trimmed[scheme_pos + 3..];
-    let (before_frag, frag) = match after_scheme.split_once('#') {
-        Some((b, f)) => (b, Some(f)),
-        None => (after_scheme, None),
-    };
-    let before_query = before_frag.split('?').next().unwrap_or(before_frag);
-    let (authority, path) = match before_query.find('/') {
-        Some(i) => (&before_query[..i], &before_query[i..]),
-        None => (before_query, ""),
-    };
-    let host_port = match authority.rsplit_once('@') {
-        Some((_, hp)) => hp,
-        None => authority,
-    };
-    if host_port.is_empty() {
-        return "<redacted>".into();
-    }
-    let mut out = format!("{scheme}://{host_port}{path}");
-    if let Some(f) = frag
-        && let Some(hex) = f.strip_prefix("sha256=")
-        && !hex.is_empty()
-        && hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        out.push('#');
-        out.push_str(f);
-    }
-    out
-}
-
 /// One cloud as `cloud_status` lists it.
 #[derive(Clone, PartialEq, Default, Deserialize, uniffi::Record)]
 pub struct CloudProvider {
@@ -244,7 +203,10 @@ impl std::fmt::Debug for CloudProvider {
             .field("relay_mode", &self.relay_mode)
             .field(
                 "spacesd_download_url",
-                &self.spacesd_download_url.as_deref().map(redact_url),
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
             )
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
@@ -571,7 +533,10 @@ impl std::fmt::Debug for CloudTarget {
             )
             .field(
                 "spacesd_download_url",
-                &self.spacesd_download_url.as_deref().map(redact_url),
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
             )
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)

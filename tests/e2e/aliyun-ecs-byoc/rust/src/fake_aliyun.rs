@@ -162,6 +162,7 @@ pub struct FakeAliyun {
     pub vpcs: BTreeMap<String, FakeVpc>,
     pub vswitches: BTreeMap<String, FakeVSwitch>,
     pub security_groups: BTreeMap<String, FakeSg>,
+    pub security_group_rules: BTreeMap<String, Vec<Value>>,
     pub instances: BTreeMap<String, FakeInstance>,
     pub calls: Vec<RecordedCall>,
     pub authorize_sg_calls: usize,
@@ -172,6 +173,7 @@ pub struct FakeAliyun {
     pub run_instances_dry_run_error: Option<(u16, String, String)>,
     pub force_auth_error: Option<(String, String)>,
     pub sold_out_zones: BTreeSet<String>,
+    pub run_fail_zones: BTreeSet<String>,
     pub unsupported_zones: BTreeSet<String>,
     pub boot_fail: Option<BootFailMode>,
     pub console_output: Option<String>,
@@ -268,6 +270,7 @@ impl Default for FakeAliyun {
             vpcs: BTreeMap::new(),
             vswitches: BTreeMap::new(),
             security_groups: BTreeMap::new(),
+            security_group_rules: BTreeMap::new(),
             instances: BTreeMap::new(),
             calls: Vec::new(),
             authorize_sg_calls: 0,
@@ -278,6 +281,7 @@ impl Default for FakeAliyun {
             run_instances_dry_run_error: None,
             force_auth_error: None,
             sold_out_zones: BTreeSet::new(),
+            run_fail_zones: BTreeSet::new(),
             unsupported_zones: BTreeSet::new(),
             boot_fail: None,
             console_output: None,
@@ -658,6 +662,14 @@ fn extract_machine_id(user_data: &str) -> Option<String> {
     {
         return Some(mid.to_string());
     }
+    let ps_files = crate::decode_ps_puts(user_data);
+    if let Some(mid) = ps_files
+        .get("machine-id")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(mid.to_string());
+    }
     let expanded = crate::decode_user_data_scripts(user_data);
     for line in expanded.lines() {
         let trimmed = line.trim();
@@ -856,11 +868,18 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeInstanceTypes") => {
-                let filter_id = params.get("InstanceType").cloned();
+                let requested: Option<Vec<String>> = params
+                    .get("InstanceTypes")
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .or_else(|| params.get("InstanceType").map(|id| vec![id.clone()]));
                 let items: Vec<Value> = f
                     .instance_types
                     .iter()
-                    .filter(|t| filter_id.as_ref().is_none_or(|id| id == &t.id))
+                    .filter(|t| {
+                        requested
+                            .as_ref()
+                            .is_none_or(|reqs| reqs.iter().any(|id| id == &t.id))
+                    })
                     .map(|t| {
                         json!({
                             "InstanceTypeId": t.id,
@@ -975,6 +994,13 @@ pub async fn handle(
                         "RAM policy Condition requires cua-managed=true tag on ecs:CreateSecurityGroup",
                     );
                 }
+                if params.get("DryRun").map(String::as_str) == Some("true") {
+                    return err(
+                        StatusCode::PRECONDITION_FAILED,
+                        "DryRunOperation",
+                        "Request validation has been passed with DryRun flag set.",
+                    );
+                }
                 let seq = f.next_seq();
                 let id = format!("sg-fake-{seq}");
                 let region = params
@@ -995,6 +1021,7 @@ pub async fn handle(
                         is_user_owned: false,
                     },
                 );
+                f.security_group_rules.insert(id.clone(), Vec::new());
                 (
                     StatusCode::OK,
                     axum::Json(json!({
@@ -1068,9 +1095,106 @@ pub async fn handle(
                     );
                 }
                 f.security_groups.remove(&id);
+                f.security_group_rules.remove(&id);
                 (
                     StatusCode::OK,
                     axum::Json(json!({ "RequestId": "req-dsg-1" })),
+                )
+                    .into_response()
+            }
+            ("2014-05-26", "DescribeSecurityGroupAttribute") => {
+                let sg_id = params.get("SecurityGroupId").cloned().unwrap_or_default();
+                if let Some(sg) = f.security_groups.get(&sg_id).cloned() {
+                    let mut rules = f
+                        .security_group_rules
+                        .get(&sg_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    for r in &sg.ingress_rules {
+                        let mut rule = r.clone();
+                        if let Some(obj) = rule.as_object_mut() {
+                            obj.entry("Direction".to_string())
+                                .or_insert_with(|| json!("ingress"));
+                            obj.entry("Policy".to_string())
+                                .or_insert_with(|| json!("Accept"));
+                        }
+                        rules.push(rule);
+                    }
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "SecurityGroupId": sg_id,
+                            "VpcId": sg.vpc_id,
+                            "RegionId": sg.region_id,
+                            "InnerAccessPolicy": "Drop",
+                            "Permissions": { "Permission": rules },
+                            "RequestId": "req-sga-1"
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    err(
+                        StatusCode::NOT_FOUND,
+                        "InvalidSecurityGroupId.NotFound",
+                        "The specified SecurityGroupId does not exist.",
+                    )
+                }
+            }
+            ("2014-05-26", "AuthorizeSecurityGroupEgress") => {
+                let sg_id = params.get("SecurityGroupId").cloned().unwrap_or_default();
+                let Some(sg) = f.security_groups.get(&sg_id).cloned() else {
+                    return err(
+                        StatusCode::NOT_FOUND,
+                        "InvalidSecurityGroupId.NotFound",
+                        "The specified SecurityGroupId does not exist.",
+                    );
+                };
+                if f.enforce_cua_managed_tag_condition && !has_cua_managed_tag(&sg.tags) {
+                    return err(
+                        StatusCode::FORBIDDEN,
+                        "Forbidden.RAM",
+                        "RAM policy Condition requires cua-managed=true on ecs:AuthorizeSecurityGroupEgress",
+                    );
+                }
+                let ip_proto = params
+                    .get("Permissions.1.IpProtocol")
+                    .or_else(|| params.get("IpProtocol"))
+                    .cloned()
+                    .unwrap_or_default();
+                let port_range = params
+                    .get("Permissions.1.PortRange")
+                    .or_else(|| params.get("PortRange"))
+                    .cloned()
+                    .unwrap_or_default();
+                let dest_cidr = params
+                    .get("Permissions.1.DestCidrIp")
+                    .or_else(|| params.get("DestCidrIp"))
+                    .cloned()
+                    .unwrap_or_default();
+                let policy = params
+                    .get("Permissions.1.Policy")
+                    .or_else(|| params.get("Policy"))
+                    .cloned()
+                    .unwrap_or_else(|| "Accept".into());
+                let priority = params
+                    .get("Permissions.1.Priority")
+                    .or_else(|| params.get("Priority"))
+                    .cloned()
+                    .unwrap_or_else(|| "1".into());
+                f.security_group_rules
+                    .entry(sg_id)
+                    .or_default()
+                    .push(json!({
+                        "Direction": "egress",
+                        "IpProtocol": ip_proto,
+                        "PortRange": port_range,
+                        "DestCidrIp": dest_cidr,
+                        "Policy": policy,
+                        "Priority": priority,
+                    }));
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({ "RequestId": "req-asge-1" })),
                 )
                     .into_response()
             }
@@ -1089,6 +1213,13 @@ pub async fn handle(
                         StatusCode::FORBIDDEN,
                         "Forbidden.RAM",
                         "RAM policy Condition requires cua-managed=true tag on vpc:CreateVpc",
+                    );
+                }
+                if params.get("DryRun").map(String::as_str) == Some("true") {
+                    return err(
+                        StatusCode::PRECONDITION_FAILED,
+                        "DryRunOperation",
+                        "Request validation has been passed with DryRun flag set.",
                     );
                 }
                 let seq = f.next_seq();
@@ -1202,6 +1333,13 @@ pub async fn handle(
                         StatusCode::FORBIDDEN,
                         "Forbidden.RAM",
                         "RAM policy Condition requires cua-managed=true tag on vpc:CreateVSwitch",
+                    );
+                }
+                if params.get("DryRun").map(String::as_str) == Some("true") {
+                    return err(
+                        StatusCode::PRECONDITION_FAILED,
+                        "DryRunOperation",
+                        "Request validation has been passed with DryRun flag set.",
                     );
                 }
                 let seq = f.next_seq();
@@ -1377,7 +1515,7 @@ pub async fn handle(
                     .or_else(|| f.vswitches.get(&vsw_id).map(|v| v.zone_id.clone()))
                     .unwrap_or_else(|| format!("{region}-h"));
 
-                if f.sold_out_zones.contains(&zone_id) {
+                if f.sold_out_zones.contains(&zone_id) || f.run_fail_zones.contains(&zone_id) {
                     return err(
                         StatusCode::BAD_REQUEST,
                         "OperationDenied.NoStock",

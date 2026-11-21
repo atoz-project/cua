@@ -2147,6 +2147,7 @@ impl CloudApi for AliyunEcs {
         if conn.no_public_ip {
             run_params.push(("InternetMaxBandwidthOut".into(), "0".into()));
         }
+        let has_matching_sg = matching_sg_id.is_some();
         let has_vswitch = if let Some(id) = vsw_id {
             run_params.push(("VSwitchId".into(), id));
             if let Some(sg_id) = matching_sg_id {
@@ -2190,6 +2191,22 @@ impl CloudApi for AliyunEcs {
                         "permissions",
                         true,
                         "RAM permissions verified (RunInstances DryRun passed auth check)",
+                    );
+                } else if existing_vpc_pair.is_some()
+                    && !has_matching_sg
+                    && !status.is_success()
+                    && matches!(
+                        code,
+                        "InvalidSecurityGroupId" | "InvalidSecurityGroupId.NotFound"
+                    )
+                {
+                    // In existing-VPC mode before Cua creates its security group,
+                    // RunInstances sends VSwitchId without SecurityGroupId; live ECS
+                    // checks RAM authorization first and then reports InvalidSecurityGroupId.
+                    t.check(
+                        "permissions",
+                        true,
+                        "RAM permissions verified (RunInstances, CreateSecurityGroup DryRun passed)",
                     );
                 } else {
                     t.check(

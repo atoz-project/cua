@@ -868,6 +868,7 @@ impl SandboxCreateOptions {
             disk_gb: self.disk_gb,
             cloud_image_id,
             instance_type,
+            ttl: self.ttl_seconds.map(super::secs),
         })
     }
 }

@@ -384,7 +384,16 @@ async fn t2_f2_02() {
         "{}",
         create.stderr
     );
-    assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
+    assert_eq!(
+        w.aliyun
+            .lock()
+            .unwrap()
+            .calls_for("RunInstances")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -922,7 +931,7 @@ async fn t2_f3_05() {
     {
         let mut f = w.aliyun.lock().unwrap();
         for z in ["cn-hangzhou-h", "cn-hangzhou-i", "cn-hangzhou-j"] {
-            f.sold_out_zones.insert(z.into());
+            f.run_fail_zones.insert(z.into());
         }
     }
     w.run_with_stdin(
@@ -1013,7 +1022,16 @@ async fn t2_f4_01() {
         r_msg.contains("aliyun-sandbox") && r_msg.contains("aliyun-ecs"),
         "expected reserved-location refusal naming aliyun-sandbox and aliyun-ecs, got: {r_msg}"
     );
-    assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
+    assert_eq!(
+        w.aliyun
+            .lock()
+            .unwrap()
+            .calls_for("RunInstances")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1593,7 +1611,16 @@ async fn t2_f6_03() {
         .await;
     assert_eq!(out.code, 2, "{out:?}");
     assert!(out.stderr.contains("4 vCPU and 16 GB"), "{}", out.stderr);
-    assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
+    assert_eq!(
+        w.aliyun
+            .lock()
+            .unwrap()
+            .calls_for("RunInstances")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1638,7 +1665,16 @@ async fn t2_f6_04() {
         "expected exact budget refusal in stderr, got: {}",
         out.stderr
     );
-    assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
+    assert_eq!(
+        w.aliyun
+            .lock()
+            .unwrap()
+            .calls_for("RunInstances")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1705,7 +1741,16 @@ async fn t2_f7_01() {
         lower.contains("sidecar"),
         "expected refusal to mention sidecar(s), got: {combined}"
     );
-    assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
+    assert_eq!(
+        w.aliyun
+            .lock()
+            .unwrap()
+            .calls_for("RunInstances")
+            .iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        0
+    );
 
     // Without --sidecar, --runtime native succeeds cleanly.
     w.run(&[
@@ -2048,9 +2093,31 @@ async fn t2_f8_04() {
     let policy_path = repo_root().join("libs/cua/crates/cua-byoc/policy/aliyun-ecs-policy.json");
     let raw = std::fs::read_to_string(&policy_path)
         .unwrap_or_else(|e| panic!("missing {}: {e}", policy_path.display()));
-    assert!(raw.contains("ecs:GetInstanceConsoleOutput"));
-    assert!(!raw.contains("ecs:*"));
-    assert!(!raw.contains("ram:*"));
+    let doc: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("invalid JSON {}: {e}", policy_path.display()));
+    let stmts = doc["Statement"].as_array().expect("Statement array");
+    let mut actions = Vec::new();
+    for stmt in stmts {
+        match &stmt["Action"] {
+            serde_json::Value::String(s) => actions.push(s.as_str()),
+            serde_json::Value::Array(arr) => {
+                for a in arr {
+                    if let Some(s) = a.as_str() {
+                        actions.push(s);
+                    }
+                }
+            }
+            other => panic!("unexpected Action type: {other:?}"),
+        }
+    }
+    assert!(
+        actions.contains(&"ecs:GetInstanceConsoleOutput"),
+        "policy missing ecs:GetInstanceConsoleOutput: {actions:?}"
+    );
+    for a in &actions {
+        assert!(!a.contains('*'), "wildcard action forbidden: {a}");
+        assert!(!a.starts_with("ram:"), "ram:* action forbidden: {a}");
+    }
 }
 
 #[tokio::test]

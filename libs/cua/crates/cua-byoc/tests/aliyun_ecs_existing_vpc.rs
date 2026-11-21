@@ -1678,3 +1678,78 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
         0
     );
 }
+
+#[tokio::test]
+async fn existing_vpc_test_passes_when_dry_run_reports_missing_sg_before_cua_sg_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    let (api, s, _) = start_aliyun(None).await;
+    seed_user_vpc(
+        &s,
+        "cn-hangzhou",
+        "vpc-user-1",
+        "vsw-user-1",
+        Some("sg-user-1"),
+    );
+    s.lock().unwrap().run_instances_dry_run_error = Some((
+        400,
+        "InvalidSecurityGroupId".into(),
+        "The specified SecurityGroupId is invalid or does not exist.".into(),
+    ));
+    let (_, clouds) = build_env(dir.path(), vec![api], &relay.url);
+
+    // 1. Existing VPC with no Cua SG yet: VSwitchId is sent without SecurityGroupId,
+    // so live ECS returns InvalidSecurityGroupId after checking RAM authorization.
+    let report = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            region: Some("cn-hangzhou".into()),
+            vpc_id: Some("vpc-user-1".into()),
+            vswitch_id: Some("vsw-user-1".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(report.ok, "{report:?}");
+
+    // 2. Without existing VPC, InvalidSecurityGroupId must still fail permissions.
+    let no_vpc_report = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            region: Some("cn-hangzhou".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!no_vpc_report.ok, "{no_vpc_report:?}");
+
+    // 3. When a Cua SG already exists in the existing VPC, InvalidSecurityGroupId
+    // means a real broken SecurityGroupId and must fail permissions.
+    let owner = cua_byoc::state::Store::new(&dir.path().join("cloud"))
+        .owner_id()
+        .unwrap();
+    s.lock().unwrap().security_groups.push(json!({
+        "SecurityGroupId": "sg-cua-existing",
+        "SecurityGroupName": format!("cua-sandboxes-{owner}"),
+        "VpcId": "vpc-user-1",
+        "RegionId": "cn-hangzhou",
+        "Tags": { "Tag": [
+            { "TagKey": "cua-managed", "TagValue": "true" },
+            { "TagKey": "cua-owner", "TagValue": owner }
+        ]}
+    }));
+    let with_sg_report = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            region: Some("cn-hangzhou".into()),
+            vpc_id: Some("vpc-user-1".into()),
+            vswitch_id: Some("vsw-user-1".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!with_sg_report.ok, "{with_sg_report:?}");
+}

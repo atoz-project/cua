@@ -39,6 +39,8 @@ mod tests {
     const AWS_SHARES_SOURCE: &str = include_str!("aws_shares.rs");
     const GCP_SOURCE: &str = include_str!("gcp.rs");
     const ALIYUN_ECS_SOURCE: &str = include_str!("aliyun_ecs.rs");
+    const ALIYUN_NET_SOURCE: &str = include_str!("aliyun_net.rs");
+    const ALIYUN_EXISTING_VPC_SOURCE: &str = include_str!("aliyun_existing_vpc.rs");
     const DOCS: &str =
         include_str!("../../../../../docs/content/docs/cua-sdk/guides/your-cloud-safety.mdx");
 
@@ -376,7 +378,6 @@ mod tests {
 
     /// Implicit Alibaba Cloud RAM actions evaluated when `Tag.N` parameters are
     /// supplied during `RunInstances` / `CreateVpc` / `CreateVSwitch` / `CreateSecurityGroup`.
-    #[allow(dead_code)]
     const ALIYUN_IMPLICIT: &[&str] = &["ecs:TagResources", "vpc:TagResources"];
 
     fn aliyun_policy() -> Value {
@@ -500,20 +501,35 @@ mod tests {
 
     #[test]
     fn every_aliyun_call_the_provider_makes_is_allowed() {
-        // Phase B TODO: include_str!("aliyun_net.rs") and enforce strict zero-stale
-        // `allowed.difference(&used).filter(|a| !ALIYUN_IMPLICIT.contains(&a.as_str()))`
-        // parity once #4-#8 merge onto origin/feat/aliyun-ecs-byoc.
-        let used = used_aliyun_actions(&[ALIYUN_ECS_SOURCE]);
+        let used = used_aliyun_actions(&[
+            ALIYUN_ECS_SOURCE,
+            ALIYUN_NET_SOURCE,
+            ALIYUN_EXISTING_VPC_SOURCE,
+        ]);
         for known in [
             "sts:GetCallerIdentity",
             "ecs:DescribeRegions",
+            "ecs:DescribeZones",
             "ecs:DescribeAvailableResource",
             "ecs:DescribeImages",
+            "ecs:DescribeInstanceTypes",
             "ecs:DescribeInstances",
             "ecs:DescribeSecurityGroups",
+            "ecs:DescribeSecurityGroupAttribute",
             "vpc:DescribeVpcs",
             "vpc:DescribeVSwitches",
             "ecs:RunInstances",
+            "ecs:CreateSecurityGroup",
+            "vpc:CreateVpc",
+            "vpc:CreateVSwitch",
+            "ecs:AuthorizeSecurityGroupEgress",
+            "ecs:StartInstance",
+            "ecs:StopInstance",
+            "ecs:DeleteInstance",
+            "ecs:DeleteSecurityGroup",
+            "vpc:DeleteVSwitch",
+            "vpc:DeleteVpc",
+            "ecs:GetInstanceConsoleOutput",
         ] {
             assert!(used.contains(known), "scanner missed {known}: {used:?}");
         }
@@ -521,12 +537,16 @@ mod tests {
         let missing: Vec<_> = used.difference(&allowed).collect();
         assert!(
             missing.is_empty(),
-            "aliyun_ecs.rs calls {missing:?} but policy/aliyun-ecs-policy.json does not allow it: \
+            "aliyun provider sources call {missing:?} but policy/aliyun-ecs-policy.json does not allow it: \
              add it (tag-scoped if it mutates anything) and update your-cloud-safety.mdx"
         );
+        let stale: Vec<_> = allowed
+            .difference(&used)
+            .filter(|a| !ALIYUN_IMPLICIT.contains(&a.as_str()))
+            .collect();
         assert!(
-            allowed.contains("ecs:GetInstanceConsoleOutput"),
-            "aliyun-ecs-policy.json must allow tag-scoped ecs:GetInstanceConsoleOutput"
+            stale.is_empty(),
+            "policy/aliyun-ecs-policy.json allows {stale:?} but aliyun provider sources never call it: remove it"
         );
     }
 

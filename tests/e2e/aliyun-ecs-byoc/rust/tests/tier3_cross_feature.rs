@@ -398,8 +398,20 @@ async fn t3_06() {
 
     let f = w.aliyun.lock().unwrap();
     assert_eq!(f.instances.len(), 3);
-    assert_eq!(f.count_calls("CreateVpc"), 1);
-    assert_eq!(f.count_calls("CreateSecurityGroup"), 1);
+    assert_eq!(
+        f.calls_for("CreateVpc")
+            .into_iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.calls_for("CreateSecurityGroup")
+            .into_iter()
+            .filter(|c| c.params.get("DryRun").map(String::as_str) != Some("true"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

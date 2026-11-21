@@ -1353,7 +1353,7 @@ pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Re
         if is_not_found_code(code) {
             return Ok(());
         }
-        if is_retryable_delete_code(code) && tries < 24 {
+        if is_retryable_delete_code(code) && tries < 4 {
             tries += 1;
             tokio::time::sleep(api.poll_interval()).await;
             continue;

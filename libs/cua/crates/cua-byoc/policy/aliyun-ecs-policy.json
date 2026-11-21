@@ -10,6 +10,7 @@
         "ecs:DescribeZones",
         "ecs:DescribeAvailableResource",
         "ecs:DescribeImages",
+        "ecs:DescribeInstanceTypes",
         "ecs:DescribeInstances",
         "ecs:DescribeSecurityGroups",
         "ecs:DescribeSecurityGroupAttribute",
