@@ -231,8 +231,10 @@ On `aliyun-ecs`, a sandbox runs in one of two runtimes:
   `linux-slim` (Ubuntu 24.04 with Docker; `ecs.e-c1m2.large` 2 vCPU / 4 GiB or
   `ecs.e-c1m1.large` 2 vCPU / 2 GiB, `40 GiB` `cloud_essd` disk).
 - **Direct VM Sandbox** (`--runtime native`): the default for `windows`
-  (`ecs.c7.xlarge` 4 vCPU / 8 GiB, or an available 4 vCPU / 8 GiB fallback such
-  as `ecs.e-c1m2.xlarge` when `ecs.c7.xlarge` has no stock in the region, `60 GiB`
+  (`4 vCPU / 8 GiB` baseline such as `ecs.c7.xlarge` — when no `--instance-type`
+  is set, Cua dynamically queries `DescribeAvailableResource` and
+  `DescribeInstanceTypes` for an in-stock `x86_64` mainstream instance type
+  matching the required compute size in the target zone — and `60 GiB`
   `cloud_essd` disk), and optional for `linux` / `linux-slim` when you want
   `cua-spacesd` directly on the VM OS without Docker. Linux `--runtime native`
   attaches to an existing desktop session or starts `cua-spacesd join` headless

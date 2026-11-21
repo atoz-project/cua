@@ -57,39 +57,6 @@ pub const SLIM_INSTANCE_TYPE: &str = "ecs.e-c1m1.large";
 /// Default baseline Windows Direct VM instance type (4 vCPU, 8 GiB).
 pub const WINDOWS_INSTANCE_TYPE: &str = "ecs.c7.xlarge";
 
-/// Ordered x86_64 default instance-type fallback candidates for Windows (4 vCPU, 8+ GiB)
-/// when no explicit `--instance-type` is configured and the primary default has no stock.
-pub const WINDOWS_INSTANCE_TYPE_CANDIDATES: &[&str] = &[
-    WINDOWS_INSTANCE_TYPE,
-    "ecs.e-c1m2.xlarge",
-    "ecs.u1-c1m2.xlarge",
-    "ecs.c7a.xlarge",
-    "ecs.g7a.xlarge",
-    "ecs.c7se.xlarge",
-    "ecs.c9i.xlarge",
-    "ecs.g7.xlarge",
-];
-
-/// Ordered x86_64 default instance-type fallback candidates for Linux (`linux`, 2 vCPU, 4+ GiB).
-pub const LINUX_INSTANCE_TYPE_CANDIDATES: &[&str] = &[
-    LINUX_INSTANCE_TYPE,
-    "ecs.u1-c1m2.large",
-    "ecs.c7.large",
-    "ecs.c7a.large",
-    "ecs.e-c1m4.large",
-    "ecs.g7a.large",
-    "ecs.g7.large",
-];
-
-/// Ordered x86_64 default instance-type fallback candidates for `linux-slim` (2 vCPU, 2+ GiB).
-pub const SLIM_INSTANCE_TYPE_CANDIDATES: &[&str] = &[
-    SLIM_INSTANCE_TYPE,
-    "ecs.u1-c1m1.large",
-    LINUX_INSTANCE_TYPE,
-    "ecs.u1-c1m2.large",
-    "ecs.c7a.large",
-];
-
 /// Minimum ECS `cloud_essd` system disk size in GiB.
 pub const MIN_DISK_GB: u32 = 20;
 /// Maximum ECS `cloud_essd` system disk size in GiB.
@@ -112,19 +79,12 @@ pub fn ecs_instance_spec(instance_type: &str) -> Option<(u32, u64, f64)> {
         "ecs.c7.xlarge" => Some((4, 8192, 0.125)),
         "ecs.c7.2xlarge" => Some((8, 16384, 0.250)),
         "ecs.c7.4xlarge" => Some((16, 32768, 0.500)),
-        "ecs.c7a.large" => Some((2, 4096, 0.056)),
-        "ecs.c7a.xlarge" => Some((4, 8192, 0.112)),
-        "ecs.c7se.xlarge" => Some((4, 8192, 0.125)),
-        "ecs.c9i.xlarge" => Some((4, 8192, 0.125)),
         "ecs.g7.large" => Some((2, 8192, 0.085)),
         "ecs.g7.xlarge" => Some((4, 16384, 0.170)),
         "ecs.g7.2xlarge" => Some((8, 32768, 0.340)),
         "ecs.g7.4xlarge" => Some((16, 65536, 0.680)),
-        "ecs.g7a.large" => Some((2, 8192, 0.075)),
-        "ecs.g7a.xlarge" => Some((4, 16384, 0.150)),
         "ecs.r7.large" => Some((2, 16384, 0.110)),
         "ecs.r7.xlarge" => Some((4, 32768, 0.220)),
-        "ecs.u1-c1m1.large" => Some((2, 2048, 0.036)),
         "ecs.u1-c1m2.large" => Some((2, 4096, 0.048)),
         "ecs.u1-c1m2.xlarge" => Some((4, 8192, 0.096)),
         _ => None,
@@ -1323,6 +1283,70 @@ fn sanitize_hostname(name: &str) -> String {
     if s.len() < 2 { "cua-sandbox".into() } else { s }
 }
 
+/// Sanitizes an Alibaba Cloud ECS Windows `HostName` (NetBIOS computer name):
+/// 2–15 chars, ASCII letters/digits/`-` only, no `.`, no leading/trailing `-`,
+/// not all-digits, and collision-resistant via SHA-256 suffix for long names.
+fn sanitize_windows_hostname(name: &str) -> String {
+    let mut clean = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for raw in name.chars() {
+        let c = raw.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            clean.push(c);
+            prev_dash = false;
+        } else if !clean.is_empty() && !prev_dash {
+            clean.push('-');
+            prev_dash = true;
+        }
+    }
+    while clean.ends_with('-') {
+        clean.pop();
+    }
+
+    if clean.is_empty() {
+        return "cua-win".into();
+    }
+
+    let has_letter = |s: &str| s.bytes().any(|b| b.is_ascii_alphabetic());
+
+    if (2..=15).contains(&clean.len()) && has_letter(&clean) {
+        return clean;
+    }
+    if clean.len() <= 13 && (!has_letter(&clean) || clean.len() == 1) {
+        return format!("w-{clean}");
+    }
+
+    let digest = Sha256::digest(name.as_bytes());
+    let hash = hex::encode(&digest[..4]);
+    let mut prefix: String = clean.chars().take(6).collect();
+    while prefix.ends_with('-') {
+        prefix.pop();
+    }
+    if !has_letter(&prefix) {
+        prefix = format!("w{prefix}");
+        prefix.truncate(6);
+        while prefix.ends_with('-') {
+            prefix.pop();
+        }
+    }
+    format!("{prefix}-{hash}")
+}
+
+fn sanitize_hostname_for_family(name: &str, family: &str) -> String {
+    if family == "windows" {
+        sanitize_windows_hostname(name)
+    } else {
+        sanitize_hostname(name)
+    }
+}
+
+pub(crate) fn is_with_stock_category(cat: Option<&str>) -> bool {
+    match cat.map(str::trim) {
+        None | Some("") => true, // Mock/fake-server compatibility when omitted
+        Some(c) => c == "WithStock",
+    }
+}
+
 fn is_zone_capacity_error(code: &str) -> bool {
     matches!(
         code,
@@ -1363,47 +1387,385 @@ fn default_instance_type_for(family: &str) -> &'static str {
     }
 }
 
-fn default_instance_type_candidates(family: &str) -> &'static [&'static str] {
-    match family {
-        "windows" => WINDOWS_INSTANCE_TYPE_CANDIDATES,
-        "linux-slim" => SLIM_INSTANCE_TYPE_CANDIDATES,
-        _ => LINUX_INSTANCE_TYPE_CANDIDATES,
+fn target_compute_for(spec: &ProvisionSpec) -> (u32, u32) {
+    match spec.family.as_str() {
+        "windows" => {
+            let vcpus = spec.cpus.unwrap_or(4).max(4);
+            let mem_mb = spec.memory_mb.unwrap_or(8192).max(8192);
+            let mem_gib = u32::try_from(mem_mb.div_ceil(1024))
+                .unwrap_or(u32::MAX)
+                .max(8);
+            (vcpus, mem_gib)
+        }
+        "linux-slim" => {
+            let raw_cpus = spec.cpus.unwrap_or(2);
+            let raw_mem_mb = spec.memory_mb.unwrap_or(4096);
+            if raw_cpus <= 2 && raw_mem_mb <= 4096 {
+                (2, 2)
+            } else {
+                let vcpus = raw_cpus.max(2);
+                let mem_gib = u32::try_from(raw_mem_mb.div_ceil(1024))
+                    .unwrap_or(u32::MAX)
+                    .max(2);
+                (vcpus, mem_gib)
+            }
+        }
+        _ => {
+            let vcpus = spec.cpus.unwrap_or(2).max(2);
+            let mem_mb = spec.memory_mb.unwrap_or(4096).max(4096);
+            let mem_gib = u32::try_from(mem_mb.div_ceil(1024))
+                .unwrap_or(u32::MAX)
+                .max(4);
+            (vcpus, mem_gib)
+        }
     }
 }
 
+#[derive(Clone, Debug)]
+struct InstanceTypeMeta {
+    vcpus: u32,
+    memory_mb: u64,
+    cpu_arch: Option<String>,
+    gpu_amount: Option<u64>,
+    usd_per_hour: f64,
+}
+
+fn instance_family_token(id: &str) -> String {
+    let lower = id.trim().to_ascii_lowercase();
+    let after_ecs = lower.strip_prefix("ecs.").unwrap_or(&lower);
+    after_ecs.split('.').next().unwrap_or(after_ecs).to_string()
+}
+
+fn is_excluded_instance_family(id: &str, cpu_arch: Option<&str>, gpu_amount: Option<u64>) -> bool {
+    if cpu_arch
+        .map(str::trim)
+        .is_some_and(|a| !a.is_empty() && !a.eq_ignore_ascii_case("x86"))
+    {
+        return true;
+    }
+    if gpu_amount.is_some_and(|g| g > 0) {
+        return true;
+    }
+    let fam = instance_family_token(id);
+    let base = fam.split('-').next().unwrap_or(&fam);
+    if base.is_empty() {
+        return true;
+    }
+    // Alibaba Cloud Yitian ARM families (e.g. c8y, g8y, r8y, c9y).
+    if base.ends_with('y')
+        && base.len() >= 2
+        && base[..base.len() - 1].bytes().any(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    // GPU / FPGA families (gn*, sgn*, vgn*, ebmgn*, f1/f3/f5...).
+    if base.starts_with("gn")
+        || base.starts_with("sgn")
+        || base.starts_with("vgn")
+        || base.starts_with("ebmgn")
+        || (base.starts_with('f') && base[1..].starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    // Bare-metal / supercomputing clusters (ebm*, scc*, scch*).
+    if base.starts_with("ebm") || base.starts_with("scc") {
+        return true;
+    }
+    false
+}
+
+/// Returns `(tier, sub_rank)` where lower is preferred:
+/// - `0`: non-burstable mainstream families (`e-*`, `u*`, `c*`, `g*`, `hfc*`, `hfg*`, `sn*`, `n4*`)
+/// - `1`: other non-burstable x86 families (e.g. `r*`, `ic*`)
+/// - `2`: burstable families (`t5*`, `t6*`, `t7*`)
+fn family_preference_tier(id: &str) -> (u8, u8) {
+    let fam = instance_family_token(id);
+    let base = fam.split('-').next().unwrap_or(&fam);
+    if base.starts_with('t') && base[1..].starts_with(|c: char| c.is_ascii_digit()) {
+        return (2, 0);
+    }
+    if fam.starts_with("e-") || base == "e" {
+        return (0, 0);
+    }
+    if base.starts_with('u') {
+        return (0, 1);
+    }
+    if base.starts_with('c') {
+        return (0, 2);
+    }
+    if base.starts_with('g') {
+        return (0, 3);
+    }
+    if base.starts_with("hfc")
+        || base.starts_with("hfg")
+        || base.starts_with("sn")
+        || base.starts_with("n4")
+    {
+        return (0, 4);
+    }
+    (1, 0)
+}
+
+fn estimate_usd_per_hour(vcpus: u32, memory_mb: u64) -> f64 {
+    let mem_gib = memory_mb as f64 / 1024.0;
+    (f64::from(vcpus) * 0.025 + mem_gib * 0.005).max(0.01)
+}
+
+fn select_best_dynamic_candidate(
+    family: &str,
+    target_vcpus: u32,
+    target_mem_mb: u64,
+    max_size: Option<model::MaxSize>,
+    candidates: &[(String, Vec<String>)],
+    meta_map: &BTreeMap<String, InstanceTypeMeta>,
+) -> Option<(String, InstanceTypeMeta, Vec<String>)> {
+    #[derive(Eq, PartialEq, Ord, PartialOrd)]
+    struct RankKey {
+        cpu_excess: u32,
+        mem_excess: u64,
+        tier: (u8, u8),
+        not_baseline: bool,
+        price_micros: u64,
+        id: String,
+    }
+    struct Ranked {
+        key: RankKey,
+        id: String,
+        meta: InstanceTypeMeta,
+        zones: Vec<String>,
+    }
+
+    let baseline = default_instance_type_for(family);
+    let meta_populated = !meta_map.is_empty();
+    let mut ranked: Vec<Ranked> = Vec::new();
+
+    for (id, zones) in candidates {
+        let meta = if let Some(m) = meta_map.get(id) {
+            m.clone()
+        } else if let Some((vcpus, memory_mb, usd)) = ecs_instance_spec(id) {
+            InstanceTypeMeta {
+                vcpus,
+                memory_mb,
+                cpu_arch: None,
+                gpu_amount: None,
+                usd_per_hour: usd,
+            }
+        } else if !meta_populated {
+            InstanceTypeMeta {
+                vcpus: target_vcpus,
+                memory_mb: target_mem_mb,
+                cpu_arch: None,
+                gpu_amount: None,
+                usd_per_hour: estimate_usd_per_hour(target_vcpus, target_mem_mb),
+            }
+        } else {
+            continue;
+        };
+
+        if is_excluded_instance_family(id, meta.cpu_arch.as_deref(), meta.gpu_amount) {
+            continue;
+        }
+        if meta.vcpus < target_vcpus || meta.memory_mb < target_mem_mb {
+            continue;
+        }
+        if let Some(max) = max_size
+            && !max.fits(meta.vcpus, meta.memory_mb)
+        {
+            continue;
+        }
+
+        let key = RankKey {
+            cpu_excess: meta.vcpus - target_vcpus,
+            mem_excess: meta.memory_mb - target_mem_mb,
+            tier: family_preference_tier(id),
+            not_baseline: id != baseline,
+            price_micros: (meta.usd_per_hour * 1_000_000.0).round() as u64,
+            id: id.clone(),
+        };
+        ranked.push(Ranked {
+            key,
+            id: id.clone(),
+            meta,
+            zones: zones.clone(),
+        });
+    }
+
+    ranked.sort_by(|a, b| a.key.cmp(&b.key));
+    ranked.into_iter().next().map(|r| (r.id, r.meta, r.zones))
+}
+
 impl AliyunEcs {
-    /// Picks the highest-priority default instance type for `family` that is
-    /// currently `Available` in `region` (preferring the existing VSwitch's
-    /// zone when `conn.vswitch_id` is configured), falling back to the static
-    /// baseline if `DescribeAvailableResource` returns no matching offering.
-    pub async fn resolve_default_instance_type(
+    async fn query_available_instance_types(
         &self,
         conn: &Connection,
         region: &str,
-        family: &str,
-    ) -> String {
+        target_vcpus: u32,
+        target_mem_gib: Option<u32>,
+        target_zone: Option<&str>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
         let profile_hint = self.profile_hint(conn);
         let ecs = self.ecs_endpoint(region);
-        let v = match self
+        let mut params = vec![
+            ("RegionId".into(), region.to_string()),
+            ("DestinationResource".into(), "InstanceType".into()),
+            ("InstanceChargeType".into(), "PostPaid".into()),
+            ("IoOptimized".into(), "optimized".into()),
+            ("Cores".into(), target_vcpus.to_string()),
+        ];
+        if let Some(mem) = target_mem_gib {
+            params.push(("Memory".into(), mem.to_string()));
+        }
+        if let Some(tz) = target_zone {
+            params.push(("ZoneId".into(), tz.to_string()));
+        }
+        let v = self
             .call_ok(
                 &ecs,
                 "GET",
                 "DescribeAvailableResource",
                 ECS_API_VERSION,
-                &[
-                    ("RegionId".into(), region.to_string()),
-                    ("DestinationResource".into(), "InstanceType".into()),
-                    ("InstanceChargeType".into(), "PostPaid".into()),
-                    ("IoOptimized".into(), "optimized".into()),
-                ],
+                &params,
                 profile_hint,
             )
-            .await
-        {
-            Ok(v) => v,
-            Err(_) => return default_instance_type_for(family).to_string(),
-        };
+            .await?;
 
+        let mut zones_by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for zone in v["AvailableZones"]["AvailableZone"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(st) = zone["Status"].as_str()
+                && !st.eq_ignore_ascii_case("Available")
+            {
+                continue;
+            }
+            let zone_id = zone["ZoneId"].as_str().unwrap_or("").trim();
+            if let Some(tz) = target_zone
+                && zone_id != tz
+            {
+                continue;
+            }
+            for ar in zone["AvailableResources"]["AvailableResource"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for sr in ar["SupportedResources"]["SupportedResource"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    if sr["Status"].as_str() == Some("Available")
+                        && is_with_stock_category(sr["StatusCategory"].as_str())
+                        && let Some(val) = sr["Value"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        let entry = zones_by_type.entry(val.to_string()).or_insert_with(|| {
+                            order.push(val.to_string());
+                            Vec::new()
+                        });
+                        if !zone_id.is_empty() && !entry.iter().any(|z| z == zone_id) {
+                            entry.push(zone_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(order
+            .into_iter()
+            .map(|id| {
+                let mut z = zones_by_type.remove(&id).unwrap_or_default();
+                z.sort();
+                (id, z)
+            })
+            .collect())
+    }
+
+    async fn describe_instance_types_batch(
+        &self,
+        conn: &Connection,
+        region: &str,
+        ids: &[String],
+    ) -> BTreeMap<String, InstanceTypeMeta> {
+        let mut out = BTreeMap::new();
+        if ids.is_empty() {
+            return out;
+        }
+        let profile_hint = self.profile_hint(conn);
+        let ecs = self.ecs_endpoint(region);
+        for chunk in ids.chunks(100) {
+            let ids_json = serde_json::to_string(chunk).unwrap_or_default();
+            let Ok(v) = self
+                .call_ok(
+                    &ecs,
+                    "GET",
+                    "DescribeInstanceTypes",
+                    ECS_API_VERSION,
+                    &[("InstanceTypes".into(), ids_json)],
+                    profile_hint,
+                )
+                .await
+            else {
+                continue;
+            };
+            for item in v["InstanceTypes"]["InstanceType"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = item["InstanceTypeId"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let Some(vcpus) = item["CpuCoreCount"]
+                    .as_u64()
+                    .and_then(|c| u32::try_from(c).ok())
+                    .filter(|&c| c > 0)
+                else {
+                    continue;
+                };
+                let Some(mem_gib) = item["MemorySize"].as_f64().filter(|&m| m > 0.0) else {
+                    continue;
+                };
+                let memory_mb = (mem_gib * 1024.0).round() as u64;
+                let cpu_arch = item["CpuArchitecture"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let gpu_amount = item["GpuAmount"].as_u64();
+                let usd_per_hour = ecs_instance_spec(id)
+                    .map(|(_, _, u)| u)
+                    .unwrap_or_else(|| estimate_usd_per_hour(vcpus, memory_mb));
+                out.insert(
+                    id.to_string(),
+                    InstanceTypeMeta {
+                        vcpus,
+                        memory_mb,
+                        cpu_arch,
+                        gpu_amount,
+                        usd_per_hour,
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    async fn resolve_dynamic_instance_type_for_spec(
+        &self,
+        conn: &Connection,
+        region: &str,
+        spec: &ProvisionSpec,
+    ) -> (String, u32, u64, f64) {
+        let profile_hint = self.profile_hint(conn);
         let target_zone = if let Some(vsw_id) = conn
             .vswitch_id
             .as_deref()
@@ -1436,60 +1798,67 @@ impl AliyunEcs {
             None
         };
 
-        let mut available_in_zone = Vec::new();
-        let mut available_region = Vec::new();
-        for zone in v["AvailableZones"]["AvailableZone"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            let zone_id = zone["ZoneId"].as_str().unwrap_or("").trim();
-            let in_target_zone = target_zone.as_deref().is_some_and(|tz| tz == zone_id);
-            for ar in zone["AvailableResources"]["AvailableResource"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                for sr in ar["SupportedResources"]["SupportedResource"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    if sr["Status"].as_str() == Some("Available")
-                        && let Some(val) = sr["Value"].as_str()
-                    {
-                        if !available_region.iter().any(|x| x == val) {
-                            available_region.push(val.to_string());
-                        }
-                        if in_target_zone && !available_in_zone.iter().any(|x| x == val) {
-                            available_in_zone.push(val.to_string());
-                        }
-                    }
-                }
+        let (target_vcpus, target_mem_gib) = target_compute_for(spec);
+        let target_mem_mb = u64::from(target_mem_gib) * 1024;
+
+        for mem_filter in [Some(target_mem_gib), None] {
+            let Ok(cands) = self
+                .query_available_instance_types(
+                    conn,
+                    region,
+                    target_vcpus,
+                    mem_filter,
+                    target_zone.as_deref(),
+                )
+                .await
+            else {
+                break;
+            };
+            if cands.is_empty() {
+                continue;
+            }
+            let ids: Vec<String> = cands.iter().map(|(id, _)| id.clone()).collect();
+            let meta_map = self.describe_instance_types_batch(conn, region, &ids).await;
+            if let Some((picked, meta, _zones)) = select_best_dynamic_candidate(
+                &spec.family,
+                target_vcpus,
+                target_mem_mb,
+                conn.max_size,
+                &cands,
+                &meta_map,
+            ) {
+                return (picked, meta.vcpus, meta.memory_mb, meta.usd_per_hour);
             }
         }
 
-        let candidates = default_instance_type_candidates(family);
-        let fits_max_size = |cand: &str| -> bool {
-            let Some(max) = conn.max_size else {
-                return true;
-            };
-            ecs_instance_spec(cand).is_none_or(|(vcpus, mem_mb, _)| max.fits(vcpus, mem_mb))
+        let fallback = default_instance_type_for(&spec.family).to_string();
+        let (vcpus, memory_mb, usd) = ecs_instance_spec(&fallback).unwrap_or_else(|| {
+            (
+                target_vcpus,
+                target_mem_mb,
+                estimate_usd_per_hour(target_vcpus, target_mem_mb),
+            )
+        });
+        (fallback, vcpus, memory_mb, usd)
+    }
+
+    /// Picks an available, in-stock (`WithStock`) `x86_64` mainstream instance
+    /// type for `family` in `region` using `DescribeAvailableResource` (`Cores`/
+    /// `Memory`) and `DescribeInstanceTypes`, preferring the existing VSwitch's
+    /// zone when `conn.vswitch_id` is configured.
+    pub async fn resolve_default_instance_type(
+        &self,
+        conn: &Connection,
+        region: &str,
+        family: &str,
+    ) -> String {
+        let spec = ProvisionSpec {
+            family: family.to_string(),
+            ..Default::default()
         };
-        if !available_in_zone.is_empty()
-            && let Some(picked) = candidates
-                .iter()
-                .find(|c| fits_max_size(c) && available_in_zone.iter().any(|a| a == *c))
-        {
-            return (*picked).to_string();
-        }
-        if let Some(picked) = candidates
-            .iter()
-            .find(|c| fits_max_size(c) && available_region.iter().any(|a| a == *c))
-        {
-            return (*picked).to_string();
-        }
-        default_instance_type_for(family).to_string()
+        self.resolve_dynamic_instance_type_for_spec(conn, region, &spec)
+            .await
+            .0
     }
 }
 
@@ -1846,7 +2215,7 @@ impl CloudApi for AliyunEcs {
         }
 
         // 3. Machine offerings: ecs:DescribeAvailableResource
-        let mut discovered_type = LINUX_INSTANCE_TYPE.to_string();
+        let discovered_type: String;
         match self
             .call_ok(
                 &ecs,
@@ -1870,6 +2239,11 @@ impl CloudApi for AliyunEcs {
                     .into_iter()
                     .flatten()
                 {
+                    if let Some(st) = zone["Status"].as_str()
+                        && !st.eq_ignore_ascii_case("Available")
+                    {
+                        continue;
+                    }
                     for ar in zone["AvailableResources"]["AvailableResource"]
                         .as_array()
                         .into_iter()
@@ -1882,6 +2256,7 @@ impl CloudApi for AliyunEcs {
                         {
                             let status = sr["Status"].as_str().unwrap_or("");
                             if status == "Available"
+                                && is_with_stock_category(sr["StatusCategory"].as_str())
                                 && let Some(val) = sr["Value"].as_str()
                                 && !available_types.iter().any(|x| x == val)
                             {
@@ -1946,17 +2321,39 @@ impl CloudApi for AliyunEcs {
                         ),
                     );
                 } else {
-                    if let Some(preferred) = LINUX_INSTANCE_TYPE_CANDIDATES
+                    let meta_map = self
+                        .describe_instance_types_batch(conn, &conn.region, &available_types)
+                        .await;
+                    let cands: Vec<(String, Vec<String>)> = available_types
                         .iter()
-                        .find(|c| available_types.iter().any(|x| x == *c))
-                        .map(|s| (*s).to_string())
-                        .or_else(|| available_types.first().cloned())
+                        .cloned()
+                        .map(|id| (id, Vec::new()))
+                        .collect();
+                    let (picked, est_usd) = if let Some((id, meta, _)) =
+                        select_best_dynamic_candidate(
+                            "linux",
+                            2,
+                            4096,
+                            conn.max_size,
+                            &cands,
+                            &meta_map,
+                        ) {
+                        (id, meta.usd_per_hour)
+                    } else if let Some(first) = available_types
+                        .iter()
+                        .find(|id| !is_excluded_instance_family(id, None, None))
+                        .or_else(|| available_types.first())
                     {
-                        discovered_type = preferred;
-                    }
-                    let est_usd = ecs_instance_spec(&discovered_type)
-                        .map(|(_, _, u)| u)
-                        .unwrap_or(0.043);
+                        let u = meta_map
+                            .get(first)
+                            .map(|m| m.usd_per_hour)
+                            .or_else(|| ecs_instance_spec(first).map(|(_, _, u)| u))
+                            .unwrap_or(0.043);
+                        (first.clone(), u)
+                    } else {
+                        (LINUX_INSTANCE_TYPE.to_string(), 0.043)
+                    };
+                    discovered_type = picked;
                     t.check(
                         "machine",
                         true,
@@ -2348,15 +2745,39 @@ impl CloudApi for AliyunEcs {
         validate_disk_gb(spec.disk_gb)?;
         let (effective_disk_gb, _) = system_disk_for(spec);
         validate_disk_gb(effective_disk_gb)?;
-        let effective_type = if spec.machine_type.trim().is_empty() {
-            default_instance_type_for(&spec.family)
-        } else {
-            spec.machine_type.trim()
-        };
-        let (vcpus, memory_mb, inst_usd) = self.lookup_instance_type(conn, effective_type).await?;
         let disk_usd = f64::from(effective_disk_gb) * ESSD_USD_PER_GB_HOUR;
+        let explicit = spec.machine_type.trim();
+        if spec.machine_type_explicit
+            || (!explicit.is_empty() && explicit != default_instance_type_for(&spec.family))
+        {
+            let (vcpus, memory_mb, inst_usd) = self.lookup_instance_type(conn, explicit).await?;
+            return Ok(Some(ResolvedSizing {
+                machine_type: Some(explicit.to_string()),
+                vcpus,
+                memory_mb,
+                disk_gb: Some(effective_disk_gb),
+                usd_per_hour: inst_usd + disk_usd,
+            }));
+        }
+
+        let (target_vcpus, target_mem_gib) = target_compute_for(spec);
+        let target_mem_mb = u64::from(target_mem_gib) * 1024;
+        crate::limits::check_new_machine_with_disk(
+            conn,
+            self.title(),
+            Some(target_vcpus),
+            Some(target_mem_mb),
+            Some(effective_disk_gb),
+            0.0,
+            0.0,
+        )?;
+
+        let region = spec.region_or(conn);
+        let (picked, vcpus, memory_mb, inst_usd) = self
+            .resolve_dynamic_instance_type_for_spec(conn, region, spec)
+            .await;
         Ok(Some(ResolvedSizing {
-            machine_type: Some(effective_type.to_string()),
+            machine_type: Some(picked),
             vcpus,
             memory_mb,
             disk_gb: Some(effective_disk_gb),
@@ -2424,8 +2845,9 @@ impl CloudApi for AliyunEcs {
         {
             spec.machine_type.trim().to_string()
         } else {
-            self.resolve_default_instance_type(conn, &region, &spec.family)
+            self.resolve_dynamic_instance_type_for_spec(conn, &region, spec)
                 .await
+                .0
         };
         let mut effective_conn = conn.clone();
         if !region.is_empty() && effective_conn.region != region {
@@ -2451,7 +2873,7 @@ impl CloudApi for AliyunEcs {
             )));
         }
 
-        let host_name = sanitize_hostname(&spec.name);
+        let host_name = sanitize_hostname_for_family(&spec.name, &spec.family);
         let auto_release =
             (spec.ttl_secs > 0).then(|| model::rfc3339(model::now() + spec.ttl_secs.max(1860)));
         let user_data_b64 = (!spec.user_data.is_empty())
@@ -3041,5 +3463,234 @@ mod tests {
         ];
         let picked = pick_official_image(&images, false).unwrap();
         assert_eq!(picked["ImageId"].as_str(), Some("ubuntu_available"));
+    }
+
+    #[test]
+    fn sanitize_windows_hostname_enforces_netbios_rules_and_preserves_uniqueness() {
+        fn assert_valid_netbios(h: &str) {
+            assert!(
+                (2..=15).contains(&h.len()),
+                "Windows HostName length must be 2..=15, got {h:?} ({})",
+                h.len()
+            );
+            assert!(
+                !h.contains('.'),
+                "Windows HostName must not contain '.': {h:?}"
+            );
+            assert!(
+                !h.starts_with('-') && !h.ends_with('-'),
+                "Windows HostName must not start/end with '-': {h:?}"
+            );
+            assert!(
+                h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "Windows HostName contains invalid chars: {h:?}"
+            );
+            assert!(
+                !h.chars().all(|c| c.is_ascii_digit()),
+                "Windows HostName must not be all-digits: {h:?}"
+            );
+        }
+
+        let cases = [
+            "cua-aliyun-ecs-aaaaaaaaaaaa",
+            "cua-aliyun-ecs-aaaaaaaaaaab",
+            "cua-aliyun-ecs-d347029537d8",
+            "win.box.01",
+            "Win_Box 02!",
+            "a",
+            "9",
+            "123456",
+            "12345678901234",
+            "123456789012345",
+            "123-456-78901234",
+            "---...___",
+            "",
+            "my-very-long-windows-sandbox-name-1-suffix",
+            "my-very-long-windows-sandbox-name-2-suffix",
+        ];
+        for raw in cases {
+            let out = sanitize_windows_hostname(raw);
+            assert_valid_netbios(&out);
+        }
+
+        let a = sanitize_windows_hostname("cua-aliyun-ecs-aaaaaaaaaaaa");
+        let b = sanitize_windows_hostname("cua-aliyun-ecs-aaaaaaaaaaab");
+        assert_ne!(a, b, "distinct 27-char names must not collide: {a} vs {b}");
+
+        let m1 = sanitize_windows_hostname("my-very-long-windows-sandbox-name-1-suffix");
+        let m2 = sanitize_windows_hostname("my-very-long-windows-sandbox-name-2-suffix");
+        assert_ne!(m1, m2, "long names differing in middle must not collide");
+
+        assert_eq!(sanitize_windows_hostname("win.box.01"), "win-box-01");
+        // Linux behavior remains unchanged (up to 63 chars, dots preserved).
+        assert_eq!(
+            sanitize_hostname_for_family("cua-aliyun-ecs-aaaaaaaaaaaa", "linux"),
+            "cua-aliyun-ecs-aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            sanitize_hostname_for_family("my.linux.host.01", "linux"),
+            "my.linux.host.01"
+        );
+    }
+
+    #[test]
+    fn dynamic_instance_selection_filters_exclusions_and_ranks_mainstream_over_burstable() {
+        assert!(is_with_stock_category(None));
+        assert!(is_with_stock_category(Some("")));
+        assert!(is_with_stock_category(Some("WithStock")));
+        assert!(!is_with_stock_category(Some("ClosedWithStock")));
+        assert!(!is_with_stock_category(Some("WithoutStock")));
+
+        assert!(is_excluded_instance_family(
+            "ecs.c8y.xlarge",
+            Some("ARM"),
+            None
+        ));
+        assert!(is_excluded_instance_family("ecs.g8y.large", None, None));
+        assert!(is_excluded_instance_family("ecs.r8y.large", None, None));
+        assert!(is_excluded_instance_family(
+            "ecs.gn7i-c8g1.2xlarge",
+            Some("X86"),
+            Some(1)
+        ));
+        assert!(is_excluded_instance_family("ecs.sgn7i.large", None, None));
+        assert!(is_excluded_instance_family("ecs.vgn6i.large", None, None));
+        assert!(is_excluded_instance_family("ecs.f3.large", None, None));
+        assert!(is_excluded_instance_family("ecs.ebmgn7.xlarge", None, None));
+        assert!(is_excluded_instance_family(
+            "ecs.ebmg7.32xlarge",
+            None,
+            None
+        ));
+        assert!(is_excluded_instance_family("ecs.sccg7.large", None, None));
+        assert!(!is_excluded_instance_family(
+            "ecs.hfc7.xlarge",
+            Some("X86"),
+            Some(0)
+        ));
+        assert!(!is_excluded_instance_family(
+            "ecs.c9i.xlarge",
+            Some("X86"),
+            None
+        ));
+        assert!(!is_excluded_instance_family(
+            "ecs.u2a-c1m2.xlarge",
+            Some("X86"),
+            None
+        ));
+
+        let cands = vec![
+            (
+                "ecs.c8y.xlarge".to_string(),
+                vec!["ap-southeast-1a".to_string()],
+            ),
+            (
+                "ecs.gn7i.xlarge".to_string(),
+                vec!["ap-southeast-1a".to_string()],
+            ),
+            (
+                "ecs.ebmg7.xlarge".to_string(),
+                vec!["ap-southeast-1a".to_string()],
+            ),
+            (
+                "ecs.t6-c1m2.xlarge".to_string(),
+                vec!["ap-southeast-1a".to_string()],
+            ),
+            (
+                "ecs.c9i.xlarge".to_string(),
+                vec!["ap-southeast-1b".to_string()],
+            ),
+            (
+                "ecs.g7.2xlarge".to_string(),
+                vec!["ap-southeast-1a".to_string()],
+            ),
+        ];
+        let meta = BTreeMap::from([
+            (
+                "ecs.c8y.xlarge".to_string(),
+                InstanceTypeMeta {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    cpu_arch: Some("ARM".to_string()),
+                    gpu_amount: None,
+                    usd_per_hour: 0.08,
+                },
+            ),
+            (
+                "ecs.gn7i.xlarge".to_string(),
+                InstanceTypeMeta {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    cpu_arch: Some("X86".to_string()),
+                    gpu_amount: Some(1),
+                    usd_per_hour: 0.90,
+                },
+            ),
+            (
+                "ecs.ebmg7.xlarge".to_string(),
+                InstanceTypeMeta {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    cpu_arch: Some("X86".to_string()),
+                    gpu_amount: None,
+                    usd_per_hour: 0.50,
+                },
+            ),
+            (
+                "ecs.t6-c1m2.xlarge".to_string(),
+                InstanceTypeMeta {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    cpu_arch: Some("X86".to_string()),
+                    gpu_amount: None,
+                    usd_per_hour: 0.05,
+                },
+            ),
+            (
+                "ecs.c9i.xlarge".to_string(),
+                InstanceTypeMeta {
+                    vcpus: 4,
+                    memory_mb: 8192,
+                    cpu_arch: Some("X86".to_string()),
+                    gpu_amount: None,
+                    usd_per_hour: 0.14,
+                },
+            ),
+            (
+                "ecs.g7.2xlarge".to_string(),
+                InstanceTypeMeta {
+                    vcpus: 8,
+                    memory_mb: 32768,
+                    cpu_arch: Some("X86".to_string()),
+                    gpu_amount: None,
+                    usd_per_hour: 0.34,
+                },
+            ),
+        ]);
+
+        let (picked, _, zones) =
+            select_best_dynamic_candidate("windows", 4, 8192, None, &cands, &meta).unwrap();
+        assert_eq!(picked, "ecs.c9i.xlarge");
+        assert_eq!(zones, vec!["ap-southeast-1b".to_string()]);
+
+        // With only burstable available, burstable is still usable.
+        let only_burstable = vec![(
+            "ecs.t6-c1m2.xlarge".to_string(),
+            vec!["ap-southeast-1a".to_string()],
+        )];
+        let (picked_b, _, _) =
+            select_best_dynamic_candidate("windows", 4, 8192, None, &only_burstable, &meta)
+                .unwrap();
+        assert_eq!(picked_b, "ecs.t6-c1m2.xlarge");
+
+        // Respects max_size by rejecting 8c32g when max_size is 4x16.
+        let big_only = vec![(
+            "ecs.g7.2xlarge".to_string(),
+            vec!["ap-southeast-1a".to_string()],
+        )];
+        let max_4x16 = model::MaxSize::parse("4x16");
+        assert!(
+            select_best_dynamic_candidate("windows", 4, 8192, max_4x16, &big_only, &meta).is_none()
+        );
     }
 }

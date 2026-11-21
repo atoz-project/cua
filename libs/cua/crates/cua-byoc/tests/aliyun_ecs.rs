@@ -5576,3 +5576,368 @@ async fn aliyun_net_delete_part_retries_dependency_violation_network_interface_p
         "DeleteVSwitch should be attempted 31 times (30 DependencyViolation.NetworkInterface + 1 success)"
     );
 }
+
+#[tokio::test]
+async fn windows_run_instances_enforces_netbios_hostname_15_char_limit_and_uniqueness() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+
+    let win_spec = |name: &str| ProvisionSpec {
+        name: name.into(),
+        family: "windows".into(),
+        image: "windows".into(),
+        kind: "vm".into(),
+        machine_type: "ecs.c7.xlarge".into(),
+        machine_type_explicit: true,
+        disk_gb: 60,
+        user_data: "#ps1_sysnative\nWrite-Output ok\n".into(),
+        tags: model::tags("owner-hn", "win-hn", "cloud-hn", 0),
+        ttl_secs: 3600,
+        arch: "amd64".into(),
+        runtime: "native".into(),
+        ..Default::default()
+    };
+
+    let assert_valid_netbios = |h: &str| {
+        assert!(
+            (2..=15).contains(&h.len()),
+            "Windows RunInstances HostName must be 2..=15 chars, got {h:?} ({})",
+            h.len()
+        );
+        assert!(
+            h.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+            "Windows HostName must be [A-Za-z0-9-], got {h:?}"
+        );
+        assert!(!h.contains('.'), "Windows HostName must omit '.': {h:?}");
+        assert!(
+            !h.starts_with('-') && !h.ends_with('-'),
+            "Windows HostName must not start/end with '-': {h:?}"
+        );
+        assert!(
+            !h.chars().all(|ch| ch.is_ascii_digit()),
+            "Windows HostName must not be all-digits: {h:?}"
+        );
+    };
+
+    api.provision(&c, &win_spec("cua-aliyun-ecs-aaaaaaaaaaaa"))
+        .await
+        .unwrap();
+    api.provision(&c, &win_spec("cua-aliyun-ecs-aaaaaaaaaaab"))
+        .await
+        .unwrap();
+    api.provision(&c, &win_spec("win.box.01")).await.unwrap();
+    api.provision(&c, &win_spec("123456789012345"))
+        .await
+        .unwrap();
+
+    let win_hostnames: Vec<String> = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .filter(|call| call.action == "RunInstances" && !call.params.contains_key("DryRun"))
+            .map(|call| call.params.get("HostName").cloned().unwrap_or_default())
+            .collect()
+    };
+    assert_eq!(win_hostnames.len(), 4);
+    for hn in &win_hostnames {
+        assert_valid_netbios(hn);
+    }
+    assert_ne!(
+        win_hostnames[0], win_hostnames[1],
+        "distinct cua-aliyun-ecs-<12-hex> names must produce distinct NetBIOS HostNames"
+    );
+    assert_eq!(win_hostnames[2], "win-box-01");
+
+    // Linux retains full sanitized hostnames up to 63 chars (including dots).
+    s.lock().unwrap().calls.clear();
+    let lin_spec = ProvisionSpec {
+        name: "cua-aliyun-ecs-aaaaaaaaaaaa".into(),
+        family: "linux".into(),
+        image: HERMETIC_LINUX_IMAGE.into(),
+        kind: "container".into(),
+        machine_type: "ecs.e-c1m2.large".into(),
+        machine_type_explicit: true,
+        disk_gb: 40,
+        user_data: "#cloud-config\n".into(),
+        tags: model::tags("owner-hn", "lin-hn", "cloud-hn-lin", 0),
+        ttl_secs: 3600,
+        arch: "amd64".into(),
+        runtime: "docker".into(),
+        ..Default::default()
+    };
+    api.provision(&c, &lin_spec).await.unwrap();
+    let mut lin_dots = lin_spec.clone();
+    lin_dots.name = "my.linux.host.01".into();
+    api.provision(&c, &lin_dots).await.unwrap();
+    let lin_hostnames: Vec<String> = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .filter(|call| call.action == "RunInstances" && !call.params.contains_key("DryRun"))
+            .map(|call| call.params.get("HostName").cloned().unwrap_or_default())
+            .collect()
+    };
+    assert_eq!(
+        lin_hostnames,
+        vec![
+            "cua-aliyun-ecs-aaaaaaaaaaaa".to_string(),
+            "my.linux.host.01".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock_and_aligns_zone() {
+    use cua_sandbox_core::placement::Runtime;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.zones = vec!["ap-southeast-1a".into(), "ap-southeast-1b".into()];
+        // Register non-hardcoded families + ARM + GPU + bare-metal + burstable + oversized types.
+        f.instance_types.insert("ecs.c8y.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.gn7i.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.ebmg7.xlarge".into(), (4, 8.0));
+        f.instance_types
+            .insert("ecs.t6-c1m2.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.c9i.xlarge".into(), (4, 8.0));
+        f.instance_types
+            .insert("ecs.u2a-c1m2.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.g8i.2xlarge".into(), (8, 16.0));
+        f.instance_type_details
+            .insert("ecs.c8y.xlarge".into(), json!({ "CpuArchitecture": "ARM" }));
+        f.instance_type_details.insert(
+            "ecs.gn7i.xlarge".into(),
+            json!({ "CpuArchitecture": "X86", "GpuAmount": 1 }),
+        );
+        f.instance_type_details.insert(
+            "ecs.ebmg7.xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+        f.instance_type_details.insert(
+            "ecs.t6-c1m2.xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+        f.instance_type_details
+            .insert("ecs.c9i.xlarge".into(), json!({ "CpuArchitecture": "X86" }));
+        f.instance_type_details.insert(
+            "ecs.u2a-c1m2.xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+        f.instance_type_details.insert(
+            "ecs.g8i.2xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+
+        // Zone -a has ClosedWithStock for c7/c9i, ARM (WithStock), GPU (WithStock), bare-metal (WithStock),
+        // and burstable t6 (WithStock); Zone -b has WithStock for non-hardcoded ecs.c9i.xlarge!
+        f.available_zones_override = Some(vec![
+            json!({
+                "RegionId": "ap-southeast-1",
+                "ZoneId": "ap-southeast-1a",
+                "Status": "Available",
+                "AvailableResources": {
+                    "AvailableResource": [{
+                        "Type": "InstanceType",
+                        "SupportedResources": {
+                            "SupportedResource": [
+                                { "Value": "ecs.c7.xlarge", "Status": "Available", "StatusCategory": "ClosedWithStock" },
+                                { "Value": "ecs.c9i.xlarge", "Status": "Available", "StatusCategory": "ClosedWithStock" },
+                                { "Value": "ecs.c8y.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.gn7i.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.ebmg7.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.t6-c1m2.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.e-c1m2.large", "Status": "Available", "StatusCategory": "WithStock" }
+                            ]
+                        }
+                    }]
+                }
+            }),
+            json!({
+                "RegionId": "ap-southeast-1",
+                "ZoneId": "ap-southeast-1b",
+                "Status": "Available",
+                "AvailableResources": {
+                    "AvailableResource": [{
+                        "Type": "InstanceType",
+                        "SupportedResources": {
+                            "SupportedResource": [
+                                { "Value": "ecs.c9i.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.g8i.2xlarge", "Status": "Available", "StatusCategory": "WithStock" }
+                            ]
+                        }
+                    }]
+                }
+            }),
+        ]);
+
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("ap-southeast-1".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            max_size: Some("4x8x80".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    s.lock().unwrap().calls.clear();
+
+    let mut win_opts = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_opts.contrib = Some("aliyun-ecs".into());
+    win_opts.name = Some("win-dynamic-c9i".into());
+    win_opts.os = "windows".into();
+    win_opts.runtime = Runtime::Other("native".into());
+    win_opts.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_opts).await.unwrap();
+
+    assert_eq!(
+        sb.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c9i.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let avail_calls: Vec<_> = f
+            .calls
+            .iter()
+            .filter(|c| c.action == "DescribeAvailableResource")
+            .collect();
+        assert!(
+            avail_calls.iter().any(|c| {
+                c.params.get("Cores").map(String::as_str) == Some("4")
+                    && c.params.get("Memory").map(String::as_str) == Some("8")
+            }),
+            "DescribeAvailableResource must pass Cores=4 & Memory=8: {avail_calls:?}"
+        );
+        assert!(
+            f.calls.iter().any(|c| c.action == "DescribeInstanceTypes"),
+            "DescribeInstanceTypes must be queried to inspect architecture/GPU/sizing"
+        );
+        let run = f
+            .calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap();
+        assert_eq!(
+            run.params.get("InstanceType").map(String::as_str),
+            Some("ecs.c9i.xlarge")
+        );
+        assert_eq!(
+            run.params.get("ZoneId").map(String::as_str),
+            Some("ap-southeast-1b"),
+            "RunInstances must align with the WithStock zone of ecs.c9i.xlarge"
+        );
+        let run_vsw = run.params.get("VSwitchId").unwrap();
+        let vsw = f
+            .vswitches
+            .iter()
+            .find(|v| v["VSwitchId"].as_str() == Some(run_vsw.as_str()))
+            .unwrap();
+        assert_eq!(
+            vsw["ZoneId"].as_str(),
+            Some("ap-southeast-1b"),
+            "created VSwitch must be in the WithStock zone of the selected instance type"
+        );
+    }
+    sb.delete().await.unwrap();
+
+    // Verify WithoutStock is rejected while another non-hardcoded family (ecs.u2a-c1m2.xlarge)
+    // is dynamically selected, and explicit --instance-type overrides dynamic selection.
+    {
+        let mut f = s.lock().unwrap();
+        f.available_zones_override = Some(vec![json!({
+            "RegionId": "ap-southeast-1",
+            "ZoneId": "ap-southeast-1a",
+            "Status": "Available",
+            "AvailableResources": {
+                "AvailableResource": [{
+                    "Type": "InstanceType",
+                    "SupportedResources": {
+                        "SupportedResource": [
+                            { "Value": "ecs.c9i.xlarge", "Status": "Available", "StatusCategory": "WithoutStock" },
+                            { "Value": "ecs.u2a-c1m2.xlarge", "Status": "Available", "StatusCategory": "WithStock" }
+                        ]
+                    }
+                }]
+            }
+        })]);
+    }
+    let mut win_u2a = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_u2a.contrib = Some("aliyun-ecs".into());
+    win_u2a.name = Some("win-dynamic-u2a".into());
+    win_u2a.os = "windows".into();
+    win_u2a.runtime = Runtime::Other("native".into());
+    win_u2a.ready_timeout = std::time::Duration::from_secs(10);
+    let sb2 = sbx.create(win_u2a).await.unwrap();
+    assert_eq!(
+        sb2.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.u2a-c1m2.xlarge")
+    );
+    sb2.delete().await.unwrap();
+
+    let mut win_explicit = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_explicit.contrib = Some("aliyun-ecs".into());
+    win_explicit.name = Some("win-explicit-override".into());
+    win_explicit.os = "windows".into();
+    win_explicit.runtime = Runtime::Other("native".into());
+    win_explicit.instance_type = Some("ecs.c7.xlarge".into());
+    win_explicit.ready_timeout = std::time::Duration::from_secs(10);
+    let sb3 = sbx.create(win_explicit).await.unwrap();
+    assert_eq!(
+        sb3.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    sb3.delete().await.unwrap();
+}

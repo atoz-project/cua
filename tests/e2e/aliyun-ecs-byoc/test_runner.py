@@ -357,6 +357,22 @@ class RunnerBehaviorTests(unittest.TestCase):
                 run.main(["--lanes", "live"])
             self.assertIn("--profile", str(ctx.exception))
 
+    def test_parse_cargo_test_output_handles_live_smoke_lines_and_stderr(self) -> None:
+        ok_stdout = "running 1 test\ntest live_ecs_smoke ... ok\n\ntest result: ok. 1 passed;\n"
+        fail_stdout = "running 1 test\ntest live_ecs_smoke ... FAILED\n\ntest result: FAILED.\n"
+        diag_stderr = (
+            "CUA_E2E_SMOKE_OWNER=97bce51b794adeb1\n"
+            "[live_ecs_smoke] linux docker probe:\nLinux ...\n"
+        )
+        self.assertEqual(
+            run.parse_cargo_test_output(ok_stdout, diag_stderr),
+            {"live_ecs_smoke": "pass"},
+        )
+        self.assertEqual(
+            run.parse_cargo_test_output(fail_stdout, diag_stderr),
+            {"live_ecs_smoke": "fail"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -559,6 +559,7 @@ pub async fn discover_zones(
                 .any(|sr| {
                     sr["Value"].as_str() == Some(instance_type)
                         && sr["Status"].as_str() == Some("Available")
+                        && crate::aliyun_ecs::is_with_stock_category(sr["StatusCategory"].as_str())
                 });
             if has_type && !stock_zones.iter().any(|z| z == zone_id) {
                 stock_zones.push(zone_id.to_string());

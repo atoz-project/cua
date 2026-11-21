@@ -691,6 +691,28 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         };
         // Say a budget share passed before a new machine adds to it.
         crate::alerts::check_all(&self.store, now());
+        let spent = self
+            .store
+            .spent_for_limits(&conn, now())
+            .await
+            .map_err(Self::io)?;
+        if self.api.name() == "aliyun-ecs" {
+            let (min_cpus, min_mem_mb) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
+            let min_usd_floor = if machine_type_explicit {
+                0.0
+            } else {
+                f64::from(min_cpus.unwrap_or(2)) * 0.01 + f64::from(disk_gb) * 0.00014
+            };
+            crate::limits::check_new_machine_with_disk(
+                &conn,
+                self.api.title(),
+                min_cpus,
+                min_mem_mb,
+                Some(disk_gb),
+                min_usd_floor,
+                spent,
+            )?;
+        }
         let sizing = self.api.resolve_machine_sizing(&conn, &provision).await?;
         if let Some(resolved_mt) = sizing
             .as_ref()
@@ -723,10 +745,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             eff_mem_mb,
             Some(eff_disk_gb),
             eff_usd,
-            self.store
-                .spent_for_limits(&conn, now())
-                .await
-                .map_err(Self::io)?,
+            spent,
         )?;
         if let Some(resolved_image) = self.api.resolve_provision_image(&conn, &provision).await? {
             provision.cloud_image_id = Some(resolved_image);

@@ -54,6 +54,10 @@ pub struct FakeAliyun {
     pub security_group_rules: BTreeMap<String, Vec<Value>>,
     /// Instance type specs (`DescribeInstanceTypes`: `type_id -> (vcpu, mem_gib)`).
     pub instance_types: BTreeMap<String, (u32, f64)>,
+    /// Optional per-instance-type extra fields (`CpuArchitecture`, `GpuAmount`, etc.) for `DescribeInstanceTypes`.
+    pub instance_type_details: BTreeMap<String, Value>,
+    /// Optional custom `AvailableZone` payload for `DescribeAvailableResource`.
+    pub available_zones_override: Option<Vec<Value>>,
     /// Catalog of ECS images (`DescribeImages`).
     pub images: Vec<Value>,
     /// Existing instances keyed by `InstanceId`.
@@ -111,6 +115,8 @@ impl Default for FakeAliyun {
                 ("ecs.g7.large".into(), (2, 8.0)),
                 ("ecs.g7.4xlarge".into(), (16, 64.0)),
             ]),
+            instance_type_details: BTreeMap::new(),
+            available_zones_override: None,
             images: vec![
                 json!({
                     "ImageId": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
@@ -659,45 +665,54 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeAvailableResource") => {
-                let region = params
-                    .get("RegionId")
-                    .cloned()
-                    .unwrap_or_else(|| "cn-hangzhou".into());
-                let zone_ids = if f.zones.is_empty() {
-                    vec![format!("{region}-h")]
+                let azs: Vec<Value> = if let Some(ref custom) = f.available_zones_override {
+                    let zone_filter = params.get("ZoneId").map(String::as_str);
+                    custom
+                        .iter()
+                        .filter(|z| zone_filter.is_none_or(|zf| z["ZoneId"].as_str() == Some(zf)))
+                        .cloned()
+                        .collect()
                 } else {
-                    f.zones.clone()
+                    let region = params
+                        .get("RegionId")
+                        .cloned()
+                        .unwrap_or_else(|| "cn-hangzhou".into());
+                    let zone_ids = if f.zones.is_empty() {
+                        vec![format!("{region}-h")]
+                    } else {
+                        f.zones.clone()
+                    };
+                    let supported: Vec<Value> = f
+                        .available_instance_types
+                        .iter()
+                        .map(|t| {
+                            json!({
+                                "Value": t,
+                                "Status": "Available",
+                                "StatusCategory": "WithStock"
+                            })
+                        })
+                        .collect();
+                    zone_ids
+                        .into_iter()
+                        .filter(|zid| !f.sold_out_zones.contains_key(zid))
+                        .map(|zid| {
+                            json!({
+                                "RegionId": region,
+                                "ZoneId": zid,
+                                "Status": "Available",
+                                "AvailableResources": {
+                                    "AvailableResource": [{
+                                        "Type": "InstanceType",
+                                        "SupportedResources": {
+                                            "SupportedResource": supported
+                                        }
+                                    }]
+                                }
+                            })
+                        })
+                        .collect()
                 };
-                let supported: Vec<Value> = f
-                    .available_instance_types
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "Value": t,
-                            "Status": "Available",
-                            "StatusCategory": "WithStock"
-                        })
-                    })
-                    .collect();
-                let azs: Vec<Value> = zone_ids
-                    .into_iter()
-                    .filter(|zid| !f.sold_out_zones.contains_key(zid))
-                    .map(|zid| {
-                        json!({
-                            "RegionId": region,
-                            "ZoneId": zid,
-                            "Status": "Available",
-                            "AvailableResources": {
-                                "AvailableResource": [{
-                                    "Type": "InstanceType",
-                                    "SupportedResources": {
-                                        "SupportedResource": supported
-                                    }
-                                }]
-                            }
-                        })
-                    })
-                    .collect();
                 (
                     StatusCode::OK,
                     axum::Json(json!({
@@ -783,11 +798,20 @@ pub async fn handle(
                             .is_none_or(|reqs| reqs.iter().any(|r| r == *id))
                     })
                     .map(|(id, (vcpu, mem_gib))| {
-                        json!({
+                        let mut item = json!({
                             "InstanceTypeId": id,
                             "CpuCoreCount": vcpu,
                             "MemorySize": mem_gib
-                        })
+                        });
+                        if let Some(extra) =
+                            f.instance_type_details.get(id).and_then(|v| v.as_object())
+                            && let Some(obj) = item.as_object_mut()
+                        {
+                            for (k, val) in extra {
+                                obj.insert(k.clone(), val.clone());
+                            }
+                        }
+                        item
                     })
                     .collect();
                 (
@@ -1335,6 +1359,28 @@ pub async fn handle(
                         "No capacity available in requested zone.",
                     )
                 } else {
+                    let img_id = params.get("ImageId").map(String::as_str).unwrap_or("");
+                    let is_windows_img = f.images.iter().any(|img| {
+                        img["ImageId"].as_str() == Some(img_id)
+                            && img["OSType"]
+                                .as_str()
+                                .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+                    });
+                    if is_windows_img && let Some(hn) = params.get("HostName") {
+                        let valid_win_hostname = (2..=15).contains(&hn.len())
+                            && !hn.contains('.')
+                            && !hn.starts_with('-')
+                            && !hn.ends_with('-')
+                            && hn.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                            && !hn.chars().all(|c| c.is_ascii_digit());
+                        if !valid_win_hostname {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                "InvalidHostName.Malformed",
+                                "The specified parameter \"HostName\" is not valid.",
+                            );
+                        }
+                    }
                     let id = format!("i-fake-{}", f.next_id);
                     f.next_id += 1;
                     let region = params

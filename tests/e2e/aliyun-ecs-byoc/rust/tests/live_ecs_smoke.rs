@@ -233,7 +233,7 @@ fn record_smoke_owner(isolated_home: &Path) {
         && let Some(owner) = v["owner_id"].as_str().filter(|s| !s.is_empty())
     {
         RECORDED.store(true, std::sync::atomic::Ordering::Relaxed);
-        println!("CUA_E2E_SMOKE_OWNER={owner}");
+        eprintln!("CUA_E2E_SMOKE_OWNER={owner}");
         if let Ok(out_file) = std::env::var("CUA_E2E_OWNER_FILE")
             && !out_file.trim().is_empty()
         {
@@ -380,7 +380,7 @@ async fn live_ecs_smoke() {
         )
         .await;
         assert_eq!(rc, 0, "linux docker exec failed: out={out}\nerr={err}");
-        println!("[live_ecs_smoke] linux docker probe:\n{out}");
+        eprintln!("[live_ecs_smoke] linux docker probe:\n{out}");
         assert!(
             out.contains("Linux"),
             "unexpected linux docker exec output: {out}"
@@ -423,7 +423,7 @@ async fn live_ecs_smoke() {
         )
         .await;
         assert_eq!(rc, 0, "linux native exec failed: out={out}\nerr={err}");
-        println!("[live_ecs_smoke] linux native probe:\n{out}");
+        eprintln!("[live_ecs_smoke] linux native probe:\n{out}");
         assert!(
             out.contains("Linux") && out.contains("active"),
             "expected Linux + active cua-spacesd service, got: {out}"
@@ -482,7 +482,7 @@ async fn live_ecs_smoke() {
         )
         .await;
         assert_eq!(rc, 0, "windows session probe failed: out={out}\nerr={err}");
-        println!("[live_ecs_smoke] windows native probe:\n{out}");
+        eprintln!("[live_ecs_smoke] windows native probe:\n{out}");
 
         let sess_id: u32 = out
             .lines()
