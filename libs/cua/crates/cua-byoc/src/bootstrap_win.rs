@@ -340,10 +340,10 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20 Set-ItemProperty -Path $wl -Name 'DefaultPassword' -Value ([Text.Encoding]::UTF8.GetString((Dec {pw}))) -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'ForceAutoLogon' -Value '1' -Type String\n\
          \x20 $sp = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'\n\
-         \x20 New-Item -Path $sp -Force | Out-Null\n\
+         \x20 if (-not (Test-Path -LiteralPath $sp)) {{ New-Item -Path $sp -Force | Out-Null }}\n\
          \x20 Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord\n\
          \x20 $pp = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization'\n\
-         \x20 New-Item -Path $pp -Force | Out-Null\n\
+         \x20 if (-not (Test-Path -LiteralPath $pp)) {{ New-Item -Path $pp -Force | Out-Null }}\n\
          \x20 Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord\n\
          \x20 Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name 'ScreenSaveActive' -Value '0' -Type String -ErrorAction SilentlyContinue\n\
          \x20 & reg.exe add 'HKU\\.DEFAULT\\Control Panel\\Desktop' /v ScreenSaveActive /t REG_SZ /d 0 /f | Out-Null\n\
@@ -826,5 +826,57 @@ mod tests {
             "raw UserData {} >= 16 KiB",
             ps.len()
         );
+    }
+
+    #[test]
+    fn registry_policy_keys_guard_new_item_with_test_path() {
+        let j = static_join();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_reg".to_string(),
+        )]);
+        let pw = "WinPass!1234Abcd";
+        let boot = WindowsVmBoot {
+            join: &j,
+            env: &env,
+            expires: 1_900_000_000,
+            ttl_secs: 8 * 3600,
+            provider: "aliyun-ecs",
+            spacesd_download_url: None,
+            desktop_user: "Administrator",
+            desktop_password: pw,
+        };
+        for ps in [
+            windows_user_data(&boot),
+            windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
+        ] {
+            assert!(
+                ps.len() < MAX_USER_DATA_BYTES,
+                "raw UserData {} >= 16 KiB",
+                ps.len()
+            );
+            assert!(
+                ps.contains("if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }"),
+                "missing Test-Path guard on $sp: {ps}"
+            );
+            assert!(
+                ps.contains("if (-not (Test-Path -LiteralPath $pp)) { New-Item -Path $pp -Force | Out-Null }"),
+                "missing Test-Path guard on $pp: {ps}"
+            );
+            for line in ps.lines() {
+                let trimmed = line.trim_start();
+                assert!(
+                    !trimmed.starts_with("New-Item -Path $sp")
+                        && !trimmed.starts_with("New-Item -Path $pp"),
+                    "unguarded New-Item on registry key: {line}"
+                );
+            }
+            assert!(ps.contains(
+                "Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord"
+            ));
+            assert!(
+                ps.contains("Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord")
+            );
+        }
     }
 }
