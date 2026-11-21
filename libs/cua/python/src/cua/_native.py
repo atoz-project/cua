@@ -11164,7 +11164,7 @@ class CloudProvider:
     """
     One cloud as `cloud_status` lists it.
 """
-    def __init__(self, *, name:str, title:str, tier:str, connected:bool, default:bool, credentials:CloudCredentials, account:str, profile:str, region:str, zone:str, project:str, environment:str, label:str, ttl_hours:int, kinds:typing.List[CloudKind], auth:str, status:str, budget_usd_month:typing.Optional[float], max_size:str, spent_month:float, running:int, approval:str, approval_agent:str, pending_budget_usd_month:typing.Optional[float], pending_max_size:str, can_approve:bool, suggest_auth:str, issue:str, holders:typing.List[str], relay_url:typing.Optional[str], relay_mode:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT):
+    def __init__(self, *, name:str, title:str, tier:str, connected:bool, default:bool, credentials:CloudCredentials, account:str, profile:str, region:str, zone:str, project:str, environment:str, label:str, ttl_hours:int, kinds:typing.List[CloudKind], auth:str, status:str, budget_usd_month:typing.Optional[float], max_size:str, spent_month:float, running:int, approval:str, approval_agent:str, pending_budget_usd_month:typing.Optional[float], pending_max_size:str, can_approve:bool, suggest_auth:str, issue:str, holders:typing.List[str], relay_url:typing.Optional[str], relay_mode:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT, vpc_id:typing.Optional[str], vswitch_id:typing.Optional[str], no_public_ip:bool):
         self.name = name
         self.title = title
         self.tier = tier
@@ -11203,12 +11203,15 @@ class CloudProvider:
             self.spacesd_download_url = None
         else:
             self.spacesd_download_url = spacesd_download_url
+        self.vpc_id = vpc_id
+        self.vswitch_id = vswitch_id
+        self.no_public_ip = no_public_ip
 
 
 
 
     def __str__(self):
-        return "CloudProvider(name={}, title={}, tier={}, connected={}, default={}, credentials={}, account={}, profile={}, region={}, zone={}, project={}, environment={}, label={}, ttl_hours={}, kinds={}, auth={}, status={}, budget_usd_month={}, max_size={}, spent_month={}, running={}, approval={}, approval_agent={}, pending_budget_usd_month={}, pending_max_size={}, can_approve={}, suggest_auth={}, issue={}, holders={}, relay_url={}, relay_mode={}, spacesd_download_url={})".format(self.name, self.title, self.tier, self.connected, self.default, self.credentials, self.account, self.profile, self.region, self.zone, self.project, self.environment, self.label, self.ttl_hours, self.kinds, self.auth, self.status, self.budget_usd_month, self.max_size, self.spent_month, self.running, self.approval, self.approval_agent, self.pending_budget_usd_month, self.pending_max_size, self.can_approve, self.suggest_auth, self.issue, self.holders, self.relay_url, self.relay_mode, self.spacesd_download_url)
+        return "CloudProvider(name={}, title={}, tier={}, connected={}, default={}, credentials={}, account={}, profile={}, region={}, zone={}, project={}, environment={}, label={}, ttl_hours={}, kinds={}, auth={}, status={}, budget_usd_month={}, max_size={}, spent_month={}, running={}, approval={}, approval_agent={}, pending_budget_usd_month={}, pending_max_size={}, can_approve={}, suggest_auth={}, issue={}, holders={}, relay_url={}, relay_mode={}, spacesd_download_url={}, vpc_id={}, vswitch_id={}, no_public_ip={})".format(self.name, self.title, self.tier, self.connected, self.default, self.credentials, self.account, self.profile, self.region, self.zone, self.project, self.environment, self.label, self.ttl_hours, self.kinds, self.auth, self.status, self.budget_usd_month, self.max_size, self.spent_month, self.running, self.approval, self.approval_agent, self.pending_budget_usd_month, self.pending_max_size, self.can_approve, self.suggest_auth, self.issue, self.holders, self.relay_url, self.relay_mode, self.spacesd_download_url, self.vpc_id, self.vswitch_id, self.no_public_ip)
     def __eq__(self, other):
         if self.name != other.name:
             return False
@@ -11274,6 +11277,12 @@ class CloudProvider:
             return False
         if self.spacesd_download_url != other.spacesd_download_url:
             return False
+        if self.vpc_id != other.vpc_id:
+            return False
+        if self.vswitch_id != other.vswitch_id:
+            return False
+        if self.no_public_ip != other.no_public_ip:
+            return False
         return True
 
 class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
@@ -11312,6 +11321,9 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
             relay_url=_UniffiFfiConverterOptionalString.read(buf),
             relay_mode=_UniffiFfiConverterOptionalString.read(buf),
             spacesd_download_url=_UniffiFfiConverterOptionalString.read(buf),
+            vpc_id=_UniffiFfiConverterOptionalString.read(buf),
+            vswitch_id=_UniffiFfiConverterOptionalString.read(buf),
+            no_public_ip=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -11348,6 +11360,9 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.relay_url)
         _UniffiFfiConverterOptionalString.check_lower(value.relay_mode)
         _UniffiFfiConverterOptionalString.check_lower(value.spacesd_download_url)
+        _UniffiFfiConverterOptionalString.check_lower(value.vpc_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.vswitch_id)
+        _UniffiFfiConverterBoolean.check_lower(value.no_public_ip)
 
     @staticmethod
     def write(value, buf):
@@ -11383,6 +11398,9 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.relay_url, buf)
         _UniffiFfiConverterOptionalString.write(value.relay_mode, buf)
         _UniffiFfiConverterOptionalString.write(value.spacesd_download_url, buf)
+        _UniffiFfiConverterOptionalString.write(value.vpc_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.vswitch_id, buf)
+        _UniffiFfiConverterBoolean.write(value.no_public_ip, buf)
 
 class _UniffiFfiConverterSequenceTypeCloudCheck(_UniffiConverterRustBuffer):
     @classmethod
@@ -12022,7 +12040,7 @@ class CloudTarget:
     their own CLI sign-in; Hetzner takes its API token in `token` (or
     `HCLOUD_TOKEN`).
 """
-    def __init__(self, *, provider:str, profile:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, zone:typing.Optional[str] = _DEFAULT, project:typing.Optional[str] = _DEFAULT, environment:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, relay_url:typing.Optional[str] = _DEFAULT, relay_mode:typing.Optional[str] = _DEFAULT, relay_token:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT):
+    def __init__(self, *, provider:str, profile:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, zone:typing.Optional[str] = _DEFAULT, project:typing.Optional[str] = _DEFAULT, environment:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, relay_url:typing.Optional[str] = _DEFAULT, relay_mode:typing.Optional[str] = _DEFAULT, relay_token:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT, vpc_id:typing.Optional[str] = _DEFAULT, vswitch_id:typing.Optional[str] = _DEFAULT, no_public_ip:bool = False):
         self.provider = provider
         if profile is _DEFAULT:
             self.profile = None
@@ -12064,12 +12082,21 @@ class CloudTarget:
             self.spacesd_download_url = None
         else:
             self.spacesd_download_url = spacesd_download_url
+        if vpc_id is _DEFAULT:
+            self.vpc_id = None
+        else:
+            self.vpc_id = vpc_id
+        if vswitch_id is _DEFAULT:
+            self.vswitch_id = None
+        else:
+            self.vswitch_id = vswitch_id
+        self.no_public_ip = no_public_ip
 
 
 
 
     def __str__(self):
-        return "CloudTarget(provider={}, profile={}, region={}, zone={}, project={}, environment={}, token={}, relay_url={}, relay_mode={}, relay_token={}, spacesd_download_url={})".format(self.provider, self.profile, self.region, self.zone, self.project, self.environment, self.token, self.relay_url, self.relay_mode, self.relay_token, self.spacesd_download_url)
+        return "CloudTarget(provider={}, profile={}, region={}, zone={}, project={}, environment={}, token={}, relay_url={}, relay_mode={}, relay_token={}, spacesd_download_url={}, vpc_id={}, vswitch_id={}, no_public_ip={})".format(self.provider, self.profile, self.region, self.zone, self.project, self.environment, self.token, self.relay_url, self.relay_mode, self.relay_token, self.spacesd_download_url, self.vpc_id, self.vswitch_id, self.no_public_ip)
     def __eq__(self, other):
         if self.provider != other.provider:
             return False
@@ -12093,6 +12120,12 @@ class CloudTarget:
             return False
         if self.spacesd_download_url != other.spacesd_download_url:
             return False
+        if self.vpc_id != other.vpc_id:
+            return False
+        if self.vswitch_id != other.vswitch_id:
+            return False
+        if self.no_public_ip != other.no_public_ip:
+            return False
         return True
 
 class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
@@ -12110,6 +12143,9 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
             relay_mode=_UniffiFfiConverterOptionalString.read(buf),
             relay_token=_UniffiFfiConverterOptionalString.read(buf),
             spacesd_download_url=_UniffiFfiConverterOptionalString.read(buf),
+            vpc_id=_UniffiFfiConverterOptionalString.read(buf),
+            vswitch_id=_UniffiFfiConverterOptionalString.read(buf),
+            no_public_ip=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -12125,6 +12161,9 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.relay_mode)
         _UniffiFfiConverterOptionalString.check_lower(value.relay_token)
         _UniffiFfiConverterOptionalString.check_lower(value.spacesd_download_url)
+        _UniffiFfiConverterOptionalString.check_lower(value.vpc_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.vswitch_id)
+        _UniffiFfiConverterBoolean.check_lower(value.no_public_ip)
 
     @staticmethod
     def write(value, buf):
@@ -12139,6 +12178,9 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.relay_mode, buf)
         _UniffiFfiConverterOptionalString.write(value.relay_token, buf)
         _UniffiFfiConverterOptionalString.write(value.spacesd_download_url, buf)
+        _UniffiFfiConverterOptionalString.write(value.vpc_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.vswitch_id, buf)
+        _UniffiFfiConverterBoolean.write(value.no_public_ip, buf)
 
 @dataclass
 class CloudTestReport:

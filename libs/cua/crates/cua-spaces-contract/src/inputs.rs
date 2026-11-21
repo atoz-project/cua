@@ -2142,6 +2142,18 @@ pub struct CloudTarget {
     /// `#sha256=<64 hex>` fragment).
     #[serde(default)]
     pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+    /// with `vswitch_id`.
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+    /// paired with `vpc_id`.
+    #[serde(default)]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[serde(default)]
+    pub no_public_ip: Option<bool>,
 }
 
 fn redact_url(raw: &str) -> String {
@@ -2205,6 +2217,9 @@ impl std::fmt::Debug for CloudTarget {
                 "spacesd_download_url",
                 &self.spacesd_download_url.as_deref().map(redact_url),
             )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
             .finish()
     }
 }

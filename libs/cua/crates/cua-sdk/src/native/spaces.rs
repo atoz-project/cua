@@ -3866,6 +3866,9 @@ mod require_fields_tests {
             "relay_mode",
             "relay_token",
             "spacesd_download_url",
+            "vpc_id",
+            "vswitch_id",
+            "no_public_ip",
         ];
         assert!(missing_fields(&ours, "cloud_connect", &all).is_empty());
         assert!(
@@ -3876,7 +3879,10 @@ mod require_fields_tests {
                     "relay_url",
                     "relay_mode",
                     "relay_token",
-                    "spacesd_download_url"
+                    "spacesd_download_url",
+                    "vpc_id",
+                    "vswitch_id",
+                    "no_public_ip",
                 ]
             )
             .is_empty()

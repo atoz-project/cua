@@ -79,11 +79,7 @@ pub fn verdict(
     if !model::is_ours(tags, owner) {
         return keep("not Cua's (tags): never touched");
     }
-    let recorded = records.iter().find(|x| {
-        x.provider == r.provider
-            && x.resource_type == r.resource_type
-            && ((!x.id.is_empty() && x.id == r.id) || (!x.name.is_empty() && x.name == r.name))
-    });
+    let recorded = records.iter().find(|x| same(x, r));
     let expires = recorded
         .map(|x| x.expires)
         .filter(|e| *e > 0)
@@ -322,19 +318,28 @@ pub async fn sweep_provider(
         if listed.iter().any(|r| same(rec, r)) {
             continue;
         }
-        // Not in the listing. Gone only if the cloud, asked where the
-        // record says it lives, says so; otherwise it is simply not seen
-        // and stays recorded.
+        // Not in the listing. Gone or no longer Cua-owned only if the cloud,
+        // asked where the record says it lives, says so; otherwise it is
+        // simply not seen and stays recorded.
         let scoped = swept.iter().any(|c| in_scope(rec, c));
-        let gone = rec.id.is_empty()
-            || (scoped
-                && match provider.describe(conn_for(&rec.region), rec).await {
-                    Ok(None) => true,
-                    Ok(Some((state, _))) => state == "terminated",
-                    Err(_) => false,
-                });
+        let gone_reason = if rec.id.is_empty() {
+            Some("no longer in the cloud")
+        } else if scoped {
+            match provider.describe(conn_for(&rec.region), rec).await {
+                Ok(None) => Some("no longer in the cloud"),
+                Ok(Some((state, _))) if state == "terminated" => Some("no longer in the cloud"),
+                Ok(Some((_, tags))) if !model::is_ours(&tags, &owner) => {
+                    Some("not Cua-owned in the cloud")
+                }
+                Ok(Some(_)) | Err(_) => None,
+            }
+        } else {
+            None
+        };
         let mut w = rec.wire(t);
-        if gone && forget_missing {
+        if let Some(reason) = gone_reason
+            && forget_missing
+        {
             if !dry_run {
                 let _ = store.forget(rec);
             }
@@ -346,7 +351,7 @@ pub async fn sweep_provider(
                 } else {
                     "forgotten".into()
                 },
-                reason: "no longer in the cloud".into(),
+                reason: reason.into(),
             });
         } else if !rec.id.is_empty() {
             let reason = if !scoped {
@@ -376,7 +381,11 @@ pub async fn sweep_provider(
 pub(crate) fn same(a: &Resource, b: &Resource) -> bool {
     a.provider == b.provider
         && a.resource_type == b.resource_type
-        && ((!a.id.is_empty() && a.id == b.id) || (!a.name.is_empty() && a.name == b.name))
+        && if !a.id.is_empty() && !b.id.is_empty() {
+            a.id == b.id
+        } else {
+            !a.name.is_empty() && a.name == b.name
+        }
 }
 
 /// A report from the rows of every provider.
@@ -542,5 +551,32 @@ mod tests {
         assert!(delete_rank("security_group") < delete_rank("vswitch"));
         assert_eq!(delete_rank("vswitch"), delete_rank("subnet"));
         assert!(delete_rank("vswitch") < delete_rank("vpc"));
+    }
+
+    #[test]
+    fn same_distinguishes_distinct_ids_with_same_name_and_matches_pending() {
+        let sg1 = Resource {
+            provider: "aliyun-ecs".into(),
+            resource_type: "security_group".into(),
+            id: "sg-1".into(),
+            name: "cua-sandboxes-owner1".into(),
+            ..Default::default()
+        };
+        let sg2 = Resource {
+            id: "sg-2".into(),
+            ..sg1.clone()
+        };
+        let sg1_unnamed = Resource {
+            name: String::new(),
+            ..sg1.clone()
+        };
+        let pending = Resource {
+            id: String::new(),
+            ..sg1.clone()
+        };
+        assert!(!same(&sg1, &sg2));
+        assert!(same(&sg1, &sg1_unnamed));
+        assert!(same(&pending, &sg1));
+        assert!(same(&sg2, &pending));
     }
 }

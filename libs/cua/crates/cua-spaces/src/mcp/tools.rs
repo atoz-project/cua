@@ -1082,6 +1082,10 @@ fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget
         // Keep `Some("")` distinct from `None` so empty `--relay-token-stdin` does not fall through.
         relay_token: t.relay_token.map(|v| v.trim().to_string()),
         spacesd_download_url: t.spacesd_download_url.map(|v| v.trim().to_string()),
+        // Keep `Some("")` distinct from `None` so empty IDs fail validation rather than falling back to isolated VPC.
+        vpc_id: t.vpc_id.map(|v| v.trim().to_string()),
+        vswitch_id: t.vswitch_id.map(|v| v.trim().to_string()),
+        no_public_ip: t.no_public_ip.unwrap_or(false),
     })
 }
 
@@ -1683,6 +1687,9 @@ mod tests {
             token: Some("  \n".into()),
             relay_token: Some(" \t ".into()),
             spacesd_download_url: Some(" https://mirror.example/cua-spacesd.exe ".into()),
+            vpc_id: Some("  ".into()),
+            vswitch_id: Some(" vsw-1 ".into()),
+            no_public_ip: Some(true),
             ..Default::default()
         })
         .unwrap();
@@ -1692,6 +1699,9 @@ mod tests {
             out.spacesd_download_url.as_deref(),
             Some("https://mirror.example/cua-spacesd.exe")
         );
+        assert_eq!(out.vpc_id.as_deref(), Some(""));
+        assert_eq!(out.vswitch_id.as_deref(), Some("vsw-1"));
+        assert!(out.no_public_ip);
 
         let omitted = cloud_target(i::CloudTarget {
             provider: "aliyun-ecs".into(),
@@ -1702,5 +1712,8 @@ mod tests {
         .unwrap();
         assert_eq!(omitted.token, None);
         assert_eq!(omitted.relay_token, None);
+        assert_eq!(omitted.vpc_id, None);
+        assert_eq!(omitted.vswitch_id, None);
+        assert!(!omitted.no_public_ip);
     }
 }

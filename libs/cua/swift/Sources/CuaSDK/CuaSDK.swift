@@ -22445,6 +22445,18 @@ public struct CloudProvider: Equatable, Hashable {
      * Optional custom `cua-spacesd` binary mirror URL.
      */
     public var spacesdDownloadUrl: String?
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+     */
+    public var vpcId: String?
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+     */
+    public var vswitchId: String?
+    /**
+     * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+     */
+    public var noPublicIp: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -22528,7 +22540,16 @@ public struct CloudProvider: Equatable, Hashable {
          */relayMode: String? = nil,
         /**
          * Optional custom `cua-spacesd` binary mirror URL.
-         */spacesdDownloadUrl: String? = nil) {
+         */spacesdDownloadUrl: String? = nil,
+        /**
+         * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+         */vpcId: String?,
+        /**
+         * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+         */vswitchId: String?,
+        /**
+         * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+         */noPublicIp: Bool) {
         self.name = name
         self.title = title
         self.tier = tier
@@ -22561,6 +22582,9 @@ public struct CloudProvider: Equatable, Hashable {
         self.relayUrl = relayUrl
         self.relayMode = relayMode
         self.spacesdDownloadUrl = spacesdDownloadUrl
+        self.vpcId = vpcId
+        self.vswitchId = vswitchId
+        self.noPublicIp = noPublicIp
     }
 
 
@@ -22610,7 +22634,10 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
                 holders: FfiConverterSequenceString.read(from: &buf),
                 relayUrl: FfiConverterOptionString.read(from: &buf),
                 relayMode: FfiConverterOptionString.read(from: &buf),
-                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf)
+                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf),
+                vpcId: FfiConverterOptionString.read(from: &buf),
+                vswitchId: FfiConverterOptionString.read(from: &buf),
+                noPublicIp: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -22647,6 +22674,9 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayMode, into: &buf)
         FfiConverterOptionString.write(value.spacesdDownloadUrl, into: &buf)
+        FfiConverterOptionString.write(value.vpcId, into: &buf)
+        FfiConverterOptionString.write(value.vswitchId, into: &buf)
+        FfiConverterBool.write(value.noPublicIp, into: &buf)
     }
 }
 
@@ -23063,6 +23093,21 @@ public struct CloudTarget: Equatable, Hashable {
      * `#sha256=<64 hex>` fragment).
      */
     public var spacesdDownloadUrl: String?
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+     * with `vswitch_id`.
+     */
+    public var vpcId: String?
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+     * paired with `vpc_id`.
+     */
+    public var vswitchId: String?
+    /**
+     * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+     * `aliyun-ecs` only).
+     */
+    public var noPublicIp: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -23104,7 +23149,19 @@ public struct CloudTarget: Equatable, Hashable {
         /**
          * Optional custom `cua-spacesd` binary mirror URL (with optional
          * `#sha256=<64 hex>` fragment).
-         */spacesdDownloadUrl: String? = nil) {
+         */spacesdDownloadUrl: String? = nil,
+        /**
+         * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+         * with `vswitch_id`.
+         */vpcId: String? = nil,
+        /**
+         * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+         * paired with `vpc_id`.
+         */vswitchId: String? = nil,
+        /**
+         * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+         * `aliyun-ecs` only).
+         */noPublicIp: Bool = false) {
         self.provider = provider
         self.profile = profile
         self.region = region
@@ -23116,6 +23173,9 @@ public struct CloudTarget: Equatable, Hashable {
         self.relayMode = relayMode
         self.relayToken = relayToken
         self.spacesdDownloadUrl = spacesdDownloadUrl
+        self.vpcId = vpcId
+        self.vswitchId = vswitchId
+        self.noPublicIp = noPublicIp
     }
 
 
@@ -23144,7 +23204,10 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
                 relayUrl: FfiConverterOptionString.read(from: &buf),
                 relayMode: FfiConverterOptionString.read(from: &buf),
                 relayToken: FfiConverterOptionString.read(from: &buf),
-                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf)
+                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf),
+                vpcId: FfiConverterOptionString.read(from: &buf),
+                vswitchId: FfiConverterOptionString.read(from: &buf),
+                noPublicIp: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -23160,6 +23223,9 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.relayMode, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
         FfiConverterOptionString.write(value.spacesdDownloadUrl, into: &buf)
+        FfiConverterOptionString.write(value.vpcId, into: &buf)
+        FfiConverterOptionString.write(value.vswitchId, into: &buf)
+        FfiConverterBool.write(value.noPublicIp, into: &buf)
     }
 }
 

@@ -53,6 +53,9 @@ pub fn target_of(c: &Connection) -> Target {
         relay_mode: c.relay_mode,
         relay_token: None,
         spacesd_download_url: c.spacesd_download_url.clone(),
+        vpc_id: c.vpc_id.clone(),
+        vswitch_id: c.vswitch_id.clone(),
+        no_public_ip: c.no_public_ip,
     }
 }
 
