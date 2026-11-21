@@ -377,6 +377,9 @@ impl Provider for Daytona {
             max_memory_mb: None,
             credential_env: DAYTONA_ENV,
             gpus: vec![],
+            oses: vec!["linux"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
         }
     }
 

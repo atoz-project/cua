@@ -469,6 +469,10 @@
             },
             "type": "array"
           },
+          "cloud_image_id": {
+            "description": "Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),\ndistinct from `image` (the Sandbox Image).",
+            "type": "string"
+          },
           "command": {
             "description": "Entrypoint override (argv), for example\n`[\"python\", \"-m\", \"my_mcp\", \"--port\", \"8765\"]`.",
             "items": {
@@ -494,6 +498,12 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "disk_gb": {
+            "description": "Grow the boot disk to this many GiB (local VMs and `aliyun-ecs`).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
           },
           "durable": {
             "description": "Keep it on the user's machines (with `on` `auto`): when its machine\ngoes away it is created again on another one, with the same name\n(its disk starts fresh); `list_spaces` shows it with `durable` (its\nname), and `delete_space` deletes it for good. Default false.",
@@ -7137,6 +7147,14 @@
             "description": "Modal environment (default: the profile's).",
             "type": "string"
           },
+          "instance_type": {
+            "description": "Default cloud instance type (`aliyun-ecs`: `--instance-type`).",
+            "type": "string"
+          },
+          "linux_image_id": {
+            "description": "Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).",
+            "type": "string"
+          },
           "make_default": {
             "description": "Also make it the default location (`default.on`). Default false.",
             "type": "boolean"
@@ -7223,6 +7241,10 @@
             "description": "Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be\npaired with `vpc_id`.",
             "type": "string"
           },
+          "windows_image_id": {
+            "description": "Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).",
+            "type": "string"
+          },
           "zone": {
             "description": "GCP zone in the region (default: its `-a` zone).",
             "type": "string"
@@ -7275,6 +7297,14 @@
             "description": "Modal environment (default: the profile's).",
             "type": "string"
           },
+          "instance_type": {
+            "description": "Default cloud instance type (`aliyun-ecs`: `--instance-type`).",
+            "type": "string"
+          },
+          "linux_image_id": {
+            "description": "Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).",
+            "type": "string"
+          },
           "no_public_ip": {
             "description": "Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,\n`aliyun-ecs` only).",
             "type": "boolean"
@@ -7321,6 +7351,10 @@
           },
           "vswitch_id": {
             "description": "Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be\npaired with `vpc_id`.",
+            "type": "string"
+          },
+          "windows_image_id": {
+            "description": "Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).",
             "type": "string"
           },
           "zone": {

@@ -357,8 +357,60 @@ impl DaemonClient {
             .ok_or_else(|| Error::Internal("daemon returned no sandbox".into()))
     }
 
+    /// Refuses before sending a create request when any M6a cloud image or
+    /// sizing field (`cloud_image_id`, `instance_type`, `disk_gb`) is set and
+    /// the daemon does not advertise [`crate::FEATURE_CLOUD_IMAGE_AND_SIZING`]
+    /// (or predates `GetInfo`).
+    pub async fn require_cloud_image_and_sizing(&self, fields: &[&str]) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        match self.info().await {
+            Ok(info) => {
+                if info
+                    .features
+                    .iter()
+                    .any(|f| f == crate::FEATURE_CLOUD_IMAGE_AND_SIZING)
+                {
+                    return Ok(());
+                }
+                let version = if info.version.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", info.version)
+                };
+                Err(Error::CapabilityMissing(format!(
+                    "{}: the cua daemon{version} is too old to enforce it (these sandbox \
+                     options would be ignored); update cua and restart its daemon",
+                    fields.join(", ")
+                )))
+            }
+            Err(Error::Unsupported(_)) => Err(Error::CapabilityMissing(format!(
+                "{}: the cua daemon is too old to enforce it (these sandbox options would be \
+                 ignored); update cua and restart its daemon",
+                fields.join(", ")
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn preflight_create(&self, r: &CreateRequest) -> Result<()> {
+        let mut asked = Vec::new();
+        if r.cloud_image_id.is_some() {
+            asked.push("cloud_image_id");
+        }
+        if r.instance_type.is_some() {
+            asked.push("instance_type");
+        }
+        if r.disk_gb.is_some() {
+            asked.push("disk_gb");
+        }
+        self.require_cloud_image_and_sizing(&asked).await
+    }
+
     /// `CreateSandbox`.
     pub async fn create(&self, r: CreateRequest) -> Result<SandboxRecord> {
+        self.preflight_create(&r).await?;
         let req = create_pb(r);
         let asked = req.network.clone();
         let r = self
@@ -406,6 +458,7 @@ impl DaemonClient {
         progress: cua_sandbox_core::progress::Sink,
     ) -> Result<SandboxRecord> {
         use pb::create_sandbox_stream_response::Event;
+        self.preflight_create(&r).await?;
         let req = create_pb(r);
         let asked = req.network.clone();
         let mut stream = match self

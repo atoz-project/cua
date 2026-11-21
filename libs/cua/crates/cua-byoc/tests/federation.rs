@@ -881,6 +881,7 @@ fn cli_aws(account: &str) -> Connection {
         max_size: Some(cua_byoc::MaxSize {
             vcpu: 2,
             mem_gib: 8,
+            disk_gib: None,
         }),
         ..Default::default()
     }

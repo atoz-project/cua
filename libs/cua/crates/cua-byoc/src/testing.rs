@@ -49,6 +49,10 @@ pub struct FakeAccount {
     pub types: Option<Vec<HostType>>,
     /// The type and price `kinds` quotes (default `fake.small`, 0.02).
     pub estimate: Option<(String, f64)>,
+    /// Allow custom `--cloud-image-id`, `--instance-type`, and `--disk` / `disk_gb`.
+    pub allow_custom_image_and_sizing: bool,
+    /// Override supported OSes (`["linux"]` when `None`).
+    pub supported_oses: Option<&'static [&'static str]>,
 }
 
 /// A scripted provider named `name`.
@@ -128,6 +132,22 @@ impl CloudApi for FakeProvider {
         vec!["amd64"]
     }
 
+    fn supported_oses(&self) -> &'static [&'static str] {
+        self.account
+            .lock()
+            .unwrap()
+            .supported_oses
+            .unwrap_or(&["linux"])
+    }
+
+    fn supports_image_defaults(&self) -> bool {
+        self.account.lock().unwrap().allow_custom_image_and_sizing
+    }
+
+    fn supports_custom_image_and_sizing(&self) -> bool {
+        self.account.lock().unwrap().allow_custom_image_and_sizing
+    }
+
     fn detect(&self) -> CloudCredentials {
         CloudCredentials {
             found: true,
@@ -145,30 +165,39 @@ impl CloudApi for FakeProvider {
     }
 
     fn kinds(&self, _: &Connection) -> Vec<CloudKind> {
-        let (est_type, est_usd) = self
-            .account
-            .lock()
-            .unwrap()
-            .estimate
-            .clone()
-            .unwrap_or(("fake.small".into(), 0.02));
-        vec![
-            CloudKind {
-                image: "linux".into(),
-                kind: "container".into(),
+        let acct = self.account.lock().unwrap();
+        let (est_type, est_usd) = acct.estimate.clone().unwrap_or(("fake.small".into(), 0.02));
+        let has_windows = acct
+            .supported_oses
+            .as_ref()
+            .is_some_and(|oses| oses.iter().any(|os| os.eq_ignore_ascii_case("windows")));
+        drop(acct);
+        let mut out = vec![CloudKind {
+            image: "linux".into(),
+            kind: "container".into(),
+            supported: true,
+            machine_type: est_type.clone(),
+            usd_per_hour: est_usd,
+            ..Default::default()
+        }];
+        if has_windows {
+            out.push(CloudKind {
+                image: "windows".into(),
+                kind: "vm".into(),
                 supported: true,
                 machine_type: est_type,
                 usd_per_hour: est_usd,
                 ..Default::default()
-            },
-            CloudKind {
-                image: "macos".into(),
-                kind: "vm".into(),
-                supported: false,
-                reason: "not offered".into(),
-                ..Default::default()
-            },
-        ]
+            });
+        }
+        out.push(CloudKind {
+            image: "macos".into(),
+            kind: "vm".into(),
+            supported: false,
+            reason: "not offered".into(),
+            ..Default::default()
+        });
+        out
     }
 
     async fn test(&self, conn: &Connection) -> Tested {

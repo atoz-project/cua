@@ -108,6 +108,15 @@ pub struct Link {
     /// [`Connection::no_public_ip`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_public_ip: bool,
+    /// [`Connection::windows_image_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// [`Connection::linux_image_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// [`Connection::instance_type`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -126,6 +135,9 @@ impl Link {
             && c.vpc_id.is_none()
             && c.vswitch_id.is_none()
             && !c.no_public_ip
+            && c.windows_image_id.is_none()
+            && c.linux_image_id.is_none()
+            && c.instance_type.is_none()
         {
             return None;
         }
@@ -142,6 +154,9 @@ impl Link {
             vpc_id: c.vpc_id.clone(),
             vswitch_id: c.vswitch_id.clone(),
             no_public_ip: c.no_public_ip,
+            windows_image_id: c.windows_image_id.clone(),
+            linux_image_id: c.linux_image_id.clone(),
+            instance_type: c.instance_type.clone(),
         })
     }
 
@@ -157,6 +172,9 @@ impl Link {
             && c.vpc_id.is_none()
             && c.vswitch_id.is_none()
             && !c.no_public_ip
+            && c.windows_image_id.is_none()
+            && c.linux_image_id.is_none()
+            && c.instance_type.is_none()
             && c.account == self.account
             && c.connected_at == self.connected_at
     }
@@ -354,6 +372,9 @@ impl Store {
                 c.vpc_id = l.vpc_id.clone();
                 c.vswitch_id = l.vswitch_id.clone();
                 c.no_public_ip = l.no_public_ip;
+                c.windows_image_id = l.windows_image_id.clone();
+                c.linux_image_id = l.linux_image_id.clone();
+                c.instance_type = l.instance_type.clone();
             }
             if c.profile == FEDERATED_PROFILE {
                 c.profile = String::new();
@@ -739,6 +760,7 @@ mod tests {
             max_size: Some(crate::model::MaxSize {
                 vcpu: 4,
                 mem_gib: 16,
+                disk_gib: None,
             }),
             ..Default::default()
         };
@@ -787,6 +809,7 @@ mod tests {
             max_size: Some(crate::model::MaxSize {
                 vcpu: 4,
                 mem_gib: 16,
+                disk_gib: None,
             }),
             ..Default::default()
         }

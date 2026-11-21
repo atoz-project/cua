@@ -78,6 +78,11 @@ pub const VERSION: &str = env!("CUA_DAEMON_VERSION");
 /// Type URL of a packed `DaemonErrorInfo`.
 pub const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/cua.daemon.v1.DaemonErrorInfo";
 
+/// Feature word in `GetInfoResponse.features` advertised by daemons that read
+/// `cloud_image_id`, `instance_type`, and `disk_gb` on `CreateSandboxRequest`
+/// (and BYOC `Spaces::create` sizing overrides).
+pub const FEATURE_CLOUD_IMAGE_AND_SIZING: &str = "sandboxes.cloud_image_and_sizing";
+
 /// Every failure of the SDK runtime, in both topologies.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {

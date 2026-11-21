@@ -642,6 +642,16 @@ pub struct SandboxCreateOptions {
     /// Other kinds ignore it. `None` (the default): not one.
     #[uniffi(default = None)]
     pub forkable: Option<bool>,
+    /// Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+    #[uniffi(default = None)]
+    pub disk_gb: Option<u32>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    #[uniffi(default = None)]
+    pub cloud_image_id: Option<String>,
+    /// Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+    #[uniffi(default = None)]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for SandboxCreateOptions {
@@ -678,6 +688,9 @@ impl std::fmt::Debug for SandboxCreateOptions {
             .field("spacesd", &self.spacesd)
             .field("profile", &self.profile)
             .field("forkable", &self.forkable)
+            .field("disk_gb", &self.disk_gb)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -730,6 +743,9 @@ impl SandboxCreateOptions {
             spacesd: None,
             profile: None,
             forkable: None,
+            disk_gb: None,
+            cloud_image_id: None,
+            instance_type: None,
         }
     }
 
@@ -781,6 +797,19 @@ impl SandboxCreateOptions {
             // `placement()` refused the cloud above.
             On::Relay(_) | On::Host(_) | On::Auto | On::Cloud => (None, None),
         };
+        if self.disk_gb == Some(0) {
+            return Err(CuaError::InvalidArgument(
+                "disk_gb must be greater than 0".into(),
+            ));
+        }
+        let cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            self.cloud_image_id.as_deref(),
+        )?;
+        let instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            self.instance_type.as_deref(),
+        )?;
         Ok(CreateRequest {
             // Resolved here, in the caller's process: a daemon never applies
             // its own environment to this request.
@@ -836,6 +865,9 @@ impl SandboxCreateOptions {
             spacesd: self.spacesd,
             profile: self.profile.clone().filter(|p| !p.trim().is_empty()),
             forkable: self.forkable.unwrap_or(false),
+            disk_gb: self.disk_gb,
+            cloud_image_id,
+            instance_type,
         })
     }
 }
@@ -2765,6 +2797,32 @@ mod tests {
             SandboxPhase::of(SandboxStatus::Unknown),
             SandboxPhase::Starting
         );
+    }
+
+    #[test]
+    fn to_request_rejects_disk_zero_and_whitespace_cloud_image_or_instance_type() {
+        let mut zero = SandboxCreateOptions::new("aliyun-ecs", "windows");
+        zero.disk_gb = Some(0);
+        let err = zero.to_request().unwrap_err();
+        assert!(matches!(err, CuaError::InvalidArgument(_)), "{err:?}");
+
+        for bad in ["", "   ", "m-foo bar"] {
+            let mut img = SandboxCreateOptions::new("aliyun-ecs", "windows");
+            img.cloud_image_id = Some(bad.into());
+            let err = img.to_request().unwrap_err();
+            assert!(
+                matches!(err, CuaError::InvalidArgument(_)),
+                "cloud_image_id {bad:?}: {err:?}"
+            );
+
+            let mut inst = SandboxCreateOptions::new("aliyun-ecs", "windows");
+            inst.instance_type = Some(bad.into());
+            let err = inst.to_request().unwrap_err();
+            assert!(
+                matches!(err, CuaError::InvalidArgument(_)),
+                "instance_type {bad:?}: {err:?}"
+            );
+        }
     }
 }
 

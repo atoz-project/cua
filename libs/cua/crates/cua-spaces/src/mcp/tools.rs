@@ -298,6 +298,8 @@ async fn dispatch(
                 name,
                 cpus: a.cpus,
                 memory_mb: a.memory_mb,
+                disk_gb: a.disk_gb,
+                cloud_image_id: a.cloud_image_id.clone(),
                 timeout: a.timeout.map(Duration::from_secs),
                 wait: a.wait,
                 reuse: a.reuse.unwrap_or(false),
@@ -1086,6 +1088,9 @@ fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget
         vpc_id: t.vpc_id.map(|v| v.trim().to_string()),
         vswitch_id: t.vswitch_id.map(|v| v.trim().to_string()),
         no_public_ip: t.no_public_ip.unwrap_or(false),
+        windows_image_id: t.windows_image_id.map(|v| v.trim().to_string()),
+        linux_image_id: t.linux_image_id.map(|v| v.trim().to_string()),
+        instance_type: t.instance_type.map(|v| v.trim().to_string()),
     })
 }
 
@@ -1690,6 +1695,9 @@ mod tests {
             vpc_id: Some("  ".into()),
             vswitch_id: Some(" vsw-1 ".into()),
             no_public_ip: Some(true),
+            windows_image_id: Some("  ".into()),
+            linux_image_id: Some(" m-lin ".into()),
+            instance_type: Some(" ecs.c7.xlarge ".into()),
             ..Default::default()
         })
         .unwrap();
@@ -1702,6 +1710,9 @@ mod tests {
         assert_eq!(out.vpc_id.as_deref(), Some(""));
         assert_eq!(out.vswitch_id.as_deref(), Some("vsw-1"));
         assert!(out.no_public_ip);
+        assert_eq!(out.windows_image_id.as_deref(), Some(""));
+        assert_eq!(out.linux_image_id.as_deref(), Some("m-lin"));
+        assert_eq!(out.instance_type.as_deref(), Some("ecs.c7.xlarge"));
 
         let omitted = cloud_target(i::CloudTarget {
             provider: "aliyun-ecs".into(),
@@ -1715,5 +1726,8 @@ mod tests {
         assert_eq!(omitted.vpc_id, None);
         assert_eq!(omitted.vswitch_id, None);
         assert!(!omitted.no_public_ip);
+        assert_eq!(omitted.windows_image_id, None);
+        assert_eq!(omitted.linux_image_id, None);
+        assert_eq!(omitted.instance_type, None);
     }
 }

@@ -528,6 +528,9 @@ impl Clouds {
             vpc_id: conn.and_then(|c| c.vpc_id.clone()),
             vswitch_id: conn.and_then(|c| c.vswitch_id.clone()),
             no_public_ip: conn.is_some_and(|c| c.no_public_ip),
+            windows_image_id: conn.and_then(|c| c.windows_image_id.clone()),
+            linux_image_id: conn.and_then(|c| c.linux_image_id.clone()),
+            instance_type: conn.and_then(|c| c.instance_type.clone()),
             ..Default::default()
         }
     }
@@ -618,6 +621,45 @@ pub(crate) fn validate_target_network_flags(provider: &str, target: &CloudTarget
     Ok(())
 }
 
+pub(crate) fn merge_image_defaults(
+    p: &dyn CloudApi,
+    target: &CloudTarget,
+    existing: Option<&Connection>,
+) -> Result<CloudTarget> {
+    if !p.supports_image_defaults() {
+        if target.windows_image_id.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "--windows-image-id is not supported for {} (supported on: aliyun-ecs)",
+                p.name()
+            )));
+        }
+        if target.linux_image_id.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "--linux-image-id is not supported for {} (supported on: aliyun-ecs)",
+                p.name()
+            )));
+        }
+        if target.instance_type.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "--instance-type is not supported for {} (supported on: aliyun-ecs)",
+                p.name()
+            )));
+        }
+        return Ok(target.clone());
+    }
+    let mut merged = target.clone();
+    if merged.windows_image_id.is_none() {
+        merged.windows_image_id = existing.and_then(|c| c.windows_image_id.clone());
+    }
+    if merged.linux_image_id.is_none() {
+        merged.linux_image_id = existing.and_then(|c| c.linux_image_id.clone());
+    }
+    if merged.instance_type.is_none() {
+        merged.instance_type = existing.and_then(|c| c.instance_type.clone());
+    }
+    Ok(merged)
+}
+
 pub(crate) struct ResolvedTargetRelay {
     pub mode: cua_sandbox_core::byoc::RelayMode,
     pub url: Option<String>,
@@ -698,6 +740,95 @@ pub(crate) fn resolve_target_relay(
         staged_token,
         probe_url,
     })
+}
+
+impl Clouds {
+    pub(crate) async fn connect_with_limits(
+        &self,
+        target: &CloudTarget,
+        make_default: bool,
+        ttl_hours: Option<u32>,
+        budget_usd_month: Option<f64>,
+        max_size: Option<model::MaxSize>,
+    ) -> Result<CloudConnected> {
+        let p = self.api(&target.provider)?;
+        validate_target_network_flags(p.name(), target)?;
+        let existing = self.store.connection(p.name()).map_err(Error::Io)?;
+        let merged = merge_image_defaults(p.as_ref(), target, existing.as_ref())?;
+        let relay = resolve_target_relay(
+            self.store.home().as_deref(),
+            p.name(),
+            &merged,
+            existing.as_ref(),
+        )?;
+        let spacesd_download_url = resolve_target_spacesd_download_url(&merged, existing.as_ref())?;
+        p.stage_secret(&merged);
+        let _unstage = UnstageGuard(p.as_ref());
+        let mut conn = p.resolve(&merged)?;
+        conn.relay_url = relay.url;
+        conn.relay_mode = relay.stored_mode;
+        conn.spacesd_download_url = spacesd_download_url;
+        conn.budget_usd_month =
+            budget_usd_month.or_else(|| existing.as_ref().and_then(|c| c.budget_usd_month));
+        conn.max_size = max_size.or_else(|| existing.as_ref().and_then(|c| c.max_size));
+        let mut tested = p.test(&conn).await;
+        if let Some(url) = relay.probe_url.as_deref() {
+            tested
+                .checks
+                .push(crate::relay::probe_relay_check(url, relay.mode).await);
+        }
+        if !tested.ok() {
+            let failed: Vec<String> = tested
+                .checks
+                .iter()
+                .filter(|c| !c.ok)
+                .map(|c| format!("{}: {}", c.name, c.detail))
+                .collect();
+            return Err(Error::Cloud(format!(
+                "{} is not ready, nothing was connected: {}",
+                p.title(),
+                if failed.is_empty() {
+                    "no checks ran".to_string()
+                } else {
+                    failed.join("; ")
+                }
+            )));
+        }
+        conn.account = tested.account.clone();
+        conn.ttl_hours = match (p.name(), ttl_hours.unwrap_or(model::DEFAULT_TTL_HOURS)) {
+            // A Modal sandbox lives at most 24 hours.
+            ("modal", 0) => 24,
+            ("modal", h) => h.min(24),
+            (_, h) => h,
+        };
+        conn.connected_at = model::rfc3339(model::now());
+        p.persist_secret()?;
+        let home = self.store.home();
+        match relay.mode {
+            cua_sandbox_core::byoc::RelayMode::Static => {
+                if let Some(tok) = relay.staged_token {
+                    crate::relay::save_static_relay_token(home.as_deref(), p.name(), tok.expose())?;
+                }
+            }
+            cua_sandbox_core::byoc::RelayMode::Account => {
+                crate::relay::clear_static_relay_token(home.as_deref(), p.name());
+            }
+        }
+        self.store.connect(conn.clone()).map_err(Error::Io)?;
+        let mut a = audit::entry("connect", p.name(), "user");
+        a.detail = format!("{} ttl {}h", conn.label(p.title()), conn.ttl_hours);
+        self.store.audit(a);
+        if make_default {
+            self.make_default(p.name())?;
+        }
+        let default_on = self.default_on();
+        Ok(CloudConnected {
+            provider: self.row(p.as_ref(), Some(&conn), &default_on),
+            checks: tested.checks,
+            next: None,
+            verify: format!("cua cloud status {}", p.name()),
+        })
+    }
 }
 
 #[async_trait]
@@ -794,19 +925,21 @@ impl CloudManager for Clouds {
         let p = self.api(&target.provider)?;
         validate_target_network_flags(p.name(), target)?;
         let existing = self.store.connection(p.name()).map_err(Error::Io)?;
+        let merged = merge_image_defaults(p.as_ref(), target, existing.as_ref())?;
         let relay = resolve_target_relay(
             self.store.home().as_deref(),
             p.name(),
-            target,
+            &merged,
             existing.as_ref(),
         )?;
-        let spacesd_download_url = resolve_target_spacesd_download_url(target, existing.as_ref())?;
-        p.stage_secret(target);
+        let spacesd_download_url = resolve_target_spacesd_download_url(&merged, existing.as_ref())?;
+        p.stage_secret(&merged);
         let _unstage = UnstageGuard(p.as_ref());
-        let mut conn = p.resolve(target)?;
+        let mut conn = p.resolve(&merged)?;
         conn.relay_url = relay.url;
         conn.relay_mode = relay.stored_mode;
         conn.spacesd_download_url = spacesd_download_url;
+        conn.max_size = existing.as_ref().and_then(|c| c.max_size);
         let mut t = p.test(&conn).await;
         if let Some(url) = relay.probe_url.as_deref() {
             t.checks
@@ -826,79 +959,8 @@ impl CloudManager for Clouds {
         make_default: bool,
         ttl_hours: Option<u32>,
     ) -> Result<CloudConnected> {
-        let p = self.api(&target.provider)?;
-        validate_target_network_flags(p.name(), target)?;
-        let existing = self.store.connection(p.name()).map_err(Error::Io)?;
-        let relay = resolve_target_relay(
-            self.store.home().as_deref(),
-            p.name(),
-            target,
-            existing.as_ref(),
-        )?;
-        let spacesd_download_url = resolve_target_spacesd_download_url(target, existing.as_ref())?;
-        p.stage_secret(target);
-        let _unstage = UnstageGuard(p.as_ref());
-        let mut conn = p.resolve(target)?;
-        conn.relay_url = relay.url;
-        conn.relay_mode = relay.stored_mode;
-        conn.spacesd_download_url = spacesd_download_url;
-        let mut tested = p.test(&conn).await;
-        if let Some(url) = relay.probe_url.as_deref() {
-            tested
-                .checks
-                .push(crate::relay::probe_relay_check(url, relay.mode).await);
-        }
-        if !tested.ok() {
-            let failed: Vec<String> = tested
-                .checks
-                .iter()
-                .filter(|c| !c.ok)
-                .map(|c| format!("{}: {}", c.name, c.detail))
-                .collect();
-            return Err(Error::Cloud(format!(
-                "{} is not ready, nothing was connected: {}",
-                p.title(),
-                if failed.is_empty() {
-                    "no checks ran".to_string()
-                } else {
-                    failed.join("; ")
-                }
-            )));
-        }
-        conn.account = tested.account.clone();
-        conn.ttl_hours = match (p.name(), ttl_hours.unwrap_or(model::DEFAULT_TTL_HOURS)) {
-            // A Modal sandbox lives at most 24 hours.
-            ("modal", 0) => 24,
-            ("modal", h) => h.min(24),
-            (_, h) => h,
-        };
-        conn.connected_at = model::rfc3339(model::now());
-        p.persist_secret()?;
-        let home = self.store.home();
-        match relay.mode {
-            cua_sandbox_core::byoc::RelayMode::Static => {
-                if let Some(tok) = relay.staged_token {
-                    crate::relay::save_static_relay_token(home.as_deref(), p.name(), tok.expose())?;
-                }
-            }
-            cua_sandbox_core::byoc::RelayMode::Account => {
-                crate::relay::clear_static_relay_token(home.as_deref(), p.name());
-            }
-        }
-        self.store.connect(conn.clone()).map_err(Error::Io)?;
-        let mut a = audit::entry("connect", p.name(), "user");
-        a.detail = format!("{} ttl {}h", conn.label(p.title()), conn.ttl_hours);
-        self.store.audit(a);
-        if make_default {
-            self.make_default(p.name())?;
-        }
-        let default_on = self.default_on();
-        Ok(CloudConnected {
-            provider: self.row(p.as_ref(), Some(&conn), &default_on),
-            checks: tested.checks,
-            next: None,
-            verify: format!("cua cloud status {}", p.name()),
-        })
+        self.connect_with_limits(target, make_default, ttl_hours, None, None)
+            .await
     }
 
     async fn connect_with(

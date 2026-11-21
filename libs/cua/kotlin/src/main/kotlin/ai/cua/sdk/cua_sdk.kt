@@ -32593,17 +32593,32 @@ data class CloudProvider (
     /**
      * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
      */
-    var `vpcId`: kotlin.String?
+    var `vpcId`: kotlin.String? = null
     ,
     /**
      * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
      */
-    var `vswitchId`: kotlin.String?
+    var `vswitchId`: kotlin.String? = null
     ,
     /**
      * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
      */
-    var `noPublicIp`: kotlin.Boolean
+    var `noPublicIp`: kotlin.Boolean = false
+    ,
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    var `windowsImageId`: kotlin.String? = null
+    ,
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    var `linuxImageId`: kotlin.String? = null
+    ,
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    var `instanceType`: kotlin.String? = null
 
 ){
 
@@ -32655,6 +32670,9 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -32693,7 +32711,10 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`) +
             FfiConverterOptionalString.allocationSize(value.`vpcId`) +
             FfiConverterOptionalString.allocationSize(value.`vswitchId`) +
-            FfiConverterBoolean.allocationSize(value.`noPublicIp`)
+            FfiConverterBoolean.allocationSize(value.`noPublicIp`) +
+            FfiConverterOptionalString.allocationSize(value.`windowsImageId`) +
+            FfiConverterOptionalString.allocationSize(value.`linuxImageId`) +
+            FfiConverterOptionalString.allocationSize(value.`instanceType`)
     )
 
     override fun write(value: CloudProvider, buf: ByteBuffer) {
@@ -32732,6 +32753,9 @@ public object FfiConverterTypeCloudProvider: FfiConverterRustBuffer<CloudProvide
             FfiConverterOptionalString.write(value.`vpcId`, buf)
             FfiConverterOptionalString.write(value.`vswitchId`, buf)
             FfiConverterBoolean.write(value.`noPublicIp`, buf)
+            FfiConverterOptionalString.write(value.`windowsImageId`, buf)
+            FfiConverterOptionalString.write(value.`linuxImageId`, buf)
+            FfiConverterOptionalString.write(value.`instanceType`, buf)
     }
 }
 
@@ -33077,6 +33101,21 @@ data class CloudTarget (
      * `aliyun-ecs` only).
      */
     var `noPublicIp`: kotlin.Boolean = false
+    ,
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    var `windowsImageId`: kotlin.String? = null
+    ,
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    var `linuxImageId`: kotlin.String? = null
+    ,
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    var `instanceType`: kotlin.String? = null
 
 ){
 
@@ -33107,6 +33146,9 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -33124,7 +33166,10 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.allocationSize(value.`spacesdDownloadUrl`) +
             FfiConverterOptionalString.allocationSize(value.`vpcId`) +
             FfiConverterOptionalString.allocationSize(value.`vswitchId`) +
-            FfiConverterBoolean.allocationSize(value.`noPublicIp`)
+            FfiConverterBoolean.allocationSize(value.`noPublicIp`) +
+            FfiConverterOptionalString.allocationSize(value.`windowsImageId`) +
+            FfiConverterOptionalString.allocationSize(value.`linuxImageId`) +
+            FfiConverterOptionalString.allocationSize(value.`instanceType`)
     )
 
     override fun write(value: CloudTarget, buf: ByteBuffer) {
@@ -33142,6 +33187,9 @@ public object FfiConverterTypeCloudTarget: FfiConverterRustBuffer<CloudTarget> {
             FfiConverterOptionalString.write(value.`vpcId`, buf)
             FfiConverterOptionalString.write(value.`vswitchId`, buf)
             FfiConverterBoolean.write(value.`noPublicIp`, buf)
+            FfiConverterOptionalString.write(value.`windowsImageId`, buf)
+            FfiConverterOptionalString.write(value.`linuxImageId`, buf)
+            FfiConverterOptionalString.write(value.`instanceType`, buf)
     }
 }
 
@@ -43044,6 +43092,22 @@ data class SandboxCreateOptions (
      * Other kinds ignore it. `None` (the default): not one.
      */
     var `forkable`: kotlin.Boolean? = null
+    ,
+    /**
+     * Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+     */
+    var `diskGb`: kotlin.UInt? = null
+    ,
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    var `cloudImageId`: kotlin.String? = null
+    ,
+    /**
+     * Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+     */
+    var `instanceType`: kotlin.String? = null
 
 ){
 
@@ -43088,6 +43152,9 @@ public object FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer<Sandb
             FfiConverterOptionalBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalBoolean.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -43119,7 +43186,10 @@ public object FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer<Sandb
             FfiConverterBoolean.allocationSize(value.`headless`) +
             FfiConverterOptionalBoolean.allocationSize(value.`spacesd`) +
             FfiConverterOptionalString.allocationSize(value.`profile`) +
-            FfiConverterOptionalBoolean.allocationSize(value.`forkable`)
+            FfiConverterOptionalBoolean.allocationSize(value.`forkable`) +
+            FfiConverterOptionalUInt.allocationSize(value.`diskGb`) +
+            FfiConverterOptionalString.allocationSize(value.`cloudImageId`) +
+            FfiConverterOptionalString.allocationSize(value.`instanceType`)
     )
 
     override fun write(value: SandboxCreateOptions, buf: ByteBuffer) {
@@ -43151,6 +43221,9 @@ public object FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer<Sandb
             FfiConverterOptionalBoolean.write(value.`spacesd`, buf)
             FfiConverterOptionalString.write(value.`profile`, buf)
             FfiConverterOptionalBoolean.write(value.`forkable`, buf)
+            FfiConverterOptionalUInt.write(value.`diskGb`, buf)
+            FfiConverterOptionalString.write(value.`cloudImageId`, buf)
+            FfiConverterOptionalString.write(value.`instanceType`, buf)
     }
 }
 
@@ -45211,6 +45284,12 @@ data class SpaceCreateOptions (
      * `None`: off. Only a Space the machine of the runtime runs itself.
      */
     var `children`: kotlin.Boolean? = null
+    ,
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    var `cloudImageId`: kotlin.String? = null
 
 ){
 
@@ -45259,6 +45338,7 @@ public object FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer<SpaceCr
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -45294,7 +45374,8 @@ public object FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer<SpaceCr
             FfiConverterOptionalBoolean.allocationSize(value.`widen`) +
             FfiConverterOptionalString.allocationSize(value.`instanceType`) +
             FfiConverterOptionalString.allocationSize(value.`region`) +
-            FfiConverterOptionalBoolean.allocationSize(value.`children`)
+            FfiConverterOptionalBoolean.allocationSize(value.`children`) +
+            FfiConverterOptionalString.allocationSize(value.`cloudImageId`)
     )
 
     override fun write(value: SpaceCreateOptions, buf: ByteBuffer) {
@@ -45330,6 +45411,7 @@ public object FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer<SpaceCr
             FfiConverterOptionalString.write(value.`instanceType`, buf)
             FfiConverterOptionalString.write(value.`region`, buf)
             FfiConverterOptionalBoolean.write(value.`children`, buf)
+            FfiConverterOptionalString.write(value.`cloudImageId`, buf)
     }
 }
 

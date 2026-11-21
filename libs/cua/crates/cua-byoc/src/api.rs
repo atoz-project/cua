@@ -56,7 +56,20 @@ pub fn target_of(c: &Connection) -> Target {
         vpc_id: c.vpc_id.clone(),
         vswitch_id: c.vswitch_id.clone(),
         no_public_ip: c.no_public_ip,
+        windows_image_id: c.windows_image_id.clone(),
+        linux_image_id: c.linux_image_id.clone(),
+        instance_type: c.instance_type.clone(),
     }
+}
+
+/// Resolved effective machine sizing (vCPUs, RAM, total hourly price including
+/// disk) returned by [`CloudApi::resolve_machine_sizing`] before `--max-size`
+/// and `--budget` preflight checks.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolvedSizing {
+    pub vcpus: u32,
+    pub memory_mb: u64,
+    pub usd_per_hour: f64,
 }
 
 /// A cloud API token in memory: never printed (`Debug` says `redacted`),
@@ -171,6 +184,38 @@ pub trait CloudApi: Send + Sync + 'static {
     /// rules is refused here, never created without them.
     fn takes_network_rules(&self) -> bool {
         false
+    }
+
+    /// Whether this cloud supports connection-level default Cloud Image IDs
+    /// (`--windows-image-id`, `--linux-image-id`) and default `--instance-type`.
+    fn supports_image_defaults(&self) -> bool {
+        false
+    }
+
+    /// Whether this cloud supports per-create `--cloud-image-id`, `--instance-type`,
+    /// and `--disk` / `disk_gb` overrides.
+    fn supports_custom_image_and_sizing(&self) -> bool {
+        false
+    }
+
+    /// Resolves effective machine sizing (vCPUs, memory, hourly cost including
+    /// disk) and validates disk bounds before `--max-size`/`--budget` checks.
+    async fn resolve_machine_sizing(
+        &self,
+        _conn: &Connection,
+        _spec: &ProvisionSpec,
+    ) -> Result<Option<ResolvedSizing>> {
+        Ok(None)
+    }
+
+    /// Resolves and validates the Cloud Image ID for `spec` (precedence:
+    /// per-create -> connection default -> official fallback) before provisioning.
+    async fn resolve_provision_image(
+        &self,
+        _conn: &Connection,
+        _spec: &ProvisionSpec,
+    ) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Whether this machine has the cloud's CLI sign-in or config, and

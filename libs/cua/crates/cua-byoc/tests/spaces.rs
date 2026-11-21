@@ -427,3 +427,35 @@ async fn static_relay_cloud_space_works_without_cua_auth_login() {
     assert!(fake.account.lock().unwrap().resources.is_empty());
     assert!(spaces.list().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn spaces_create_forwards_cloud_image_id_disk_gb_and_instance_type_to_provider() {
+    let w = world().await;
+    {
+        let mut acct = w.fake.account.lock().unwrap();
+        acct.allow_custom_image_and_sizing = true;
+        acct.supported_oses = Some(&["linux", "windows"]);
+    }
+    let created = w
+        .spaces
+        .create(SpaceCreate {
+            on: Some(On::Provider("aws".into())),
+            image: Some("windows".into()),
+            name: Some("Win Space".into()),
+            disk_gb: Some(90),
+            instance_type: Some("ecs.c7.2xlarge".into()),
+            cloud_image_id: Some("m-win11-space".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .ready()
+        .unwrap();
+    assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
+    let specs = w.fake.account.lock().unwrap().specs.clone();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].cloud_image_id.as_deref(), Some("m-win11-space"));
+    assert_eq!(specs[0].disk_gb, 90);
+    assert_eq!(specs[0].machine_type, "ecs.c7.2xlarge");
+    assert_eq!(specs[0].family, "windows");
+}

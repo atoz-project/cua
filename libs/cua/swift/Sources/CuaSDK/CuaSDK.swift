@@ -22457,6 +22457,18 @@ public struct CloudProvider: Equatable, Hashable {
      * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
      */
     public var noPublicIp: Bool
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    public var windowsImageId: String?
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    public var linuxImageId: String?
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    public var instanceType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -22543,13 +22555,22 @@ public struct CloudProvider: Equatable, Hashable {
          */spacesdDownloadUrl: String? = nil,
         /**
          * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
-         */vpcId: String?,
+         */vpcId: String? = nil,
         /**
          * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
-         */vswitchId: String?,
+         */vswitchId: String? = nil,
         /**
          * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
-         */noPublicIp: Bool) {
+         */noPublicIp: Bool = false,
+        /**
+         * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+         */windowsImageId: String? = nil,
+        /**
+         * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+         */linuxImageId: String? = nil,
+        /**
+         * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+         */instanceType: String? = nil) {
         self.name = name
         self.title = title
         self.tier = tier
@@ -22585,6 +22606,9 @@ public struct CloudProvider: Equatable, Hashable {
         self.vpcId = vpcId
         self.vswitchId = vswitchId
         self.noPublicIp = noPublicIp
+        self.windowsImageId = windowsImageId
+        self.linuxImageId = linuxImageId
+        self.instanceType = instanceType
     }
 
 
@@ -22637,7 +22661,10 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
                 spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf),
                 vpcId: FfiConverterOptionString.read(from: &buf),
                 vswitchId: FfiConverterOptionString.read(from: &buf),
-                noPublicIp: FfiConverterBool.read(from: &buf)
+                noPublicIp: FfiConverterBool.read(from: &buf),
+                windowsImageId: FfiConverterOptionString.read(from: &buf),
+                linuxImageId: FfiConverterOptionString.read(from: &buf),
+                instanceType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -22677,6 +22704,9 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.vpcId, into: &buf)
         FfiConverterOptionString.write(value.vswitchId, into: &buf)
         FfiConverterBool.write(value.noPublicIp, into: &buf)
+        FfiConverterOptionString.write(value.windowsImageId, into: &buf)
+        FfiConverterOptionString.write(value.linuxImageId, into: &buf)
+        FfiConverterOptionString.write(value.instanceType, into: &buf)
     }
 }
 
@@ -23108,6 +23138,18 @@ public struct CloudTarget: Equatable, Hashable {
      * `aliyun-ecs` only).
      */
     public var noPublicIp: Bool
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    public var windowsImageId: String?
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    public var linuxImageId: String?
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    public var instanceType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -23161,7 +23203,16 @@ public struct CloudTarget: Equatable, Hashable {
         /**
          * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
          * `aliyun-ecs` only).
-         */noPublicIp: Bool = false) {
+         */noPublicIp: Bool = false,
+        /**
+         * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+         */windowsImageId: String? = nil,
+        /**
+         * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+         */linuxImageId: String? = nil,
+        /**
+         * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+         */instanceType: String? = nil) {
         self.provider = provider
         self.profile = profile
         self.region = region
@@ -23176,6 +23227,9 @@ public struct CloudTarget: Equatable, Hashable {
         self.vpcId = vpcId
         self.vswitchId = vswitchId
         self.noPublicIp = noPublicIp
+        self.windowsImageId = windowsImageId
+        self.linuxImageId = linuxImageId
+        self.instanceType = instanceType
     }
 
 
@@ -23207,7 +23261,10 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
                 spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf),
                 vpcId: FfiConverterOptionString.read(from: &buf),
                 vswitchId: FfiConverterOptionString.read(from: &buf),
-                noPublicIp: FfiConverterBool.read(from: &buf)
+                noPublicIp: FfiConverterBool.read(from: &buf),
+                windowsImageId: FfiConverterOptionString.read(from: &buf),
+                linuxImageId: FfiConverterOptionString.read(from: &buf),
+                instanceType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -23226,6 +23283,9 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.vpcId, into: &buf)
         FfiConverterOptionString.write(value.vswitchId, into: &buf)
         FfiConverterBool.write(value.noPublicIp, into: &buf)
+        FfiConverterOptionString.write(value.windowsImageId, into: &buf)
+        FfiConverterOptionString.write(value.linuxImageId, into: &buf)
+        FfiConverterOptionString.write(value.instanceType, into: &buf)
     }
 }
 
@@ -36429,6 +36489,19 @@ public struct SandboxCreateOptions: Equatable, Hashable {
      * Other kinds ignore it. `None` (the default): not one.
      */
     public var forkable: Bool?
+    /**
+     * Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+     */
+    public var diskGb: UInt32?
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    public var cloudImageId: String?
+    /**
+     * Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+     */
+    public var instanceType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -36565,7 +36638,17 @@ public struct SandboxCreateOptions: Equatable, Hashable {
          * shared file, so its checkpoints take milliseconds and forks of them
          * share its pages ([`Sandboxes::checkpoint`], [`Sandboxes::fork`]).
          * Other kinds ignore it. `None` (the default): not one.
-         */forkable: Bool? = nil) {
+         */forkable: Bool? = nil,
+        /**
+         * Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+         */diskGb: UInt32? = nil,
+        /**
+         * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+         * distinct from `image` (the Sandbox Image).
+         */cloudImageId: String? = nil,
+        /**
+         * Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+         */instanceType: String? = nil) {
         self.on = on
         self.kind = kind
         self.runtime = runtime
@@ -36594,6 +36677,9 @@ public struct SandboxCreateOptions: Equatable, Hashable {
         self.spacesd = spacesd
         self.profile = profile
         self.forkable = forkable
+        self.diskGb = diskGb
+        self.cloudImageId = cloudImageId
+        self.instanceType = instanceType
     }
 
 
@@ -36639,7 +36725,10 @@ public struct FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer {
                 headless: FfiConverterBool.read(from: &buf),
                 spacesd: FfiConverterOptionBool.read(from: &buf),
                 profile: FfiConverterOptionString.read(from: &buf),
-                forkable: FfiConverterOptionBool.read(from: &buf)
+                forkable: FfiConverterOptionBool.read(from: &buf),
+                diskGb: FfiConverterOptionUInt32.read(from: &buf),
+                cloudImageId: FfiConverterOptionString.read(from: &buf),
+                instanceType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -36672,6 +36761,9 @@ public struct FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer {
         FfiConverterOptionBool.write(value.spacesd, into: &buf)
         FfiConverterOptionString.write(value.profile, into: &buf)
         FfiConverterOptionBool.write(value.forkable, into: &buf)
+        FfiConverterOptionUInt32.write(value.diskGb, into: &buf)
+        FfiConverterOptionString.write(value.cloudImageId, into: &buf)
+        FfiConverterOptionString.write(value.instanceType, into: &buf)
     }
 }
 
@@ -39395,6 +39487,11 @@ public struct SpaceCreateOptions: Equatable, Hashable {
      * `None`: off. Only a Space the machine of the runtime runs itself.
      */
     public var children: Bool?
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    public var cloudImageId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -39549,7 +39646,11 @@ public struct SpaceCreateOptions: Equatable, Hashable {
         /**
          * Lets the Space make child Spaces of its own ([`Spaces::set_children`]).
          * `None`: off. Only a Space the machine of the runtime runs itself.
-         */children: Bool? = nil) {
+         */children: Bool? = nil,
+        /**
+         * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+         * distinct from `image` (the Sandbox Image).
+         */cloudImageId: String? = nil) {
         self.image = image
         self.on = on
         self.kind = kind
@@ -39582,6 +39683,7 @@ public struct SpaceCreateOptions: Equatable, Hashable {
         self.instanceType = instanceType
         self.region = region
         self.children = children
+        self.cloudImageId = cloudImageId
     }
 
 
@@ -39631,7 +39733,8 @@ public struct FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer {
                 widen: FfiConverterOptionBool.read(from: &buf),
                 instanceType: FfiConverterOptionString.read(from: &buf),
                 region: FfiConverterOptionString.read(from: &buf),
-                children: FfiConverterOptionBool.read(from: &buf)
+                children: FfiConverterOptionBool.read(from: &buf),
+                cloudImageId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -39668,6 +39771,7 @@ public struct FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.instanceType, into: &buf)
         FfiConverterOptionString.write(value.region, into: &buf)
         FfiConverterOptionBool.write(value.children, into: &buf)
+        FfiConverterOptionString.write(value.cloudImageId, into: &buf)
     }
 }
 

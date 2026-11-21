@@ -260,6 +260,9 @@ impl Provider for StopStart {
             max_memory_mb: None,
             credential_env: &[],
             gpus: vec![],
+            oses: vec!["linux"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
         }
     }
 

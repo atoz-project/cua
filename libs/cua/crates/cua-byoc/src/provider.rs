@@ -430,10 +430,14 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
+        let oses = self.api.supported_oses().to_vec();
         let mut kinds = vec![RunKind::Container];
-        if self.api.runtimes().iter().any(|r| r.as_str() == "native") {
+        if self.api.runtimes().iter().any(|r| r.as_str() == "native")
+            || oses.iter().any(|o| o.eq_ignore_ascii_case("windows"))
+        {
             kinds.push(RunKind::Vm);
         }
+        let custom = self.api.supports_custom_image_and_sizing();
         ProviderCapabilities {
             kinds,
             // The default engine (`--runtime` picks another where offered).
@@ -456,6 +460,9 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             credential_env: &[],
             // No GPU in your cloud (yet): GPU machine types are off.
             gpus: vec![],
+            oses,
+            custom_disk_gb: custom,
+            custom_cloud_image: custom,
         }
     }
 
@@ -480,7 +487,24 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
 
     async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
         let conn = self.connection()?;
-        let family = family_of(&spec.image.reference);
+        let family = if spec.os.eq_ignore_ascii_case("windows") {
+            "windows"
+        } else if spec.os.eq_ignore_ascii_case("macos") {
+            "macos"
+        } else if spec.os.eq_ignore_ascii_case("linux") {
+            let r = spec.image.reference.to_ascii_lowercase();
+            if r.contains("macos") {
+                "macos"
+            } else if r.contains("omarchy") {
+                "omarchy"
+            } else if r.contains("-slim") {
+                "linux-slim"
+            } else {
+                "linux"
+            }
+        } else {
+            family_of(&spec.image.reference)
+        };
         let kinds = self.api.kinds(&conn);
         let offer = kinds.iter().find(|k| k.image == family).ok_or_else(|| {
             Error::UnsupportedImage(format!(
@@ -549,20 +573,50 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             };
             ("container", rt)
         };
-        // Say a budget share passed before a new machine adds to it.
-        crate::alerts::check_all(&self.store, now());
-        let (check_cpus, check_mem) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
-        crate::limits::check_new_machine(
-            &conn,
-            self.api.title(),
-            check_cpus,
-            check_mem,
-            offer.usd_per_hour,
-            self.store
-                .spent_for_limits(&conn, now())
-                .await
-                .map_err(Self::io)?,
+        if spec.disk_gb == Some(0) {
+            return Err(Error::InvalidArgument(
+                "disk_gb must be greater than 0".into(),
+            ));
+        }
+        let cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            spec.cloud_image_id.as_deref(),
         )?;
+        let spec_instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            spec.instance_type.as_deref(),
+        )?;
+        if !self.api.supports_custom_image_and_sizing() {
+            if spec.disk_gb.is_some() {
+                return Err(Error::InvalidArgument(
+                    "disk_gb sizes local VMs only: provider sandboxes boot the image's disk".into(),
+                ));
+            }
+            if cloud_image_id.is_some() {
+                return Err(cua_sandbox_core::provider::unsupported(
+                    self.api.name(),
+                    "custom Cloud Image IDs (--cloud-image-id)",
+                ));
+            }
+            if spec_instance_type.is_some() {
+                return Err(cua_sandbox_core::provider::unsupported(
+                    self.api.name(),
+                    "custom instance types (--instance-type)",
+                ));
+            }
+        }
+        let machine_type = spec_instance_type
+            .or_else(|| {
+                conn.instance_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| offer.machine_type.clone());
+        let disk_gb = spec
+            .disk_gb
+            .unwrap_or_else(|| self.api.default_disk_gb(family));
         let owner = self.store.owner_id().map_err(Self::io)?;
         let created = now();
         let ttl_secs = match spec.ttl {
@@ -599,6 +653,55 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 self.api.title()
             )));
         };
+        let desktop_password = if family == "windows" {
+            Some(crate::bootstrap_win::generate_desktop_password())
+        } else {
+            None
+        };
+        let mut provision = ProvisionSpec {
+            name: resource_name.clone(),
+            family: family.into(),
+            image: spec.image.pinned_ref.clone(),
+            kind: effective_kind.into(),
+            machine_type: machine_type.clone(),
+            disk_gb,
+            cpus: Some(spec.cpus),
+            memory_mb: Some(spec.memory_mb),
+            tags: BTreeMap::new(),
+            ttl_secs,
+            arch: spec.image.arch.clone(),
+            runtime: effective_runtime.clone(),
+            network,
+            spacesd_download_url: conn.spacesd_download_url.clone(),
+            desktop_password: desktop_password.clone(),
+            cloud_image_id,
+            ..Default::default()
+        };
+        // Say a budget share passed before a new machine adds to it.
+        crate::alerts::check_all(&self.store, now());
+        let sizing = self.api.resolve_machine_sizing(&conn, &provision).await?;
+        let (eff_cpus, eff_mem_mb, eff_usd) = match sizing {
+            Some(s) => (Some(s.vcpus), Some(s.memory_mb), s.usd_per_hour),
+            None => {
+                let (c, m) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
+                (c, m, offer.usd_per_hour)
+            }
+        };
+        crate::limits::check_new_machine_with_disk(
+            &conn,
+            self.api.title(),
+            eff_cpus,
+            eff_mem_mb,
+            Some(disk_gb),
+            eff_usd,
+            self.store
+                .spent_for_limits(&conn, now())
+                .await
+                .map_err(Self::io)?,
+        )?;
+        if let Some(resolved_image) = self.api.resolve_provision_image(&conn, &provision).await? {
+            provision.cloud_image_id = Some(resolved_image);
+        }
         // 1. The relay machine the sandbox joins as (account registration or static token).
         let (join, static_env_token) = match &resolved_relay {
             ResolvedConnectionRelay::Account(relay) => {
@@ -675,12 +778,9 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             state: "pending".into(),
             ..Default::default()
         };
+        rec.extra.insert(detail::MACHINE_TYPE.into(), machine_type);
         rec.extra
-            .insert(detail::MACHINE_TYPE.into(), offer.machine_type.clone());
-        rec.extra.insert(
-            detail::USD_PER_HOUR.into(),
-            format!("{:.4}", offer.usd_per_hour),
-        );
+            .insert(detail::USD_PER_HOUR.into(), format!("{eff_usd:.4}"));
         if matches!(self.api.tier(), Tier::Vm) {
             let detail_rt = if effective_runtime == "native" {
                 "native"
@@ -701,29 +801,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             "ok",
             "recorded before the cloud call",
         ));
-        let desktop_password = if family == "windows" {
-            Some(crate::bootstrap_win::generate_desktop_password())
-        } else {
-            None
-        };
-        let mut provision = ProvisionSpec {
-            name: resource_name,
-            family: family.into(),
-            image: spec.image.pinned_ref.clone(),
-            kind: effective_kind.into(),
-            machine_type: offer.machine_type.clone(),
-            disk_gb: self.api.default_disk_gb(family),
-            cpus: Some(spec.cpus),
-            memory_mb: Some(spec.memory_mb),
-            tags: rec.tags.clone(),
-            ttl_secs,
-            arch: spec.image.arch.clone(),
-            runtime: effective_runtime,
-            network,
-            spacesd_download_url: conn.spacesd_download_url.clone(),
-            desktop_password: desktop_password.clone(),
-            ..Default::default()
-        };
+        provision.tags = rec.tags.clone();
         match self.api.tier() {
             Tier::Vm if family == "windows" => {
                 provision.user_data = windows_user_data(&WindowsVmBoot {

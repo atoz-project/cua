@@ -193,6 +193,13 @@ pub struct CreateSpace {
     /// Memory for each Space, in MiB. Default: the location's default size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u64>,
+    /// Grow the boot disk to this many GiB (local VMs and `aliyun-ecs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<u32>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_image_id: Option<String>,
     /// Return a reachable registered Space in the same location that has
     /// the requested services instead of creating one (get-or-create).
     /// Default false.
@@ -2154,6 +2161,15 @@ pub struct CloudTarget {
     /// `aliyun-ecs` only).
     #[serde(default)]
     pub no_public_ip: Option<bool>,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 fn redact_url(raw: &str) -> String {
@@ -2220,6 +2236,9 @@ impl std::fmt::Debug for CloudTarget {
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
             .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }

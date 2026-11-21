@@ -75,6 +75,7 @@ pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Resul
     crate::manager::validate_target_network_flags(p.name(), &req.target)?;
     let limits = limits_of(req)?;
     let existing = clouds.store().connection(p.name()).map_err(Error::Io)?;
+    let _ = crate::manager::merge_image_defaults(p.as_ref(), &req.target, existing.as_ref())?;
     let relay = crate::manager::resolve_target_relay(
         clouds.store().home().as_deref(),
         p.name(),
@@ -357,6 +358,7 @@ async fn connect_sealed(
                 s.limits.max_size.map(|m| MaxSize {
                     vcpu: m.vcpu,
                     mem_gib: m.memory_gib,
+                    disk_gib: None,
                 })
             })
         })
@@ -553,6 +555,7 @@ async fn connect_sealed(
         .map(|m| MaxSize {
             vcpu: m.vcpu,
             mem_gib: m.memory_gib,
+            disk_gib: None,
         })
         .or(max_size);
     crate::relay::clear_static_relay_token(store.home().as_deref(), name);
@@ -626,19 +629,15 @@ async fn connect_cli(
     req: &ConnectRequest,
     limits: &Limits,
 ) -> Result<CloudConnected> {
-    use cua_sandbox_core::byoc::CloudManager as _;
     let mut c = clouds
-        .connect(&req.target, req.make_default, req.ttl_hours)
+        .connect_with_limits(
+            &req.target,
+            req.make_default,
+            req.ttl_hours,
+            limits.budget,
+            limits.max_size,
+        )
         .await?;
-    if limits.budget.is_some() || limits.max_size.is_some() {
-        let store = clouds.store();
-        if let Some(mut conn) = store.connection(p.name()).map_err(Error::Io)? {
-            conn.budget_usd_month = limits.budget.or(conn.budget_usd_month);
-            conn.max_size = limits.max_size.or(conn.max_size);
-            store.connect(conn.clone()).map_err(Error::Io)?;
-            c.provider = clouds.row(p, Some(&conn), &clouds.default_on());
-        }
-    }
     c.provider.status = status::CONNECTED.into();
     c.verify = format!("cua cloud status {}", p.name());
     Ok(c)
@@ -1345,6 +1344,7 @@ async fn connect_oidc(
                 s.limits.max_size.map(|m| MaxSize {
                     vcpu: m.vcpu,
                     mem_gib: m.memory_gib,
+                    disk_gib: None,
                 })
             })
         })
@@ -1500,6 +1500,7 @@ async fn connect_oidc(
         .map(|m| MaxSize {
             vcpu: m.vcpu,
             mem_gib: m.memory_gib,
+            disk_gib: None,
         })
         .or(max_size);
     let mut candidate = fed.candidate(&server.id, &recorded, &region, req, local.as_ref());
@@ -1829,6 +1830,7 @@ pub(crate) async fn merge_server_status(
                                     MaxSize {
                                         vcpu: m.vcpu,
                                         mem_gib: m.memory_gib,
+                                        disk_gib: None,
                                     }
                                     .to_string()
                                 })
@@ -1927,6 +1929,7 @@ pub(crate) async fn approve_with(
             saved.max_size = Some(MaxSize {
                 vcpu: m.vcpu,
                 mem_gib: m.memory_gib,
+                disk_gib: None,
             });
         }
         if server.status == "revoked" {

@@ -467,6 +467,9 @@ Request for `SandboxService.CreateSandbox`.
 | `profile` | 40 | `string` | Size profile: "rollout" or "default". |
 | `spacesd` | 41 | optional `bool` | Inject cua-spacesd into an image without it. Unset: yes. |
 | `local_pool` | 42 | `string` | A local pool (`PoolService`): the sandbox takes its image and shape. (4, the Cua Cloud pool, is reserved.) |
+| `disk_gb` | 43 | `uint32` | Grow a cloud VM's boot disk to this many GiB (0 uses the provider/OS default). |
+| `cloud_image_id` | 44 | `string` | Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`), distinct from `image` (the Sandbox Image). |
+| `instance_type` | 45 | `string` | Per-create cloud instance type override (e.g. `ecs.g7.xlarge`). |
 
 ### CreateSandboxResponse
 

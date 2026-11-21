@@ -1221,6 +1221,10 @@ pub struct SpaceCreateOptions {
     /// `None`: off. Only a Space the machine of the runtime runs itself.
     #[uniffi(default = None)]
     pub children: Option<bool>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    #[uniffi(default = None)]
+    pub cloud_image_id: Option<String>,
 }
 
 impl SpaceCreateOptions {
@@ -3794,13 +3798,26 @@ impl SpacesToolCaller {
         if fields.is_empty() {
             return Ok(());
         }
-        let listed = d
+        let listed = match d
             .spaces()
             .list_space_tools(dpb::ListSpaceToolsRequest {})
             .await
-            .map_err(daemon_err)?
-            .into_inner()
-            .tools_json;
+        {
+            Ok(r) => r.into_inner().tools_json,
+            Err(e) if e.code() == tonic::Code::Unimplemented => {
+                let version = d
+                    .info()
+                    .await
+                    .map(|i| format!(" (cua {})", i.version))
+                    .unwrap_or_default();
+                return Err(CuaError::CapabilityMissing(format!(
+                    "the cua daemon{version} is too old to {what} (it does not list Spaces \
+                     tools), so nothing was changed; update cua and restart its daemon (`cua \
+                     daemon stop`, then run this again, or quit and reopen Cua Spaces)"
+                )));
+            }
+            Err(e) => return Err(daemon_err(e)),
+        };
         let missing = missing_fields(&listed, tool, fields);
         if missing.is_empty() {
             return Ok(());
@@ -3869,6 +3886,9 @@ mod require_fields_tests {
             "vpc_id",
             "vswitch_id",
             "no_public_ip",
+            "windows_image_id",
+            "linux_image_id",
+            "instance_type",
         ];
         assert!(missing_fields(&ours, "cloud_connect", &all).is_empty());
         assert!(
@@ -3883,10 +3903,60 @@ mod require_fields_tests {
                     "vpc_id",
                     "vswitch_id",
                     "no_public_ip",
+                    "windows_image_id",
+                    "linux_image_id",
+                    "instance_type",
                 ]
             )
             .is_empty()
         );
+        assert!(missing_fields(&ours, "create_space", &["cloud_image_id"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn space_create_rejects_disk_zero_and_whitespace_cloud_image_or_instance_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = crate::Cua::embedded(crate::CuaConfig {
+            state_dir: Some(dir.path().join("sandboxes").display().to_string()),
+            spaces_home: Some(dir.path().display().to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .spaces();
+        let zero = super::SpaceCreateOptions {
+            on: Some("aliyun-ecs".into()),
+            disk_gb: Some(0),
+            ..Default::default()
+        };
+        let err = spaces.create(zero).await.unwrap_err();
+        assert!(
+            matches!(err, crate::CuaError::InvalidArgument(_)),
+            "{err:?}"
+        );
+
+        for bad in ["", "   ", "m-foo bar"] {
+            let img = super::SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                cloud_image_id: Some(bad.into()),
+                ..Default::default()
+            };
+            let err = spaces.create(img).await.unwrap_err();
+            assert!(
+                matches!(err, crate::CuaError::InvalidArgument(_)),
+                "{err:?}"
+            );
+
+            let inst = super::SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                instance_type: Some(bad.into()),
+                ..Default::default()
+            };
+            let err = spaces.create(inst).await.unwrap_err();
+            assert!(
+                matches!(err, crate::CuaError::InvalidArgument(_)),
+                "{err:?}"
+            );
+        }
     }
 
     struct Nothing;
@@ -4439,7 +4509,21 @@ impl Spaces {
                     .into(),
             ));
         }
+        if options.disk_gb == Some(0) {
+            return Err(CuaError::InvalidArgument(
+                "disk_gb must be greater than 0".into(),
+            ));
+        }
+        let cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            options.cloud_image_id.as_deref(),
+        )?;
+        let instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            options.instance_type.as_deref(),
+        )?;
         let host = self.host.clone();
+        let tool_caller = self.tool_caller();
         run(async move {
             match &host {
                 Host::Embedded(s) => {
@@ -4477,10 +4561,11 @@ impl Spaces {
                             network_settings: network_settings.clone(),
                             parent: text(&options.parent),
                             widen: options.widen.unwrap_or(false),
-                            instance_type: text(&options.instance_type),
+                            instance_type: instance_type.clone(),
                             region: text(&options.region),
                             tree: None,
                             relay: None,
+                            cloud_image_id: cloud_image_id.clone(),
                         })
                         .await?;
                     if options.children == Some(true)
@@ -4502,6 +4587,34 @@ impl Spaces {
                     })
                 }
                 Host::Daemon(d) => {
+                    let mut required: Vec<&str> = Vec::new();
+                    if cloud_image_id.is_some() {
+                        required.push("cloud_image_id");
+                    }
+                    if options.disk_gb.is_some()
+                        && matches!(on, Some(cua_sandbox_core::placement::On::Provider(_)))
+                    {
+                        required.push("disk_gb");
+                    }
+                    if !required.is_empty() {
+                        let what = if cloud_image_id.is_some() {
+                            "create a Space with a custom Cloud Image ID"
+                        } else {
+                            "create a cloud Space with a custom disk size"
+                        };
+                        tool_caller
+                            .require_fields("create_space", &required, what)
+                            .await?;
+                    }
+                    if instance_type.is_some()
+                        && matches!(
+                            on,
+                            Some(cua_sandbox_core::placement::On::Provider(ref p)) if p == "aliyun-ecs"
+                        )
+                    {
+                        d.require_cloud_image_and_sizing(&["instance_type"])
+                            .await?;
+                    }
                     let request = dpb::CreateSpaceRequest {
                         image: options.image.unwrap_or_default(),
                         location: on.map(|o| o.to_string()).unwrap_or_default(),
@@ -4537,9 +4650,10 @@ impl Spaces {
                         network_settings: network_settings.as_ref().map(cua_spaces::network::to_pb),
                         parent: options.parent.clone().unwrap_or_default(),
                         widen: options.widen.unwrap_or(false),
-                        instance_type: options.instance_type.clone().unwrap_or_default(),
+                        instance_type: instance_type.clone().unwrap_or_default(),
                         region: options.region.clone().unwrap_or_default(),
                         children: options.children,
+                        cloud_image_id: cloud_image_id.clone().unwrap_or_default(),
                     };
                     let r = match listener {
                         Some(l) => daemon_create_streaming(d, request, l).await?,

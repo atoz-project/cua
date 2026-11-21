@@ -508,6 +508,8 @@ Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
     cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
   Optional existing VPC attachment and private-only networking (--no-public-ip):
     cua cloud connect aliyun-ecs --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
+  Optional default Cloud Image IDs and instance type:
+    cua cloud connect aliyun-ecs --windows-image-id m-win11 --linux-image-id m-ubuntu --instance-type ecs.c7.2xlarge
   Verify: cua cloud status aliyun-ecs
 
 Self-hosted relay (per connection, default https://relay.cua.ai in Account Relay Mode):
@@ -540,6 +542,9 @@ cua cloud connect [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-connect--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Optional custom `cua-spacesd` binary mirror URL for Windows Direct VM provisioning (with optional `#sha256=<64 hex>` fragment). |
 | <span id="cua-cloud-connect--vpc-id"></span>`--vpc-id` | string |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `--vswitch-id`. |
 | <span id="cua-cloud-connect--vswitch-id"></span>`--vswitch-id` | string |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `--vpc-id`. |
+| <span id="cua-cloud-connect--windows-image-id"></span>`--windows-image-id` | string |  | Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g. golden Windows 10/11/Server image) for Windows sandboxes. |
+| <span id="cua-cloud-connect--linux-image-id"></span>`--linux-image-id` | string |  | Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux sandboxes. |
+| <span id="cua-cloud-connect--instance-type"></span>`--instance-type` | string |  | Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`). |
 | <span id="cua-cloud-connect--ttl-hours"></span>`--ttl-hours` | integer |  | Delete each Space there after this many hours (default 8; 0: never; Modal caps a sandbox at 24; a Hetzner server shuts itself down then and `cua cloud sweep --delete` removes it). |
 | <span id="cua-cloud-connect--budget"></span>`--budget` | number |  | The most Cua may spend there per calendar month, in US dollars. New machines are refused once it is reached; stopping and deleting always works. Needed with --oidc. |
 | <span id="cua-cloud-connect--max-size"></span>`--max-size` | string |  | The largest machine Cua may create there: vCPUs x GB, for example 4x16. |
@@ -671,6 +676,9 @@ cua cloud test [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-test--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Optional custom `cua-spacesd` binary mirror URL for Windows Direct VM provisioning (with optional `#sha256=<64 hex>` fragment). |
 | <span id="cua-cloud-test--vpc-id"></span>`--vpc-id` | string |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `--vswitch-id`. |
 | <span id="cua-cloud-test--vswitch-id"></span>`--vswitch-id` | string |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `--vpc-id`. |
+| <span id="cua-cloud-test--windows-image-id"></span>`--windows-image-id` | string |  | Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g. golden Windows 10/11/Server image) for Windows sandboxes. |
+| <span id="cua-cloud-test--linux-image-id"></span>`--linux-image-id` | string |  | Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux sandboxes. |
+| <span id="cua-cloud-test--instance-type"></span>`--instance-type` | string |  | Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`). |
 | <span id="cua-cloud-test--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store. |
 | <span id="cua-cloud-test--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). |
 | <span id="cua-cloud-test--no-public-ip"></span>`--no-public-ip` | boolean | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
