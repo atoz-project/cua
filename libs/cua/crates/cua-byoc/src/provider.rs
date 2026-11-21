@@ -691,15 +691,16 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         // Say a budget share passed before a new machine adds to it.
         crate::alerts::check_all(&self.store, now());
         let sizing = self.api.resolve_machine_sizing(&conn, &provision).await?;
-        let (eff_cpus, eff_mem_mb, eff_usd) = match sizing {
+        let (eff_cpus, eff_mem_mb, eff_disk_gb, eff_usd) = match sizing {
             Some(s) => (
                 Some(s.vcpus.max(spec.cpus)),
                 Some(s.memory_mb.max(spec.memory_mb)),
+                s.disk_gb.unwrap_or(disk_gb),
                 s.usd_per_hour,
             ),
             None => {
                 let (c, m) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
-                (c, m, offer.usd_per_hour)
+                (c, m, disk_gb, offer.usd_per_hour)
             }
         };
         crate::limits::check_new_machine_with_disk(
@@ -707,7 +708,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             self.api.title(),
             eff_cpus,
             eff_mem_mb,
-            Some(disk_gb),
+            Some(eff_disk_gb),
             eff_usd,
             self.store
                 .spent_for_limits(&conn, now())

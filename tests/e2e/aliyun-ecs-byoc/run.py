@@ -228,9 +228,20 @@ def _is_e2e_leaked_resource(item: dict, run_id: str, owner: str | None = None) -
         return False
     space = tags.get("cua-space", "")
     created_by = tags.get("cua-created-by", "")
+    res_owner = tags.get("cua-owner", "")
     if space.startswith(f"cua-e2e-{run_id}-") or created_by == f"cua-e2e-{run_id}":
         return True
-    if owner and tags.get("cua-owner") == owner:
+    if owner and res_owner == owner:
+        return True
+    name = (
+        item.get("SecurityGroupName")
+        or item.get("VpcName")
+        or item.get("InstanceName")
+        or ""
+    )
+    if name in ("cua-sandboxes-dryrun", "cua-sb-dryrun"):
+        return True
+    if not space and not created_by and not res_owner:
         return True
     return False
 

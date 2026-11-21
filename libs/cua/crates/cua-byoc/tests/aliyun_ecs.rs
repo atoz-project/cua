@@ -1195,20 +1195,31 @@ fn sb_create_opts(name: &str) -> CreateOptions {
 }
 
 #[tokio::test]
-async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
+async fn test_permissions_dry_runs_vpc_and_creates_zero_security_groups() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
     let (api, s, _) = start(None).await;
     api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
 
-    // 1. Passing test sends Tag.1.Key=cua-managed on RunInstances, CreateVpc, CreateSecurityGroup DryRun=true.
+    // 1. Passing test sends Tag.1.Key=cua-managed on RunInstances and CreateVpc DryRun=true,
+    //    and NEVER calls CreateSecurityGroup (which ignores DryRun=true on real Alibaba Cloud).
     let t = api.test(&conn(&api)).await;
     assert!(t.ok(), "{:?}", t.checks);
     {
         let f = s.lock().unwrap();
-        assert!(f.vpcs.is_empty() && f.security_groups.is_empty() && f.instances.is_empty());
-        for action in ["RunInstances", "CreateVpc", "CreateSecurityGroup"] {
+        assert!(
+            f.vpcs.is_empty() && f.security_groups.is_empty() && f.instances.is_empty(),
+            "test must create zero resources: vpcs={:?} sgs={:?} inst={:?}",
+            f.vpcs,
+            f.security_groups,
+            f.instances
+        );
+        assert!(
+            !f.calls.iter().any(|c| c.action == "CreateSecurityGroup"),
+            "AliyunEcs::test() must never call CreateSecurityGroup (DryRun=true is ignored live)"
+        );
+        for action in ["RunInstances", "CreateVpc"] {
             let call = f
                 .calls
                 .iter()
@@ -1226,8 +1237,55 @@ async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
         }
     }
 
-    // 2. Forbidden.RAM on vpc:CreateVpc or ecs:CreateSecurityGroup fails permissions (never swallowed).
-    for perm_action in ["vpc:CreateVpc", "ecs:CreateSecurityGroup"] {
+    // 1b. Even when the account already has a pre-existing unrelated VPC/VSwitch, `test()`
+    //     creates ZERO security groups and leaves the existing VPC/VSwitch untouched.
+    {
+        let mut f = s.lock().unwrap();
+        f.calls.clear();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-unrelated",
+            "VpcName": "cua-relay-sg-vpc",
+            "CidrBlock": "10.0.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": [
+                { "TagKey": "role", "TagValue": "cua-relay" },
+                { "TagKey": "managed-by", "TagValue": "manual" }
+            ]}
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-unrelated",
+            "VSwitchName": "cua-relay-sg-vsw",
+            "VpcId": "vpc-unrelated",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.0.1.0/24",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+    }
+    let t_pre = api.test(&conn(&api)).await;
+    assert!(t_pre.ok(), "{:?}", t_pre.checks);
+    {
+        let f = s.lock().unwrap();
+        assert!(
+            f.security_groups.is_empty(),
+            "test() must create zero security groups even with pre-existing VPC: {:?}",
+            f.security_groups
+        );
+        assert!(
+            !f.calls.iter().any(|c| c.action == "CreateSecurityGroup"),
+            "CreateSecurityGroup must not be called when pre-existing VPC exists"
+        );
+    }
+
+    // 2. Forbidden.RAM on vpc:CreateVpc, ecs:DescribeSecurityGroups, or ecs:RunInstances fails permissions.
+    for perm_action in [
+        "vpc:CreateVpc",
+        "ecs:DescribeSecurityGroups",
+        "ecs:RunInstances",
+    ] {
         s.lock()
             .unwrap()
             .forbidden_actions
@@ -1241,11 +1299,6 @@ async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
         );
         s.lock().unwrap().forbidden_actions.clear();
     }
-
-    // 3. Account with zero VPCs returning InvalidVpcId.NotFound on CreateSecurityGroup DryRun=true passes.
-    s.lock().unwrap().create_sg_missing_vpc = true;
-    let t = api.test(&conn(&api)).await;
-    assert!(t.ok(), "{:?}", t.checks);
 }
 
 #[tokio::test]
@@ -5092,5 +5145,274 @@ async fn create_options_ttl_zero_disables_connection_default_auto_release_time()
         !run_zero.params.contains_key("AutoReleaseTime"),
         "expected no AutoReleaseTime when CreateOptions.ttl is Some(ZERO): {:?}",
         run_zero.params
+    );
+}
+
+#[tokio::test]
+async fn delete_part_retries_more_than_four_transient_dependency_violations_and_short_circuits_non_cua_blocker()
+ {
+    use std::time::{Duration, Instant};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let api = api.with_poll(Duration::from_millis(10));
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+    let c = conn(&api);
+    let owner = "owner1";
+    let tags = aliyun_net::part_tags(owner);
+
+    {
+        let mut f = s.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-retry-1",
+            "VpcName": aliyun_net::vpc_name(owner),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-retry-1",
+            "VSwitchName": aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
+            "VpcId": "vpc-retry-1",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-retry-1",
+            "SecurityGroupName": aliyun_net::sg_name(owner),
+            "VpcId": "vpc-retry-1",
+            "RegionId": "cn-hangzhou",
+            "SecurityGroupType": "enterprise",
+            "InnerAccessPolicy": "Drop",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"TagKey": k, "TagValue": v})).collect::<Vec<_>>() }
+        }));
+    }
+
+    // 1. Each part tolerates 6 (> 4) transient DependencyViolation responses before succeeding.
+    for (rtype, rid, action) in [
+        ("security_group", "sg-retry-1", "DeleteSecurityGroup"),
+        ("vswitch", "vsw-retry-1", "DeleteVSwitch"),
+        ("vpc", "vpc-retry-1", "DeleteVpc"),
+    ] {
+        {
+            let mut f = s.lock().unwrap();
+            f.calls.clear();
+            f.transient_dependency_errors = 6;
+        }
+        let res = Resource {
+            provider: "aliyun-ecs".into(),
+            id: rid.into(),
+            resource_type: rtype.into(),
+            region: "cn-hangzhou".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        };
+        aliyun_net::delete_part(&api, &c, &res)
+            .await
+            .unwrap_or_else(|e| panic!("{rtype} must succeed after 6 transient retries: {e}"));
+        let del_count = s
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| call.action == action)
+            .count();
+        assert_eq!(
+            del_count, 7,
+            "{action} should be attempted 7 times (6 DependencyViolation + 1 success)"
+        );
+    }
+
+    // 2. Permanent non-Cua instance attached to Cua's SG/VSwitch/VPC short-circuits immediately
+    //    (even with a long poll interval) instead of burning 24 * poll_interval per part.
+    let slow_api = api.with_poll(Duration::from_secs(5));
+    {
+        let mut f = s.lock().unwrap();
+        f.calls.clear();
+        f.transient_dependency_errors = 0;
+        f.vpcs.push(json!({
+            "VpcId": "vpc-blocked-1",
+            "VpcName": aliyun_net::vpc_name(owner),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-blocked-1",
+            "VSwitchName": aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
+            "VpcId": "vpc-blocked-1",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-blocked-1",
+            "SecurityGroupName": aliyun_net::sg_name(owner),
+            "VpcId": "vpc-blocked-1",
+            "RegionId": "cn-hangzhou",
+            "SecurityGroupType": "enterprise",
+            "InnerAccessPolicy": "Drop",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"TagKey": k, "TagValue": v})).collect::<Vec<_>>() }
+        }));
+        f.instances.insert(
+            "i-foreign-blocker".into(),
+            json!({
+                "InstanceId": "i-foreign-blocker",
+                "InstanceName": "foreign-box",
+                "RegionId": "cn-hangzhou",
+                "ZoneId": "cn-hangzhou-h",
+                "Status": "Running",
+                "VpcAttributes": {
+                    "VpcId": "vpc-blocked-1",
+                    "VSwitchId": "vsw-blocked-1"
+                },
+                "SecurityGroupIds": {
+                    "SecurityGroupId": ["sg-blocked-1"]
+                },
+                "Tags": { "Tag": [
+                    { "TagKey": "cua-managed", "TagValue": "true" },
+                    { "TagKey": "cua-owner", "TagValue": "other-owner" }
+                ]}
+            }),
+        );
+    }
+
+    let t0 = Instant::now();
+    for (rtype, rid, action) in [
+        ("security_group", "sg-blocked-1", "DeleteSecurityGroup"),
+        ("vswitch", "vsw-blocked-1", "DeleteVSwitch"),
+        ("vpc", "vpc-blocked-1", "DeleteVpc"),
+    ] {
+        let res = Resource {
+            provider: "aliyun-ecs".into(),
+            id: rid.into(),
+            resource_type: rtype.into(),
+            region: "cn-hangzhou".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        };
+        let err = aliyun_net::delete_part(&slow_api, &c, &res)
+            .await
+            .expect_err("permanently blocked part must return DependencyViolation error");
+        assert!(err.to_string().contains("DependencyViolation"), "{err}");
+        let attempts = s
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| call.action == action)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "{action} must short-circuit after 1 attempt when blocked by foreign instance"
+        );
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "permanent blocker checks took {:?}, expected immediate short-circuit",
+        t0.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn clamped_disk_gb_cannot_bypass_max_size_or_budget() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    // 1. --max-size 4x16x30 must reject --disk-gb 25 on Linux because aliyun-ecs clamps it to 40 GiB.
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("4x16x30".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.lock().unwrap().calls.clear();
+
+    let mut small_disk = sb_create_opts("clamp-max-size");
+    small_disk.disk_gb = Some(25);
+    let err = sandboxes.create(small_disk).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("allows disks up to 30 GB")
+            && err.to_string().contains("needs 40 GB"),
+        "{err}"
+    );
+    assert!(
+        !s.lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|c| c.action == "RunInstances"),
+        "RunInstances must not be called when clamped disk exceeds --max-size"
+    );
+
+    // 2. --budget between 25 GiB cost ($0.0465/h) and clamped 40 GiB cost ($0.0486/h)
+    //    must reject --disk-gb 25 before RunInstances.
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("4x16x80".into()),
+            budget_usd_month: Some(0.047),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.lock().unwrap().calls.clear();
+
+    let mut under_priced = sb_create_opts("clamp-budget");
+    under_priced.disk_gb = Some(25);
+    let budget_err = sandboxes.create(under_priced).await.unwrap_err();
+    assert!(
+        matches!(budget_err, cua_sandbox_core::Error::Cloud(_)),
+        "{budget_err:?}"
+    );
+    assert!(
+        budget_err.to_string().contains("budget of $0.05")
+            || budget_err.to_string().contains("budget"),
+        "{budget_err}"
+    );
+    assert!(
+        !s.lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|c| c.action == "RunInstances"),
+        "RunInstances must not be called when clamped disk exceeds --budget"
     );
 }

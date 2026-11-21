@@ -70,8 +70,6 @@ pub struct FakeAliyun {
     pub forbidden_actions: BTreeSet<String>,
     /// Simulate VPC-only region returning `InvalidVSwitchId.NotFound` on `DryRun=true` when `VSwitchId` is omitted.
     pub run_instances_missing_vswitch: bool,
-    /// Simulate `CreateSecurityGroup DryRun=true` returning `InvalidVpcId.NotFound` when `VpcId` is omitted.
-    pub create_sg_missing_vpc: bool,
     /// Optional forced error `(http_status, code, message)` for `RunInstances DryRun=true`.
     pub run_instances_dry_run_error: Option<(u16, String, String)>,
     /// Optional forced error `(http_status, code, message)` for non-DryRun `RunInstances`.
@@ -168,7 +166,6 @@ impl Default for FakeAliyun {
             transient_dependency_errors: 0,
             forbidden_actions: BTreeSet::new(),
             run_instances_missing_vswitch: false,
-            create_sg_missing_vpc: false,
             run_instances_dry_run_error: None,
             run_instances_error: None,
             force_auth_error: None,
@@ -839,52 +836,38 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "CreateSecurityGroup") => {
-                if params.get("DryRun").map(String::as_str) == Some("true") {
-                    if f.create_sg_missing_vpc && !params.contains_key("VpcId") {
-                        err(
-                            StatusCode::BAD_REQUEST,
-                            "InvalidVpcId.NotFound",
-                            "The specified VpcId does not exist.",
-                        )
-                    } else {
-                        err(
-                            StatusCode::PRECONDITION_FAILED,
-                            "DryRunOperation",
-                            "Request validation has been passed with DryRun flag set.",
-                        )
-                    }
+                // Real Alibaba Cloud ECS `CreateSecurityGroup` does NOT support `DryRun=true`:
+                // it ignores `DryRun` and creates the security group returning HTTP 200 OK.
+                let sg_id = format!("sg-fake-{}", f.next_id);
+                f.next_id += 1;
+                let sg_type = params
+                    .get("SecurityGroupType")
+                    .cloned()
+                    .unwrap_or_else(|| "normal".into());
+                let inner = if sg_type == "enterprise" {
+                    "Drop"
                 } else {
-                    let sg_id = format!("sg-fake-{}", f.next_id);
-                    f.next_id += 1;
-                    let sg_type = params
-                        .get("SecurityGroupType")
-                        .cloned()
-                        .unwrap_or_else(|| "normal".into());
-                    let inner = if sg_type == "enterprise" {
-                        "Drop"
-                    } else {
-                        "Accept"
-                    };
-                    let tags = parse_tag_params(&params, true);
-                    f.security_groups.push(json!({
+                    "Accept"
+                };
+                let tags = parse_tag_params(&params, true);
+                f.security_groups.push(json!({
+                    "SecurityGroupId": sg_id,
+                    "SecurityGroupName": params.get("SecurityGroupName").cloned().unwrap_or_default(),
+                    "VpcId": params.get("VpcId").cloned().unwrap_or_default(),
+                    "RegionId": params.get("RegionId").cloned().unwrap_or_else(|| "cn-hangzhou".into()),
+                    "SecurityGroupType": sg_type,
+                    "InnerAccessPolicy": inner,
+                    "Tags": { "Tag": tags }
+                }));
+                f.security_group_rules.insert(sg_id.clone(), Vec::new());
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
                         "SecurityGroupId": sg_id,
-                        "SecurityGroupName": params.get("SecurityGroupName").cloned().unwrap_or_default(),
-                        "VpcId": params.get("VpcId").cloned().unwrap_or_default(),
-                        "RegionId": params.get("RegionId").cloned().unwrap_or_else(|| "cn-hangzhou".into()),
-                        "SecurityGroupType": sg_type,
-                        "InnerAccessPolicy": inner,
-                        "Tags": { "Tag": tags }
-                    }));
-                    f.security_group_rules.insert(sg_id.clone(), Vec::new());
-                    (
-                        StatusCode::OK,
-                        axum::Json(json!({
-                            "SecurityGroupId": sg_id,
-                            "RequestId": "req-csg-1"
-                        })),
-                    )
-                        .into_response()
-                }
+                        "RequestId": "req-csg-1"
+                    })),
+                )
+                    .into_response()
             }
             ("2014-05-26", "DescribeSecurityGroups") => {
                 let vpc_filter = params.get("VpcId").cloned();
@@ -1126,45 +1109,54 @@ pub async fn handle(
                     .into_response()
             }
             ("2016-04-28", "DeleteVpc") => {
-                let vpc_id = params.get("VpcId").cloned().unwrap_or_default();
-                let has_children = f
-                    .vswitches
-                    .iter()
-                    .any(|v| v["VpcId"].as_str() == Some(&vpc_id))
-                    || f.security_groups
-                        .iter()
-                        .any(|sg| sg["VpcId"].as_str() == Some(&vpc_id));
-                if has_children {
+                if f.transient_dependency_errors > 0 {
+                    f.transient_dependency_errors -= 1;
                     err(
                         StatusCode::BAD_REQUEST,
                         "DependencyViolation",
-                        "VPC has dependent VSwitches or SecurityGroups.",
+                        "VPC has dependent resources.",
                     )
-                } else if let Some(pos) = f
-                    .vpcs
-                    .iter()
-                    .position(|v| v["VpcId"].as_str() == Some(&vpc_id))
-                {
-                    if f.vpcs[pos]["IsDefault"].as_bool().unwrap_or(false) {
+                } else {
+                    let vpc_id = params.get("VpcId").cloned().unwrap_or_default();
+                    let has_children = f
+                        .vswitches
+                        .iter()
+                        .any(|v| v["VpcId"].as_str() == Some(&vpc_id))
+                        || f.security_groups
+                            .iter()
+                            .any(|sg| sg["VpcId"].as_str() == Some(&vpc_id));
+                    if has_children {
                         err(
                             StatusCode::BAD_REQUEST,
-                            "Forbidden.DefaultVpc",
-                            "Cannot delete default VPC.",
+                            "DependencyViolation",
+                            "VPC has dependent VSwitches or SecurityGroups.",
                         )
+                    } else if let Some(pos) = f
+                        .vpcs
+                        .iter()
+                        .position(|v| v["VpcId"].as_str() == Some(&vpc_id))
+                    {
+                        if f.vpcs[pos]["IsDefault"].as_bool().unwrap_or(false) {
+                            err(
+                                StatusCode::BAD_REQUEST,
+                                "Forbidden.DefaultVpc",
+                                "Cannot delete default VPC.",
+                            )
+                        } else {
+                            f.vpcs.remove(pos);
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({ "RequestId": "req-dvpc-1" })),
+                            )
+                                .into_response()
+                        }
                     } else {
-                        f.vpcs.remove(pos);
-                        (
-                            StatusCode::OK,
-                            axum::Json(json!({ "RequestId": "req-dvpc-1" })),
+                        err(
+                            StatusCode::NOT_FOUND,
+                            "InvalidVpcId.NotFound",
+                            "VPC not found.",
                         )
-                            .into_response()
                     }
-                } else {
-                    err(
-                        StatusCode::NOT_FOUND,
-                        "InvalidVpcId.NotFound",
-                        "VPC not found.",
-                    )
                 }
             }
             ("2016-04-28", "CreateVSwitch") => {

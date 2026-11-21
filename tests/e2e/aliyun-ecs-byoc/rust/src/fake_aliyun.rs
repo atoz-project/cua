@@ -986,19 +986,14 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "CreateSecurityGroup") => {
+                // Real Alibaba Cloud ECS `CreateSecurityGroup` does NOT support `DryRun=true`:
+                // it ignores `DryRun` and creates the security group returning HTTP 200 OK.
                 let tags = parse_tags(&params);
                 if f.enforce_cua_managed_tag_condition && !has_cua_managed_tag(&tags) {
                     return err(
                         StatusCode::FORBIDDEN,
                         "Forbidden.RAM",
                         "RAM policy Condition requires cua-managed=true tag on ecs:CreateSecurityGroup",
-                    );
-                }
-                if params.get("DryRun").map(String::as_str) == Some("true") {
-                    return err(
-                        StatusCode::PRECONDITION_FAILED,
-                        "DryRunOperation",
-                        "Request validation has been passed with DryRun flag set.",
                     );
                 }
                 let seq = f.next_seq();

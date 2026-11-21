@@ -272,6 +272,73 @@ class RunnerBehaviorTests(unittest.TestCase):
         self.assertIn("sg-shared-smoke", joined)
         self.assertNotIn("vpc-other-owner", joined)
 
+    def test_check_aliyun_leaks_catches_dryrun_sg_and_ignores_permanent_relay(self) -> None:
+        run_id = "run_dry"
+
+        def fake_runner(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            action = cmd[2]
+            if action == "DescribeInstances":
+                body = json.dumps(
+                    {
+                        "TotalCount": 1,
+                        "Instances": {
+                            "Instance": [
+                                {
+                                    "InstanceId": "i-cua-relay-sg",
+                                    "InstanceName": "cua-relay-sg",
+                                    "Tags": {
+                                        "Tag": [
+                                            {"TagKey": "role", "TagValue": "cua-relay"},
+                                            {"TagKey": "managed-by", "TagValue": "manual"},
+                                        ]
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            elif action == "DescribeSecurityGroups":
+                body = json.dumps(
+                    {
+                        "TotalCount": 3,
+                        "SecurityGroups": {
+                            "SecurityGroup": [
+                                {
+                                    "SecurityGroupId": "sg-cua-relay",
+                                    "SecurityGroupName": "cua-relay-sg",
+                                    "Tags": {
+                                        "Tag": [
+                                            {"TagKey": "role", "TagValue": "cua-relay"},
+                                            {"TagKey": "managed-by", "TagValue": "manual"},
+                                        ]
+                                    },
+                                },
+                                {
+                                    "SecurityGroupId": "sg-nodeskclaw",
+                                    "SecurityGroupName": "nodeskclaw-sg",
+                                    "Tags": {"Tag": []},
+                                },
+                                {
+                                    "SecurityGroupId": "sg-dryrun-leak",
+                                    "SecurityGroupName": "cua-sandboxes-dryrun",
+                                    "Tags": {
+                                        "Tag": [
+                                            {"TagKey": "cua-managed", "TagValue": "true"},
+                                        ]
+                                    },
+                                },
+                            ]
+                        },
+                    }
+                )
+            else:
+                body = json.dumps({"TotalCount": 0})
+            return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
+
+        leaks = run.check_aliyun_leaks("webhook_manager", "ap-southeast-1", run_id, runner=fake_runner)
+        self.assertEqual(len(leaks), 1)
+        self.assertIn("sg-dryrun-leak", leaks[0])
+
     def test_live_lane_validates_profile_before_building_cua_cli(self) -> None:
         clean_env = {
             k: v

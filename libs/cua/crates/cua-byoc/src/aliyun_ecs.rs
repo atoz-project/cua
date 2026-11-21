@@ -1880,7 +1880,10 @@ impl CloudApi for AliyunEcs {
         }
 
         // 5. Permissions: DescribeInstances, DescribeVpcs, DescribeVSwitches, DescribeSecurityGroups,
-        //    CreateVpc DryRun=true (isolated mode), CreateSecurityGroup DryRun=true, RunInstances DryRun=true
+        //    CreateVpc DryRun=true (isolated mode), RunInstances DryRun=true.
+        //    Note: Alibaba Cloud ECS `CreateSecurityGroup` does NOT support `DryRun=true` (it ignores
+        //    the flag and creates a real security group returning HTTP 200 OK), so `test()` never
+        //    invokes `CreateSecurityGroup`.
         if let Err(e) = self
             .call_ok(
                 &ecs,
@@ -1899,152 +1902,136 @@ impl CloudApi for AliyunEcs {
             return t;
         }
 
-        let (first_vpc_id, vsw_id, vsw_vpc_id, matching_sg_id) =
-            if let Some((vpc_id, vswitch_id)) = existing_vpc_pair {
-                let sgs = match self
-                    .call_ok(
-                        &ecs,
-                        "GET",
-                        "DescribeSecurityGroups",
-                        ECS_API_VERSION,
-                        &[
-                            ("RegionId".into(), conn.region.clone()),
-                            ("VpcId".into(), vpc_id.to_string()),
-                            ("PageSize".into(), "50".into()),
-                        ],
-                        profile_hint,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        t.check("permissions", false, e.to_string());
-                        return t;
-                    }
-                };
-                let sg_id = sgs["SecurityGroups"]["SecurityGroup"]
+        let (vsw_id, matching_sg_id) = if let Some((vpc_id, vswitch_id)) = existing_vpc_pair {
+            let sgs = match self
+                .call_ok(
+                    &ecs,
+                    "GET",
+                    "DescribeSecurityGroups",
+                    ECS_API_VERSION,
+                    &[
+                        ("RegionId".into(), conn.region.clone()),
+                        ("VpcId".into(), vpc_id.to_string()),
+                        ("PageSize".into(), "50".into()),
+                    ],
+                    profile_hint,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    t.check("permissions", false, e.to_string());
+                    return t;
+                }
+            };
+            let sg_id = sgs["SecurityGroups"]["SecurityGroup"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|sg| {
+                    sg["VpcId"].as_str() == Some(vpc_id)
+                        && aliyun_net::tags_of(sg)
+                            .get(tag::MANAGED)
+                            .map(String::as_str)
+                            == Some("true")
+                })
+                .and_then(|sg| sg["SecurityGroupId"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            (Some(vswitch_id.to_string()), sg_id)
+        } else {
+            if let Err(e) = self
+                .call_ok(
+                    &vpc,
+                    "GET",
+                    "DescribeVpcs",
+                    VPC_API_VERSION,
+                    &[
+                        ("RegionId".into(), conn.region.clone()),
+                        ("PageSize".into(), "1".into()),
+                    ],
+                    profile_hint,
+                )
+                .await
+            {
+                t.check("permissions", false, e.to_string());
+                return t;
+            }
+
+            let vsw = match self
+                .call_ok(
+                    &vpc,
+                    "GET",
+                    "DescribeVSwitches",
+                    VPC_API_VERSION,
+                    &[
+                        ("RegionId".into(), conn.region.clone()),
+                        ("PageSize".into(), "1".into()),
+                    ],
+                    profile_hint,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    t.check("permissions", false, e.to_string());
+                    return t;
+                }
+            };
+
+            let first_vsw = vsw["VSwitches"]["VSwitch"]
+                .as_array()
+                .and_then(|a| a.first());
+            let vsw_id = first_vsw
+                .and_then(|x| x["VSwitchId"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let vsw_vpc_id = first_vsw
+                .and_then(|x| x["VpcId"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            let mut sg_params = vec![
+                ("RegionId".into(), conn.region.clone()),
+                ("PageSize".into(), "10".into()),
+            ];
+            if let Some(ref vpc_id) = vsw_vpc_id {
+                sg_params.push(("VpcId".into(), vpc_id.clone()));
+            }
+            let sgs = match self
+                .call_ok(
+                    &ecs,
+                    "GET",
+                    "DescribeSecurityGroups",
+                    ECS_API_VERSION,
+                    &sg_params,
+                    profile_hint,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    t.check("permissions", false, e.to_string());
+                    return t;
+                }
+            };
+
+            let matching_sg_id = vsw_vpc_id.as_deref().and_then(|vpc_id| {
+                sgs["SecurityGroups"]["SecurityGroup"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .find(|sg| {
-                        sg["VpcId"].as_str() == Some(vpc_id)
-                            && aliyun_net::tags_of(sg)
-                                .get(tag::MANAGED)
-                                .map(String::as_str)
-                                == Some("true")
-                    })
+                    .find(|sg| sg["VpcId"].as_str() == Some(vpc_id))
                     .and_then(|sg| sg["SecurityGroupId"].as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-                (
-                    Some(vpc_id.to_string()),
-                    Some(vswitch_id.to_string()),
-                    Some(vpc_id.to_string()),
-                    sg_id,
-                )
-            } else {
-                let vpcs = match self
-                    .call_ok(
-                        &vpc,
-                        "GET",
-                        "DescribeVpcs",
-                        VPC_API_VERSION,
-                        &[
-                            ("RegionId".into(), conn.region.clone()),
-                            ("PageSize".into(), "1".into()),
-                        ],
-                        profile_hint,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        t.check("permissions", false, e.to_string());
-                        return t;
-                    }
-                };
-                let first_vpc_id = vpcs["Vpcs"]["Vpc"]
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|x| x["VpcId"].as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-
-                let vsw = match self
-                    .call_ok(
-                        &vpc,
-                        "GET",
-                        "DescribeVSwitches",
-                        VPC_API_VERSION,
-                        &[
-                            ("RegionId".into(), conn.region.clone()),
-                            ("PageSize".into(), "1".into()),
-                        ],
-                        profile_hint,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        t.check("permissions", false, e.to_string());
-                        return t;
-                    }
-                };
-
-                let first_vsw = vsw["VSwitches"]["VSwitch"]
-                    .as_array()
-                    .and_then(|a| a.first());
-                let vsw_id = first_vsw
-                    .and_then(|x| x["VSwitchId"].as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-                let vsw_vpc_id = first_vsw
-                    .and_then(|x| x["VpcId"].as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-
-                let mut sg_params = vec![
-                    ("RegionId".into(), conn.region.clone()),
-                    ("PageSize".into(), "10".into()),
-                ];
-                if let Some(ref vpc_id) = vsw_vpc_id {
-                    sg_params.push(("VpcId".into(), vpc_id.clone()));
-                }
-                let sgs = match self
-                    .call_ok(
-                        &ecs,
-                        "GET",
-                        "DescribeSecurityGroups",
-                        ECS_API_VERSION,
-                        &sg_params,
-                        profile_hint,
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        t.check("permissions", false, e.to_string());
-                        return t;
-                    }
-                };
-
-                let matching_sg_id = vsw_vpc_id.as_deref().and_then(|vpc_id| {
-                    sgs["SecurityGroups"]["SecurityGroup"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|sg| sg["VpcId"].as_str() == Some(vpc_id))
-                        .and_then(|sg| sg["SecurityGroupId"].as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                });
-                (first_vpc_id, vsw_id, vsw_vpc_id, matching_sg_id)
-            };
+                    .map(str::to_string)
+            });
+            (vsw_id, matching_sg_id)
+        };
 
         if existing_vpc_pair.is_none() {
             let vpc_dry_params = vec![
@@ -2084,55 +2071,6 @@ impl CloudApi for AliyunEcs {
                     t.check("permissions", false, e.to_string());
                     return t;
                 }
-            }
-        }
-
-        let sg_vpc_id = vsw_vpc_id.or(first_vpc_id);
-        let mut sg_dry_params = vec![
-            ("RegionId".into(), conn.region.clone()),
-            ("SecurityGroupName".into(), "cua-sandboxes-dryrun".into()),
-            ("SecurityGroupType".into(), "enterprise".into()),
-            ("Tag.1.Key".into(), tag::MANAGED.into()),
-            ("Tag.1.Value".into(), "true".into()),
-            ("DryRun".into(), "true".into()),
-        ];
-        let has_vpc = if let Some(ref vpc_id) = sg_vpc_id {
-            sg_dry_params.push(("VpcId".into(), vpc_id.clone()));
-            true
-        } else {
-            false
-        };
-        match self
-            .call_raw(
-                &ecs,
-                "POST",
-                "CreateSecurityGroup",
-                ECS_API_VERSION,
-                &sg_dry_params,
-                profile_hint,
-            )
-            .await
-        {
-            Ok((status, body)) => {
-                let code = match &body {
-                    ApiBody::Json(v) => api_error_code_message(v).0,
-                    ApiBody::Text(_) => "",
-                };
-                let ok_dry = !status.is_success()
-                    && (code == "DryRunOperation" || (!has_vpc && code == "InvalidVpcId.NotFound"));
-                if !ok_dry {
-                    t.check(
-                        "permissions",
-                        false,
-                        map_api_error("CreateSecurityGroup", ECS_API_VERSION, status, &body)
-                            .to_string(),
-                    );
-                    return t;
-                }
-            }
-            Err(e) => {
-                t.check("permissions", false, e.to_string());
-                return t;
             }
         }
 
@@ -2176,9 +2114,9 @@ impl CloudApi for AliyunEcs {
                 };
                 if !status.is_success() && code == "DryRunOperation" {
                     let msg = if existing_vpc_pair.is_some() {
-                        "RAM permissions verified (RunInstances, CreateSecurityGroup DryRun passed)"
+                        "RAM permissions verified (RunInstances DryRun passed)"
                     } else {
-                        "RAM permissions verified (RunInstances, CreateVpc, CreateSecurityGroup DryRun passed)"
+                        "RAM permissions verified (RunInstances, CreateVpc DryRun passed)"
                     };
                     t.check("permissions", true, msg);
                 } else if !has_vswitch
@@ -2206,7 +2144,7 @@ impl CloudApi for AliyunEcs {
                     t.check(
                         "permissions",
                         true,
-                        "RAM permissions verified (RunInstances, CreateSecurityGroup DryRun passed)",
+                        "RAM permissions verified (RunInstances DryRun passed)",
                     );
                 } else {
                     t.check(
@@ -2230,12 +2168,15 @@ impl CloudApi for AliyunEcs {
         spec: &ProvisionSpec,
     ) -> Result<Option<ResolvedSizing>> {
         validate_disk_gb(spec.disk_gb)?;
+        let (effective_disk_gb, _) = system_disk_for(spec);
+        validate_disk_gb(effective_disk_gb)?;
         let (vcpus, memory_mb, inst_usd) =
             self.lookup_instance_type(conn, &spec.machine_type).await?;
-        let disk_usd = f64::from(spec.disk_gb) * ESSD_USD_PER_GB_HOUR;
+        let disk_usd = f64::from(effective_disk_gb) * ESSD_USD_PER_GB_HOUR;
         Ok(Some(ResolvedSizing {
             vcpus,
             memory_mb,
+            disk_gb: Some(effective_disk_gb),
             usd_per_hour: inst_usd + disk_usd,
         }))
     }

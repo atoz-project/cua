@@ -62,13 +62,14 @@ pub fn target_of(c: &Connection) -> Target {
     }
 }
 
-/// Resolved effective machine sizing (vCPUs, RAM, total hourly price including
-/// disk) returned by [`CloudApi::resolve_machine_sizing`] before `--max-size`
-/// and `--budget` preflight checks.
+/// Resolved effective machine sizing (vCPUs, RAM, effective disk GiB, total
+/// hourly price including disk) returned by [`CloudApi::resolve_machine_sizing`]
+/// before `--max-size` and `--budget` preflight checks.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedSizing {
     pub vcpus: u32,
     pub memory_mb: u64,
+    pub disk_gb: Option<u32>,
     pub usd_per_hour: f64,
 }
 

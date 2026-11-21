@@ -89,7 +89,8 @@ cua cloud connect aliyun-ecs --region cn-hangzhou
 
 `--ttl-hours` sets how long each sandbox there lives before it deletes itself
 (default 8; `0` keeps it until you delete it; Modal caps a sandbox at 24; a
-Hetzner server shuts itself down then, and `cua cloud sweep --delete` removes it):
+Hetzner server shuts itself down then, and `cua cloud sweep --delete` removes it).
+You can also override that lifetime per sandbox with `cua sb create --ttl <seconds>` (`0` disables auto-expiry for that sandbox):
 
 ```bash test="cli-shape" id="cua-cloud-connect-ttl"
 cua cloud connect aws --ttl-hours 2
