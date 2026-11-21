@@ -1389,7 +1389,6 @@ impl CloudApi for AliyunEcs {
             )
         }
     }
-
     fn detect(&self) -> CloudCredentials {
         if let Some(Ok(_)) = self.staged.lock().unwrap().as_ref() {
             return CloudCredentials {
@@ -2247,11 +2246,12 @@ impl CloudApi for AliyunEcs {
                 }
             }
             "linux" | "linux-slim" => {
-                if !spec.runtime.is_empty() && spec.runtime != "docker" {
+                if !spec.runtime.is_empty() && spec.runtime != "docker" && spec.runtime != "native"
+                {
                     return Err(Error::Unsupported {
                         provider: cua_sandbox_core::ProviderKind::Contrib,
                         op: format!(
-                            "aliyun-ecs does not yet support --runtime {} on {} (Direct VM for Linux is tracked in #7)",
+                            "aliyun-ecs does not support --runtime {} on {}",
                             spec.runtime, spec.family
                         ),
                     });

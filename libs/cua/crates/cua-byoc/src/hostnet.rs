@@ -332,6 +332,133 @@ pub fn install_snippet(net: &HostNet<'_>) -> String {
     s
 }
 
+/// Host-level `OUTPUT` firewall script (POSIX `sh`, run as root) for Direct VM
+/// Sandboxes (`--runtime native`), where workloads run directly on the guest OS
+/// rather than behind a Docker bridge.
+///
+/// Blocks `PLATFORM_DENY_V4` (`100.100.100.200/32`, `169.254.169.254/32`, etc.)
+/// and `PLATFORM_DENY_V6` on `OUTPUT` while preserving loopback, VPC DNS, and
+/// relay/internet egress. Persisted across reboots via [`native_unit`].
+pub fn native_script(net: &HostNet<'_>) -> String {
+    let _ = net.provider;
+    let extra = net.extra_cidrs.join(" ");
+    let platform_v4_nft = PLATFORM_DENY_V4.join(", ");
+    let platform_v6_nft = PLATFORM_DENY_V6.join(", ");
+    format!(
+        r#"#!/bin/sh
+# Cua: block cloud metadata endpoints on host OUTPUT for Direct VM Sandboxes.
+set -eu
+PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin
+PLATFORM_V4="{platform_v4}"
+PLATFORM_V6="{platform_v6}"
+EXTRA_CIDRS="{extra}"
+GUARD=CUA-HOST-GUARD
+run() {{ if [ "${{CUA_NET_DRY:-0}}" = 1 ]; then echo "$*"; else "$@"; fi; }}
+resolvers() {{
+  if [ -n "${{CUA_NET_RESOLVERS+x}}" ]; then echo $CUA_NET_RESOLVERS; return; fi
+  for f in /run/systemd/resolve/resolv.conf /etc/resolv.conf; do
+    [ -r "$f" ] || continue
+    out=""
+    for ns in $(awk '$1=="nameserver"{{print $2}}' "$f"); do
+      case "$ns" in 127.*|::1|*:*|{AZURE_WIRESERVER}|100.100.100.200) ;; *) out="$out $ns" ;; esac
+    done
+    if [ -n "$out" ]; then echo $out; return; fi
+  done
+  return 0
+}}
+fresh() {{ run $1 -N "$2" 2>/dev/null || true; run $1 -F "$2"; }}
+hook_output() {{
+  if [ "${{CUA_NET_DRY:-0}}" = 1 ] || ! $1 -C OUTPUT -j "$2" 2>/dev/null; then
+    run $1 -I OUTPUT 1 -j "$2"
+  fi
+}}
+backend=""
+if [ "${{CUA_NET_DRY:-0}}" = 1 ]; then backend="${{CUA_NET_BACKEND:-iptables}}"
+elif command -v iptables >/dev/null 2>&1; then backend=iptables
+elif command -v nft >/dev/null 2>&1; then backend=nft
+fi
+if [ "$backend" = iptables ]; then
+  RES=$(resolvers)
+  fresh iptables $GUARD
+  run iptables -A $GUARD -o lo -j RETURN
+  for r in $RES; do
+    if [ "$r" = 100.100.100.200 ]; then continue; fi
+    run iptables -A $GUARD -d "$r" -p udp --dport 53 -j RETURN
+    run iptables -A $GUARD -d "$r" -p tcp --dport 53 -j RETURN
+  done
+  for n in $PLATFORM_V4; do run iptables -A $GUARD -d "$n" -j DROP; done
+  for n in $EXTRA_CIDRS; do
+    case "$n" in *:*) ;; *) run iptables -A $GUARD -d "$n" -j DROP ;; esac
+  done
+  run iptables -A $GUARD -j RETURN
+  hook_output iptables $GUARD
+  if [ "${{CUA_NET_DRY:-0}}" = 1 ] || command -v ip6tables >/dev/null 2>&1; then
+    fresh ip6tables $GUARD
+    run ip6tables -A $GUARD -o lo -j RETURN
+    for n in $PLATFORM_V6; do run ip6tables -A $GUARD -d "$n" -j DROP; done
+    for n in $EXTRA_CIDRS; do
+      case "$n" in *:*) run ip6tables -A $GUARD -d "$n" -j DROP ;; *) ;; esac
+    done
+    run ip6tables -A $GUARD -j RETURN
+    hook_output ip6tables $GUARD
+  fi
+elif [ "$backend" = nft ]; then
+  RES=$(resolvers)
+  NFT_RULES=$(
+    printf 'table inet cua_host_guard {{\n  chain output {{\n    type filter hook output priority -100; policy accept;\n    oifname "lo" return\n'
+    for r in $RES; do
+      if [ "$r" = 100.100.100.200 ]; then continue; fi
+      printf '    ip daddr %s udp dport 53 return\n    ip daddr %s tcp dport 53 return\n' "$r" "$r"
+    done
+    printf '    ip daddr {{ {platform_v4_nft} }} drop\n'
+    for n in $EXTRA_CIDRS; do
+      case "$n" in *:*) printf '    ip6 daddr %s drop\n' "$n" ;; *) printf '    ip daddr %s drop\n' "$n" ;; esac
+    done
+    printf '    ip6 daddr {{ {platform_v6_nft} }} drop\n  }}\n}}\n'
+  )
+  if [ "${{CUA_NET_DRY:-0}}" = 1 ]; then printf '%s\n' "$NFT_RULES"
+  else nft delete table inet cua_host_guard 2>/dev/null || true; printf '%s\n' "$NFT_RULES" | nft -f -
+  fi
+else
+  echo "cua: neither iptables nor nft is installed to block metadata endpoints" >&2; exit 1
+fi
+"#,
+        platform_v4 = list(PLATFORM_DENY_V4),
+        platform_v6 = list(PLATFORM_DENY_V6),
+    )
+}
+
+/// Systemd unit that installs the host `OUTPUT` metadata firewall before
+/// `cua-spacesd.service` starts and keeps it across reboots/stop-start.
+pub fn native_unit() -> &'static str {
+    "[Unit]\n\
+     Description=Cua: keep Direct VM Spaces off the cloud metadata service\n\
+     After=network-online.target\n\
+     Wants=network-online.target\n\
+     Before=cua-spacesd.service\n\n\
+     [Service]\n\
+     Type=oneshot\n\
+     RemainAfterExit=yes\n\
+     ExecStart=/usr/local/sbin/cua-host-net\n\n\
+     [Install]\n\
+     WantedBy=multi-user.target\n"
+}
+
+/// Shell lines that enable and start [`native_unit`].
+pub fn native_install_snippet(net: &HostNet<'_>) -> String {
+    format!(
+        "# Cua: host metadata firewall for Direct VM Spaces.\n\
+         mkdir -p /etc/cua\n\
+         cat > {SCRIPT_PATH} <<'CUA_HOST_NET'\n{}CUA_HOST_NET\n\
+         chmod 755 {SCRIPT_PATH}\n\
+         cat > /etc/systemd/system/{UNIT} <<'CUA_HOST_NET_UNIT'\n{}CUA_HOST_NET_UNIT\n\
+         systemctl daemon-reload\n\
+         systemctl enable --now {UNIT}\n",
+        native_script(net),
+        native_unit(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +760,221 @@ mod tests {
         assert!(az.contains("d['dns'] = ['169.254.53.53']"));
         // The resolver and its docker setting come before the guard starts.
         assert!(az.find("cua-dns.service").unwrap() < az.rfind("cua-host-net.service").unwrap());
+    }
+
+    #[test]
+    fn native_output_guard_blocks_metadata_keeps_loopback_dns_and_relay_egress() {
+        let net = HostNet {
+            provider: "aliyun-ecs",
+            extra_cidrs: &[],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-guard.sh");
+        let s = native_script(&net);
+        std::fs::write(&path, &s).unwrap();
+        let st = Command::new("sh").arg("-n").arg(&path).status().unwrap();
+        assert!(st.success(), "native_script failed sh -n");
+
+        let out = Command::new("sh")
+            .arg(&path)
+            .env("CUA_NET_DRY", "1")
+            .env("CUA_NET_RESOLVERS", "100.100.2.136 100.100.100.200")
+            .env("CUA_NET_CIDRS", "")
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            lines.contains(&"iptables -I OUTPUT 1 -j CUA-HOST-GUARD".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"ip6tables -I OUTPUT 1 -j CUA-HOST-GUARD".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"iptables -A CUA-HOST-GUARD -o lo -j RETURN".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"iptables -A CUA-HOST-GUARD -d 100.100.2.136 -p udp --dport 53 -j RETURN"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
+        // 100.100.100.200 must NEVER get a DNS RETURN exemption.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("100.100.100.200") && l.contains("RETURN")),
+            "{lines:?}"
+        );
+        for md in PLATFORM_DENY_V4 {
+            assert!(
+                lines.contains(&format!("iptables -A CUA-HOST-GUARD -d {md} -j DROP")),
+                "missing DROP for {md}: {lines:?}"
+            );
+        }
+        assert!(
+            lines.contains(&"ip6tables -A CUA-HOST-GUARD -d fd00:ec2::254/128 -j DROP".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .rfind(|l| l.starts_with("iptables -A CUA-HOST-GUARD "))
+                .map(String::as_str),
+            Some("iptables -A CUA-HOST-GUARD -j RETURN")
+        );
+
+        let u = native_unit();
+        assert!(u.contains("Before=cua-spacesd.service"), "{u}");
+        assert!(u.contains("WantedBy=multi-user.target"), "{u}");
+        assert!(!u.contains("docker.service"), "{u}");
+    }
+
+    #[test]
+    fn native_output_guard_nft_fallback_matches_iptables_rules() {
+        let extra = vec!["10.42.0.0/16".to_string(), "fd00:42::/48".to_string()];
+        let net = HostNet {
+            provider: "aliyun-ecs",
+            extra_cidrs: &extra,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-guard-nft.sh");
+        std::fs::write(&path, native_script(&net)).unwrap();
+
+        let out = Command::new("sh")
+            .arg(&path)
+            .env("CUA_NET_DRY", "1")
+            .env("CUA_NET_BACKEND", "nft")
+            .env("CUA_NET_RESOLVERS", "100.100.2.136 100.100.100.200")
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let nft_rules = String::from_utf8(out.stdout).unwrap();
+        assert!(nft_rules.contains("oifname \"lo\" return"), "{nft_rules}");
+        assert!(
+            nft_rules.contains("ip daddr 100.100.2.136 udp dport 53 return"),
+            "{nft_rules}"
+        );
+        assert!(
+            nft_rules.contains("ip daddr 100.100.2.136 tcp dport 53 return"),
+            "{nft_rules}"
+        );
+        assert!(
+            !nft_rules.contains("100.100.100.200 udp dport 53 return")
+                && !nft_rules.contains("100.100.100.200 tcp dport 53 return"),
+            "{nft_rules}"
+        );
+        assert!(
+            nft_rules.contains("ip daddr 10.42.0.0/16 drop"),
+            "{nft_rules}"
+        );
+        assert!(
+            nft_rules.contains("ip6 daddr fd00:42::/48 drop"),
+            "{nft_rules}"
+        );
+        for md in PLATFORM_DENY_V4 {
+            assert!(nft_rules.contains(md), "missing {md}: {nft_rules}");
+        }
+        assert!(nft_rules.contains("fd00:ec2::254/128"), "{nft_rules}");
+
+        if let Ok(mut child) = Command::new("nft")
+            .args(["-c", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            use std::io::Write as _;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(nft_rules.as_bytes())
+                .unwrap();
+            let check = child.wait_with_output().unwrap();
+            assert!(
+                check.status.success(),
+                "nft -c failed: {}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn native_output_guard_succeeds_with_stub_only_resolv_conf() {
+        let extra = vec!["10.42.0.0/16".to_string(), "fd00:42::/48".to_string()];
+        let net = HostNet {
+            provider: "aliyun-ecs",
+            extra_cidrs: &extra,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let missing_resolv = dir.path().join("missing-resolv.conf");
+        let stub_resolv = dir.path().join("stub-resolv.conf");
+        std::fs::write(
+            &stub_resolv,
+            "nameserver 127.0.0.53\nnameserver 100.100.100.200\nnameserver ::1\n",
+        )
+        .unwrap();
+
+        let patched = native_script(&net).replace(
+            "/run/systemd/resolve/resolv.conf /etc/resolv.conf",
+            &format!("{} {}", missing_resolv.display(), stub_resolv.display()),
+        );
+        let path = dir.path().join("native-guard-stub.sh");
+        std::fs::write(&path, &patched).unwrap();
+
+        for backend in ["iptables", "nft"] {
+            let out = Command::new("sh")
+                .arg(&path)
+                .env("CUA_NET_DRY", "1")
+                .env("CUA_NET_BACKEND", backend)
+                .env_remove("CUA_NET_RESOLVERS")
+                .output()
+                .expect("sh");
+            assert!(
+                out.status.success(),
+                "backend={backend} aborted on stub-only resolv.conf (status={}): stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            if backend == "iptables" {
+                let lines: Vec<&str> = stdout.lines().collect();
+                assert!(
+                    lines.contains(&"iptables -A CUA-HOST-GUARD -d 100.100.100.200/32 -j DROP"),
+                    "{lines:?}"
+                );
+                assert!(
+                    lines.contains(&"iptables -A CUA-HOST-GUARD -d 10.42.0.0/16 -j DROP"),
+                    "{lines:?}"
+                );
+                assert!(
+                    !lines.contains(&"iptables -A CUA-HOST-GUARD -d fd00:42::/48 -j DROP"),
+                    "IPv6 CIDR must not be passed to iptables: {lines:?}"
+                );
+                assert!(
+                    lines.contains(&"ip6tables -A CUA-HOST-GUARD -d fd00:42::/48 -j DROP"),
+                    "{lines:?}"
+                );
+            } else {
+                assert!(stdout.contains("100.100.100.200/32"), "{stdout}");
+            }
+        }
     }
 }

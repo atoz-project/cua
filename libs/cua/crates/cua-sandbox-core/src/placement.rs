@@ -951,9 +951,21 @@ pub fn select(
         ));
     }
     if image.known() {
+        let native_direct_vm = matches!(on, On::Provider(_))
+            && (runtime.as_str() == "native"
+                || (*runtime == Runtime::Auto
+                    && kind == Kind::Vm
+                    && caps
+                        .runtimes(Kind::Vm)
+                        .first()
+                        .is_some_and(|r| r.as_str() == "native")));
         let fits = match kind {
-            // A microVM boots the container rootfs.
+            // A microVM boots the container rootfs; a cloud Direct VM (`--runtime native`)
+            // runs a native cloud OS image for either Linux (`Rootfs`) or disk-based families.
             Kind::Container | Kind::MicroVm => image.has(Variant::Rootfs),
+            Kind::Vm if native_direct_vm => {
+                image.has(Variant::Rootfs) || image.has(Variant::Containerdisk)
+            }
             _ => image.has(Variant::Containerdisk) || image.has(Variant::Lume),
         };
         if !fits {
@@ -1711,5 +1723,36 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn direct_vm_native_runtime_allows_linux_rootfs_and_keeps_docker_default() {
+        register_provider(Capabilities {
+            name: "test-direct-vm".into(),
+            description: "test direct VM cloud".into(),
+            kinds: vec![
+                KindSupport {
+                    kind: Container,
+                    runtimes: vec![rt("docker")],
+                },
+                KindSupport {
+                    kind: Vm,
+                    runtimes: vec![rt("native")],
+                },
+            ],
+        })
+        .unwrap();
+        let on = On::parse("test-direct-vm").unwrap();
+        assert_eq!(validate(&on, Auto, &rt("native")).unwrap(), Vm);
+        let linux_rootfs = img(Some("linux"), &[Rootfs]);
+        // Default (`auto`) selects Docker-on-VM (`container` / `docker`).
+        let def = select(&on, Auto, &Runtime::Auto, &linux_rootfs, &MAC).unwrap();
+        assert_eq!((def.kind, def.runtime), (Container, rt("docker")));
+        // Explicit `--runtime native` selects Direct VM (`vm` / `native`) even with Rootfs.
+        let nat = select(&on, Auto, &rt("native"), &linux_rootfs, &MAC).unwrap();
+        assert_eq!((nat.kind, nat.runtime), (Vm, rt("native")));
+        // Unknown runtime lists `auto, docker, native`.
+        let err = validate(&on, Auto, &Runtime::Qemu).unwrap_err();
+        assert_eq!(err.valid, ["auto", "docker", "native"]);
     }
 }

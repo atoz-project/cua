@@ -539,7 +539,7 @@ cua cloud connect [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-connect--environment"></span>`--environment` | string |  | Modal environment (default: the profile's). |
 | <span id="cua-cloud-connect--relay-url"></span>`--relay-url` | string |  | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
 | <span id="cua-cloud-connect--relay-mode"></span>`--relay-mode` | `account` \| `static` |  | Relay authentication mode (`account` or `static`; defaults to `account`). |
-| <span id="cua-cloud-connect--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Optional custom `cua-spacesd` binary mirror URL for Windows Direct VM provisioning (with optional `#sha256=<64 hex>` fragment). |
+| <span id="cua-cloud-connect--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Custom `cua-spacesd` binary or `.tar.gz` download URL override for Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment). |
 | <span id="cua-cloud-connect--vpc-id"></span>`--vpc-id` | string |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `--vswitch-id`. |
 | <span id="cua-cloud-connect--vswitch-id"></span>`--vswitch-id` | string |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `--vpc-id`. |
 | <span id="cua-cloud-connect--windows-image-id"></span>`--windows-image-id` | string |  | Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g. golden Windows 10/11/Server image) for Windows sandboxes. |
@@ -673,7 +673,7 @@ cua cloud test [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-test--environment"></span>`--environment` | string |  | Modal environment (default: the profile's). |
 | <span id="cua-cloud-test--relay-url"></span>`--relay-url` | string |  | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
 | <span id="cua-cloud-test--relay-mode"></span>`--relay-mode` | `account` \| `static` |  | Relay authentication mode (`account` or `static`; defaults to `account`). |
-| <span id="cua-cloud-test--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Optional custom `cua-spacesd` binary mirror URL for Windows Direct VM provisioning (with optional `#sha256=<64 hex>` fragment). |
+| <span id="cua-cloud-test--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Custom `cua-spacesd` binary or `.tar.gz` download URL override for Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment). |
 | <span id="cua-cloud-test--vpc-id"></span>`--vpc-id` | string |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `--vswitch-id`. |
 | <span id="cua-cloud-test--vswitch-id"></span>`--vswitch-id` | string |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `--vpc-id`. |
 | <span id="cua-cloud-test--windows-image-id"></span>`--windows-image-id` | string |  | Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g. golden Windows 10/11/Server image) for Windows sandboxes. |

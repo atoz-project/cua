@@ -123,6 +123,168 @@ impl std::fmt::Display for RelayMode {
 /// The default official Cua relay URL.
 pub const DEFAULT_RELAY_URL: &str = "https://relay.cua.ai";
 
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+fn is_valid_ipv4_or_dns_host(host: &str) -> bool {
+    if host.is_empty() || !host.is_ascii() {
+        return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let h = host.strip_suffix('.').unwrap_or(host);
+    if h.is_empty() || h.len() > 253 {
+        return false;
+    }
+    for label in h.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return false;
+        }
+    }
+    let last_label = h.rsplit('.').next().unwrap_or(h);
+    !last_label.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Returns `true` when `auth` is a strict RFC-3986 `host` or `host:port`
+/// (IPv4, bracketed IPv6, or ASCII DNS hostname, with optional `1..=65535` port
+/// without leading `'0'`).
+pub fn is_valid_host_or_hostport(auth: &str) -> bool {
+    if auth.is_empty() || !auth.is_ascii() {
+        return false;
+    }
+    if let Some(rest) = auth.strip_prefix('[') {
+        let Some((ip, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return tail.is_empty() || tail.strip_prefix(':').is_some_and(is_valid_port);
+    }
+    if auth.contains(['[', ']']) {
+        return false;
+    }
+    match auth.split_once(':') {
+        Some((host, port)) => is_valid_ipv4_or_dns_host(host) && is_valid_port(port),
+        None => is_valid_ipv4_or_dns_host(auth),
+    }
+}
+
+/// Returns `true` when `host_port` is a valid IPv4/IPv6 literal, `localhost`,
+/// or a dotted domain name (as opposed to a bare single-label name such as
+/// `user:8080`).
+pub fn is_qualified_host(host_port: &str) -> bool {
+    if !is_valid_host_or_hostport(host_port) {
+        return false;
+    }
+    if host_port.starts_with('[') {
+        return true;
+    }
+    let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let h = host.trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost") || h.contains('.')
+}
+
+enum UrlReject {
+    BadChars,
+    MissingScheme,
+    UnsupportedScheme(String),
+    BackslashInAuthority,
+    InvalidHostOrPort,
+    UrlParse(url::ParseError),
+    EmptyHost,
+}
+
+struct ParsedHttpUrl<'a> {
+    parsed: url::Url,
+    raw_path: &'a str,
+    has_userinfo: bool,
+    multi_at: bool,
+    ambiguous_at: bool,
+}
+
+fn parse_http_url_structural(trimmed: &str) -> std::result::Result<ParsedHttpUrl<'_>, UrlReject> {
+    if !trimmed.is_ascii()
+        || trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"'))
+    {
+        return Err(UrlReject::BadChars);
+    }
+    let Some((scheme_raw, after_scheme)) = trimmed.split_once("://") else {
+        return Err(UrlReject::MissingScheme);
+    };
+    let scheme_lower = scheme_raw.to_ascii_lowercase();
+    if !matches!(scheme_lower.as_str(), "http" | "https") {
+        return Err(UrlReject::UnsupportedScheme(scheme_lower));
+    }
+    let delim_pos = after_scheme
+        .find(['/', '\\', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let raw_authority = &after_scheme[..delim_pos];
+    let raw_tail = &after_scheme[delim_pos..];
+    if raw_tail.starts_with('\\') {
+        return Err(UrlReject::BackslashInAuthority);
+    }
+    let at_count = raw_authority.bytes().filter(|&b| b == b'@').count();
+    let has_userinfo = at_count > 0;
+    let multi_at = at_count > 1;
+    let raw_host_port = raw_authority
+        .rsplit_once('@')
+        .map_or(raw_authority, |(_, hp)| hp);
+    if !is_valid_host_or_hostport(raw_host_port) {
+        return Err(UrlReject::InvalidHostOrPort);
+    }
+    let has_port_colon = if let Some(rest) = raw_host_port.strip_prefix('[') {
+        rest.split_once(']')
+            .is_some_and(|(_, t)| t.starts_with(':'))
+    } else {
+        raw_host_port.contains(':')
+    };
+    let parsed = url::Url::parse(trimmed).map_err(UrlReject::UrlParse)?;
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(UrlReject::EmptyHost);
+    }
+    if parsed.port() == Some(0) {
+        return Err(UrlReject::InvalidHostOrPort);
+    }
+    let ambiguous_at = raw_tail.contains("?@")
+        || raw_tail.contains("#@")
+        || (raw_tail.starts_with("/@") && has_port_colon && !is_qualified_host(raw_host_port))
+        || (!raw_tail.starts_with('/')
+            && raw_tail.contains('@')
+            && (has_userinfo || has_port_colon || !is_qualified_host(raw_host_port)))
+        || (raw_tail.contains('@') && has_port_colon && !is_qualified_host(raw_host_port));
+    let raw_path = if raw_tail.starts_with('/') {
+        let end = raw_tail.find(['?', '#']).unwrap_or(raw_tail.len());
+        &raw_tail[..end]
+    } else {
+        ""
+    };
+    Ok(ParsedHttpUrl {
+        parsed,
+        raw_path,
+        has_userinfo,
+        multi_at,
+        ambiguous_at,
+    })
+}
+
 /// Strips URL userinfo (`user:pass@`), `?query` parameters, and non-`#sha256=`
 /// fragments from `raw` so credentials and signed tokens never appear in logs,
 /// error messages, or `Debug` output.
@@ -131,38 +293,26 @@ pub fn redact_url(raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let Some(scheme_pos) = trimmed.find("://") else {
+    let Ok(u) = parse_http_url_structural(trimmed) else {
         return "<redacted>".into();
     };
-    let scheme = &trimmed[..scheme_pos];
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return "<redacted>".into();
-    }
-    let after_scheme = &trimmed[scheme_pos + 3..];
-    let (before_frag, frag) = match after_scheme.split_once('#') {
-        Some((b, f)) => (b, Some(f)),
-        None => (after_scheme, None),
-    };
-    let before_query = before_frag.split('?').next().unwrap_or(before_frag);
-    let (authority, path) = match before_query.find('/') {
-        Some(i) => (&before_query[..i], &before_query[i..]),
-        None => (before_query, ""),
-    };
-    let host_port = match authority.rsplit_once('@') {
-        Some((_, hp)) => hp,
-        None => authority,
-    };
-    if host_port.is_empty() {
+    if u.multi_at || u.ambiguous_at {
         return "<redacted>".into();
     }
-    let mut out = format!("{scheme}://{host_port}{path}");
-    if let Some(f) = frag
-        && let Some(hex) = f.strip_prefix("sha256=")
+    let Some(host) = u.parsed.host_str() else {
+        return "<redacted>".into();
+    };
+    let mut out = match u.parsed.port() {
+        Some(port) => format!("{}://{}:{}{}", u.parsed.scheme(), host, port, u.raw_path),
+        None => format!("{}://{}{}", u.parsed.scheme(), host, u.raw_path),
+    };
+    if let Some(frag) = u.parsed.fragment()
+        && let Some(hex) = frag.strip_prefix("sha256=")
         && !hex.is_empty()
         && hex.bytes().all(|b| b.is_ascii_hexdigit())
     {
         out.push('#');
-        out.push_str(f);
+        out.push_str(frag);
     }
     out
 }
@@ -926,6 +1076,102 @@ impl std::fmt::Debug for CloudTarget {
     }
 }
 
+/// Validates a custom `cua-spacesd` binary/archive download URL: must be
+/// `https://`, loopback `http://` (`localhost` / `127.0.0.1` / `[::1]`), or
+/// RFC 1918 private-IPv4 `http://`, without embedded URL userinfo
+/// credentials, backslashes in authority, quotes, non-ASCII, or whitespace; an
+/// optional `#sha256=<64 hex>` fragment is checked if present.
+pub fn validate_spacesd_download_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::InvalidArgument(
+            "--spacesd-download-url cannot be empty".into(),
+        ));
+    }
+    let safe = redact_url(trimmed);
+    let u = match parse_http_url_structural(trimmed) {
+        Ok(u) => u,
+        Err(UrlReject::BadChars) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url {safe:?} must be an ASCII URL without whitespace or quotes"
+            )));
+        }
+        Err(UrlReject::MissingScheme) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url {safe:?}: missing URL scheme (use https://)"
+            )));
+        }
+        Err(UrlReject::UnsupportedScheme(other)) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url scheme {other:?} is not supported (use https://)"
+            )));
+        }
+        Err(UrlReject::BackslashInAuthority) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url {safe:?} cannot contain '\\\\' in host"
+            )));
+        }
+        Err(UrlReject::EmptyHost) => {
+            return Err(crate::Error::InvalidArgument(
+                "--spacesd-download-url must include a host".into(),
+            ));
+        }
+        Err(UrlReject::InvalidHostOrPort) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url {safe:?} has an invalid host or port"
+            )));
+        }
+        Err(UrlReject::UrlParse(e)) => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url {safe:?}: {e}"
+            )));
+        }
+    };
+    if u.has_userinfo
+        || u.ambiguous_at
+        || !u.parsed.username().is_empty()
+        || u.parsed.password().is_some()
+    {
+        return Err(crate::Error::InvalidArgument(
+            "--spacesd-download-url cannot include embedded username or password credentials"
+                .into(),
+        ));
+    }
+    let is_local_http = match u.parsed.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match u.parsed.scheme() {
+        "https" => {}
+        "http" if is_local_http => {}
+        "http" => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url {safe:?}: use https:// (plain http is only allowed for localhost/127.0.0.1 or RFC1918 private IPs)"
+            )));
+        }
+        other => {
+            return Err(crate::Error::InvalidArgument(format!(
+                "--spacesd-download-url scheme {other:?} is not supported (use https://)"
+            )));
+        }
+    }
+    if let Some(frag) = u.parsed.fragment()
+        && let Some(hex) = frag.strip_prefix("sha256=")
+        && (hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(crate::Error::InvalidArgument(format!(
+            "--spacesd-download-url #sha256= fragment must be 64 hex characters (got {} chars)",
+            hex.len()
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// What a linked cloud supplies to the elastic pool.
 pub mod supplies {
     /// Machines the pool controls: each runs cua-spacesd as a host and many
@@ -1324,5 +1570,229 @@ mod tests {
         assert!(!serialized.contains("vpc_id"), "{serialized}");
         assert!(!serialized.contains("vswitch_id"), "{serialized}");
         assert!(!serialized.contains("no_public_ip"), "{serialized}");
+    }
+
+    #[test]
+    fn spacesd_download_url_allows_https_and_loopback_or_private_http_only() {
+        assert_eq!(
+            validate_spacesd_download_url("  https://mirror.example.cn/cua/cua-spacesd.tar.gz  ")
+                .unwrap(),
+            "https://mirror.example.cn/cua/cua-spacesd.tar.gz"
+        );
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(
+            validate_spacesd_download_url(&format!("https://mirror.example.cn/bin#sha256={hex}"))
+                .is_ok()
+        );
+        assert!(validate_spacesd_download_url("http://127.0.0.1:8080/cua-spacesd").is_ok());
+        assert!(validate_spacesd_download_url("http://localhost:9000/cua-spacesd.tar.gz").is_ok());
+        assert!(validate_spacesd_download_url("http://[::1]:9000/cua-spacesd").is_ok());
+        assert!(validate_spacesd_download_url("http://10.0.0.5:8080/cua-spacesd.exe").is_ok());
+
+        for bad in [
+            "",
+            "   ",
+            "http://mirror.example.cn/cua-spacesd",
+            "http://100.100.100.200/latest/meta-data",
+            "http://169.254.169.254/latest/meta-data",
+            "ftp://mirror.example.cn/cua-spacesd",
+            "https:///no-host.exe",
+            "https://mirror.example.cn/bad'quote",
+            "https://mirror.example.cn/bad space",
+            "https://mirror.example.cn/cua\u{2018}.exe",
+            "https://mirror.example.cn/bin#sha256=nothex",
+        ] {
+            assert!(validate_spacesd_download_url(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn spacesd_download_url_rejects_userinfo_and_redacts_errors() {
+        for bad in [
+            "https://user:secret@mirror.example.com/cua-spacesd.tar.gz",
+            "http://user:secret@localhost:8080/cua-spacesd",
+            "https://127.0.0.1@evil.com/bin",
+            "https://user@mirror.example.com/bin",
+            "https://:secret@mirror.example.com/bin",
+            "https://@mirror.example.com/bin",
+            "http://user:secret@mirror.example.com/cua-spacesd.tar.gz",
+            "https://user:secret@mirror.example.com/bad space",
+            "https://user:secret@[invalid/cua-spacesd",
+            "https://user:s3cr3t\\@mirror.example.com/bin",
+            "https://s3cr3t\\@mirror.example.com/bin",
+            "https://user:8443\\@mirror.example.com/bin",
+            "https://user:12345\\@mirror.example.com/bin",
+            "https://mirror.example.com\\@s3cr3t@evil.com/bin",
+            "https://user:s3cr3t/@mirror.example.com/bin",
+            "https://user:s3cr3t/@mirror.example.com/bad space",
+            "https://user:s3cr3t/@mirror.example.com/bad space?sig=DeadBeefCafe9988",
+            "https://mirror.example.com\\evil.com/bin",
+        ] {
+            let err = validate_spacesd_download_url(bad).expect_err(bad);
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_)),
+                "{bad:?} -> {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(!msg.contains("secret"), "secret leaked for {bad:?}: {msg}");
+            assert!(!msg.contains("s3cr3t"), "s3cr3t leaked for {bad:?}: {msg}");
+            assert!(
+                !msg.contains("DeadBeefCafe9988"),
+                "query leaked for {bad:?}: {msg}"
+            );
+            assert!(!msg.contains("user:"), "userinfo leaked for {bad:?}: {msg}");
+            assert!(!msg.contains("8443"), "port/pass leaked for {bad:?}: {msg}");
+            assert!(
+                !msg.contains("12345"),
+                "port/pass leaked for {bad:?}: {msg}"
+            );
+            assert!(
+                !msg.contains("127.0.0.1@"),
+                "userinfo leaked for {bad:?}: {msg}"
+            );
+            assert!(!msg.contains("user@"), "userinfo leaked for {bad:?}: {msg}");
+        }
+        // Legitimate `@` in URL path, query, and fragment is still accepted.
+        for ok in [
+            "https://mirror.example.com/@cua/cua-spacesd.tar.gz",
+            "https://mirror.example.com/@path/cua-spacesd.tar.gz",
+            "http://localhost:8080/@cua/cua-spacesd",
+            "https://mirror.example.com/bin?user=ada@example.com",
+            "https://mirror.example.com/bin#owner=ada@example.com",
+        ] {
+            assert!(validate_spacesd_download_url(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn redact_url_and_rejected_url_scrub_adversarial_authority_leaks() {
+        for bad in [
+            "https://user:s3cr3t secret/@evil.com/bin?sig=DeadBeef",
+            "https://user:s3cr3t?@evil.com/bin",
+            "https://user:s3cr3t @mirror.example.com/bin",
+        ] {
+            let redacted = redact_url(bad);
+            assert!(
+                !redacted.contains("user:s3cr3t"),
+                "redact_url leaked userinfo for {bad:?}: {redacted}"
+            );
+            assert!(
+                !redacted.contains("s3cr3t"),
+                "redact_url leaked secret for {bad:?}: {redacted}"
+            );
+            assert!(
+                !redacted.contains("DeadBeef"),
+                "redact_url leaked query for {bad:?}: {redacted}"
+            );
+
+            let err = validate_spacesd_download_url(bad).expect_err(bad);
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("user:s3cr3t"),
+                "error leaked userinfo for {bad:?}: {msg}"
+            );
+            assert!(
+                !msg.contains("s3cr3t"),
+                "error leaked secret for {bad:?}: {msg}"
+            );
+            assert!(
+                !msg.contains("DeadBeef"),
+                "error leaked query for {bad:?}: {msg}"
+            );
+        }
+        assert_eq!(
+            redact_url("https://mirror.example.com/@org/cua-spacesd?sig=DeadBeef"),
+            "https://mirror.example.com/@org/cua-spacesd"
+        );
+    }
+
+    #[test]
+    fn structural_url_redaction_blocks_port_and_delimiter_at_confusion_bypasses() {
+        for bad in [
+            "https://user:123456#@evil.com/bin",
+            "https://user:123456?x=@evil.com/bin",
+            "https://user:8080#@evil.com/bin",
+            "https://user:8080?x=@evil.com/bin",
+            "https://user:s3cr3t?@evil.com/bin",
+            "https://user:s3cr3t#@evil.com/bin",
+            "https://user:s3cr3t?x=@evil.com/bin",
+            "https://user:s3cr3t secret/@evil.com/bin?sig=DeadBeef",
+            "https://user:8080 foo/@evil.com/bin",
+            "https://user:s3cr3t @mirror.example.com/bin",
+            "https://user:8080/@evil.com/bin",
+            "https://ada@org:p4ssw0rd/@evil.com/bin",
+            "https://ada@org:8080/@evil.com/bin",
+            "https://ada@org:secret@mirror.example.com/bin",
+            "https://user:s3cr3t\\@mirror.example.com/bin",
+            "https://user:8443\\@mirror.example.com/bin",
+            "https://mirror.example.com\\@s3cr3t@evil.com/bin",
+            "https://example.com:0/bin",
+            "https://example.com:/bin",
+            "https://example.com:08080/bin",
+        ] {
+            let redacted = redact_url(bad);
+            assert_eq!(
+                redacted, "<redacted>",
+                "redact_url must fail closed for {bad:?}, got {redacted:?}"
+            );
+            let err = validate_spacesd_download_url(bad).expect_err(bad);
+            assert!(
+                matches!(err, crate::Error::InvalidArgument(_)),
+                "{bad:?} -> {err:?}"
+            );
+            let msg = err.to_string();
+            for leak in [
+                "user:", "123456", "8080", "8443", "08080", "s3cr3t", "p4ssw0rd", "ada@org",
+                "DeadBeef", "secret", "evil.com",
+            ] {
+                assert!(
+                    !msg.contains(leak),
+                    "validate_spacesd_download_url leaked {leak:?} for {bad:?}: {msg}"
+                );
+            }
+        }
+
+        let bad_sha = "https://mirror.example.com/bin#sha256=user:s3cr3t@evil.com";
+        let err = validate_spacesd_download_url(bad_sha).expect_err(bad_sha);
+        let msg = err.to_string();
+        assert!(!msg.contains("s3cr3t") && !msg.contains("user:"), "{msg}");
+
+        // Preserve valid URLs, templates, localhost/@org, and query @ parameters.
+        assert_eq!(
+            redact_url("https://mirror.example.com/cua-{version}-{arch}.tar.gz"),
+            "https://mirror.example.com/cua-{version}-{arch}.tar.gz"
+        );
+        assert_eq!(
+            redact_url("http://localhost:8080/@cua/cua-spacesd"),
+            "http://localhost:8080/@cua/cua-spacesd"
+        );
+        assert_eq!(
+            redact_url("https://cdn.example.com/pkg/@v1/spacesd"),
+            "https://cdn.example.com/pkg/@v1/spacesd"
+        );
+        let sha64 = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            redact_url(&format!(
+                "https://mirror.example.com/bin?user=ada@example.com&sig=AbCd#sha256={sha64}"
+            )),
+            format!("https://mirror.example.com/bin#sha256={sha64}")
+        );
+        assert_eq!(
+            redact_url(&format!(
+                "https://mirror.example.com?user=ada@example.com&sig=AbCd#sha256={sha64}"
+            )),
+            format!("https://mirror.example.com#sha256={sha64}")
+        );
+        for ok in [
+            "https://mirror.example.com/@org/cua-spacesd",
+            "https://cdn.example.com/pkg/@v1/spacesd",
+            "http://10.0.0.5:8080/cua-spacesd",
+            "http://[::1]:8080/cua-spacesd",
+            "http://localhost:9000/cua-spacesd",
+            "http://localhost:8080/@cua/cua-spacesd",
+            &format!("https://mirror.example.com?user=ada@example.com&sig=AbCd#sha256={sha64}"),
+        ] {
+            assert!(validate_spacesd_download_url(ok).is_ok(), "{ok:?}");
+        }
     }
 }
