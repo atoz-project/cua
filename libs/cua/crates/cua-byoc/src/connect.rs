@@ -76,6 +76,7 @@ pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Resul
     let limits = limits_of(req)?;
     let existing = clouds.store().connection(p.name()).map_err(Error::Io)?;
     let _ = crate::manager::merge_image_defaults(p.as_ref(), &req.target, existing.as_ref())?;
+    let _ = crate::manager::resolve_target_spacesd_download_url(&req.target, existing.as_ref())?;
     let relay = crate::manager::resolve_target_relay(
         clouds.store().home().as_deref(),
         p.name(),

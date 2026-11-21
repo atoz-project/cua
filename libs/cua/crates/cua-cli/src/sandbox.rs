@@ -4371,6 +4371,21 @@ mod tests {
         assert_eq!(t.a.runtime, Some(Runtime::Qemu));
         let t = p(&["--on", "direct:[::1]:3211"]).unwrap();
         assert_eq!(t.a.on, Some(On::Direct("[::1]:3211".into())));
+        let t = p(&["--on", "aliyun-ecs", "--runtime", "native"]).unwrap();
+        assert_eq!(t.a.on, Some(On::Provider("aliyun-ecs".into())));
+        assert_eq!(t.a.runtime, Some(Runtime::Other("native".into())));
+        let t_slim = p(&[
+            "--tier",
+            "slim",
+            "--on",
+            "aliyun-ecs",
+            "--runtime",
+            "native",
+        ])
+        .unwrap();
+        assert_eq!(t_slim.a.tier.as_deref(), Some("slim"));
+        assert_eq!(t_slim.a.on, Some(On::Provider("aliyun-ecs".into())));
+        assert_eq!(t_slim.a.runtime, Some(Runtime::Other("native".into())));
         // Engines and kinds are not locations; the error points at the flag.
         for (bad, hint) in [
             ("qemu", "--runtime qemu"),

@@ -63,6 +63,7 @@ pub struct FakeProvider {
     pub account: Arc<Mutex<FakeAccount>>,
     hook: Mutex<Option<BootHook>>,
     next: Mutex<u64>,
+    runtimes: Mutex<Vec<cua_sandbox_core::placement::Runtime>>,
 }
 
 impl FakeProvider {
@@ -74,7 +75,13 @@ impl FakeProvider {
             account: Default::default(),
             hook: Mutex::new(None),
             next: Mutex::new(1),
+            runtimes: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Configures the runtimes advertised by [`CloudApi::runtimes`].
+    pub fn set_runtimes(&self, runtimes: Vec<cua_sandbox_core::placement::Runtime>) {
+        *self.runtimes.lock().unwrap() = runtimes;
     }
 
     /// Runs `hook` for every machine it provisions.
@@ -140,6 +147,10 @@ impl CloudApi for FakeProvider {
             .unwrap_or(&["linux"])
     }
 
+    fn runtimes(&self) -> Vec<cua_sandbox_core::placement::Runtime> {
+        self.runtimes.lock().unwrap().clone()
+    }
+
     fn supports_image_defaults(&self) -> bool {
         self.account.lock().unwrap().allow_custom_image_and_sizing
     }
@@ -185,7 +196,7 @@ impl CloudApi for FakeProvider {
                 image: "windows".into(),
                 kind: "vm".into(),
                 supported: true,
-                machine_type: est_type,
+                machine_type: est_type.clone(),
                 usd_per_hour: est_usd,
                 ..Default::default()
             });
@@ -197,6 +208,16 @@ impl CloudApi for FakeProvider {
             reason: "not offered".into(),
             ..Default::default()
         });
+        if !self.runtimes.lock().unwrap().is_empty() {
+            out.push(CloudKind {
+                image: "linux-slim".into(),
+                kind: "container".into(),
+                supported: true,
+                machine_type: est_type,
+                usd_per_hour: est_usd,
+                ..Default::default()
+            });
+        }
         out
     }
 

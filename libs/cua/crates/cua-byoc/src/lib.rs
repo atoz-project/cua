@@ -219,7 +219,7 @@ pub fn cloud_kinds(
 
 #[cfg(test)]
 mod tests {
-    use super::cloud_kinds;
+    use super::*;
     use cua_sandbox_core::placement::{Kind, Runtime};
 
     #[test]
@@ -227,16 +227,32 @@ mod tests {
         let kinds = cloud_kinds(vec![
             Runtime::Other("docker".into()),
             Runtime::Other("native".into()),
+            Runtime::Other("microvm".into()),
         ]);
-        assert_eq!(kinds.len(), 2);
+        assert_eq!(kinds.len(), 3);
         assert_eq!(kinds[0].kind, Kind::Container);
         assert_eq!(kinds[0].runtimes, vec![Runtime::Other("docker".into())]);
         assert_eq!(kinds[1].kind, Kind::Vm);
         assert_eq!(kinds[1].runtimes, vec![Runtime::Other("native".into())]);
+        assert_eq!(kinds[2].kind, Kind::MicroVm);
+        assert_eq!(kinds[2].runtimes, vec![Runtime::Other("microvm".into())]);
 
         let modal = cloud_kinds(vec![Runtime::Gvisor, Runtime::Other("microvm".into())]);
         assert_eq!(modal.len(), 2);
         assert_eq!(modal[0].kind, Kind::Container);
         assert_eq!(modal[1].kind, Kind::MicroVm);
+    }
+
+    #[cfg(feature = "aliyun-ecs")]
+    #[test]
+    fn aliyun_ecs_offers_docker_default_then_native() {
+        let api = aliyun_ecs::AliyunEcs::new();
+        assert_eq!(
+            api.runtimes(),
+            vec![
+                Runtime::Other("docker".into()),
+                Runtime::Other("native".into()),
+            ]
+        );
     }
 }

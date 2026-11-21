@@ -37,6 +37,7 @@ const SECRET_WORDS: &[&str] = &[
     "private key",
     "credential",
     "sandbox.env",
+    "spacesd.env",
     "jwks",
 ];
 
@@ -53,31 +54,27 @@ const URL_QUERY_SECRET_PARAMS: &[&str] = &[
     "x-amz-signature=",
     "x-amz-credential=",
     "x-amz-security-token=",
+    "x-goog-signature=",
+    "x-goog-credential=",
+    "x-goog-algorithm=",
+    "googleaccessid=",
     "ossaccesskeyid=",
     "x-oss-signature=",
+    "x-oss-security-token=",
+    "x-oss-credential=",
+    "awsaccesskeyid=",
     "?sas=",
     "&sas=",
+    "?auth=",
+    "&auth=",
+    "?key=",
+    "&key=",
+    "?hmac=",
+    "&hmac=",
 ];
 
 fn contains_url_secret(low: &str) -> bool {
-    if URL_QUERY_SECRET_PARAMS.iter().any(|p| low.contains(p)) {
-        return true;
-    }
-    for scheme in ["https://", "http://"] {
-        let mut rest = low;
-        while let Some(idx) = rest.find(scheme) {
-            let after = &rest[idx + scheme.len()..];
-            let authority = after
-                .split(['/', '?', '#', ' ', '\t', '"', '\''])
-                .next()
-                .unwrap_or("");
-            if authority.contains('@') {
-                return true;
-            }
-            rest = after;
-        }
-    }
-    false
+    URL_QUERY_SECRET_PARAMS.iter().any(|p| low.contains(p))
 }
 
 fn strip_escapes(line: &str) -> String {
@@ -100,8 +97,145 @@ fn strip_escapes(line: &str) -> String {
     out
 }
 
+fn scrub_path_and_sha256(rest_of_token: &str) -> String {
+    let path = rest_of_token.split(['?', '#']).next().unwrap_or("");
+    let mut out = String::from(path);
+    if let Some((_, frag)) = rest_of_token.split_once('#')
+        && let Some(hex) = frag.strip_prefix("sha256=")
+        && !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        out.push('#');
+        out.push_str(frag);
+    }
+    out
+}
+
+fn next_url_scheme_start(after_token: &str) -> Option<usize> {
+    let sep = after_token.find("://")?;
+    let bytes = after_token.as_bytes();
+    let mut start = sep;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    Some(start)
+}
+
+fn scrub_line_urls(line: &str) -> Option<String> {
+    use cua_sandbox_core::byoc::{is_qualified_host, is_valid_host_or_hostport};
+
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(idx) = rest.find("://") {
+        let before_sep = &rest[..idx];
+        let scheme = before_sep
+            .rsplit_once(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '-' | '.'))
+            .map_or(before_sep, |(_, s)| s);
+        out.push_str(&rest[..idx + 3]);
+        let after_scheme = &rest[idx + 3..];
+        let token_end = after_scheme
+            .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>'))
+            .unwrap_or(after_scheme.len());
+        let mut body_end = token_end;
+        while body_end > 0 {
+            let b = after_scheme.as_bytes()[body_end - 1];
+            let slice = &after_scheme[..body_end];
+            if matches!(b, b',' | b')' | b';')
+                || (b == b']' && (!slice.starts_with('[') || slice.contains(['/', '?', '#'])))
+            {
+                body_end -= 1;
+            } else {
+                break;
+            }
+        }
+        let url_body = &after_scheme[..body_end];
+        let after_token = &after_scheme[body_end..];
+        let auth_end = url_body.find(['/', '?', '#']).unwrap_or(url_body.len());
+        let raw_auth = &url_body[..auth_end];
+        let rest_of_token = &url_body[auth_end..];
+
+        let gap = match next_url_scheme_start(after_token) {
+            Some(n) => &after_token[..n],
+            None => after_token,
+        };
+        for w in gap.split_whitespace() {
+            let wt = w.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '\'' | '"' | '<' | '>' | '(' | ')' | '[' | ']' | ',' | ';'
+                )
+            });
+            if wt.starts_with('@')
+                || wt.contains("/@")
+                || wt
+                    .split_once('@')
+                    .is_some_and(|(_, tail)| tail.contains(['/', '?', '#']))
+                || (!rest_of_token.starts_with('/')
+                    && !is_qualified_host(raw_auth)
+                    && wt.contains('@'))
+            {
+                return None;
+            }
+        }
+
+        if raw_auth.is_empty() {
+            if rest_of_token.is_empty() {
+                rest = after_token;
+                continue;
+            }
+            if matches!(scheme.to_ascii_lowercase().as_str(), "file" | "unix")
+                && rest_of_token.starts_with('/')
+                && !rest_of_token.contains('@')
+            {
+                out.push_str(&scrub_path_and_sha256(rest_of_token));
+                rest = after_token;
+                continue;
+            }
+            return None;
+        } else if let Some((_, host_candidate)) = raw_auth.rsplit_once('@') {
+            if !is_valid_host_or_hostport(host_candidate) {
+                return None;
+            }
+            if !rest_of_token.starts_with('/') && rest_of_token.contains('@') {
+                return None;
+            }
+            if rest_of_token.starts_with("/@")
+                && host_candidate.contains(':')
+                && !is_qualified_host(host_candidate)
+            {
+                return None;
+            }
+            out.push_str("<redacted>@");
+            out.push_str(host_candidate);
+            out.push_str(&scrub_path_and_sha256(rest_of_token));
+        } else {
+            if !is_valid_host_or_hostport(raw_auth) {
+                return None;
+            }
+            if !rest_of_token.starts_with('/') && rest_of_token.contains('@') {
+                return None;
+            }
+            if rest_of_token.contains('@') && raw_auth.contains(':') && !is_qualified_host(raw_auth)
+            {
+                return None;
+            }
+            out.push_str(raw_auth);
+            out.push_str(&scrub_path_and_sha256(rest_of_token));
+        }
+        rest = after_token;
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// The last [`KEEP_LINES`] lines of `raw` without any line that mentions a
-/// secret word or one of the `secrets` values themselves.
+/// secret word or one of the `secrets` values themselves, with URL userinfo
+/// credentials scrubbed.
 pub fn filter(raw: &str, secrets: &[&str]) -> Vec<String> {
     let secrets: Vec<&str> = secrets
         .iter()
@@ -118,6 +252,7 @@ pub fn filter(raw: &str, secrets: &[&str]) -> Vec<String> {
                 && !contains_url_secret(&low)
                 && !secrets.iter().any(|s| l.contains(s))
         })
+        .filter_map(|l| scrub_line_urls(&l))
         .collect();
     let drop = lines.len().saturating_sub(KEEP_LINES);
     lines.drain(..drop);
@@ -234,5 +369,182 @@ mod tests {
             "{s}"
         );
         assert!(s.contains(&p.display().to_string()));
+    }
+
+    #[test]
+    fn spacesd_env_and_url_userinfo_are_redacted() {
+        let raw = "\
+boot step 1 ok\n\
+chmod 0600 /etc/cua/spacesd.env\n\
+downloading cua-spacesd from https://user:s3cr3t@mirror.example.com/cua-spacesd.tar.gz\n\
+also https://user:secret@mirror.example.com/cua-spacesd.tar.gz\n\
+fallback http://tok:p4ssw0rd@127.0.0.1:8080/cua-spacesd failed\n\
+mirror https://mirror.example.com/@cua/cua-spacesd.tar.gz ok\n\
+owner ada@example.com done\n";
+        let out = filter(raw, &[]);
+        assert!(
+            out.iter().all(|l| !l.contains("spacesd.env")),
+            "spacesd.env line leaked: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .all(|l| !l.contains("s3cr3t") && !l.contains("p4ssw0rd") && !l.contains("secret")),
+            "URL password leaked: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .all(|l| !l.contains("user:") && !l.contains("tok:")),
+            "URL username leaked: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.contains("https://<redacted>@mirror.example.com/cua-spacesd.tar.gz")),
+            "expected redacted https URL in {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.contains("http://<redacted>@127.0.0.1:8080/cua-spacesd")),
+            "expected redacted http URL in {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|l| l.contains("https://mirror.example.com/@cua/cua-spacesd.tar.gz")),
+            "valid @ path corrupted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("ada@example.com")),
+            "plain email corrupted: {out:?}"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_with_backslash_before_at_is_redacted() {
+        let raw = "\
+downloading from https://user:8443\\@mirror.example.com/bin failed\n\
+downloading from https://s3cr3t\\@mirror.example.com/bin failed\n\
+mirror https://mirror.example.com/@cua/cua-spacesd.tar.gz ok\n";
+        let out = filter(raw, &[]);
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert!(
+            out.iter()
+                .all(|l| !l.contains("8443") && !l.contains("user:") && !l.contains("s3cr3t")),
+            "URL credentials leaked with backslash before @: {out:?}"
+        );
+        assert_eq!(
+            out[0],
+            "downloading from https://<redacted>@mirror.example.com/bin failed"
+        );
+        assert_eq!(
+            out[1],
+            "downloading from https://<redacted>@mirror.example.com/bin failed"
+        );
+        assert_eq!(
+            out[2],
+            "mirror https://mirror.example.com/@cua/cua-spacesd.tar.gz ok"
+        );
+    }
+
+    #[test]
+    fn structural_url_scrubbing_blocks_bypasses_and_preserves_legitimate_lines() {
+        for (line, forbidden) in [
+            (
+                "downloading https://user:p4ssw0rd?@evil.com/bin",
+                &["user", "p4ssw0rd"][..],
+            ),
+            (
+                "downloading https://user:p4ssw0rd#@evil.com/bin",
+                &["user", "p4ssw0rd"][..],
+            ),
+            (
+                "downloading https://user:p4ssw0rd foo/@evil.com/bin",
+                &["user", "p4ssw0rd", "foo/"][..],
+            ),
+            (
+                "downloading https://user:p4ssw0rd @evil.com/bin",
+                &["user", "p4ssw0rd"][..],
+            ),
+            (
+                "downloading https://user:8080?x=@evil.com/bin",
+                &["user", "8080"][..],
+            ),
+            (
+                "downloading https://user:8080#@evil.com/bin",
+                &["user", "8080"][..],
+            ),
+            (
+                "downloading https://user:8080 foo/@evil.com/bin",
+                &["user", "8080", "foo/"][..],
+            ),
+            (
+                "downloading https://user:123456#@evil.com/bin",
+                &["user", "123456"][..],
+            ),
+            (
+                "downloading https://user:123456?x=@evil.com/bin",
+                &["user", "123456"][..],
+            ),
+            (
+                "downloading https://user:p4ssw0rd%40evil.com/bin",
+                &["user", "p4ssw0rd"][..],
+            ),
+            (
+                "downloading https://ada@org:p4ssw0rd/@evil.com/bin",
+                &["ada", "org", "p4ssw0rd"][..],
+            ),
+            (
+                "downloading https://ada@org:8080/@evil.com/bin",
+                &["ada", "org", "8080"][..],
+            ),
+            (
+                "downloading https://mirror.example.com/bin?X-Goog-Signature=GOOG9988",
+                &["GOOG9988"][..],
+            ),
+            (
+                "GET /bin?X-Goog-Signature=GOOG9988 HTTP/1.1",
+                &["GOOG9988"][..],
+            ),
+            (
+                "GET /bin?AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE HTTP/1.1",
+                &["AKIAIOSFODNN7EXAMPLE"][..],
+            ),
+            (
+                "downloading https://mirror.example.com/bin?X-Custom-Auth=CUST9988",
+                &["CUST9988"][..],
+            ),
+        ] {
+            let out = filter(line, &[]);
+            for bad in forbidden {
+                assert!(
+                    out.iter().all(|l| !l.contains(bad)),
+                    "leaked {bad:?} for {line:?}: {out:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            filter("downloading https://ada@org:p4ssw0rd@evil.com/bin", &[]),
+            vec!["downloading https://<redacted>@evil.com/bin"]
+        );
+
+        let sha = "0123456789abcdef".repeat(4);
+        for ok in [
+            "downloading https://example.com/@org/cua-spacesd".to_string(),
+            "downloading https://mirror.example.com/bin".to_string(),
+            "fallback http://localhost:8080/@cua/cua-spacesd ok".to_string(),
+            "owner ops@example.com done".to_string(),
+            "downloading https://mirror.example.com/bin contact ops@example.com".to_string(),
+            "socket unix:///var/run/docker.sock ready".to_string(),
+            format!("downloading https://mirror.example.com/bin#sha256={sha}"),
+        ] {
+            assert_eq!(filter(&ok, &[]), vec![ok.clone()], "corrupted {ok:?}");
+        }
+
+        assert_eq!(
+            filter(
+                "first https://u:p@a.com/bin second https://b.com/@org/bin",
+                &[]
+            ),
+            vec!["first https://<redacted>@a.com/bin second https://b.com/@org/bin"]
+        );
     }
 }

@@ -175,8 +175,8 @@ pub struct TargetArgs {
     /// from stdin (never pass tokens in argv).
     #[arg(long, conflicts_with = "token_stdin")]
     pub relay_token_stdin: bool,
-    /// Optional custom `cua-spacesd` binary mirror URL for Windows Direct VM
-    /// provisioning (with optional `#sha256=<64 hex>` fragment).
+    /// Custom `cua-spacesd` binary or `.tar.gz` download URL override for
+    /// Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment).
     #[arg(long, value_name = "URL")]
     pub spacesd_download_url: Option<String>,
     /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
@@ -2608,5 +2608,36 @@ mod tests {
         assert_eq!(j["windows_image_id"], "m-win11");
         assert_eq!(j["linux_image_id"], "m-ubuntu");
         assert_eq!(j["instance_type"], "ecs.c7.2xlarge");
+    }
+
+    #[test]
+    fn spacesd_download_url_flag_parses_for_connect_and_test() {
+        let url = "https://mirror.example.cn/cua/cua-spacesd-linux-x86_64.tar.gz";
+        match parse(&["connect", "aliyun-ecs", "--spacesd-download-url", url]) {
+            CloudCmd::Connect { target, .. } => {
+                assert_eq!(target.provider, "aliyun-ecs");
+                assert_eq!(target.spacesd_download_url.as_deref(), Some(url));
+                let wire = target.target_with_stdin(String::new);
+                assert_eq!(wire.spacesd_download_url.as_deref(), Some(url));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["test", "aliyun-ecs", "--spacesd-download-url", url]) {
+            CloudCmd::Test { target } => {
+                assert_eq!(target.provider, "aliyun-ecs");
+                assert_eq!(target.spacesd_download_url.as_deref(), Some(url));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let p = cua_sdk::CloudProvider {
+            name: "aliyun-ecs".into(),
+            title: "Alibaba Cloud ECS".into(),
+            connected: true,
+            status: "connected".into(),
+            spacesd_download_url: Some(url.into()),
+            ..Default::default()
+        };
+        assert_eq!(provider_json(&p)["spacesd_download_url"], url);
     }
 }

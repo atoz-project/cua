@@ -537,47 +537,11 @@ impl Clouds {
 }
 
 pub(crate) fn normalize_spacesd_download_url(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(Error::InvalidArgument(
-            "--spacesd-download-url must not be empty".into(),
-        ));
-    }
-    if !trimmed.is_ascii()
-        || trimmed.contains('\'')
-        || trimmed.contains('"')
-        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err(Error::InvalidArgument(
-            "--spacesd-download-url must be an ASCII URL without whitespace or quotes".into(),
-        ));
-    }
+    let trimmed = cua_sandbox_core::byoc::validate_spacesd_download_url(raw)?;
     let (url_part, frag) = match trimmed.split_once('#') {
         Some((u, f)) => (u, Some(f)),
-        None => (trimmed, None),
+        None => (trimmed.as_str(), None),
     };
-    if let Some(after_scheme) = url_part
-        .strip_prefix("https://")
-        .or_else(|| url_part.strip_prefix("http://"))
-        && after_scheme.starts_with('/')
-    {
-        return Err(Error::InvalidArgument(
-            "--spacesd-download-url must include a host".into(),
-        ));
-    }
-    let parsed = url::Url::parse(url_part).map_err(|_| {
-        Error::InvalidArgument("--spacesd-download-url must be a valid http(s) URL".into())
-    })?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(Error::InvalidArgument(
-            "--spacesd-download-url must start with https:// or http://".into(),
-        ));
-    }
-    if parsed.host_str().is_none_or(str::is_empty) {
-        return Err(Error::InvalidArgument(
-            "--spacesd-download-url must include a host".into(),
-        ));
-    }
     if let Some(f) = frag {
         let Some(hex) = f.strip_prefix("sha256=") else {
             return Err(Error::InvalidArgument(
@@ -591,6 +555,9 @@ pub(crate) fn normalize_spacesd_download_url(raw: &str) -> Result<String> {
         }
         return Ok(format!("{url_part}#sha256={}", hex.to_ascii_lowercase()));
     }
+    let parsed = url::Url::parse(url_part).map_err(|_| {
+        Error::InvalidArgument("--spacesd-download-url must be a valid http(s) URL".into())
+    })?;
     if parsed.query().is_some() {
         return Err(Error::InvalidArgument(
             "--spacesd-download-url with a query string must include `#sha256=<64 hex>` (sidecar `.sha256` cannot be appended to a signed query)"
@@ -1288,17 +1255,21 @@ mod tests {
             "https://bucket.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988",
             "https://mirror.example/a.exe#sha256=short",
             "https://mirror.example/a.exe#other=123",
+            &format!(
+                "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={hex}"
+            ),
         ] {
             let err = normalize_spacesd_download_url(bad).unwrap_err();
             assert!(!err.to_string().contains("DeadBeefCafe9988"), "{err}");
+            assert!(!err.to_string().contains("MyPass998877"), "{err}");
         }
         assert_eq!(
             normalize_spacesd_download_url(&format!(
-                "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={hex}"
+                "https://mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={hex}"
             ))
             .unwrap(),
             format!(
-                "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
+                "https://mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
                 "a".repeat(64)
             )
         );

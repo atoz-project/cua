@@ -1675,13 +1675,13 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
         "budget refusal must happen before ANY cloud API call"
     );
 
-    // 3. --runtime native is refused cleanly until M4 (#5).
-    let mut native_opts = sb_create_opts("native-unsupported");
-    native_opts.runtime = Runtime::Other("native".into());
-    let err_native = sb_budget.create(native_opts).await.unwrap_err();
+    // 3. Unsupported runtime is refused cleanly before any cloud API call.
+    let mut bad_rt_opts = sb_create_opts("runtime-unsupported");
+    bad_rt_opts.runtime = Runtime::Qemu;
+    let err_rt = sb_budget.create(bad_rt_opts).await.unwrap_err();
     assert!(
-        err_native.to_string().contains("docker") || err_native.to_string().contains("native"),
-        "{err_native}"
+        err_rt.to_string().contains("docker") || err_rt.to_string().contains("native"),
+        "{err_rt}"
     );
     assert!(s2.lock().unwrap().calls.is_empty());
 }
@@ -2915,8 +2915,34 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
     let (fail_tx, mut fail_rx) = tokio::sync::oneshot::channel::<()>();
     let fail_tx = Arc::new(Mutex::new(Some(fail_tx)));
     let captured_pw: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let mirror_url = format!(
+    let cred_mirror = format!(
         "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
+        "ef".repeat(32)
+    );
+    let cred_err = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+                relay_token: Some(static_tok.into()),
+                spacesd_download_url: Some(cred_mirror.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(!cred_err.to_string().contains("MyPass998877"), "{cred_err}");
+    assert!(
+        !cred_err.to_string().contains("DeadBeefCafe9988"),
+        "{cred_err}"
+    );
+
+    let mirror_url = format!(
+        "https://mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
         "ef".repeat(32)
     );
     let conn_res = clouds
@@ -2936,7 +2962,6 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
         .await
         .unwrap();
     let conn_dbg = format!("{conn_res:?}");
-    assert!(!conn_dbg.contains("MyPass998877"), "{conn_dbg}");
     assert!(!conn_dbg.contains("DeadBeefCafe9988"), "{conn_dbg}");
     {
         let mut f = s.lock().unwrap();
@@ -2944,6 +2969,7 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
         let fail_tx = fail_tx.clone();
         let captured_pw = captured_pw.clone();
         let mirror_url = mirror_url.clone();
+        let cred_mirror = cred_mirror.clone();
         f.on_run_instance = Some(Arc::new(move |id, params| {
             let id_owned = id.to_string();
             let pw = params.get("Password").cloned().unwrap_or_default();
@@ -2951,12 +2977,13 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
             let s2 = s_inner.clone();
             let tx = fail_tx.clone();
             let mirror_url = mirror_url.clone();
+            let cred_mirror = cred_mirror.clone();
             tokio::spawn(async move {
                 let mut f = s2.lock().unwrap();
                 f.console_outputs.insert(
                     id_owned.clone(),
                     format!(
-                        "cloudbase-init starting\nCUA_RELAY_TOKEN={static_tok}\nWinlogonPassword={pw}\nInvoke-WebRequest failed: {mirror_url}\nfatal: mirror download 404\n"
+                        "cloudbase-init starting\nCUA_RELAY_TOKEN={static_tok}\nWinlogonPassword={pw}\nInvoke-WebRequest failed: {mirror_url}\nfallback: {cred_mirror}\nfatal: mirror download 404\n"
                     ),
                 );
                 if let Some(inst) = f.instances.get_mut(&id_owned) {
@@ -4417,4 +4444,523 @@ async fn cloud_sandboxes_create_rejects_disk_zero_and_whitespace_directly() {
         );
     }
     assert!(s.lock().unwrap().calls.is_empty());
+}
+
+fn decode_native_cloud_init_file(user_data: &str, path: &str) -> Option<String> {
+    let at = user_data.find(&format!("path: {path}\n"))?;
+    let rest = &user_data[at..];
+    let c = rest.find("content: ")? + "content: ".len();
+    if let Some(after_pipe) = rest[c..].strip_prefix("|\n") {
+        let mut out = String::new();
+        let mut indent: Option<usize> = None;
+        for line in after_pipe.split('\n') {
+            if line.is_empty() {
+                out.push('\n');
+                continue;
+            }
+            let spaces = line.bytes().take_while(|b| *b == b' ').count();
+            let ind = *indent.get_or_insert(spaces);
+            if spaces < ind {
+                break;
+            }
+            out.push_str(&line[ind..]);
+            out.push('\n');
+        }
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        return Some(out);
+    }
+    let end = rest[c..].find('\n').unwrap_or(rest.len() - c);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(rest[c..c + end].trim())
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+#[tokio::test]
+async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
+    use cua_sandbox_core::placement::{Kind, Runtime};
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+        ),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+    clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Default (`Runtime::Auto`) keeps Docker-on-VM (`docker-on-vm`).
+    let sb_docker = sandboxes
+        .create(sb_create_opts("linux-docker-default"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sb_docker.placement(),
+        (Kind::Container, Runtime::Other("docker-on-vm".into()))
+    );
+    assert_eq!(
+        sb_docker
+            .provider_details()
+            .get("runtime")
+            .map(String::as_str),
+        Some("docker-on-vm")
+    );
+    sandboxes.delete("linux-docker-default").await.unwrap();
+    s.lock().unwrap().calls.clear();
+
+    // 2. Explicit `--runtime native` creates a Linux Direct VM Sandbox.
+    let mut opts = sb_create_opts("linux-native-acct");
+    opts.runtime = Runtime::Other("native".into());
+    opts.env.insert("APP_ENV".into(), "production".into());
+    let sb = sandboxes.create(opts).await.unwrap();
+    assert_eq!(sb.placement(), (Kind::Vm, Runtime::Other("native".into())));
+    assert_eq!(
+        sb.provider_details().get("runtime").map(String::as_str),
+        Some("native")
+    );
+
+    let run_call = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run_call.params.get("InstanceType").map(String::as_str),
+        Some("ecs.e-c1m2.large")
+    );
+    assert_eq!(
+        run_call.params.get("SystemDisk.Size").map(String::as_str),
+        Some("40")
+    );
+    assert_eq!(
+        run_call
+            .params
+            .get("SystemDisk.Category")
+            .map(String::as_str),
+        Some("cloud_essd")
+    );
+    assert_eq!(
+        run_call
+            .params
+            .get("InstanceChargeType")
+            .map(String::as_str),
+        Some("PostPaid")
+    );
+    assert_eq!(
+        run_call.params.get("StoppedMode").map(String::as_str),
+        Some("StopCharging")
+    );
+    assert_eq!(
+        run_call.params.get("HttpTokens").map(String::as_str),
+        Some("required")
+    );
+    assert!(run_call.params.contains_key("AutoReleaseTime"));
+    assert!(!run_call.params.contains_key("Password"));
+    let img_id = run_call.params.get("ImageId").unwrap();
+    assert!(img_id.starts_with("ubuntu_24_04"), "{img_id}");
+
+    // All 6 Cua tags attached at creation time.
+    let mut run_tags = BTreeMap::new();
+    for i in 1..=10 {
+        if let (Some(k), Some(v)) = (
+            run_call.params.get(&format!("Tag.{i}.Key")),
+            run_call.params.get(&format!("Tag.{i}.Value")),
+        ) {
+            run_tags.insert(k.clone(), v.clone());
+        }
+    }
+    for req_key in [
+        model::tag::MANAGED,
+        model::tag::OWNER,
+        model::tag::SPACE,
+        model::tag::MACHINE,
+        model::tag::CREATED_BY,
+        model::tag::EXPIRES,
+    ] {
+        assert!(run_tags.contains_key(req_key), "missing tag {req_key}");
+    }
+
+    let ud = decode_b64_str(run_call.params.get("UserData").unwrap());
+    assert!(ud.starts_with("#cloud-config\n"));
+    assert!(ud.len() < 16 * 1024, "UserData {} >= 16384", ud.len());
+    let boot = decode_native_cloud_init_file(&ud, "/usr/local/sbin/cua-first-boot").unwrap();
+    assert!(!boot.contains("docker.io") && !boot.contains("docker run"));
+    assert!(boot.contains("/usr/local/bin/cua-spacesd"));
+    assert!(boot.contains("sha256sum"));
+    assert!(boot.contains("100.100.100.200/32"));
+    assert!(ud.contains("cua-expire.timer"));
+    assert!(decode_native_cloud_init_file(&ud, "/etc/systemd/system/cua-expire.timer").is_some());
+    assert!(boot.contains("CUA_ENV_NO_DESKTOP=1"));
+    assert!(boot.contains("cua-spacesd.service"));
+    let envf = decode_native_cloud_init_file(&ud, "/etc/cua/spacesd.env").unwrap();
+    assert!(envf.contains("APP_ENV=production\n"));
+    assert!(envf.contains("CUA_RELAY_JWKS=/etc/cua/relay/jwks.json"));
+    assert!(decode_native_cloud_init_file(&ud, "/etc/cua/relay/jwks.json").is_some());
+
+    // Reachable over FakeRelay, then Stop/Start/Delete cleanly.
+    sandboxes.suspend("linux-native-acct").await.unwrap();
+    sandboxes.resume("linux-native-acct").await.unwrap();
+    sandboxes.delete("linux-native-acct").await.unwrap();
+    assert!(s.lock().unwrap().instances.is_empty());
+}
+
+#[tokio::test]
+async fn aliyun_ecs_linux_slim_direct_vm_static_relay_mirror_and_failed_boot_rollback() {
+    use cua_sandbox_core::placement::{Kind, Runtime};
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    let static_tok = "static-linux-native-secret-xyz";
+    relay.add_static_token(static_tok);
+    relay.set_account_auth(false);
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("unused".into())),
+        ),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+
+    let mirror_sha = "ab".repeat(32);
+    let mirror_url = format!(
+        "https://mirror.example.cn/cua/cua-spacesd-linux-x86_64.tar.gz#sha256={mirror_sha}"
+    );
+    clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+                relay_token: Some(static_tok.into()),
+                spacesd_download_url: Some(mirror_url.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Successful Static Relay Mode `linux-slim --runtime native` with custom mirror.
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            let mut mid = None;
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                {
+                    mid = params.get(&format!("Tag.{i}.Value")).cloned();
+                }
+            }
+            if let Some(mid) = mid {
+                let ud = decode_b64_str(params.get("UserData").unwrap());
+                let envf = decode_native_cloud_init_file(&ud, "/etc/cua/spacesd.env").unwrap();
+                let env_tok = envf
+                    .lines()
+                    .find_map(|l| l.strip_prefix("CUA_ENV_TOKEN="))
+                    .unwrap()
+                    .to_string();
+                relay.tunnel(&mid, &mock_url);
+                relay.set_static_online(&mid, true, Some(&env_tok));
+            }
+        }));
+    }
+
+    let mut o = CreateOptions::new(
+        ProviderKind::Contrib,
+        "registry.invalid/trycua/linux:24.04-slim",
+    );
+    o.contrib = Some("aliyun-ecs".into());
+    o.name = Some("linux-slim-static-native".into());
+    o.runtime = Runtime::Other("native".into());
+    let sb = sandboxes.create(o).await.unwrap();
+    assert_eq!(sb.placement(), (Kind::Vm, Runtime::Other("native".into())));
+
+    let run_call = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run_call.params.get("InstanceType").map(String::as_str),
+        Some("ecs.e-c1m1.large")
+    );
+    let ud = decode_b64_str(run_call.params.get("UserData").unwrap());
+    assert!(ud.len() < 16 * 1024, "UserData {} >= 16384", ud.len());
+    assert!(!ud.contains(static_tok));
+    assert!(decode_native_cloud_init_file(&ud, "/etc/cua/relay/jwks.json").is_none());
+    let boot = decode_native_cloud_init_file(&ud, "/usr/local/sbin/cua-first-boot").unwrap();
+    assert!(boot.contains("https://mirror.example.cn/cua/cua-spacesd-linux-x86_64.tar.gz"));
+    assert!(boot.contains(&mirror_sha));
+
+    let client = sb.spacesd().await.unwrap();
+    client.health().await.unwrap();
+    sandboxes.delete("linux-slim-static-native").await.unwrap();
+    assert!(s.lock().unwrap().instances.is_empty());
+
+    // 2. Failed boot: `GetInstanceConsoleOutput` redacted (`spacesd.env` & URL userinfo) + rollback.
+    {
+        let s_inner = s.clone();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |id, params| {
+            let id_owned = id.to_string();
+            let ud = decode_b64_str(params.get("UserData").unwrap());
+            let envf = decode_native_cloud_init_file(&ud, "/etc/cua/spacesd.env").unwrap();
+            let env_tok = envf
+                .lines()
+                .find_map(|l| l.strip_prefix("CUA_ENV_TOKEN="))
+                .unwrap()
+                .to_string();
+            let s2 = s_inner.clone();
+            tokio::spawn(async move {
+                let mut f = s2.lock().unwrap();
+                f.console_outputs.insert(
+                    id_owned.clone(),
+                    format!(
+                        "cua-first-boot: chmod 0600 /etc/cua/spacesd.env\n\
+                         cua-first-boot: CUA_ENV_TOKEN={env_tok}\n\
+                         cua-first-boot: relay_token={static_tok}\n\
+                         cua-first-boot: downloading https://user:s3cr3t\\@mirror.example.com/cua-spacesd.tar.gz\n\
+                         cua-first-boot: fatal: linux native SHA-256 mismatch\n"
+                    ),
+                );
+                if let Some(inst) = f.instances.get_mut(&id_owned) {
+                    inst["Status"] = json!("Stopped");
+                }
+            });
+        }));
+    }
+
+    let mut o_fail = CreateOptions::new(ProviderKind::Contrib, HERMETIC_LINUX_IMAGE);
+    o_fail.contrib = Some("aliyun-ecs".into());
+    o_fail.name = Some("linux-native-boot-fail".into());
+    o_fail.runtime = Runtime::Other("native".into());
+    let err = sandboxes.create(o_fail).await.unwrap_err().to_string();
+    assert!(
+        err.contains("fatal: linux native SHA-256 mismatch"),
+        "{err}"
+    );
+    assert!(!err.contains(static_tok), "{err}");
+    assert!(!err.contains("spacesd.env"), "{err}");
+    assert!(!err.contains("s3cr3t"), "{err}");
+    assert!(!err.contains("user:"), "{err}");
+    assert!(
+        s.lock().unwrap().instances.is_empty(),
+        "failed Linux native boot instance must be rolled back"
+    );
+
+    let boot_logs_dir = home.path().join("cloud/boot-logs");
+    let logs: Vec<String> = std::fs::read_dir(&boot_logs_dir)
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert!(!logs.is_empty());
+    for log in &logs {
+        assert!(!log.contains(static_tok), "{log}");
+        assert!(!log.contains("spacesd.env"), "{log}");
+        assert!(!log.contains("s3cr3t"), "{log}");
+        assert!(!log.contains("user:"), "{log}");
+        assert!(
+            log.contains("fatal: linux native SHA-256 mismatch"),
+            "{log}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn linux_native_supports_custom_linux_image_id_cloud_image_id_instance_type_and_disk() {
+    use cua_sandbox_core::placement::{Kind, Runtime};
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        f.images.push(json!({
+            "ImageId": "m-lin-conn-native",
+            "ImageName": "lin-conn-native",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 30
+        }));
+        f.images.push(json!({
+            "ImageId": "m-lin-over-native",
+            "ImageName": "lin-over-native",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 40
+        }));
+        f.available_instance_types.push("ecs.c7.2xlarge".into());
+        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+        ),
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                linux_image_id: Some("m-lin-conn-native".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 1. Linux `--runtime native` picks up connection `--linux-image-id`.
+    let mut o_conn = sb_create_opts("lin-native-conn-img");
+    o_conn.runtime = Runtime::Other("native".into());
+    let sb1 = sandboxes.create(o_conn).await.unwrap();
+    assert_eq!(sb1.placement(), (Kind::Vm, Runtime::Other("native".into())));
+    sandboxes.delete("lin-native-conn-img").await.unwrap();
+    let run1 = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run1.params.get("ImageId").map(String::as_str),
+        Some("m-lin-conn-native")
+    );
+    assert!(decode_b64_str(run1.params.get("UserData").unwrap()).starts_with("#cloud-config\n"));
+
+    // 2. Per-create `--cloud-image-id`, `--instance-type`, and `--disk` override defaults on `--runtime native`.
+    let mut o_over = sb_create_opts("lin-native-override-img");
+    o_over.runtime = Runtime::Other("native".into());
+    o_over.cloud_image_id = Some("m-lin-over-native".into());
+    o_over.instance_type = Some("ecs.c7.2xlarge".into());
+    o_over.disk_gb = Some(90);
+    let sb2 = sandboxes.create(o_over).await.unwrap();
+    assert_eq!(sb2.placement(), (Kind::Vm, Runtime::Other("native".into())));
+    sandboxes.delete("lin-native-override-img").await.unwrap();
+    let run2 = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run2.params.get("ImageId").map(String::as_str),
+        Some("m-lin-over-native")
+    );
+    assert_eq!(
+        run2.params.get("InstanceType").map(String::as_str),
+        Some("ecs.c7.2xlarge")
+    );
+    assert_eq!(
+        run2.params.get("SystemDisk.Size").map(String::as_str),
+        Some("90")
+    );
+    let ud2 = decode_b64_str(run2.params.get("UserData").unwrap());
+    assert!(ud2.starts_with("#cloud-config\n"));
+    let boot2 = decode_native_cloud_init_file(&ud2, "/usr/local/sbin/cua-first-boot").unwrap();
+    assert!(!boot2.contains("docker.io") && !boot2.contains("docker run"));
 }

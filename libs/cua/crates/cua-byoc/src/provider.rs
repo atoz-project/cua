@@ -22,7 +22,9 @@ use cua_sandbox_core::{Error, ServiceEndpoint, Status};
 use crate::api::{CloudApi, Result};
 use crate::audit;
 use crate::bootlog;
-use crate::bootstrap::{VmBoot, WindowsVmBoot, cloud_init, windows_user_data};
+use crate::bootstrap::{
+    VmBoot, WindowsVmBoot, cloud_init, linux_native_cloud_init, windows_user_data,
+};
 use crate::model::{self, Connection, ProvisionSpec, Resource, Tier, now};
 use crate::relay::RelayAccess;
 use crate::state::Store;
@@ -487,6 +489,9 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
 
     async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
         let conn = self.connection()?;
+        if let Some(url) = conn.spacesd_download_url.as_deref() {
+            crate::manager::normalize_spacesd_download_url(url)?;
+        }
         let family = if spec.os.eq_ignore_ascii_case("windows") {
             "windows"
         } else if spec.os.eq_ignore_ascii_case("macos") {
@@ -554,16 +559,18 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 asked_runtime
             };
             ("vm", rt)
-        } else {
-            if asked_runtime == "native" {
+        } else if asked_runtime == "native" {
+            if !offered_runtimes.iter().any(|r| r.as_str() == "native") {
                 return Err(Error::Unsupported {
                     provider: cua_sandbox_core::ProviderKind::Contrib,
                     op: format!(
-                        "Linux Direct VM (--runtime native) on {} awaits #7; use --runtime docker",
-                        self.api.name()
+                        "{} does not support Linux Direct VM (--runtime native)",
+                        self.api.title()
                     ),
                 });
             }
+            ("vm", "native".to_string())
+        } else {
             let rt = if asked_runtime.is_empty()
                 && offered_runtimes.iter().any(|r| r.as_str() == "docker")
             {
@@ -573,6 +580,10 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             };
             ("container", rt)
         };
+        let is_linux_native = matches!(self.api.tier(), Tier::Vm)
+            && matches!(family, "linux" | "linux-slim")
+            && effective_runtime == "native";
+        crate::bootstrap::validate_env_keys(&spec.env, is_linux_native)?;
         if spec.disk_gb == Some(0) {
             return Err(Error::InvalidArgument(
                 "disk_gb must be greater than 0".into(),
@@ -817,7 +828,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             }
             Tier::Vm => {
                 let (net_guard, share_slots) = VmBoot::switches();
-                provision.user_data = cloud_init(&VmBoot {
+                let boot = VmBoot {
                     join: &join,
                     image: &spec.image.pinned_ref,
                     env: &guest_env,
@@ -827,7 +838,13 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                     provider: self.api.name(),
                     net_guard,
                     share_slots,
-                });
+                };
+                provision.user_data =
+                    if matches!(family, "linux" | "linux-slim") && provision.runtime == "native" {
+                        linux_native_cloud_init(&boot, conn.spacesd_download_url.as_deref())
+                    } else {
+                        cloud_init(&boot)
+                    };
             }
             Tier::Sandbox => {
                 let mut env = guest_env.clone();
