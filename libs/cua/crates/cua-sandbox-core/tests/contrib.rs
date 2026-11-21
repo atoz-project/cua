@@ -542,12 +542,21 @@ async fn windows_direct_vm_bypasses_oci_and_rejects_docker_or_container_kind() {
     );
     let spec = fake.created.lock().unwrap()[0].clone();
     assert_eq!(spec.image.kind, RunKind::Vm);
+    // env_to_entrypoint = true on Windows Direct VM mints and delivers CUA_ENV_TOKEN.
+    let minted = sb
+        .env_token()
+        .expect("Windows contrib with env_to_entrypoint=true must mint env_token");
+    assert_eq!(
+        spec.env.get("CUA_ENV_TOKEN").map(String::as_str),
+        Some(minted.as_str())
+    );
 
-    // Persisted state records kind "vm" (not hardcoded "container").
+    // Persisted state records kind "vm" (not hardcoded "container") and env_token.
     let raw_state =
         std::fs::read_to_string(dir.path().join("sandboxes/win-direct-a.json")).unwrap();
     let state_json: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
     assert_eq!(state_json["image"]["kind"], "vm");
+    assert_eq!(state_json["env_token"], minted);
 
     // 2. Windows + --runtime docker or --kind container is rejected before provider create.
     let mut bad_rt = CreateOptions::new(ProviderKind::Contrib, "windows");

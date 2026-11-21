@@ -356,13 +356,11 @@ impl Sandboxes {
             ),
         };
         // The token reaches spacesd through the environment only where the
-        // platform hands it to the image's entrypoint; elsewhere the driver
-        // starts in bootstrap mode and `spacesd()` installs one with `Init`.
-        let env_token = if caps.env_to_entrypoint {
-            local_env_token(o)
-        } else {
-            o.env_token.clone().filter(|t| !t.is_empty())
-        };
+        // platform hands it to the image's entrypoint (including BYOC Direct
+        // VMs whose UserData stages `CUA_ENV_TOKEN` even on Windows);
+        // elsewhere the driver starts in bootstrap mode and `spacesd()`
+        // installs one with `Init`.
+        let env_token = contrib_env_token(o, caps.env_to_entrypoint);
         let env = if caps.env_to_entrypoint {
             guest_env(o, env_token.as_deref())
         } else {

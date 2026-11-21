@@ -2914,21 +2914,49 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
     let s_clone = s.clone();
     let (fail_tx, mut fail_rx) = tokio::sync::oneshot::channel::<()>();
     let fail_tx = Arc::new(Mutex::new(Some(fail_tx)));
+    let captured_pw: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mirror_url = format!(
+        "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
+        "ef".repeat(32)
+    );
+    let conn_res = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-hangzhou".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+                relay_token: Some(static_tok.into()),
+                spacesd_download_url: Some(mirror_url.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let conn_dbg = format!("{conn_res:?}");
+    assert!(!conn_dbg.contains("MyPass998877"), "{conn_dbg}");
+    assert!(!conn_dbg.contains("DeadBeefCafe9988"), "{conn_dbg}");
     {
         let mut f = s.lock().unwrap();
         let s_inner = s_clone.clone();
         let fail_tx = fail_tx.clone();
+        let captured_pw = captured_pw.clone();
+        let mirror_url = mirror_url.clone();
         f.on_run_instance = Some(Arc::new(move |id, params| {
             let id_owned = id.to_string();
             let pw = params.get("Password").cloned().unwrap_or_default();
+            *captured_pw.lock().unwrap() = Some(pw.clone());
             let s2 = s_inner.clone();
             let tx = fail_tx.clone();
+            let mirror_url = mirror_url.clone();
             tokio::spawn(async move {
                 let mut f = s2.lock().unwrap();
                 f.console_outputs.insert(
                     id_owned.clone(),
                     format!(
-                        "cloudbase-init starting\nCUA_RELAY_TOKEN={static_tok}\nWinlogonPassword={pw}\nfatal: mirror download 404\n"
+                        "cloudbase-init starting\nCUA_RELAY_TOKEN={static_tok}\nWinlogonPassword={pw}\nInvoke-WebRequest failed: {mirror_url}\nfatal: mirror download 404\n"
                     ),
                 );
                 if let Some(inst) = f.instances.get_mut(&id_owned) {
@@ -2947,6 +2975,7 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
     o_fail.os = "windows".into();
     let err = sandboxes.create(o_fail).await.unwrap_err();
     let _ = fail_rx.try_recv();
+    let pw = captured_pw.lock().unwrap().clone().unwrap();
     assert!(
         err.to_string()
             .contains("stopped before its sandbox came online"),
@@ -2957,6 +2986,9 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
         "{err}"
     );
     assert!(!err.to_string().contains(static_tok), "{err}");
+    assert!(!err.to_string().contains(&pw), "{err}");
+    assert!(!err.to_string().contains("MyPass998877"), "{err}");
+    assert!(!err.to_string().contains("DeadBeefCafe9988"), "{err}");
     assert!(
         s.lock().unwrap().instances.is_empty(),
         "failed boot instance must be rolled back"
@@ -2970,6 +3002,9 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
     assert!(!logs.is_empty());
     for log in &logs {
         assert!(!log.contains(static_tok), "{log}");
+        assert!(!log.contains(&pw), "{log}");
+        assert!(!log.contains("MyPass998877"), "{log}");
+        assert!(!log.contains("DeadBeefCafe9988"), "{log}");
         assert!(log.contains("fatal: mirror download 404"), "{log}");
     }
 }
@@ -2988,12 +3023,14 @@ async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind(
     let static_tok = "static-spaces-win-tok";
     relay.add_static_token(static_tok);
     relay.set_account_auth(false);
-    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+    let mock_holder: Arc<Mutex<Option<MockServer>>> = Arc::new(Mutex::new(None));
+    let expected_env_tok: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let (api, s, _store) = start(None).await;
     {
         let relay = relay.clone();
-        let mock_url = mock_spacesd.url();
+        let mock_holder = mock_holder.clone();
+        let expected_env_tok = expected_env_tok.clone();
         let mut f = s.lock().unwrap();
         f.on_run_instance = Some(Arc::new(move |_id, params| {
             let mut mid = None;
@@ -3007,8 +3044,20 @@ async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind(
             if let Some(mid) = mid {
                 let ud = decode_b64_str(params.get("UserData").unwrap());
                 let env_tok = decode_ps_put(&ud, "env-token").unwrap();
-                relay.tunnel(&mid, &mock_url);
-                relay.set_static_online(&mid, true, Some(&env_tok));
+                *expected_env_tok.lock().unwrap() = Some(env_tok.clone());
+                let relay = relay.clone();
+                let mock_holder = mock_holder.clone();
+                tokio::spawn(async move {
+                    let mock = MockServer::start(MockAuth {
+                        token: Some(env_tok.clone()),
+                        ..Default::default()
+                    })
+                    .await;
+                    let mock_url = mock.url();
+                    *mock_holder.lock().unwrap() = Some(mock);
+                    relay.tunnel(&mid, &mock_url);
+                    relay.set_static_online(&mid, true, Some(&env_tok));
+                });
             }
         }));
     }
@@ -3061,6 +3110,24 @@ async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind(
     assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
     assert_eq!(created.kind, "vm");
 
+    // Static Relay Mode must propagate & persist env_token so spaces.space() and
+    // sandbox.service("env").endpoint() authenticate against cua-spacesd.exe.
+    let expected_tok = expected_env_tok.lock().unwrap().clone().unwrap();
+    let space = spaces.space(&created.id).await.unwrap();
+    space.spacesd().unwrap().health().await.unwrap();
+    let sb_name = spaces.cloud_sandbox_of(&created.id).unwrap().unwrap();
+    let sb = sandboxes.connect(&sb_name).await.unwrap();
+    assert_eq!(sb.env_token().as_deref(), Some(expected_tok.as_str()));
+    let ep = sb.service("env").unwrap().endpoint().await.unwrap();
+    assert!(
+        ep.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case(cua_spacesd_client::transport::ENV_TOKEN_HEADER)
+                && v == &format!("Bearer {expected_tok}")
+        }),
+        "missing/wrong env token header in {:?}",
+        ep.headers
+    );
+
     let run_call = {
         let f = s.lock().unwrap();
         f.calls
@@ -3084,4 +3151,5 @@ async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind(
     assert_eq!(on.state, "running");
     spaces.delete(&created.id).await.unwrap();
     assert!(s.lock().unwrap().instances.is_empty());
+    drop(mock_holder);
 }

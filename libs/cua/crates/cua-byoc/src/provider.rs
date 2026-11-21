@@ -815,6 +815,28 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         if let Err(e) = joined {
             // The evidence first: the rollback deletes the machine and its
             // log with it.
+            let mut owned_secrets = Vec::new();
+            if let Some(raw_url) = conn.spacesd_download_url.as_deref() {
+                let no_frag = raw_url.split('#').next().unwrap_or(raw_url);
+                if let Ok(u) = url::Url::parse(no_frag)
+                    && (!u.username().is_empty() || u.password().is_some() || u.query().is_some())
+                {
+                    owned_secrets.push(raw_url.to_string());
+                    owned_secrets.push(no_frag.to_string());
+                    if !u.username().is_empty() {
+                        owned_secrets.push(u.username().to_string());
+                    }
+                    if let Some(pw) = u.password() {
+                        owned_secrets.push(pw.to_string());
+                    }
+                    if let Some(q) = u.query() {
+                        owned_secrets.push(q.to_string());
+                        for (_, v) in u.query_pairs() {
+                            owned_secrets.push(v.into_owned());
+                        }
+                    }
+                }
+            }
             let mut secrets: Vec<&str> = vec![&join.machine_token];
             if !join.jwks_json.is_empty() {
                 secrets.push(&join.jwks_json);
@@ -823,6 +845,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 secrets.push(pw);
             }
             secrets.extend(guest_env.values().map(String::as_str));
+            secrets.extend(owned_secrets.iter().map(String::as_str));
             let evidence = self.keep_boot_log(&conn, &all[0], &secrets).await;
             self.rollback(&conn, &owner, &all[..1], &machine).await;
             return Err(with_evidence(e, evidence));

@@ -313,7 +313,7 @@ impl std::fmt::Display for MaxSize {
 }
 
 /// Where Spaces go in one cloud account: names only, never a secret.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
     /// `aws`, `gcp`, `modal`.
     pub provider: String,
@@ -364,6 +364,34 @@ pub struct Connection {
     /// Optional custom `cua-spacesd` binary mirror URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spacesd_download_url: Option<String>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("provider", &self.provider)
+            .field("profile", &self.profile)
+            .field("region", &self.region)
+            .field("zone", &self.zone)
+            .field("project", &self.project)
+            .field("environment", &self.environment)
+            .field("account", &self.account)
+            .field("ttl_hours", &self.ttl_hours)
+            .field("connected_at", &self.connected_at)
+            .field("auth", &self.auth)
+            .field("budget_usd_month", &self.budget_usd_month)
+            .field("max_size", &self.max_size)
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .finish()
+    }
 }
 
 fn default_ttl() -> u32 {
@@ -588,7 +616,13 @@ impl std::fmt::Debug for ProvisionSpec {
             .field("ttl_secs", &self.ttl_secs)
             .field("role", &self.role)
             .field("region", &self.region)
-            .field("spacesd_download_url", &self.spacesd_download_url)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
             .field(
                 "desktop_password",
                 &self.desktop_password.as_ref().map(|_| "<redacted>"),
@@ -727,5 +761,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(m.label("Modal"), "Modal \u{b7} cua-byoc");
+    }
+
+    #[test]
+    fn connection_and_provision_spec_debug_redact_url_secrets() {
+        let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab";
+        let conn = Connection {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let c_dbg = format!("{conn:?}");
+        assert!(!c_dbg.contains("MyPass998877"), "{c_dbg}");
+        assert!(!c_dbg.contains("DeadBeefCafe9988"), "{c_dbg}");
+        assert!(
+            c_dbg.contains("https://mirror.example.com/cua-spacesd.exe#sha256=abab"),
+            "{c_dbg}"
+        );
+
+        let spec = ProvisionSpec {
+            name: "test".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            desktop_password: Some("WinPass!99".into()),
+            ..Default::default()
+        };
+        let s_dbg = format!("{spec:?}");
+        assert!(!s_dbg.contains("WinPass!99"), "{s_dbg}");
+        assert!(!s_dbg.contains("MyPass998877"), "{s_dbg}");
+        assert!(!s_dbg.contains("DeadBeefCafe9988"), "{s_dbg}");
+        assert!(
+            s_dbg.contains("https://mirror.example.com/cua-spacesd.exe#sha256=abab"),
+            "{s_dbg}"
+        );
     }
 }

@@ -4051,15 +4051,25 @@ fn local_env_token_keeping(o: &CreateOptions, recorded: Option<String>) -> Optio
     }
 }
 
-fn local_env_token(o: &CreateOptions) -> Option<String> {
-    let given = o
-        .env
+fn given_env_token(o: &CreateOptions) -> Option<String> {
+    o.env
         .get("CUA_SPACESD_TOKEN")
         .or_else(|| o.env.get("CUA_ENV_TOKEN"))
         .or(o.env_token.as_ref())
         .filter(|t| !t.is_empty())
-        .cloned();
-    given.or_else(|| (!o.os.eq_ignore_ascii_case("windows")).then(mint_env_token))
+        .cloned()
+}
+
+fn local_env_token(o: &CreateOptions) -> Option<String> {
+    given_env_token(o).or_else(|| (!o.os.eq_ignore_ascii_case("windows")).then(mint_env_token))
+}
+
+fn contrib_env_token(o: &CreateOptions, env_to_entrypoint: bool) -> Option<String> {
+    if env_to_entrypoint {
+        given_env_token(o).or_else(|| Some(mint_env_token()))
+    } else {
+        o.env_token.clone().filter(|t| !t.is_empty())
+    }
 }
 
 #[cfg(test)]

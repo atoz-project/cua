@@ -2144,6 +2144,47 @@ pub struct CloudTarget {
     pub spacesd_download_url: Option<String>,
 }
 
+fn redact_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Some(scheme_pos) = trimmed.find("://") else {
+        return "<redacted>".into();
+    };
+    let scheme = &trimmed[..scheme_pos];
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return "<redacted>".into();
+    }
+    let after_scheme = &trimmed[scheme_pos + 3..];
+    let (before_frag, frag) = match after_scheme.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (after_scheme, None),
+    };
+    let before_query = before_frag.split('?').next().unwrap_or(before_frag);
+    let (authority, path) = match before_query.find('/') {
+        Some(i) => (&before_query[..i], &before_query[i..]),
+        None => (before_query, ""),
+    };
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return "<redacted>".into();
+    }
+    let mut out = format!("{scheme}://{host_port}{path}");
+    if let Some(f) = frag
+        && let Some(hex) = f.strip_prefix("sha256=")
+        && !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
 impl std::fmt::Debug for CloudTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudTarget")
@@ -2160,7 +2201,10 @@ impl std::fmt::Debug for CloudTarget {
                 "relay_token",
                 &self.relay_token.as_ref().map(|_| "<redacted>"),
             )
-            .field("spacesd_download_url", &self.spacesd_download_url)
+            .field(
+                "spacesd_download_url",
+                &self.spacesd_download_url.as_deref().map(redact_url),
+            )
             .finish()
     }
 }
@@ -2362,4 +2406,28 @@ pub struct PrewarmList {}
 pub struct PrewarmRemove {
     /// The prewarm (`pw-xxxxxx`).
     pub id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_target_debug_redacts_url_credentials_and_query() {
+        let t = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some(
+                "https://dluser:MyPass998877@mirror.example.com/cua.exe?sig=DeadBeefCafe9988#sha256=abab"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains("MyPass998877"), "{dbg}");
+        assert!(!dbg.contains("DeadBeefCafe9988"), "{dbg}");
+        assert!(
+            dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
+            "{dbg}"
+        );
+    }
 }

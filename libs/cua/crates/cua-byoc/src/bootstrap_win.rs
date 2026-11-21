@@ -42,7 +42,7 @@ pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 315_360_000;
 
 /// What one Windows Direct VM's first boot needs.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WindowsVmBoot<'a> {
     /// The relay machine the sandbox joins as.
     pub join: &'a Join,
@@ -61,6 +61,26 @@ pub struct WindowsVmBoot<'a> {
     pub desktop_user: &'a str,
     /// Windows desktop user password (secret; never logged or echoed).
     pub desktop_password: &'a str,
+}
+
+impl std::fmt::Debug for WindowsVmBoot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsVmBoot")
+            .field("join", self.join)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("expires", &self.expires)
+            .field("ttl_secs", &self.ttl_secs)
+            .field("provider", &self.provider)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field("desktop_user", &self.desktop_user)
+            .field("desktop_password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Generates a strong random password satisfying ECS Windows complexity rules
@@ -104,7 +124,16 @@ fn b64(s: &str) -> String {
 }
 
 fn ps_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    if s.is_ascii() && !s.chars().any(|c| c.is_control()) {
+        format!("'{}'", s.replace('\'', "''"))
+    } else {
+        // Non-ASCII (e.g., Unicode curly single quotes U+2018..U+201B) and
+        // control characters bypass PowerShell's tokenizer via base64.
+        format!(
+            "([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')))",
+            b64(s)
+        )
+    }
 }
 
 /// Builds the compact `#ps1_sysnative` PowerShell script for `cloudbase-init`.
@@ -179,7 +208,7 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          $stg = Join-Path $env:TEMP ('cua-stg-' + [Guid]::NewGuid().ToString('N'))\n\
          $dlTmp = $null\n\
          $sumTmp = $null\n\
-         New-Item -ItemType Directory -Force -Path $sd,$dd,$ld,$bd,$stg | Out-Null\n\
+         New-Item -ItemType Directory -Force -Path $sd,$ld,$bd,$stg | Out-Null\n\
          function Log([string]$m) {{\n\
          \x20 $ln = \"[cua-win-boot] $((Get-Date).ToUniversalTime().ToString('o')) $m\"\n\
          \x20 Add-Content -LiteralPath (Join-Path $ld 'boot.log') -Value $ln -Encoding UTF8\n\
@@ -191,40 +220,40 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
         user = ps_single_quote(desktop_user),
     ));
 
-    // ACL-restricted directory (SYSTEM, Administrators, desktop user only) + staged secrets cleanup.
+    // ACL-restricted directory (SYSTEM, Administrators, desktop user only) + direct $sd staging.
     s.push_str(&format!(
         "Log \"staging secrets for $provider\"\n\
-         & icacls.exe $sd /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \"$u`:(OI)(CI)M\" | Out-Null\n\
+         & icacls.exe $sd /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \"$u`:(OI)(CI)M\" /T | Out-Null\n\
          if ($LASTEXITCODE -ne 0) {{ throw \"icacls failed: $LASTEXITCODE\" }}\n\
+         New-Item -ItemType Directory -Force -Path $dd | Out-Null\n\
          try {{\n\
-         \x20 Put (Join-Path $stg 'relay-token') {relay_tok}\n\
-         \x20 Put (Join-Path $stg 'machine-id') {mach_id}\n\
-         \x20 Put (Join-Path $stg 'host-policy.json') {policy}\n",
+         \x20 Put (Join-Path $sd 'relay-token') {relay_tok}\n\
+         \x20 Put (Join-Path $sd 'machine-id') {mach_id}\n\
+         \x20 Put (Join-Path $sd 'host-policy.json') {policy}\n",
         relay_tok = ps_single_quote(&relay_token_b64),
         mach_id = ps_single_quote(&machine_id_b64),
         policy = ps_single_quote(&policy_b64),
     ));
     if has_jwks {
         s.push_str(&format!(
-            "  Put (Join-Path $stg 'jwks.json') {}\n",
+            "  Put (Join-Path $sd 'jwks.json') {}\n",
             ps_single_quote(&jwks_b64)
         ));
     }
     if let Some(et) = &env_token_b64 {
         s.push_str(&format!(
-            "  Put (Join-Path $stg 'env-token') {}\n",
+            "  Put (Join-Path $sd 'env-token') {}\n",
             ps_single_quote(et)
         ));
     }
     if let Some(ee) = &extra_env_b64 {
         s.push_str(&format!(
-            "  Put (Join-Path $stg 'extra-env.json') {}\n",
+            "  Put (Join-Path $sd 'extra-env.json') {}\n",
             ps_single_quote(ee)
         ));
     }
     s.push_str(&format!(
-        "  Get-ChildItem -LiteralPath $stg -File | ForEach-Object {{ Move-Item -LiteralPath $_.FullName -Destination (Join-Path $sd $_.Name) -Force }}\n\
-         \x20 Put (Join-Path $sd 'launch-spacesd.ps1') {launcher}\n\
+        "  Put (Join-Path $sd 'launch-spacesd.ps1') {launcher}\n\
          \x20 Put (Join-Path $sd 'tscon-recover.ps1') {tscon}\n",
         launcher = ps_single_quote(&launcher_b64),
         tscon = ps_single_quote(&tscon_b64),
@@ -235,6 +264,8 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
         Some(hex) => ps_single_quote(&hex.to_ascii_lowercase()),
         None => "$null".into(),
     };
+    let dl_url_b64 = b64(dl_url);
+    let dl_url_redacted = cua_sandbox_core::byoc::redact_url(dl_url);
     s.push_str(&format!(
         "  $exe = $null\n\
          \x20 foreach ($cand in @((Join-Path $bd 'cua-spacesd.exe'), (Join-Path $env:LOCALAPPDATA 'cua\\spacesd\\cua-spacesd.exe'))) {{\n\
@@ -245,9 +276,9 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20   if ($cmd) {{ $exe = $cmd.Source }}\n\
          \x20 }}\n\
          \x20 if (-not $exe) {{\n\
-         \x20   $dlUrl = {dl_url}\n\
+         \x20   $dlUrl = [Text.Encoding]::UTF8.GetString((Dec {dl_url_b64}))\n\
          \x20   $wantSha = {want_sha}\n\
-         \x20   Log \"downloading cua-spacesd.exe from $dlUrl\"\n\
+         \x20   Log ('downloading cua-spacesd.exe from ' + {dl_url_redacted})\n\
          \x20   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12\n\
          \x20   $dlTmp = Join-Path $stg 'cua-spacesd.exe'\n\
          \x20   Invoke-WebRequest -UseBasicParsing -Uri $dlUrl -OutFile $dlTmp\n\
@@ -263,7 +294,8 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20   Move-Item -LiteralPath $dlTmp -Destination $exe -Force\n\
          \x20 }} else {{ Log \"using pre-installed $exe\" }}\n\
          \x20 Set-Content -LiteralPath (Join-Path $sd 'bin-path') -Value $exe -NoNewline -Encoding ASCII\n",
-        dl_url = ps_single_quote(dl_url),
+        dl_url_b64 = ps_single_quote(&dl_url_b64),
+        dl_url_redacted = ps_single_quote(&dl_url_redacted),
         want_sha = expected_sha_ps,
     ));
 
@@ -384,17 +416,17 @@ fn build_launcher_ps(
         );
     }
     ps.push_str(&format!(
-        "$args = @('join','--relay',{relay},'--relay-token-file',(Join-Path $sd 'relay-token'),'--machine-id',{mid},'--host-policy',(Join-Path $sd 'host-policy.json'),'--data-dir',(Join-Path $sd 'data'))\n",
+        "$cuaArgs = @('join','--relay',{relay},'--relay-token-file',(Join-Path $sd 'relay-token'),'--machine-id',{mid},'--host-policy',(Join-Path $sd 'host-policy.json'),'--data-dir',(Join-Path $sd 'data'))\n",
         relay = ps_single_quote(relay_url),
         mid = ps_single_quote(machine_id),
     ));
     if has_jwks {
-        ps.push_str("$args += @('--relay-jwks',(Join-Path $sd 'jwks.json'))\n");
+        ps.push_str("$cuaArgs += @('--relay-jwks',(Join-Path $sd 'jwks.json'))\n");
     }
     if has_env_token {
-        ps.push_str("$args += @('--token-file',(Join-Path $sd 'env-token'))\n");
+        ps.push_str("$cuaArgs += @('--token-file',(Join-Path $sd 'env-token'))\n");
     }
-    ps.push_str("& $exe @args\n");
+    ps.push_str("& $exe @cuaArgs\n");
     ps
 }
 
@@ -407,8 +439,14 @@ fn build_tscon_ps() -> String {
      \x20 $sid = $xml.Event.UserData.EventXML.SessionID\n\
      }\n\
      if (-not $sid -or [int]$sid -lt 1) {\n\
-     \x20 foreach ($l in (& \"$env:SystemRoot\\System32\\quser.exe\" 2>$null)) {\n\
-     \x20   if ($l -match '\\s+(\\d+)\\s+Disc\\b') { $sid = $Matches[1]; break }\n\
+     \x20 $prevEap = $ErrorActionPreference\n\
+     \x20 $ErrorActionPreference = 'Continue'\n\
+     \x20 try {\n\
+     \x20   foreach ($l in (& \"$env:SystemRoot\\System32\\quser.exe\" 2>$null)) {\n\
+     \x20     if ($l -match '\\s+(\\d+)\\s+Disc\\b') { $sid = $Matches[1]; break }\n\
+     \x20   }\n\
+     \x20 } finally {\n\
+     \x20   $ErrorActionPreference = $prevEap\n\
      \x20 }\n\
      }\n\
      if ($sid -and [int]$sid -ge 1) {\n\
@@ -506,9 +544,30 @@ mod tests {
         assert!(!ps.contains(pw));
         assert!(!ps.contains(&j.jwks_json));
 
-        // ACL hardening with language-independent SIDs + temp cleanup.
+        // ACL hardening with language-independent SIDs + direct $sd staging + $dd after /T + temp cleanup.
         assert!(ps.contains("*S-1-5-18:(OI)(CI)F"), "{ps}");
         assert!(ps.contains("*S-1-5-32-544:(OI)(CI)F"), "{ps}");
+        let icacls_pos = ps.find("& icacls.exe $sd /inheritance:r").unwrap();
+        assert!(ps[icacls_pos..].contains(" /T "), "{ps}");
+        let dd_create_pos = ps
+            .find("New-Item -ItemType Directory -Force -Path $dd")
+            .unwrap();
+        assert!(
+            dd_create_pos > icacls_pos,
+            "$dd must be created AFTER icacls /T on $sd"
+        );
+        assert!(
+            !ps.contains("Put (Join-Path $stg 'relay-token')"),
+            "secrets must be written directly to ACL-hardened $sd, not moved from $stg"
+        );
+        assert!(
+            !ps.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $sd"),
+            "must not same-volume Move-Item secret files from $stg into $sd"
+        );
+        assert!(ps.contains("Put (Join-Path $sd 'relay-token')"));
+        assert!(ps.contains("Put (Join-Path $sd 'machine-id')"));
+        assert!(ps.contains("Put (Join-Path $sd 'host-policy.json')"));
+        assert!(ps.contains("Put (Join-Path $sd 'jwks.json')"));
         assert!(ps.contains("Remove-Item -LiteralPath $stg -Recurse -Force"));
 
         // Account mode stages jwks.json and owner in host-policy.json.
@@ -553,6 +612,8 @@ mod tests {
         assert!(launcher.contains(".SessionId") && launcher.contains("$sid -lt 1"));
         assert!(launcher.contains("--relay-jwks"));
         assert!(!launcher.contains("--token-file"));
+        assert!(launcher.contains("$cuaArgs"));
+        assert!(!launcher.contains("$args =") && !launcher.contains("@args"));
 
         // Event ID 24 tscon.exe recovery task under SYSTEM.
         assert!(ps.contains("EventID=24"));
@@ -560,6 +621,8 @@ mod tests {
         let tscon = decode_put(&ps, "tscon-recover.ps1").unwrap();
         assert!(tscon.contains("tscon.exe"));
         assert!(tscon.contains("/dest:console"));
+        assert!(tscon.contains("$ErrorActionPreference = 'Continue'"));
+        assert!(tscon.contains("quser.exe"));
 
         // TTL backstop.
         assert!(ps.contains("shutdown.exe /s /t 28800"));
@@ -618,5 +681,86 @@ mod tests {
         // ttl_secs == 0 omits TTL shutdown backstop.
         assert!(!ps.contains("shutdown.exe /s"));
         assert!(decode_put(&ps, "expire-check.ps1").is_none());
+    }
+
+    #[test]
+    fn windows_vm_boot_debug_redacts_secrets_and_url_credentials_and_blocks_curly_quotes() {
+        let mut j = static_join();
+        j.relay_url = "https://relay.example\u{2019};Invoke-Expression(whoami)".into();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_99".to_string(),
+        )]);
+        let pw = "WinPass!Secret9988";
+        let secret_mirror = format!(
+            "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
+            "ab".repeat(32)
+        );
+        let boot = WindowsVmBoot {
+            join: &j,
+            env: &env,
+            expires: 0,
+            ttl_secs: 0,
+            provider: "aliyun-ecs",
+            spacesd_download_url: Some(&secret_mirror),
+            desktop_user: "Administrator",
+            desktop_password: pw,
+        };
+        let dbg = format!("{boot:?}");
+        assert!(!dbg.contains(pw), "Debug leaked desktop_password: {dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(
+            !dbg.contains("MyPass998877"),
+            "Debug leaked URL pass: {dbg}"
+        );
+        assert!(
+            !dbg.contains("DeadBeefCafe9988"),
+            "Debug leaked URL query: {dbg}"
+        );
+        assert!(
+            !dbg.contains("env_secret_static_99"),
+            "Debug leaked env token: {dbg}"
+        );
+        assert!(
+            dbg.contains("https://mirror.example.com/cua-spacesd.exe"),
+            "{dbg}"
+        );
+
+        let ps = windows_user_data(&boot);
+        // Secret URL userinfo & query must never appear in plaintext UserData/Log.
+        assert!(!ps.contains("MyPass998877"), "{ps}");
+        assert!(!ps.contains("DeadBeefCafe9988"), "{ps}");
+        assert!(!ps.contains("dluser"), "{ps}");
+        assert!(
+            ps.contains("https://mirror.example.com/cua-spacesd.exe"),
+            "{ps}"
+        );
+        // Curly quotes must never appear unescaped in PowerShell single-quoted literals.
+        for q in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+            assert!(!ps.contains(q), "raw curly quote {q:?} in UserData: {ps}");
+            let j2 = static_join();
+            let curly_url = format!(
+                "https://mirror.example.com/cua{q};Invoke-Expression(whoami);#sha256={}",
+                "ab".repeat(32)
+            );
+            let ps2 = windows_user_data(&WindowsVmBoot {
+                join: &j2,
+                env: &env,
+                expires: 0,
+                ttl_secs: 0,
+                provider: "aliyun-ecs",
+                spacesd_download_url: Some(&curly_url),
+                desktop_user: "Administrator",
+                desktop_password: pw,
+            });
+            assert!(!ps2.contains(q), "raw curly quote {q:?} leaked: {ps2}");
+            assert!(
+                !ps2.contains("Invoke-Expression"),
+                "injection leaked: {ps2}"
+            );
+        }
+        let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
+        assert!(!launcher.contains('\u{2019}'), "{launcher}");
+        assert!(!launcher.contains("Invoke-Expression"), "{launcher}");
     }
 }
