@@ -3798,13 +3798,26 @@ impl SpacesToolCaller {
         if fields.is_empty() {
             return Ok(());
         }
-        let listed = d
+        let listed = match d
             .spaces()
             .list_space_tools(dpb::ListSpaceToolsRequest {})
             .await
-            .map_err(daemon_err)?
-            .into_inner()
-            .tools_json;
+        {
+            Ok(r) => r.into_inner().tools_json,
+            Err(e) if e.code() == tonic::Code::Unimplemented => {
+                let version = d
+                    .info()
+                    .await
+                    .map(|i| format!(" (cua {})", i.version))
+                    .unwrap_or_default();
+                return Err(CuaError::CapabilityMissing(format!(
+                    "the cua daemon{version} is too old to {what} (it does not list Spaces \
+                     tools), so nothing was changed; update cua and restart its daemon (`cua \
+                     daemon stop`, then run this again, or quit and reopen Cua Spaces)"
+                )));
+            }
+            Err(e) => return Err(daemon_err(e)),
+        };
         let missing = missing_fields(&listed, tool, fields);
         if missing.is_empty() {
             return Ok(());
@@ -4510,6 +4523,7 @@ impl Spaces {
             options.instance_type.as_deref(),
         )?;
         let host = self.host.clone();
+        let tool_caller = self.tool_caller();
         run(async move {
             match &host {
                 Host::Embedded(s) => {
@@ -4573,6 +4587,34 @@ impl Spaces {
                     })
                 }
                 Host::Daemon(d) => {
+                    let mut required: Vec<&str> = Vec::new();
+                    if cloud_image_id.is_some() {
+                        required.push("cloud_image_id");
+                    }
+                    if options.disk_gb.is_some()
+                        && matches!(on, Some(cua_sandbox_core::placement::On::Provider(_)))
+                    {
+                        required.push("disk_gb");
+                    }
+                    if !required.is_empty() {
+                        let what = if cloud_image_id.is_some() {
+                            "create a Space with a custom Cloud Image ID"
+                        } else {
+                            "create a cloud Space with a custom disk size"
+                        };
+                        tool_caller
+                            .require_fields("create_space", &required, what)
+                            .await?;
+                    }
+                    if instance_type.is_some()
+                        && matches!(
+                            on,
+                            Some(cua_sandbox_core::placement::On::Provider(ref p)) if p == "aliyun-ecs"
+                        )
+                    {
+                        d.require_cloud_image_and_sizing(&["instance_type"])
+                            .await?;
+                    }
                     let request = dpb::CreateSpaceRequest {
                         image: options.image.unwrap_or_default(),
                         location: on.map(|o| o.to_string()).unwrap_or_default(),
