@@ -1,0 +1,137 @@
+{
+  "$comment": "Opaque-box E2E scenario registry for aliyun-ecs BYOC (96 hermetic Tiers 1-4 + LIVE-01).",
+  "lanes": {
+    "baseline": {
+      "gate": null,
+      "what": "Feature 1 (#2) baseline tests runnable on f2a40f6aa + test_runner.py",
+      "trigger": "pull_request"
+    },
+    "hermetic": {
+      "gate": null,
+      "what": "All 96 Tiers 1-4 hermetic E2E tests via AliyunConnectProxy + FakeAliyun + FakeRelay + FakeMirror",
+      "trigger": "pull_request"
+    },
+    "live": {
+      "gate": "CUA_E2E_ALIYUN_LIVE=1 + --profile <name>",
+      "what": "Opt-in real Alibaba Cloud ECS smoke test (#9) + post-teardown aliyun CLI leak check",
+      "trigger": "manual"
+    }
+  },
+  "scenarios": [
+    {"id": "T1-F1-01", "feature": "F1", "tier": 1, "milestone": "M1", "lane": "baseline", "test_file": "tier1_feature_coverage", "test_name": "t1_f1_01"},
+    {"id": "T1-F1-02", "feature": "F1", "tier": 1, "milestone": "M1", "lane": "baseline", "test_file": "tier1_feature_coverage", "test_name": "t1_f1_02"},
+    {"id": "T1-F1-03", "feature": "F1", "tier": 1, "milestone": "M1", "lane": "baseline", "test_file": "tier1_feature_coverage", "test_name": "t1_f1_03"},
+    {"id": "T1-F1-04", "feature": "F1", "tier": 1, "milestone": "M1", "lane": "baseline", "test_file": "tier1_feature_coverage", "test_name": "t1_f1_04"},
+    {"id": "T1-F1-05", "feature": "F1", "tier": 1, "milestone": "M1", "lane": "baseline", "test_file": "tier1_feature_coverage", "test_name": "t1_f1_05"},
+
+    {"id": "T1-F2-01", "feature": "F2", "tier": 1, "milestone": "M2", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f2_01"},
+    {"id": "T1-F2-02", "feature": "F2", "tier": 1, "milestone": "M2", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f2_02"},
+    {"id": "T1-F2-03", "feature": "F2", "tier": 1, "milestone": "M2", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f2_03"},
+    {"id": "T1-F2-04", "feature": "F2", "tier": 1, "milestone": "M2", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f2_04"},
+    {"id": "T1-F2-05", "feature": "F2", "tier": 1, "milestone": "M2", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f2_05"},
+
+    {"id": "T1-F3-01", "feature": "F3", "tier": 1, "milestone": "M3", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f3_01"},
+    {"id": "T1-F3-02", "feature": "F3", "tier": 1, "milestone": "M3", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f3_02"},
+    {"id": "T1-F3-03", "feature": "F3", "tier": 1, "milestone": "M3", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f3_03"},
+    {"id": "T1-F3-04", "feature": "F3", "tier": 1, "milestone": "M3", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f3_04"},
+    {"id": "T1-F3-05", "feature": "F3", "tier": 1, "milestone": "M3", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f3_05"},
+
+    {"id": "T1-F4-01", "feature": "F4", "tier": 1, "milestone": "M4", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f4_01"},
+    {"id": "T1-F4-02", "feature": "F4", "tier": 1, "milestone": "M4", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f4_02"},
+    {"id": "T1-F4-03", "feature": "F4", "tier": 1, "milestone": "M4", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f4_03"},
+    {"id": "T1-F4-04", "feature": "F4", "tier": 1, "milestone": "M4", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f4_04"},
+    {"id": "T1-F4-05", "feature": "F4", "tier": 1, "milestone": "M4", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f4_05"},
+
+    {"id": "T1-F5-01", "feature": "F5", "tier": 1, "milestone": "M5", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f5_01"},
+    {"id": "T1-F5-02", "feature": "F5", "tier": 1, "milestone": "M5", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f5_02"},
+    {"id": "T1-F5-03", "feature": "F5", "tier": 1, "milestone": "M5", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f5_03"},
+    {"id": "T1-F5-04", "feature": "F5", "tier": 1, "milestone": "M5", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f5_04"},
+    {"id": "T1-F5-05", "feature": "F5", "tier": 1, "milestone": "M5", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f5_05"},
+
+    {"id": "T1-F6-01", "feature": "F6", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f6_01"},
+    {"id": "T1-F6-02", "feature": "F6", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f6_02"},
+    {"id": "T1-F6-03", "feature": "F6", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f6_03"},
+    {"id": "T1-F6-04", "feature": "F6", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f6_04"},
+    {"id": "T1-F6-05", "feature": "F6", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f6_05"},
+
+    {"id": "T1-F7-01", "feature": "F7", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f7_01"},
+    {"id": "T1-F7-02", "feature": "F7", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f7_02"},
+    {"id": "T1-F7-03", "feature": "F7", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f7_03"},
+    {"id": "T1-F7-04", "feature": "F7", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f7_04"},
+    {"id": "T1-F7-05", "feature": "F7", "tier": 1, "milestone": "M6", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f7_05"},
+
+    {"id": "T1-F8-01", "feature": "F8", "tier": 1, "milestone": "M7", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f8_01"},
+    {"id": "T1-F8-02", "feature": "F8", "tier": 1, "milestone": "M7", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f8_02"},
+    {"id": "T1-F8-03", "feature": "F8", "tier": 1, "milestone": "M7", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f8_03"},
+    {"id": "T1-F8-04", "feature": "F8", "tier": 1, "milestone": "M7", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f8_04"},
+    {"id": "T1-F8-05", "feature": "F8", "tier": 1, "milestone": "M7", "lane": "hermetic", "test_file": "tier1_feature_coverage", "test_name": "t1_f8_05"},
+
+    {"id": "T2-F1-01", "feature": "F1", "tier": 2, "milestone": "M1", "lane": "baseline", "test_file": "tier2_boundary_negative", "test_name": "t2_f1_01"},
+    {"id": "T2-F1-02", "feature": "F1", "tier": 2, "milestone": "M1", "lane": "baseline", "test_file": "tier2_boundary_negative", "test_name": "t2_f1_02"},
+    {"id": "T2-F1-03", "feature": "F1", "tier": 2, "milestone": "M1", "lane": "baseline", "test_file": "tier2_boundary_negative", "test_name": "t2_f1_03"},
+    {"id": "T2-F1-04", "feature": "F1", "tier": 2, "milestone": "M1", "lane": "baseline", "test_file": "tier2_boundary_negative", "test_name": "t2_f1_04"},
+    {"id": "T2-F1-05", "feature": "F1", "tier": 2, "milestone": "M1", "lane": "baseline", "test_file": "tier2_boundary_negative", "test_name": "t2_f1_05"},
+
+    {"id": "T2-F2-01", "feature": "F2", "tier": 2, "milestone": "M2", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f2_01"},
+    {"id": "T2-F2-02", "feature": "F2", "tier": 2, "milestone": "M2", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f2_02"},
+    {"id": "T2-F2-03", "feature": "F2", "tier": 2, "milestone": "M2", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f2_03"},
+    {"id": "T2-F2-04", "feature": "F2", "tier": 2, "milestone": "M2", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f2_04"},
+    {"id": "T2-F2-05", "feature": "F2", "tier": 2, "milestone": "M2", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f2_05"},
+
+    {"id": "T2-F3-01", "feature": "F3", "tier": 2, "milestone": "M3", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f3_01"},
+    {"id": "T2-F3-02", "feature": "F3", "tier": 2, "milestone": "M3", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f3_02"},
+    {"id": "T2-F3-03", "feature": "F3", "tier": 2, "milestone": "M3", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f3_03"},
+    {"id": "T2-F3-04", "feature": "F3", "tier": 2, "milestone": "M3", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f3_04"},
+    {"id": "T2-F3-05", "feature": "F3", "tier": 2, "milestone": "M3", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f3_05"},
+
+    {"id": "T2-F4-01", "feature": "F4", "tier": 2, "milestone": "M4", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f4_01"},
+    {"id": "T2-F4-02", "feature": "F4", "tier": 2, "milestone": "M4", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f4_02"},
+    {"id": "T2-F4-03", "feature": "F4", "tier": 2, "milestone": "M4", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f4_03"},
+    {"id": "T2-F4-04", "feature": "F4", "tier": 2, "milestone": "M4", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f4_04"},
+    {"id": "T2-F4-05", "feature": "F4", "tier": 2, "milestone": "M4", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f4_05"},
+
+    {"id": "T2-F5-01", "feature": "F5", "tier": 2, "milestone": "M5", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f5_01"},
+    {"id": "T2-F5-02", "feature": "F5", "tier": 2, "milestone": "M5", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f5_02"},
+    {"id": "T2-F5-03", "feature": "F5", "tier": 2, "milestone": "M5", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f5_03"},
+    {"id": "T2-F5-04", "feature": "F5", "tier": 2, "milestone": "M5", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f5_04"},
+    {"id": "T2-F5-05", "feature": "F5", "tier": 2, "milestone": "M5", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f5_05"},
+
+    {"id": "T2-F6-01", "feature": "F6", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f6_01"},
+    {"id": "T2-F6-02", "feature": "F6", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f6_02"},
+    {"id": "T2-F6-03", "feature": "F6", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f6_03"},
+    {"id": "T2-F6-04", "feature": "F6", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f6_04"},
+    {"id": "T2-F6-05", "feature": "F6", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f6_05"},
+
+    {"id": "T2-F7-01", "feature": "F7", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f7_01"},
+    {"id": "T2-F7-02", "feature": "F7", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f7_02"},
+    {"id": "T2-F7-03", "feature": "F7", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f7_03"},
+    {"id": "T2-F7-04", "feature": "F7", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f7_04"},
+    {"id": "T2-F7-05", "feature": "F7", "tier": 2, "milestone": "M6", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f7_05"},
+
+    {"id": "T2-F8-01", "feature": "F8", "tier": 2, "milestone": "M7", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f8_01"},
+    {"id": "T2-F8-02", "feature": "F8", "tier": 2, "milestone": "M7", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f8_02"},
+    {"id": "T2-F8-03", "feature": "F8", "tier": 2, "milestone": "M7", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f8_03"},
+    {"id": "T2-F8-04", "feature": "F8", "tier": 2, "milestone": "M7", "lane": "hermetic", "test_file": "tier2_boundary_negative", "test_name": "t2_f8_04"},
+    {"id": "T2-F8-05", "feature": "F8", "tier": 2, "milestone": "M1", "lane": "baseline", "test_file": "tier2_boundary_negative", "test_name": "t2_f8_05"},
+
+    {"id": "T3-01", "feature": "F2+F4+F6", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_01"},
+    {"id": "T3-02", "feature": "F2+F5+F7", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_02"},
+    {"id": "T3-03", "feature": "F1+F5+F6", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_03"},
+    {"id": "T3-04", "feature": "F3+F4", "tier": 3, "milestone": "M4", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_04"},
+    {"id": "T3-05", "feature": "F1+F2+F3", "tier": 3, "milestone": "M3", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_05"},
+    {"id": "T3-06", "feature": "F3+F4+F7", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_06"},
+    {"id": "T3-07", "feature": "F3+F6", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_07"},
+    {"id": "T3-08", "feature": "F2+F5+F6", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_08"},
+    {"id": "T3-09", "feature": "F1+F3+F5", "tier": 3, "milestone": "M5", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_09"},
+    {"id": "T3-10", "feature": "F2+F4+F7", "tier": 3, "milestone": "M6", "lane": "hermetic", "test_file": "tier3_cross_feature", "test_name": "t3_10"},
+
+    {"id": "T4-01", "feature": "F2+F4+F5+F6", "tier": 4, "milestone": "M6", "lane": "hermetic", "test_file": "tier4_scenarios", "test_name": "t4_01"},
+    {"id": "T4-02", "feature": "F1+F3+F4+F7", "tier": 4, "milestone": "M6", "lane": "hermetic", "test_file": "tier4_scenarios", "test_name": "t4_02"},
+    {"id": "T4-03", "feature": "F1+F2+F3", "tier": 4, "milestone": "M3", "lane": "hermetic", "test_file": "tier4_scenarios", "test_name": "t4_03"},
+    {"id": "T4-04", "feature": "F1+F3+F6", "tier": 4, "milestone": "M6", "lane": "hermetic", "test_file": "tier4_scenarios", "test_name": "t4_04"},
+    {"id": "T4-05", "feature": "F1+F3+F5+F8", "tier": 4, "milestone": "M7", "lane": "hermetic", "test_file": "tier4_scenarios", "test_name": "t4_05"},
+    {"id": "T4-06", "feature": "F1+F2+F3+F7", "tier": 4, "milestone": "M6", "lane": "hermetic", "test_file": "tier4_scenarios", "test_name": "t4_06"},
+
+    {"id": "LIVE-01", "feature": "F1+F3+F4+F7", "tier": 4, "milestone": "M7", "lane": "live", "test_file": "live_ecs_smoke", "test_name": "live_ecs_smoke"}
+  ]
+}
