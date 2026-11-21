@@ -455,20 +455,24 @@ its disk.
     explicit `--profile <name>` in `~/.aliyun/config.json`, saved credentials
     in Cua's credential store, or the active `current` profile in
     `~/.aliyun/config.json` (`AK` mode).
-  - Instances launch with `HttpTokens=required` (IMDSv2) and block the ECS
-    metadata service (`100.100.100.200`) on the guest OS firewall for both
-    Docker-on-VM containers and Direct VM guests.
+  - **Metadata isolation**: Linux instances launch with `HttpTokens=required`
+    (IMDSv2), while Windows instances launch with `HttpTokens=optional`
+    (Alibaba Cloud Windows `vminit` and `cloudbase-init` require IMDSv1) and
+    zero RAM instance role. Both Docker-on-VM containers and Direct VM guests
+    block the ECS metadata service (`100.100.100.200` and `169.254.169.254`) on
+    the guest OS firewall during first boot before any container or desktop
+    session runs.
   - **Billing and release**: `PostPaid` with `StoppedMode=StopCharging` and
     native ECS `AutoReleaseTime` (`--ttl-hours`, default `8`), plus an in-guest
     TTL shutdown timer. If `RunInstances` fails or times out, Cua reads
     `GetInstanceConsoleOutput` (redacted, saved under
     `~/.cua/cloud/boot-logs/<id>.log`) and deletes the instance.
-  - **Custom Windows 10 and Windows 11 images**:
-    - Official Alibaba Cloud Windows Server images include `cloudbase-init`. If
-      you supply a custom Windows 10 or Windows 11 image via
-      `--windows-image-id` or `--cloud-image-id`, it MUST have
-      `cloudbase-init` installed and enabled so ECS executes the `#ps1_sysnative`
-      `UserData` bootstrap script.
+  - **Windows Server vs. custom Windows 10 and Windows 11 images**:
+    - Official Alibaba Cloud Windows Server images use Alibaba Cloud `vminit`
+      (which executes `[powershell]` `UserData` scripts). If you supply a
+      custom Windows 10 or Windows 11 image via `--windows-image-id` or
+      `--cloud-image-id`, it MUST have `cloudbase-init` installed and enabled
+      so ECS executes the `#ps1_sysnative` `UserData` bootstrap script.
     - At boot, `UserData` configures AutoLogon, an `AtLogOn` scheduled task so
       `cua-spacesd` runs in an unlocked interactive desktop session
       (`Session >= 1`, never Session 0), and an Event ID `24` `tscon.exe`

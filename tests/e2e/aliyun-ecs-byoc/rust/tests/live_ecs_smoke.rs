@@ -24,7 +24,7 @@ fn build_live_env(home: &Path) -> HashMap<String, String> {
     env
 }
 
-const LIVE_CREATE_TIMEOUT: Duration = Duration::from_secs(1200);
+const LIVE_CREATE_TIMEOUT: Duration = Duration::from_secs(1500);
 const LIVE_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(600);
 const LIVE_CMD_TIMEOUT: Duration = Duration::from_secs(300);
 

@@ -527,9 +527,14 @@ Why it is shaped this way:
   `ecs:CreateSecurityGroup` references `vpc/*`, which allows launching into
   either Cua's isolated VPC or an existing VPC (`--vpc-id`, `--vswitch-id`)
   and custom Cloud Image IDs (`--cloud-image-id`).
-- **IMDSv2 only and no `ram:*`.** Cua launches every ECS instance with
-  `HttpTokens=required` (IMDSv2) and never assigns a RAM instance role. The
-  policy includes zero `ram:*` actions and zero wildcard actions.
+- **IMDSv2 on Linux, firewall-enforced metadata isolation on Windows, and no `ram:*`.**
+  Cua launches Linux ECS instances with `HttpTokens=required` (IMDSv2). On
+  Windows, Alibaba Cloud's `vminit` and `cloudbase-init` agents do not support
+  IMDSv2 (`ImdsSupport: "v1"`), so Windows instances launch with
+  `HttpTokens=optional` paired with an outbound Windows Defender Firewall block
+  on `100.100.100.200` and `169.254.169.254` applied during first-boot
+  `UserData` before any desktop session runs. Cua never assigns a RAM instance
+  role; the policy includes zero `ram:*` actions and zero wildcard actions.
 
 ## What a Space on a cloud host can reach
 

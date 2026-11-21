@@ -2775,7 +2775,7 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     let sb = sandboxes.create(o).await.unwrap();
     assert_eq!(sb.placement(), (Kind::Vm, Runtime::Other("native".into())));
 
-    // Inspect RunInstances call parameters & decoded #ps1_sysnative UserData.
+    // Inspect RunInstances call parameters & decoded [powershell] UserData.
     let run_call = {
         let f = s.lock().unwrap();
         f.calls
@@ -2812,7 +2812,7 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     );
     assert_eq!(
         run_call.params.get("HttpTokens").map(String::as_str),
-        Some("required")
+        Some("optional")
     );
     assert!(run_call.params.contains_key("AutoReleaseTime"));
     let img_id = run_call.params.get("ImageId").unwrap();
@@ -2842,7 +2842,9 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     }
 
     let user_data = decode_b64_str(run_call.params.get("UserData").unwrap());
-    assert!(user_data.starts_with("#ps1_sysnative\n"));
+    assert!(user_data.starts_with("[powershell]\n"));
+    assert!(user_data.contains("Is64BitOperatingSystem"));
+    assert!(user_data.contains(r"Sysnative\WindowsPowerShell\v1.0\powershell.exe"));
     assert!(user_data.len() < 16 * 1024);
     assert!(!user_data.contains(ecs_pw));
     assert!(user_data.contains("*S-1-5-18:(OI)(CI)F"));
@@ -4316,6 +4318,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("40")
     );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("required")
+    );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
 
     let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
@@ -4339,7 +4345,13 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("60")
     );
-    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("optional")
+    );
+    let win_official_ud = decode_b64_str(r.params.get("UserData").unwrap());
+    assert!(win_official_ud.starts_with("[powershell]\n"));
+    assert!(win_official_ud.contains("Is64BitOperatingSystem"));
 
     // Phase 2: Connection defaults (--windows-image-id, --linux-image-id, --instance-type).
     sbx.clouds()
@@ -4397,6 +4409,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("60")
     );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("optional")
+    );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
 
     // Phase 3: Per-create overrides (--cloud-image-id, --instance-type, --disk) beat connection defaults.
@@ -4419,6 +4435,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     assert_eq!(
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("80")
+    );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("required")
     );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
 
@@ -4445,6 +4465,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     assert_eq!(
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("120")
+    );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("optional")
     );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
 }

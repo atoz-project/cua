@@ -30,8 +30,8 @@ use crate::relay::RelayAccess;
 use crate::state::Store;
 
 /// How long a new cloud machine may take to come online on the relay: a
-/// VM's first boot installs Docker and pulls the image.
-pub const ONLINE_WAIT: Duration = Duration::from_secs(15 * 60);
+/// VM's first boot installs Docker or runs Windows `vminit`, binary download, and AutoLogon reboot.
+pub const ONLINE_WAIT: Duration = Duration::from_secs(20 * 60);
 
 /// Instance details (`provider_details`).
 pub mod detail {

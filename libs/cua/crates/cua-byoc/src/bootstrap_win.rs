@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! First-boot `#ps1_sysnative` `UserData` generator for Windows Direct VM
+//! First-boot PowerShell `UserData` generator for Windows Direct VM
 //! Sandboxes (`--runtime native` on `aliyun-ecs`).
 //!
-//! Runs under 64-bit PowerShell via `cloudbase-init` (`#ps1_sysnative`) and:
+//! Runs under 64-bit PowerShell via `vminit` (`[powershell]`, official
+//! Alibaba Cloud Windows images) or `cloudbase-init` (`#ps1_sysnative`,
+//! custom Windows 10/11 images), with a WOW64 -> `Sysnative` 64-bit
+//! self-relaunch guard, and:
 //! 1. Stages relay/environment credentials into an SID-ACL-restricted
 //!    directory (`SYSTEM`, `Administrators`, desktop user only) and removes
 //!    temporary staging artifacts.
@@ -37,6 +40,15 @@ pub const DEFAULT_WINDOWS_SPACESD_URL: &str = "https://github.com/trycua/cua/rel
 
 /// Maximum raw `UserData` length accepted by Alibaba Cloud ECS (16 KiB).
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
+
+/// Line-1 header required by `cloudbase-init` (custom Windows 10/11 images).
+pub const CLOUDBASE_HEADER: &str = "#ps1_sysnative";
+
+/// Line-1 header required by Alibaba Cloud `vminit` (`Plugin_Main_CloudinitUserData`).
+pub const ALIYUN_VMINIT_HEADER: &str = "[powershell]";
+
+/// Compact 64-bit WOW64 -> `Sysnative` self-relaunch guard for `vminit`.
+const WOW64_SYSNATIVE_GUARD: &str = r#"if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and $PSCommandPath) { & "$env:SystemRoot\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PSCommandPath; exit $LASTEXITCODE }"#;
 
 /// Maximum `/t` seconds accepted by `shutdown.exe` (10 years).
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 315_360_000;
@@ -142,6 +154,14 @@ fn ps_single_quote(s: &str) -> String {
 /// SID-ACL-protected files (`SYSTEM`, `Administrators`, `desktop_user`),
 /// never echoed to stdout/logs.
 pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
+    windows_user_data_with_header(boot, CLOUDBASE_HEADER)
+}
+
+/// Builds the compact PowerShell `UserData` script with an explicit line-1 header
+/// (`ALIYUN_VMINIT_HEADER` = `[powershell]` for Alibaba Cloud `vminit`, or
+/// `CLOUDBASE_HEADER` = `#ps1_sysnative` for `cloudbase-init`) and a 64-bit
+/// WOW64 -> `Sysnative` self-relaunch guard.
+pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> String {
     let (dl_url, expected_sha) = split_download_url(boot.spacesd_download_url);
     let desktop_user = if boot.desktop_user.trim().is_empty() {
         "Administrator"
@@ -192,8 +212,10 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
         None
     };
 
-    let mut s = String::from(
-        "#ps1_sysnative\n\
+    let hdr = header.trim();
+    let mut s = format!(
+        "{hdr}\n\
+         {WOW64_SYSNATIVE_GUARD}\n\
          $ErrorActionPreference = 'Stop'\n\
          $ProgressPreference = 'SilentlyContinue'\n",
     );
@@ -765,5 +787,44 @@ mod tests {
         assert!(!launcher.contains("Invoke-Expression"), "{launcher}");
         assert!(ps.contains("function Fetch("), "{ps}");
         assert!(ps.contains("Fetch $dlUrl $dlTmp"), "{ps}");
+    }
+
+    #[test]
+    fn aliyun_vminit_header_and_wow64_guard_contract() {
+        let j = static_join();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_vminit".to_string(),
+        )]);
+        let pw = "WinPass!1234Abcd";
+        let ps = windows_user_data_with_header(
+            &WindowsVmBoot {
+                join: &j,
+                env: &env,
+                expires: 1_900_000_000,
+                ttl_secs: 8 * 3600,
+                provider: "aliyun-ecs",
+                spacesd_download_url: None,
+                desktop_user: "Administrator",
+                desktop_password: pw,
+            },
+            ALIYUN_VMINIT_HEADER,
+        );
+        let mut lines = ps.lines();
+        assert_eq!(
+            lines.next(),
+            Some("[powershell]"),
+            "line 1 must be exact [powershell] with no spaces"
+        );
+        let guard_line = lines.next().unwrap();
+        assert!(guard_line.contains("Is64BitOperatingSystem"));
+        assert!(guard_line.contains("Is64BitProcess"));
+        assert!(guard_line.contains(r"Sysnative\WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(guard_line.contains("$PSCommandPath"));
+        assert!(
+            ps.len() < MAX_USER_DATA_BYTES,
+            "raw UserData {} >= 16 KiB",
+            ps.len()
+        );
     }
 }

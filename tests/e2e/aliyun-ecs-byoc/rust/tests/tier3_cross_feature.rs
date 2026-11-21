@@ -66,7 +66,9 @@ async fn t3_01() {
         let f = w.aliyun.lock().unwrap();
         let inst = f.instances.values().next().unwrap();
         assert_eq!(inst.image_id, "m-win11-override");
-        assert!(inst.user_data_decoded.starts_with("#ps1_sysnative"));
+        assert_eq!(inst.http_tokens.as_deref(), Some("optional"));
+        assert!(inst.user_data_decoded.starts_with("#ps1_sysnative\n"));
+        assert!(inst.user_data_decoded.contains("Is64BitOperatingSystem"));
         assert!(inst.user_data_decoded.contains(&mirror_url));
     }
 

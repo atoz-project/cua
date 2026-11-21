@@ -19,10 +19,10 @@ Existing BYOC VM providers run Linux hosts with Docker containers and reject Win
   - Native Linux images that lack a running desktop environment start `cua-spacesd join` in headless mode without installing desktop packages during boot.
 - **Custom Cloud Image IDs and binary provisioning**:
   - Connection defaults (`--windows-image-id`, `--linux-image-id`) and per-create overrides (`--cloud-image-id`) select the ECS `ImageId`, falling back to official Alibaba Cloud images when omitted.
-  - Custom Windows 10/11 images must have `cloudbase-init` pre-installed to execute ECS `UserData`.
+  - Official Alibaba Cloud Windows Server images use Alibaba Cloud `vminit` (`[powershell]` `UserData`), while custom Windows 10/11 images must have `cloudbase-init` pre-installed to execute `#ps1_sysnative` ECS `UserData`.
   - Bootstrap checks whether `cua-spacesd` is already installed on the image; if absent, it downloads the binary from a connection-configurable custom download URL (defaulting to GitHub Releases) with SHA-256 verification.
 - **Windows interactive session and RDP disconnect recovery**:
   - Windows desktop capture and UI automation fail in Session 0, so `UserData` configures AutoLogon, disables auto-lock and screensavers, registers an `AtLogOn` interactive scheduled task (`LogonType Interactive`) for `cua-spacesd.exe` in Session >= 1, and installs a `SYSTEM` scheduled task triggered by RDP disconnect Event ID `24` to run `tscon <SessionId> /dest:console`.
 - **Billing, auth, and lifecycle safety**:
   - Phase 1 authenticates via RAM sub-account AccessKey (environment variables, `~/.aliyun/config.json` profile, or `--token-stdin` local credential store) paired with a least-privilege RAM Policy; OIDC federation is deferred.
-  - Instances launch as `PostPaid` with `StoppedMode=StopCharging`, native ECS `AutoReleaseTime` (default 8 hours via `--ttl-hours`), in-guest shutdown timer, `HttpTokens=required` (IMDSv2), metadata firewall blocking (`100.100.100.200`), and `cua-managed=true` resource tagging.
+  - Instances launch as `PostPaid` with `StoppedMode=StopCharging`, native ECS `AutoReleaseTime` (default 8 hours via `--ttl-hours`), in-guest shutdown timer, `HttpTokens=required` (IMDSv2) on Linux and `HttpTokens=optional` on Windows (where Alibaba Cloud `vminit`/`cloudbase-init` lacks IMDSv2 support, mitigated by zero RAM role and first-boot OS firewall blocking of `100.100.100.200` and `169.254.169.254`), and `cua-managed=true` resource tagging.

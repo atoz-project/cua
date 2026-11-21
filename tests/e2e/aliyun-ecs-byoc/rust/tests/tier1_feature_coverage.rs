@@ -852,7 +852,7 @@ async fn t1_f4_01() {
     assert_eq!(inst.system_disk_category.as_deref(), Some("cloud_essd"));
     assert_eq!(inst.instance_charge_type, "PostPaid");
     assert_eq!(inst.stopped_mode, "StopCharging");
-    assert_eq!(inst.http_tokens.as_deref(), Some("required"));
+    assert_eq!(inst.http_tokens.as_deref(), Some("optional"));
     assert_six_cua_tags(&inst.tags);
 }
 
@@ -881,7 +881,12 @@ async fn t1_f4_02() {
     .ok();
     let f = w.aliyun.lock().unwrap();
     let ud = &f.instances.values().next().unwrap().user_data_decoded;
-    assert!(ud.starts_with("#ps1_sysnative"), "{ud}");
+    assert!(ud.starts_with("[powershell]\n"), "{ud}");
+    assert!(ud.contains("Is64BitOperatingSystem"), "{ud}");
+    assert!(
+        ud.contains(r"Sysnative\WindowsPowerShell\v1.0\powershell.exe"),
+        "{ud}"
+    );
     assert!(ud.contains("icacls"), "{ud}");
     assert!(ud.contains("Remove-Item"), "{ud}");
     assert!(ud.contains("cua-spacesd.exe"), "{ud}");

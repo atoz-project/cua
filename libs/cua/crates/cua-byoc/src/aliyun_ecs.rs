@@ -180,6 +180,17 @@ pub struct ResolvedCloudImage {
     pub size_gb: Option<u32>,
     /// Precedence tier (`"per-create"`, `"connection-default"`, or `"official-fallback"`).
     pub source: &'static str,
+    /// Lowercased `ImageOwnerAlias` from `DescribeImages` (`"system"`, `"self"`, etc.).
+    pub owner_alias: Option<String>,
+}
+
+impl ResolvedCloudImage {
+    /// Whether this image is an official Alibaba Cloud system image (uses `vminit`).
+    pub fn is_official_aliyun(&self) -> bool {
+        self.source == "official-fallback"
+            || self.owner_alias.as_deref() == Some("system")
+            || self.image_id.contains("_alibase_")
+    }
 }
 
 /// Where the Cua credential store keeps the AccessKey pair (and a fake in tests).
@@ -921,6 +932,11 @@ impl AliyunEcs {
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 0);
+        let owner_alias = img["ImageOwnerAlias"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase);
         Ok(ResolvedCloudImage {
             image_id: img["ImageId"]
                 .as_str()
@@ -930,6 +946,7 @@ impl AliyunEcs {
             os_type,
             size_gb,
             source: "explicit",
+            owner_alias,
         })
     }
 
@@ -1012,11 +1029,18 @@ impl AliyunEcs {
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 0);
+        let owner_alias = img["ImageOwnerAlias"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .or_else(|| Some("system".to_string()));
         Ok(ResolvedCloudImage {
             image_id,
             os_type: if is_windows { "windows" } else { "linux" }.into(),
             size_gb,
             source: "official-fallback",
+            owner_alias,
         })
     }
 
@@ -2853,7 +2877,8 @@ impl CloudApi for AliyunEcs {
         if !region.is_empty() && effective_conn.region != region {
             effective_conn.region = region.clone();
         }
-        let image_id = self.resolve_image_id(&effective_conn, spec).await?.image_id;
+        let resolved_image = self.resolve_image_id(&effective_conn, spec).await?;
+        let image_id = resolved_image.image_id.clone();
         let net_cfg = NetworkConfig::from_connection(&effective_conn)?;
         let net = aliyun_net::prepare_network(
             self,
@@ -2876,8 +2901,32 @@ impl CloudApi for AliyunEcs {
         let host_name = sanitize_hostname_for_family(&spec.name, &spec.family);
         let auto_release =
             (spec.ttl_secs > 0).then(|| model::rfc3339(model::now() + spec.ttl_secs.max(1860)));
-        let user_data_b64 = (!spec.user_data.is_empty())
-            .then(|| base64::engine::general_purpose::STANDARD.encode(spec.user_data.as_bytes()));
+        // Official Alibaba Cloud Windows images run `vminit` (requiring `[powershell]` on line 1),
+        // whereas custom `m-*` Windows 10/11 images run `cloudbase-init` (`#ps1_sysnative`).
+        let effective_user_data = if spec.family == "windows" && resolved_image.is_official_aliyun()
+        {
+            if let Some(rest) = spec
+                .user_data
+                .strip_prefix(crate::bootstrap_win::CLOUDBASE_HEADER)
+            {
+                format!("{}{rest}", crate::bootstrap_win::ALIYUN_VMINIT_HEADER)
+            } else {
+                spec.user_data.clone()
+            }
+        } else {
+            spec.user_data.clone()
+        };
+        let user_data_b64 = (!effective_user_data.is_empty()).then(|| {
+            base64::engine::general_purpose::STANDARD.encode(effective_user_data.as_bytes())
+        });
+        // Alibaba Cloud official Windows images support only IMDSv1 (`ImdsSupport: "v1"`),
+        // so `HttpTokens=required` blocks `vminit` (`INSTANCE_metaservernotavailable`);
+        // Windows blocks `100.100.100.200` via Windows Defender Firewall before desktop logon.
+        let http_tokens = if spec.family == "windows" {
+            "optional"
+        } else {
+            "required"
+        };
 
         let mut tried = Vec::new();
         for (idx, cand) in net.candidates.iter().enumerate() {
@@ -2922,7 +2971,7 @@ impl CloudApi for AliyunEcs {
                 ("StoppedMode".into(), "StopCharging".into()),
                 ("DeletionProtection".into(), "false".into()),
                 ("HttpEndpoint".into(), "enabled".into()),
-                ("HttpTokens".into(), "required".into()),
+                ("HttpTokens".into(), http_tokens.into()),
                 ("SystemDisk.Category".into(), disk_category.into()),
                 ("SystemDisk.Size".into(), disk_gb.to_string()),
                 ("ClientToken".into(), client_token),
