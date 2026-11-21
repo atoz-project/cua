@@ -67,6 +67,7 @@ pub fn target_of(c: &Connection) -> Target {
 /// before `--max-size` and `--budget` preflight checks.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedSizing {
+    pub machine_type: Option<String>,
     pub vcpus: u32,
     pub memory_mb: u64,
     pub disk_gb: Option<u32>,

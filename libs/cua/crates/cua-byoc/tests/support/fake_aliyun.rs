@@ -66,6 +66,8 @@ pub struct FakeAliyun {
     pub throttle: u32,
     /// Number of upcoming `DeleteSecurityGroup`/`DeleteVSwitch`/`DeleteVpc` calls to reject with `DependencyViolation`.
     pub transient_dependency_errors: u32,
+    /// Optional error code for `transient_dependency_errors` (defaults to `"DependencyViolation"`).
+    pub transient_dependency_code: Option<String>,
     /// Actions (e.g. `"ecs:RunInstances"`, `"vpc:DescribeVpcs"`) that fail with HTTP 403 `Forbidden.RAM`.
     pub forbidden_actions: BTreeSet<String>,
     /// Simulate VPC-only region returning `InvalidVSwitchId.NotFound` on `DryRun=true` when `VSwitchId` is omitted.
@@ -164,6 +166,7 @@ impl Default for FakeAliyun {
             calls: Vec::new(),
             throttle: 0,
             transient_dependency_errors: 0,
+            transient_dependency_code: None,
             forbidden_actions: BTreeSet::new(),
             run_instances_missing_vswitch: false,
             run_instances_dry_run_error: None,
@@ -1258,10 +1261,14 @@ pub async fn handle(
             ("2016-04-28", "DeleteVSwitch") => {
                 if f.transient_dependency_errors > 0 {
                     f.transient_dependency_errors -= 1;
+                    let code = f
+                        .transient_dependency_code
+                        .as_deref()
+                        .unwrap_or("DependencyViolation");
                     err(
                         StatusCode::BAD_REQUEST,
-                        "DependencyViolation",
-                        "VSwitch has active instances.",
+                        code,
+                        "VSwitch has active instances or deleting network interfaces.",
                     )
                 } else {
                     let vsw_id = params.get("VSwitchId").cloned().unwrap_or_default();

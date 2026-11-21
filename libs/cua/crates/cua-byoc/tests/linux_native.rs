@@ -225,8 +225,9 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
     assert!(env_native.contains("LOG_FORMAT=json\n"));
     assert!(decode_cloud_init_file(&spec_native.user_data, "/etc/cua/relay/jwks.json").is_some());
     let starter = extract_heredoc(&boot_native, "CUA_SPACESD_START").unwrap();
-    assert!(starter.contains("CUA_ENV_NO_DESKTOP=1"));
+    assert!(starter.contains("CUA_ENV_NO_DESKTOP=true"));
     assert!(starter.contains("join"));
+    assert!(boot_native.contains("libxkbcommon0"));
 
     // 3. `--runtime native` on `linux-slim` also works cleanly.
     let mut o_slim = create_opts(

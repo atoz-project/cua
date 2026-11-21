@@ -429,7 +429,7 @@ pub fn native_spacesd_service() -> &'static str {
 /// Lightweight starter wrapper (`/usr/local/sbin/cua-spacesd-start`) that
 /// loads `/etc/cua/spacesd.env` literally, attaches `cua-spacesd join` to an
 /// existing Wayland/X11 desktop session if present, or starts immediately in
-/// headless mode (`CUA_ENV_NO_DESKTOP=1`).
+/// headless mode (`CUA_ENV_NO_DESKTOP=true`).
 pub fn native_spacesd_start_script() -> &'static str {
     r#"#!/bin/sh
 set -eu
@@ -488,7 +488,7 @@ if ! probe_desktop && command -v systemctl >/dev/null 2>&1; then
     while [ "$i" -lt 30 ] && ! probe_desktop; do sleep 1; i=$((i + 1)); done
   fi
 fi
-[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && export CUA_ENV_NO_DESKTOP=1
+[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && export CUA_ENV_NO_DESKTOP=true
 BIN=/usr/local/bin/cua-spacesd
 [ -x "$BIN" ] || BIN=$(command -v cua-spacesd)
 exec "$BIN" join
@@ -502,7 +502,7 @@ exec "$BIN" join
 pub fn native_first_boot_script(boot: &VmBoot<'_>, spacesd_download_url: Option<&str>) -> String {
     let mut s = String::from(
         "#!/bin/sh\n\
-# Cua: Direct VM Sandbox bootstrap (no Docker); cua-spacesd join runs natively via systemd.\n\
+# Cua: Direct VM Sandbox bootstrap.\n\
 set -eu\n\
 export DEBIAN_FRONTEND=noninteractive HOME=/root\n\
 log() { echo \"[cua-first-boot] $(date -u +%FT%TZ) $*\"; }\n\
@@ -607,12 +607,12 @@ else
 fi
 if ! /usr/local/bin/cua-spacesd --version >/dev/null 2>&1; then
   if command -v ldd >/dev/null 2>&1 && ldd /usr/local/bin/cua-spacesd 2>/dev/null | grep -q 'not found'; then
-    log 'installing minimal X11 runtime libraries for cua-spacesd'
+    log 'installing X11/xkb libs'
     if command -v apt-get >/dev/null 2>&1; then
       retry apt-get update -q
-      retry apt-get install -y -q --no-install-recommends libx11-6 libxext6 libxi6 libxtst6
+      retry apt-get install -y -q --no-install-recommends libx11-6 libxext6 libxi6 libxtst6 libxkbcommon0
     elif command -v dnf >/dev/null 2>&1; then
-      retry dnf install -y libX11 libXext libXi libXtst
+      retry dnf install -y libX11 libXext libXi libXtst libxkbcommon
     fi
   fi
   /usr/local/bin/cua-spacesd --version >/dev/null
@@ -1018,7 +1018,7 @@ mod tests {
         assert!(starter.contains("/run/user/*/wayland-*"), "{starter}");
         assert!(starter.contains("/tmp/.X11-unix/X*"), "{starter}");
         assert!(starter.contains("XAUTHORITY"), "{starter}");
-        assert!(starter.contains("CUA_ENV_NO_DESKTOP=1"), "{starter}");
+        assert!(starter.contains("CUA_ENV_NO_DESKTOP=true"), "{starter}");
         assert!(starter.contains("join"), "{starter}");
 
         // Account Relay Mode files & env.
@@ -1444,5 +1444,34 @@ mod tests {
                 assert_eq!(got, expected, "under {shell} for {dl_url}");
             }
         }
+    }
+
+    #[test]
+    fn linux_native_first_boot_installs_libxkbcommon_and_uses_true_for_no_desktop() {
+        let j = join();
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".to_string(), "envtok".to_string())]);
+        let boot = VmBoot {
+            join: &j,
+            image: "ghcr.io/trycua/linux:24.04",
+            env: &env,
+            expires: 0,
+            ttl_secs: 0,
+            shm_mb: 512,
+            provider: "aliyun-ecs",
+            net_guard: true,
+            share_slots: false,
+        };
+        let first_boot = native_first_boot_script(&boot, None);
+        assert!(
+            first_boot.contains("libx11-6 libxext6 libxi6 libxtst6 libxkbcommon0"),
+            "{first_boot}"
+        );
+        assert!(
+            first_boot.contains("libX11 libXext libXi libXtst libxkbcommon"),
+            "{first_boot}"
+        );
+        let starter = native_spacesd_start_script();
+        assert!(starter.contains("CUA_ENV_NO_DESKTOP=true"), "{starter}");
+        assert!(!starter.contains("CUA_ENV_NO_DESKTOP=1"), "{starter}");
     }
 }

@@ -24,10 +24,15 @@ fn build_live_env(home: &Path) -> HashMap<String, String> {
     env
 }
 
+const LIVE_CREATE_TIMEOUT: Duration = Duration::from_secs(1200);
+const LIVE_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(600);
+const LIVE_CMD_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn run_live_cua(
     home: &Path,
     args: &[&str],
     stdin_data: Option<&str>,
+    timeout: Duration,
 ) -> (i32, String, String) {
     let mut cmd = tokio::process::Command::new(resolve_cua_bin());
     cmd.envs(build_live_env(home))
@@ -51,9 +56,15 @@ async fn run_live_cua(
             .expect("write live stdin");
         stdin.shutdown().await.ok();
     }
-    let out = tokio::time::timeout(Duration::from_secs(900), child.wait_with_output())
+    let out = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .expect("live cua command timeout")
+        .unwrap_or_else(|_| {
+            panic!(
+                "live cua command timeout after {}s: cua --embedded {}",
+                timeout.as_secs(),
+                args.join(" ")
+            )
+        })
         .expect("wait_with_output");
     (
         out.status.code().unwrap_or(-1),
@@ -119,9 +130,13 @@ impl Drop for LiveTeardownGuard {
 }
 
 async fn run_teardown(home: &Path, names: &[String]) -> (i32, String, String, i32, String, String) {
+    eprintln!("[live_ecs_smoke] step 5: teardown starting");
+    record_smoke_owner(home);
     for name in names {
-        let _ = run_live_cua(home, &["sb", "rm", name, "--force"], None).await;
+        eprintln!("[live_ecs_smoke] step 5: sb rm {name} --force");
+        let _ = run_live_cua(home, &["sb", "rm", name, "--force"], None, LIVE_CMD_TIMEOUT).await;
     }
+    eprintln!("[live_ecs_smoke] step 5: cloud sweep aliyun-ecs --all --delete");
     let (sw_rc, sw_out, sw_err) = run_live_cua(
         home,
         &[
@@ -133,14 +148,18 @@ async fn run_teardown(home: &Path, names: &[String]) -> (i32, String, String, i3
             "--json",
         ],
         None,
+        LIVE_CMD_TIMEOUT,
     )
     .await;
+    eprintln!("[live_ecs_smoke] step 5: cloud disconnect aliyun-ecs --delete");
     let (dc_rc, dc_out, dc_err) = run_live_cua(
         home,
         &["cloud", "disconnect", "aliyun-ecs", "--delete", "--json"],
         None,
+        LIVE_DISCONNECT_TIMEOUT,
     )
     .await;
+    eprintln!("[live_ecs_smoke] step 5: teardown done (sweep_rc={sw_rc} disconnect_rc={dc_rc})");
     (sw_rc, sw_out, sw_err, dc_rc, dc_out, dc_err)
 }
 
@@ -204,11 +223,16 @@ fn prepare_relay_auth(isolated_home: &Path) -> RelayAuth {
 }
 
 fn record_smoke_owner(isolated_home: &Path) {
+    static RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RECORDED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let state_path = isolated_home.join(".cua/cloud/state.json");
     if let Ok(raw) = std::fs::read_to_string(&state_path)
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
         && let Some(owner) = v["owner_id"].as_str().filter(|s| !s.is_empty())
     {
+        RECORDED.store(true, std::sync::atomic::Ordering::Relaxed);
         println!("CUA_E2E_SMOKE_OWNER={owner}");
         if let Ok(out_file) = std::env::var("CUA_E2E_OWNER_FILE")
             && !out_file.trim().is_empty()
@@ -269,6 +293,7 @@ async fn live_ecs_smoke() {
 
     let smoke_result = std::panic::AssertUnwindSafe(async {
         // 1. Test & connect
+        eprintln!("[live_ecs_smoke] step 1: cloud test aliyun-ecs (profile={profile}, region={region})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &[
@@ -282,9 +307,11 @@ async fn live_ecs_smoke() {
                 "--json",
             ],
             None,
+            LIVE_CMD_TIMEOUT,
         )
         .await;
         assert_eq!(rc, 0, "cloud test failed: out={out}\nerr={err}");
+        eprintln!("[live_ecs_smoke] step 1: cloud test passed");
 
         let mut connect_args = vec![
             "cloud",
@@ -311,12 +338,19 @@ async fn live_ecs_smoke() {
             }
             RelayAuth::AccountCredentials => None,
         };
-        let (rc, out, err) =
-            run_live_cua(dir.path(), &connect_args, stdin_token.as_deref()).await;
+        eprintln!("[live_ecs_smoke] step 1b: cloud connect aliyun-ecs");
+        let (rc, out, err) = run_live_cua(
+            dir.path(),
+            &connect_args,
+            stdin_token.as_deref(),
+            LIVE_CMD_TIMEOUT,
+        )
+        .await;
         assert_eq!(rc, 0, "cloud connect failed: out={out}\nerr={err}");
-        record_smoke_owner(dir.path());
+        eprintln!("[live_ecs_smoke] step 1b: cloud connect passed");
 
         // 2. Linux Docker-on-VM + guest probe
+        eprintln!("[live_ecs_smoke] step 2: sb create linux --runtime docker ({linux_docker_name})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &[
@@ -332,22 +366,28 @@ async fn live_ecs_smoke() {
                 "--json",
             ],
             None,
+            LIVE_CREATE_TIMEOUT,
         )
         .await;
+        record_smoke_owner(dir.path());
         assert_eq!(rc, 0, "linux docker create failed: out={out}\nerr={err}");
+        eprintln!("[live_ecs_smoke] step 2: linux docker created; running guest probe");
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &["sb", "exec", &linux_docker_name, "sh", "-c", "uname -a && id"],
             None,
+            LIVE_CMD_TIMEOUT,
         )
         .await;
         assert_eq!(rc, 0, "linux docker exec failed: out={out}\nerr={err}");
+        println!("[live_ecs_smoke] linux docker probe:\n{out}");
         assert!(
             out.contains("Linux"),
             "unexpected linux docker exec output: {out}"
         );
 
         // 3. Linux Direct VM + guest systemd probe
+        eprintln!("[live_ecs_smoke] step 3: sb create linux --runtime native ({linux_native_name})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &[
@@ -363,9 +403,11 @@ async fn live_ecs_smoke() {
                 "--json",
             ],
             None,
+            LIVE_CREATE_TIMEOUT,
         )
         .await;
         assert_eq!(rc, 0, "linux native create failed: out={out}\nerr={err}");
+        eprintln!("[live_ecs_smoke] step 3: linux native created; running systemd probe");
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &[
@@ -377,15 +419,18 @@ async fn live_ecs_smoke() {
                 "uname -a && systemctl is-active cua-spacesd",
             ],
             None,
+            LIVE_CMD_TIMEOUT,
         )
         .await;
         assert_eq!(rc, 0, "linux native exec failed: out={out}\nerr={err}");
+        println!("[live_ecs_smoke] linux native probe:\n{out}");
         assert!(
             out.contains("Linux") && out.contains("active"),
             "expected Linux + active cua-spacesd service, got: {out}"
         );
 
         // 4. Windows Direct VM (Session >= 1, AutoLogon, AtLogOn task, Event ID 24 tscon)
+        eprintln!("[live_ecs_smoke] step 4: sb create windows --runtime native ({windows_native_name})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
             &[
@@ -401,9 +446,11 @@ async fn live_ecs_smoke() {
                 "--json",
             ],
             None,
+            LIVE_CREATE_TIMEOUT,
         )
         .await;
         assert_eq!(rc, 0, "windows native create failed: out={out}\nerr={err}");
+        eprintln!("[live_ecs_smoke] step 4: windows native created; running session/AutoLogon/tscon probe");
 
         let ps_probe = concat!(
             "$ErrorActionPreference = 'Continue'; ",
@@ -431,9 +478,11 @@ async fn live_ecs_smoke() {
                 &encoded_ps_probe,
             ],
             None,
+            LIVE_CMD_TIMEOUT,
         )
         .await;
         assert_eq!(rc, 0, "windows session probe failed: out={out}\nerr={err}");
+        println!("[live_ecs_smoke] windows native probe:\n{out}");
 
         let sess_id: u32 = out
             .lines()
@@ -466,7 +515,9 @@ async fn live_ecs_smoke() {
     guard.disarm();
 
     if let Err(payload) = smoke_result {
-        eprintln!("live_ecs_smoke teardown after panic: sweep_rc={sw_rc} disconnect_rc={dc_rc}");
+        eprintln!(
+            "live_ecs_smoke teardown after panic: sweep_rc={sw_rc} disconnect_rc={dc_rc} sw_err={sw_err} dc_err={dc_err}"
+        );
         std::panic::resume_unwind(payload);
     }
 

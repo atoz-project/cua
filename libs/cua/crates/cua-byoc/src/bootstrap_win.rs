@@ -215,7 +215,8 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20 Write-Output $ln\n\
          }}\n\
          function Dec([string]$b) {{ [Convert]::FromBase64String($b) }}\n\
-         function Put([string]$p,[string]$b) {{ [IO.File]::WriteAllBytes($p,(Dec $b)) }}\n",
+         function Put([string]$p,[string]$b) {{ [IO.File]::WriteAllBytes($p,(Dec $b)) }}\n\
+         function Fetch([string]$u,[string]$o) {{ for ($i=1; $i -le 5; $i++) {{ try {{ Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $o; return }} catch {{ if ($i -eq 5) {{ throw }}; Start-Sleep -Seconds ($i*5) }} }} }}\n",
         prov = ps_single_quote(boot.provider),
         user = ps_single_quote(desktop_user),
     ));
@@ -281,10 +282,10 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20   Log ('downloading cua-spacesd.exe from ' + {dl_url_redacted})\n\
          \x20   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12\n\
          \x20   $dlTmp = Join-Path $stg 'cua-spacesd.exe'\n\
-         \x20   Invoke-WebRequest -UseBasicParsing -Uri $dlUrl -OutFile $dlTmp\n\
+         \x20   Fetch $dlUrl $dlTmp\n\
          \x20   if (-not $wantSha) {{\n\
          \x20     $sumTmp = Join-Path $stg 'cua-spacesd.exe.sha256'\n\
-         \x20     Invoke-WebRequest -UseBasicParsing -Uri \"$dlUrl.sha256\" -OutFile $sumTmp\n\
+         \x20     Fetch \"$dlUrl.sha256\" $sumTmp\n\
          \x20     $wantSha = (((Get-Content -Raw -LiteralPath $sumTmp).Trim() -split '\\s+')[0]).ToLowerInvariant()\n\
          \x20   }}\n\
          \x20   if ($wantSha -notmatch '^[0-9a-f]{{64}}$') {{ throw 'invalid sha256 checksum format' }}\n\
@@ -762,5 +763,7 @@ mod tests {
         let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
         assert!(!launcher.contains('\u{2019}'), "{launcher}");
         assert!(!launcher.contains("Invoke-Expression"), "{launcher}");
+        assert!(ps.contains("function Fetch("), "{ps}");
+        assert!(ps.contains("Fetch $dlUrl $dlTmp"), "{ps}");
     }
 }

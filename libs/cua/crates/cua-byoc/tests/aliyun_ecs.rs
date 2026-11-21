@@ -4728,7 +4728,8 @@ async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
     assert!(boot.contains("100.100.100.200/32"));
     assert!(ud.contains("cua-expire.timer"));
     assert!(decode_native_cloud_init_file(&ud, "/etc/systemd/system/cua-expire.timer").is_some());
-    assert!(boot.contains("CUA_ENV_NO_DESKTOP=1"));
+    assert!(boot.contains("CUA_ENV_NO_DESKTOP=true"));
+    assert!(boot.contains("libxkbcommon0"));
     assert!(boot.contains("cua-spacesd.service"));
     let envf = decode_native_cloud_init_file(&ud, "/etc/cua/spacesd.env").unwrap();
     assert!(envf.contains("APP_ENV=production\n"));
@@ -5414,5 +5415,164 @@ async fn clamped_disk_gb_cannot_bypass_max_size_or_budget() {
             .iter()
             .any(|c| c.action == "RunInstances"),
         "RunInstances must not be called when clamped disk exceeds --budget"
+    );
+}
+
+#[tokio::test]
+async fn aliyun_ecs_windows_auto_falls_back_when_c7_xlarge_unavailable() {
+    use cua_sandbox_core::placement::Runtime;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        // Simulate ap-southeast-1 where ecs.c7.xlarge has 0 stock while ecs.e-c1m2.xlarge is available.
+        f.available_instance_types = vec!["ecs.e-c1m2.large".into(), "ecs.e-c1m2.xlarge".into()];
+        f.instance_types
+            .insert("ecs.e-c1m2.xlarge".into(), (4, 8.0));
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("ap-southeast-1".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut win_auto = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_auto.contrib = Some("aliyun-ecs".into());
+    win_auto.name = Some("win-auto-fallback".into());
+    win_auto.os = "windows".into();
+    win_auto.runtime = Runtime::Other("native".into());
+    win_auto.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_auto).await.unwrap();
+    assert_eq!(
+        sb.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.e-c1m2.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let run = f
+            .calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap();
+        assert_eq!(
+            run.params.get("InstanceType").map(String::as_str),
+            Some("ecs.e-c1m2.xlarge")
+        );
+    }
+    sb.delete().await.unwrap();
+
+    // Explicit --instance-type must never be silently overridden.
+    let mut win_explicit = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_explicit.contrib = Some("aliyun-ecs".into());
+    win_explicit.name = Some("win-explicit-c7".into());
+    win_explicit.os = "windows".into();
+    win_explicit.runtime = Runtime::Other("native".into());
+    win_explicit.instance_type = Some("ecs.c7.xlarge".into());
+    win_explicit.ready_timeout = std::time::Duration::from_secs(10);
+    let sb2 = sbx.create(win_explicit).await.unwrap();
+    assert_eq!(
+        sb2.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    sb2.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn aliyun_net_delete_part_retries_dependency_violation_network_interface_past_48s_budget() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    let api = api.with_poll(std::time::Duration::from_millis(5));
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+    let owner = "owner-eni-retry";
+    let tags = aliyun_net::part_tags(owner);
+
+    {
+        let mut f = s.lock().unwrap();
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-eni-retry",
+            "VSwitchName": aliyun_net::vswitch_name(owner, "ap-southeast-1a"),
+            "VpcId": "vpc-eni-retry",
+            "ZoneId": "ap-southeast-1a",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.transient_dependency_errors = 30;
+        f.transient_dependency_code = Some("DependencyViolation.NetworkInterface".into());
+    }
+
+    let res = Resource {
+        provider: "aliyun-ecs".into(),
+        id: "vsw-eni-retry".into(),
+        resource_type: "vswitch".into(),
+        region: "cn-hangzhou".into(),
+        tags,
+        ..Default::default()
+    };
+    aliyun_net::delete_part(&api, &c, &res)
+        .await
+        .expect("DeleteVSwitch must retry DependencyViolation.NetworkInterface past 24 attempts");
+    let del_count = s
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|call| call.action == "DeleteVSwitch")
+        .count();
+    assert_eq!(
+        del_count, 31,
+        "DeleteVSwitch should be attempted 31 times (30 DependencyViolation.NetworkInterface + 1 success)"
     );
 }

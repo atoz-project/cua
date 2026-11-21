@@ -240,16 +240,17 @@ fn is_not_found_code(code: &str) -> bool {
 }
 
 fn is_retryable_delete_code(code: &str) -> bool {
-    matches!(
-        code,
-        "DependencyViolation"
-            | "InUse"
-            | "VpcInUse"
-            | "IncorrectVpcStatus"
-            | "IncorrectVSwitchStatus"
-            | "ResourceInUse"
-            | "InvalidOperation.Conflict"
-    )
+    code == "DependencyViolation"
+        || code.starts_with("DependencyViolation.")
+        || matches!(
+            code,
+            "InUse"
+                | "VpcInUse"
+                | "IncorrectVpcStatus"
+                | "IncorrectVSwitchStatus"
+                | "ResourceInUse"
+                | "InvalidOperation.Conflict"
+        )
 }
 
 fn net_resource(
@@ -1447,15 +1448,24 @@ pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Re
         if is_not_found_code(code) {
             return Ok(());
         }
-        if is_retryable_delete_code(code) && tries < 24 {
+        // Alibaba Cloud keeps primary ENIs in `Status: Deleting` for up to ~4 minutes
+        // after `DeleteInstance(Force=true)` before `DeleteVSwitch` succeeds (~376s budget
+        // at the default 2s poll interval; unit tests override `poll_interval()` to 10ms).
+        if is_retryable_delete_code(code) && tries < 100 {
             if tries == 0
                 && !cua_owner.is_empty()
                 && has_permanent_non_cua_blocker(api, region, r, &cua_owner, profile_hint).await
             {
                 return Err(map_api_error(action, version, status, &body));
             }
+            let poll = api.poll_interval();
+            let wait = if tries < 12 {
+                poll
+            } else {
+                poll.saturating_mul(2)
+            };
             tries += 1;
-            tokio::time::sleep(api.poll_interval()).await;
+            tokio::time::sleep(wait).await;
             continue;
         }
         return Err(map_api_error(action, version, status, &body));

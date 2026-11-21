@@ -616,15 +616,15 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 ));
             }
         }
-        let machine_type = spec_instance_type
-            .or_else(|| {
-                conn.instance_type
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| offer.machine_type.clone());
+        let explicit_machine_type = spec_instance_type.or_else(|| {
+            conn.instance_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+        let machine_type_explicit = explicit_machine_type.is_some();
+        let mut machine_type = explicit_machine_type.unwrap_or_else(|| offer.machine_type.clone());
         let disk_gb = spec
             .disk_gb
             .unwrap_or_else(|| self.api.default_disk_gb(family));
@@ -675,6 +675,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             image: spec.image.pinned_ref.clone(),
             kind: effective_kind.into(),
             machine_type: machine_type.clone(),
+            machine_type_explicit,
             disk_gb,
             cpus: Some(spec.cpus),
             memory_mb: Some(spec.memory_mb),
@@ -691,6 +692,18 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         // Say a budget share passed before a new machine adds to it.
         crate::alerts::check_all(&self.store, now());
         let sizing = self.api.resolve_machine_sizing(&conn, &provision).await?;
+        if let Some(resolved_mt) = sizing
+            .as_ref()
+            .and_then(|s| s.machine_type.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            machine_type = resolved_mt.to_string();
+            provision.machine_type = machine_type.clone();
+        } else if machine_type.is_empty() {
+            machine_type = offer.machine_type.clone();
+            provision.machine_type = machine_type.clone();
+        }
         let (eff_cpus, eff_mem_mb, eff_disk_gb, eff_usd) = match sizing {
             Some(s) => (
                 Some(s.vcpus.max(spec.cpus)),

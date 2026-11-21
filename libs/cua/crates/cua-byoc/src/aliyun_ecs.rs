@@ -57,6 +57,39 @@ pub const SLIM_INSTANCE_TYPE: &str = "ecs.e-c1m1.large";
 /// Default baseline Windows Direct VM instance type (4 vCPU, 8 GiB).
 pub const WINDOWS_INSTANCE_TYPE: &str = "ecs.c7.xlarge";
 
+/// Ordered x86_64 default instance-type fallback candidates for Windows (4 vCPU, 8+ GiB)
+/// when no explicit `--instance-type` is configured and the primary default has no stock.
+pub const WINDOWS_INSTANCE_TYPE_CANDIDATES: &[&str] = &[
+    WINDOWS_INSTANCE_TYPE,
+    "ecs.e-c1m2.xlarge",
+    "ecs.u1-c1m2.xlarge",
+    "ecs.c7a.xlarge",
+    "ecs.g7a.xlarge",
+    "ecs.c7se.xlarge",
+    "ecs.c9i.xlarge",
+    "ecs.g7.xlarge",
+];
+
+/// Ordered x86_64 default instance-type fallback candidates for Linux (`linux`, 2 vCPU, 4+ GiB).
+pub const LINUX_INSTANCE_TYPE_CANDIDATES: &[&str] = &[
+    LINUX_INSTANCE_TYPE,
+    "ecs.u1-c1m2.large",
+    "ecs.c7.large",
+    "ecs.c7a.large",
+    "ecs.e-c1m4.large",
+    "ecs.g7a.large",
+    "ecs.g7.large",
+];
+
+/// Ordered x86_64 default instance-type fallback candidates for `linux-slim` (2 vCPU, 2+ GiB).
+pub const SLIM_INSTANCE_TYPE_CANDIDATES: &[&str] = &[
+    SLIM_INSTANCE_TYPE,
+    "ecs.u1-c1m1.large",
+    LINUX_INSTANCE_TYPE,
+    "ecs.u1-c1m2.large",
+    "ecs.c7a.large",
+];
+
 /// Minimum ECS `cloud_essd` system disk size in GiB.
 pub const MIN_DISK_GB: u32 = 20;
 /// Maximum ECS `cloud_essd` system disk size in GiB.
@@ -79,12 +112,19 @@ pub fn ecs_instance_spec(instance_type: &str) -> Option<(u32, u64, f64)> {
         "ecs.c7.xlarge" => Some((4, 8192, 0.125)),
         "ecs.c7.2xlarge" => Some((8, 16384, 0.250)),
         "ecs.c7.4xlarge" => Some((16, 32768, 0.500)),
+        "ecs.c7a.large" => Some((2, 4096, 0.056)),
+        "ecs.c7a.xlarge" => Some((4, 8192, 0.112)),
+        "ecs.c7se.xlarge" => Some((4, 8192, 0.125)),
+        "ecs.c9i.xlarge" => Some((4, 8192, 0.125)),
         "ecs.g7.large" => Some((2, 8192, 0.085)),
         "ecs.g7.xlarge" => Some((4, 16384, 0.170)),
         "ecs.g7.2xlarge" => Some((8, 32768, 0.340)),
         "ecs.g7.4xlarge" => Some((16, 65536, 0.680)),
+        "ecs.g7a.large" => Some((2, 8192, 0.075)),
+        "ecs.g7a.xlarge" => Some((4, 16384, 0.150)),
         "ecs.r7.large" => Some((2, 16384, 0.110)),
         "ecs.r7.xlarge" => Some((4, 32768, 0.220)),
+        "ecs.u1-c1m1.large" => Some((2, 2048, 0.036)),
         "ecs.u1-c1m2.large" => Some((2, 4096, 0.048)),
         "ecs.u1-c1m2.xlarge" => Some((4, 8192, 0.096)),
         _ => None,
@@ -1312,10 +1352,144 @@ pub fn instance_type_for(spec: &ProvisionSpec) -> &str {
     if !explicit.is_empty() {
         return explicit;
     }
-    match spec.family.as_str() {
+    default_instance_type_for(&spec.family)
+}
+
+fn default_instance_type_for(family: &str) -> &'static str {
+    match family {
         "windows" => WINDOWS_INSTANCE_TYPE,
         "linux-slim" => SLIM_INSTANCE_TYPE,
         _ => LINUX_INSTANCE_TYPE,
+    }
+}
+
+fn default_instance_type_candidates(family: &str) -> &'static [&'static str] {
+    match family {
+        "windows" => WINDOWS_INSTANCE_TYPE_CANDIDATES,
+        "linux-slim" => SLIM_INSTANCE_TYPE_CANDIDATES,
+        _ => LINUX_INSTANCE_TYPE_CANDIDATES,
+    }
+}
+
+impl AliyunEcs {
+    /// Picks the highest-priority default instance type for `family` that is
+    /// currently `Available` in `region` (preferring the existing VSwitch's
+    /// zone when `conn.vswitch_id` is configured), falling back to the static
+    /// baseline if `DescribeAvailableResource` returns no matching offering.
+    pub async fn resolve_default_instance_type(
+        &self,
+        conn: &Connection,
+        region: &str,
+        family: &str,
+    ) -> String {
+        let profile_hint = self.profile_hint(conn);
+        let ecs = self.ecs_endpoint(region);
+        let v = match self
+            .call_ok(
+                &ecs,
+                "GET",
+                "DescribeAvailableResource",
+                ECS_API_VERSION,
+                &[
+                    ("RegionId".into(), region.to_string()),
+                    ("DestinationResource".into(), "InstanceType".into()),
+                    ("InstanceChargeType".into(), "PostPaid".into()),
+                    ("IoOptimized".into(), "optimized".into()),
+                ],
+                profile_hint,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return default_instance_type_for(family).to_string(),
+        };
+
+        let target_zone = if let Some(vsw_id) = conn
+            .vswitch_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.call_ok(
+                &self.vpc_endpoint(region),
+                "GET",
+                "DescribeVSwitches",
+                VPC_API_VERSION,
+                &[
+                    ("RegionId".into(), region.to_string()),
+                    ("VSwitchId".into(), vsw_id.to_string()),
+                ],
+                profile_hint,
+            )
+            .await
+            .ok()
+            .and_then(|resp| {
+                resp["VSwitches"]["VSwitch"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|vsw| vsw["ZoneId"].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+        } else {
+            None
+        };
+
+        let mut available_in_zone = Vec::new();
+        let mut available_region = Vec::new();
+        for zone in v["AvailableZones"]["AvailableZone"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let zone_id = zone["ZoneId"].as_str().unwrap_or("").trim();
+            let in_target_zone = target_zone.as_deref().is_some_and(|tz| tz == zone_id);
+            for ar in zone["AvailableResources"]["AvailableResource"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for sr in ar["SupportedResources"]["SupportedResource"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    if sr["Status"].as_str() == Some("Available")
+                        && let Some(val) = sr["Value"].as_str()
+                    {
+                        if !available_region.iter().any(|x| x == val) {
+                            available_region.push(val.to_string());
+                        }
+                        if in_target_zone && !available_in_zone.iter().any(|x| x == val) {
+                            available_in_zone.push(val.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let candidates = default_instance_type_candidates(family);
+        let fits_max_size = |cand: &str| -> bool {
+            let Some(max) = conn.max_size else {
+                return true;
+            };
+            ecs_instance_spec(cand).is_none_or(|(vcpus, mem_mb, _)| max.fits(vcpus, mem_mb))
+        };
+        if !available_in_zone.is_empty()
+            && let Some(picked) = candidates
+                .iter()
+                .find(|c| fits_max_size(c) && available_in_zone.iter().any(|a| a == *c))
+        {
+            return (*picked).to_string();
+        }
+        if let Some(picked) = candidates
+            .iter()
+            .find(|c| fits_max_size(c) && available_region.iter().any(|a| a == *c))
+        {
+            return (*picked).to_string();
+        }
+        default_instance_type_for(family).to_string()
     }
 }
 
@@ -1772,18 +1946,22 @@ impl CloudApi for AliyunEcs {
                         ),
                     );
                 } else {
-                    if let Some(preferred) = available_types
+                    if let Some(preferred) = LINUX_INSTANCE_TYPE_CANDIDATES
                         .iter()
-                        .find(|x| x.as_str() == LINUX_INSTANCE_TYPE)
-                        .or_else(|| available_types.first())
+                        .find(|c| available_types.iter().any(|x| x == *c))
+                        .map(|s| (*s).to_string())
+                        .or_else(|| available_types.first().cloned())
                     {
-                        discovered_type = preferred.clone();
+                        discovered_type = preferred;
                     }
+                    let est_usd = ecs_instance_spec(&discovered_type)
+                        .map(|(_, _, u)| u)
+                        .unwrap_or(0.043);
                     t.check(
                         "machine",
                         true,
                         format!(
-                            "{} instance types in {}; baseline {} (~$0.043/h)",
+                            "{} instance types in {}; baseline {} (~${est_usd:.3}/h)",
                             available_types.len(),
                             conn.region,
                             discovered_type
@@ -2170,10 +2348,15 @@ impl CloudApi for AliyunEcs {
         validate_disk_gb(spec.disk_gb)?;
         let (effective_disk_gb, _) = system_disk_for(spec);
         validate_disk_gb(effective_disk_gb)?;
-        let (vcpus, memory_mb, inst_usd) =
-            self.lookup_instance_type(conn, &spec.machine_type).await?;
+        let effective_type = if spec.machine_type.trim().is_empty() {
+            default_instance_type_for(&spec.family)
+        } else {
+            spec.machine_type.trim()
+        };
+        let (vcpus, memory_mb, inst_usd) = self.lookup_instance_type(conn, effective_type).await?;
         let disk_usd = f64::from(effective_disk_gb) * ESSD_USD_PER_GB_HOUR;
         Ok(Some(ResolvedSizing {
+            machine_type: Some(effective_type.to_string()),
             vcpus,
             memory_mb,
             disk_gb: Some(effective_disk_gb),
@@ -2234,7 +2417,16 @@ impl CloudApi for AliyunEcs {
 
         let (disk_gb, disk_category) = system_disk_for(spec);
         validate_disk_gb(disk_gb)?;
-        let instance_type = instance_type_for(spec).to_string();
+        let instance_type = if spec.machine_type_explicit {
+            instance_type_for(spec).to_string()
+        } else if !spec.machine_type.trim().is_empty()
+            && spec.machine_type.trim() != default_instance_type_for(&spec.family)
+        {
+            spec.machine_type.trim().to_string()
+        } else {
+            self.resolve_default_instance_type(conn, &region, &spec.family)
+                .await
+        };
         let mut effective_conn = conn.clone();
         if !region.is_empty() && effective_conn.region != region {
             effective_conn.region = region.clone();
