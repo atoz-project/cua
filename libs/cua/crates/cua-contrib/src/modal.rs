@@ -374,6 +374,9 @@ impl Provider for Modal {
                     usd_per_hour: None,
                 })
                 .collect(),
+            oses: vec!["linux"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
         }
     }
 

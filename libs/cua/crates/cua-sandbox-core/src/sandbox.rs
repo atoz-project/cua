@@ -322,6 +322,11 @@ pub struct CreateOptions {
     /// share its pages ([`Sandboxes::checkpoint`], [`Sandboxes::fork`]). It
     /// never claims a warm-pool member. Other kinds ignore it.
     pub forkable: bool,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
+    /// Per-create cloud instance type override (`aliyun-ecs`: `ecs.g7.xlarge`).
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CreateOptions {
@@ -365,6 +370,8 @@ impl std::fmt::Debug for CreateOptions {
             .field("mounts", &self.mounts)
             .field("ephemeral_name", &self.ephemeral_name)
             .field("forkable", &self.forkable)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -408,6 +415,8 @@ impl CreateOptions {
             mounts: vec![],
             ephemeral_name: None,
             forkable: false,
+            cloud_image_id: None,
+            instance_type: None,
         }
     }
 
@@ -853,10 +862,27 @@ impl Sandboxes {
         report(Progress::phase(Phase::Preparing).detail(&options.image));
         options.apply_placement()?;
         options.validate_sidecars()?;
-        if options.disk_gb.is_some_and(|g| g > 0) && options.provider != ProviderKind::Local {
+        if options.disk_gb.is_some_and(|g| g > 0)
+            && !matches!(
+                options.provider,
+                ProviderKind::Local | ProviderKind::Contrib
+            )
+        {
             return Err(Error::InvalidArgument(
                 "disk_gb sizes local VMs only: provider sandboxes boot the image's disk".into(),
             ));
+        }
+        if options.provider != ProviderKind::Contrib {
+            if options.cloud_image_id.is_some() {
+                return Err(Error::InvalidArgument(
+                    "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)".into(),
+                ));
+            }
+            if options.instance_type.is_some() {
+                return Err(Error::InvalidArgument(
+                    "instance_type applies to cloud providers only (--on aliyun-ecs)".into(),
+                ));
+            }
         }
         let options = self.build_image(options).await?;
         let preexisting = match (&options.provider, options.name.as_deref()) {

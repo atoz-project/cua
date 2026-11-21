@@ -137,10 +137,12 @@ Creates a new sandbox where `on` says (local: this computer, free; aws, azure, g
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `allow` | `string[]` | none | Destinations to allow (addresses or CIDRs) on top of `network`. |
+| `cloud_image_id` | `string` | none | Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`), distinct from `image` (the Sandbox Image). |
 | `command` | `string[]` | none | Entrypoint override (argv), for example `["python", "-m", "my_mcp", "--port", "8765"]`. |
 | `count` | `integer` | none | How many Spaces to create, 1 to 8 (default 1), all with the same settings (a name gets `-2`, `-3`, ... suffixes). With more than one the result is an array. At least 0. |
 | `cpus` | `integer` | none | vCPUs for each Space. Default: the location's default size. At least 0. |
 | `deny` | `string[]` | none | Destinations to block (addresses, CIDRs or `all`). |
+| `disk_gb` | `integer` | none | Grow the boot disk to this many GiB (local VMs and `aliyun-ecs`). At least 0. |
 | `durable` | `boolean` | `false` | Keep it on the user's machines (with `on` `auto`): when its machine goes away it is created again on another one, with the same name (its disk starts fresh); `list_spaces` shows it with `durable` (its name), and `delete_space` deletes it for good. Default false. |
 | `env` | `map of string` | none | Guest environment variables. |
 | `image` | `string` | none | Guest image. Default: the canonical Linux image (`ghcr.io/trycua/linux:24.04`), whose variant follows the kind. |

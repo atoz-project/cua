@@ -11164,7 +11164,7 @@ class CloudProvider:
     """
     One cloud as `cloud_status` lists it.
 """
-    def __init__(self, *, name:str, title:str, tier:str, connected:bool, default:bool, credentials:CloudCredentials, account:str, profile:str, region:str, zone:str, project:str, environment:str, label:str, ttl_hours:int, kinds:typing.List[CloudKind], auth:str, status:str, budget_usd_month:typing.Optional[float], max_size:str, spent_month:float, running:int, approval:str, approval_agent:str, pending_budget_usd_month:typing.Optional[float], pending_max_size:str, can_approve:bool, suggest_auth:str, issue:str, holders:typing.List[str], relay_url:typing.Optional[str], relay_mode:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT, vpc_id:typing.Optional[str], vswitch_id:typing.Optional[str], no_public_ip:bool):
+    def __init__(self, *, name:str, title:str, tier:str, connected:bool, default:bool, credentials:CloudCredentials, account:str, profile:str, region:str, zone:str, project:str, environment:str, label:str, ttl_hours:int, kinds:typing.List[CloudKind], auth:str, status:str, budget_usd_month:typing.Optional[float], max_size:str, spent_month:float, running:int, approval:str, approval_agent:str, pending_budget_usd_month:typing.Optional[float], pending_max_size:str, can_approve:bool, suggest_auth:str, issue:str, holders:typing.List[str], relay_url:typing.Optional[str], relay_mode:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT, vpc_id:typing.Optional[str] = _DEFAULT, vswitch_id:typing.Optional[str] = _DEFAULT, no_public_ip:bool = False, windows_image_id:typing.Optional[str] = _DEFAULT, linux_image_id:typing.Optional[str] = _DEFAULT, instance_type:typing.Optional[str] = _DEFAULT):
         self.name = name
         self.title = title
         self.tier = tier
@@ -11203,15 +11203,33 @@ class CloudProvider:
             self.spacesd_download_url = None
         else:
             self.spacesd_download_url = spacesd_download_url
-        self.vpc_id = vpc_id
-        self.vswitch_id = vswitch_id
+        if vpc_id is _DEFAULT:
+            self.vpc_id = None
+        else:
+            self.vpc_id = vpc_id
+        if vswitch_id is _DEFAULT:
+            self.vswitch_id = None
+        else:
+            self.vswitch_id = vswitch_id
         self.no_public_ip = no_public_ip
+        if windows_image_id is _DEFAULT:
+            self.windows_image_id = None
+        else:
+            self.windows_image_id = windows_image_id
+        if linux_image_id is _DEFAULT:
+            self.linux_image_id = None
+        else:
+            self.linux_image_id = linux_image_id
+        if instance_type is _DEFAULT:
+            self.instance_type = None
+        else:
+            self.instance_type = instance_type
 
 
 
 
     def __str__(self):
-        return "CloudProvider(name={}, title={}, tier={}, connected={}, default={}, credentials={}, account={}, profile={}, region={}, zone={}, project={}, environment={}, label={}, ttl_hours={}, kinds={}, auth={}, status={}, budget_usd_month={}, max_size={}, spent_month={}, running={}, approval={}, approval_agent={}, pending_budget_usd_month={}, pending_max_size={}, can_approve={}, suggest_auth={}, issue={}, holders={}, relay_url={}, relay_mode={}, spacesd_download_url={}, vpc_id={}, vswitch_id={}, no_public_ip={})".format(self.name, self.title, self.tier, self.connected, self.default, self.credentials, self.account, self.profile, self.region, self.zone, self.project, self.environment, self.label, self.ttl_hours, self.kinds, self.auth, self.status, self.budget_usd_month, self.max_size, self.spent_month, self.running, self.approval, self.approval_agent, self.pending_budget_usd_month, self.pending_max_size, self.can_approve, self.suggest_auth, self.issue, self.holders, self.relay_url, self.relay_mode, self.spacesd_download_url, self.vpc_id, self.vswitch_id, self.no_public_ip)
+        return "CloudProvider(name={}, title={}, tier={}, connected={}, default={}, credentials={}, account={}, profile={}, region={}, zone={}, project={}, environment={}, label={}, ttl_hours={}, kinds={}, auth={}, status={}, budget_usd_month={}, max_size={}, spent_month={}, running={}, approval={}, approval_agent={}, pending_budget_usd_month={}, pending_max_size={}, can_approve={}, suggest_auth={}, issue={}, holders={}, relay_url={}, relay_mode={}, spacesd_download_url={}, vpc_id={}, vswitch_id={}, no_public_ip={}, windows_image_id={}, linux_image_id={}, instance_type={})".format(self.name, self.title, self.tier, self.connected, self.default, self.credentials, self.account, self.profile, self.region, self.zone, self.project, self.environment, self.label, self.ttl_hours, self.kinds, self.auth, self.status, self.budget_usd_month, self.max_size, self.spent_month, self.running, self.approval, self.approval_agent, self.pending_budget_usd_month, self.pending_max_size, self.can_approve, self.suggest_auth, self.issue, self.holders, self.relay_url, self.relay_mode, self.spacesd_download_url, self.vpc_id, self.vswitch_id, self.no_public_ip, self.windows_image_id, self.linux_image_id, self.instance_type)
     def __eq__(self, other):
         if self.name != other.name:
             return False
@@ -11283,6 +11301,12 @@ class CloudProvider:
             return False
         if self.no_public_ip != other.no_public_ip:
             return False
+        if self.windows_image_id != other.windows_image_id:
+            return False
+        if self.linux_image_id != other.linux_image_id:
+            return False
+        if self.instance_type != other.instance_type:
+            return False
         return True
 
 class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
@@ -11324,6 +11348,9 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
             vpc_id=_UniffiFfiConverterOptionalString.read(buf),
             vswitch_id=_UniffiFfiConverterOptionalString.read(buf),
             no_public_ip=_UniffiFfiConverterBoolean.read(buf),
+            windows_image_id=_UniffiFfiConverterOptionalString.read(buf),
+            linux_image_id=_UniffiFfiConverterOptionalString.read(buf),
+            instance_type=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -11363,6 +11390,9 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.vpc_id)
         _UniffiFfiConverterOptionalString.check_lower(value.vswitch_id)
         _UniffiFfiConverterBoolean.check_lower(value.no_public_ip)
+        _UniffiFfiConverterOptionalString.check_lower(value.windows_image_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.linux_image_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.instance_type)
 
     @staticmethod
     def write(value, buf):
@@ -11401,6 +11431,9 @@ class _UniffiFfiConverterTypeCloudProvider(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.vpc_id, buf)
         _UniffiFfiConverterOptionalString.write(value.vswitch_id, buf)
         _UniffiFfiConverterBoolean.write(value.no_public_ip, buf)
+        _UniffiFfiConverterOptionalString.write(value.windows_image_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.linux_image_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.instance_type, buf)
 
 class _UniffiFfiConverterSequenceTypeCloudCheck(_UniffiConverterRustBuffer):
     @classmethod
@@ -12040,7 +12073,7 @@ class CloudTarget:
     their own CLI sign-in; Hetzner takes its API token in `token` (or
     `HCLOUD_TOKEN`).
 """
-    def __init__(self, *, provider:str, profile:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, zone:typing.Optional[str] = _DEFAULT, project:typing.Optional[str] = _DEFAULT, environment:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, relay_url:typing.Optional[str] = _DEFAULT, relay_mode:typing.Optional[str] = _DEFAULT, relay_token:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT, vpc_id:typing.Optional[str] = _DEFAULT, vswitch_id:typing.Optional[str] = _DEFAULT, no_public_ip:bool = False):
+    def __init__(self, *, provider:str, profile:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, zone:typing.Optional[str] = _DEFAULT, project:typing.Optional[str] = _DEFAULT, environment:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, relay_url:typing.Optional[str] = _DEFAULT, relay_mode:typing.Optional[str] = _DEFAULT, relay_token:typing.Optional[str] = _DEFAULT, spacesd_download_url:typing.Optional[str] = _DEFAULT, vpc_id:typing.Optional[str] = _DEFAULT, vswitch_id:typing.Optional[str] = _DEFAULT, no_public_ip:bool = False, windows_image_id:typing.Optional[str] = _DEFAULT, linux_image_id:typing.Optional[str] = _DEFAULT, instance_type:typing.Optional[str] = _DEFAULT):
         self.provider = provider
         if profile is _DEFAULT:
             self.profile = None
@@ -12091,12 +12124,24 @@ class CloudTarget:
         else:
             self.vswitch_id = vswitch_id
         self.no_public_ip = no_public_ip
+        if windows_image_id is _DEFAULT:
+            self.windows_image_id = None
+        else:
+            self.windows_image_id = windows_image_id
+        if linux_image_id is _DEFAULT:
+            self.linux_image_id = None
+        else:
+            self.linux_image_id = linux_image_id
+        if instance_type is _DEFAULT:
+            self.instance_type = None
+        else:
+            self.instance_type = instance_type
 
 
 
 
     def __str__(self):
-        return "CloudTarget(provider={}, profile={}, region={}, zone={}, project={}, environment={}, token={}, relay_url={}, relay_mode={}, relay_token={}, spacesd_download_url={}, vpc_id={}, vswitch_id={}, no_public_ip={})".format(self.provider, self.profile, self.region, self.zone, self.project, self.environment, self.token, self.relay_url, self.relay_mode, self.relay_token, self.spacesd_download_url, self.vpc_id, self.vswitch_id, self.no_public_ip)
+        return "CloudTarget(provider={}, profile={}, region={}, zone={}, project={}, environment={}, token={}, relay_url={}, relay_mode={}, relay_token={}, spacesd_download_url={}, vpc_id={}, vswitch_id={}, no_public_ip={}, windows_image_id={}, linux_image_id={}, instance_type={})".format(self.provider, self.profile, self.region, self.zone, self.project, self.environment, self.token, self.relay_url, self.relay_mode, self.relay_token, self.spacesd_download_url, self.vpc_id, self.vswitch_id, self.no_public_ip, self.windows_image_id, self.linux_image_id, self.instance_type)
     def __eq__(self, other):
         if self.provider != other.provider:
             return False
@@ -12126,6 +12171,12 @@ class CloudTarget:
             return False
         if self.no_public_ip != other.no_public_ip:
             return False
+        if self.windows_image_id != other.windows_image_id:
+            return False
+        if self.linux_image_id != other.linux_image_id:
+            return False
+        if self.instance_type != other.instance_type:
+            return False
         return True
 
 class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
@@ -12146,6 +12197,9 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
             vpc_id=_UniffiFfiConverterOptionalString.read(buf),
             vswitch_id=_UniffiFfiConverterOptionalString.read(buf),
             no_public_ip=_UniffiFfiConverterBoolean.read(buf),
+            windows_image_id=_UniffiFfiConverterOptionalString.read(buf),
+            linux_image_id=_UniffiFfiConverterOptionalString.read(buf),
+            instance_type=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -12164,6 +12218,9 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.vpc_id)
         _UniffiFfiConverterOptionalString.check_lower(value.vswitch_id)
         _UniffiFfiConverterBoolean.check_lower(value.no_public_ip)
+        _UniffiFfiConverterOptionalString.check_lower(value.windows_image_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.linux_image_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.instance_type)
 
     @staticmethod
     def write(value, buf):
@@ -12181,6 +12238,9 @@ class _UniffiFfiConverterTypeCloudTarget(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.vpc_id, buf)
         _UniffiFfiConverterOptionalString.write(value.vswitch_id, buf)
         _UniffiFfiConverterBoolean.write(value.no_public_ip, buf)
+        _UniffiFfiConverterOptionalString.write(value.windows_image_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.linux_image_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.instance_type, buf)
 
 @dataclass
 class CloudTestReport:
@@ -22904,7 +22964,7 @@ class SandboxCreateOptions:
     """
     Options for [`Sandboxes::create`].
 """
-    def __init__(self, *, on:typing.Optional[str] = _DEFAULT, kind:typing.Optional[str] = _DEFAULT, runtime:typing.Optional[str] = _DEFAULT, image:str = "", name:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, pool:typing.Optional[str] = _DEFAULT, os:typing.Optional[str] = _DEFAULT, cpus:typing.Optional[int] = _DEFAULT, memory_mb:typing.Optional[int] = _DEFAULT, ports:typing.List[int] = _DEFAULT, services:dict[str, int] = _DEFAULT, wait_for:typing.List[ReadinessProbe] = _DEFAULT, ready_timeout_ms:typing.Optional[int] = _DEFAULT, env:dict[str, str] = _DEFAULT, ttl_seconds:typing.Optional[int] = _DEFAULT, command:typing.Optional[typing.List[str]] = _DEFAULT, sidecars:typing.List[Container] = _DEFAULT, registry_secret:typing.Optional[RegistrySecret] = _DEFAULT, build:typing.Optional[ImageBuild] = _DEFAULT, network:typing.Optional[str] = _DEFAULT, overlays:typing.List[Overlay] = _DEFAULT, keep_on_failure:bool = False, gpu:typing.Optional[str] = _DEFAULT, headless:bool = False, spacesd:typing.Optional[bool] = _DEFAULT, profile:typing.Optional[str] = _DEFAULT, forkable:typing.Optional[bool] = _DEFAULT):
+    def __init__(self, *, on:typing.Optional[str] = _DEFAULT, kind:typing.Optional[str] = _DEFAULT, runtime:typing.Optional[str] = _DEFAULT, image:str = "", name:typing.Optional[str] = _DEFAULT, token:typing.Optional[str] = _DEFAULT, pool:typing.Optional[str] = _DEFAULT, os:typing.Optional[str] = _DEFAULT, cpus:typing.Optional[int] = _DEFAULT, memory_mb:typing.Optional[int] = _DEFAULT, ports:typing.List[int] = _DEFAULT, services:dict[str, int] = _DEFAULT, wait_for:typing.List[ReadinessProbe] = _DEFAULT, ready_timeout_ms:typing.Optional[int] = _DEFAULT, env:dict[str, str] = _DEFAULT, ttl_seconds:typing.Optional[int] = _DEFAULT, command:typing.Optional[typing.List[str]] = _DEFAULT, sidecars:typing.List[Container] = _DEFAULT, registry_secret:typing.Optional[RegistrySecret] = _DEFAULT, build:typing.Optional[ImageBuild] = _DEFAULT, network:typing.Optional[str] = _DEFAULT, overlays:typing.List[Overlay] = _DEFAULT, keep_on_failure:bool = False, gpu:typing.Optional[str] = _DEFAULT, headless:bool = False, spacesd:typing.Optional[bool] = _DEFAULT, profile:typing.Optional[str] = _DEFAULT, forkable:typing.Optional[bool] = _DEFAULT, disk_gb:typing.Optional[int] = _DEFAULT, cloud_image_id:typing.Optional[str] = _DEFAULT, instance_type:typing.Optional[str] = _DEFAULT):
         if on is _DEFAULT:
             self.on = None
         else:
@@ -23008,12 +23068,24 @@ class SandboxCreateOptions:
             self.forkable = None
         else:
             self.forkable = forkable
+        if disk_gb is _DEFAULT:
+            self.disk_gb = None
+        else:
+            self.disk_gb = disk_gb
+        if cloud_image_id is _DEFAULT:
+            self.cloud_image_id = None
+        else:
+            self.cloud_image_id = cloud_image_id
+        if instance_type is _DEFAULT:
+            self.instance_type = None
+        else:
+            self.instance_type = instance_type
 
 
 
 
     def __str__(self):
-        return "SandboxCreateOptions(on={}, kind={}, runtime={}, image={}, name={}, token={}, pool={}, os={}, cpus={}, memory_mb={}, ports={}, services={}, wait_for={}, ready_timeout_ms={}, env={}, ttl_seconds={}, command={}, sidecars={}, registry_secret={}, build={}, network={}, overlays={}, keep_on_failure={}, gpu={}, headless={}, spacesd={}, profile={}, forkable={})".format(self.on, self.kind, self.runtime, self.image, self.name, self.token, self.pool, self.os, self.cpus, self.memory_mb, self.ports, self.services, self.wait_for, self.ready_timeout_ms, self.env, self.ttl_seconds, self.command, self.sidecars, self.registry_secret, self.build, self.network, self.overlays, self.keep_on_failure, self.gpu, self.headless, self.spacesd, self.profile, self.forkable)
+        return "SandboxCreateOptions(on={}, kind={}, runtime={}, image={}, name={}, token={}, pool={}, os={}, cpus={}, memory_mb={}, ports={}, services={}, wait_for={}, ready_timeout_ms={}, env={}, ttl_seconds={}, command={}, sidecars={}, registry_secret={}, build={}, network={}, overlays={}, keep_on_failure={}, gpu={}, headless={}, spacesd={}, profile={}, forkable={}, disk_gb={}, cloud_image_id={}, instance_type={})".format(self.on, self.kind, self.runtime, self.image, self.name, self.token, self.pool, self.os, self.cpus, self.memory_mb, self.ports, self.services, self.wait_for, self.ready_timeout_ms, self.env, self.ttl_seconds, self.command, self.sidecars, self.registry_secret, self.build, self.network, self.overlays, self.keep_on_failure, self.gpu, self.headless, self.spacesd, self.profile, self.forkable, self.disk_gb, self.cloud_image_id, self.instance_type)
     def __eq__(self, other):
         if self.on != other.on:
             return False
@@ -23071,6 +23143,12 @@ class SandboxCreateOptions:
             return False
         if self.forkable != other.forkable:
             return False
+        if self.disk_gb != other.disk_gb:
+            return False
+        if self.cloud_image_id != other.cloud_image_id:
+            return False
+        if self.instance_type != other.instance_type:
+            return False
         return True
 
 class _UniffiFfiConverterTypeSandboxCreateOptions(_UniffiConverterRustBuffer):
@@ -23105,6 +23183,9 @@ class _UniffiFfiConverterTypeSandboxCreateOptions(_UniffiConverterRustBuffer):
             spacesd=_UniffiFfiConverterOptionalBoolean.read(buf),
             profile=_UniffiFfiConverterOptionalString.read(buf),
             forkable=_UniffiFfiConverterOptionalBoolean.read(buf),
+            disk_gb=_UniffiFfiConverterOptionalUInt32.read(buf),
+            cloud_image_id=_UniffiFfiConverterOptionalString.read(buf),
+            instance_type=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -23137,6 +23218,9 @@ class _UniffiFfiConverterTypeSandboxCreateOptions(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalBoolean.check_lower(value.spacesd)
         _UniffiFfiConverterOptionalString.check_lower(value.profile)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.forkable)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.disk_gb)
+        _UniffiFfiConverterOptionalString.check_lower(value.cloud_image_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.instance_type)
 
     @staticmethod
     def write(value, buf):
@@ -23168,6 +23252,9 @@ class _UniffiFfiConverterTypeSandboxCreateOptions(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalBoolean.write(value.spacesd, buf)
         _UniffiFfiConverterOptionalString.write(value.profile, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.forkable, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.disk_gb, buf)
+        _UniffiFfiConverterOptionalString.write(value.cloud_image_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.instance_type, buf)
 
 
 
@@ -25255,7 +25342,7 @@ class SpaceCreateOptions:
     Options for [`Spaces::create`]: the same location / kind / runtime model
     as sandboxes.
 """
-    def __init__(self, *, image:typing.Optional[str] = _DEFAULT, on:typing.Optional[str] = _DEFAULT, kind:typing.Optional[str] = _DEFAULT, runtime:typing.Optional[str] = _DEFAULT, name:typing.Optional[str] = _DEFAULT, cpus:typing.Optional[int] = _DEFAULT, memory_mb:typing.Optional[int] = _DEFAULT, disk_gb:typing.Optional[int] = _DEFAULT, timeout_ms:typing.Optional[int] = _DEFAULT, wait:typing.Optional[bool] = _DEFAULT, reuse:bool = False, command:typing.Optional[typing.List[str]] = _DEFAULT, env:dict[str, str] = _DEFAULT, services:dict[str, int] = _DEFAULT, spacesd:typing.Optional[bool] = _DEFAULT, gpu:typing.Optional[str] = _DEFAULT, create_id:typing.Optional[str] = _DEFAULT, durable:bool = False, profile:typing.Optional[str] = _DEFAULT, headless:typing.Optional[bool] = _DEFAULT, forkable:typing.Optional[bool] = _DEFAULT, build:typing.Optional[BuildOptions] = _DEFAULT, volumes:typing.List[VolumeMount] = _DEFAULT, network:typing.Optional[str] = _DEFAULT, labels:dict[str, str] = _DEFAULT, egress:typing.Optional[EgressPolicy] = _DEFAULT, network_settings:typing.Optional[NetworkSettings] = _DEFAULT, parent:typing.Optional[str] = _DEFAULT, widen:typing.Optional[bool] = _DEFAULT, instance_type:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, children:typing.Optional[bool] = _DEFAULT):
+    def __init__(self, *, image:typing.Optional[str] = _DEFAULT, on:typing.Optional[str] = _DEFAULT, kind:typing.Optional[str] = _DEFAULT, runtime:typing.Optional[str] = _DEFAULT, name:typing.Optional[str] = _DEFAULT, cpus:typing.Optional[int] = _DEFAULT, memory_mb:typing.Optional[int] = _DEFAULT, disk_gb:typing.Optional[int] = _DEFAULT, timeout_ms:typing.Optional[int] = _DEFAULT, wait:typing.Optional[bool] = _DEFAULT, reuse:bool = False, command:typing.Optional[typing.List[str]] = _DEFAULT, env:dict[str, str] = _DEFAULT, services:dict[str, int] = _DEFAULT, spacesd:typing.Optional[bool] = _DEFAULT, gpu:typing.Optional[str] = _DEFAULT, create_id:typing.Optional[str] = _DEFAULT, durable:bool = False, profile:typing.Optional[str] = _DEFAULT, headless:typing.Optional[bool] = _DEFAULT, forkable:typing.Optional[bool] = _DEFAULT, build:typing.Optional[BuildOptions] = _DEFAULT, volumes:typing.List[VolumeMount] = _DEFAULT, network:typing.Optional[str] = _DEFAULT, labels:dict[str, str] = _DEFAULT, egress:typing.Optional[EgressPolicy] = _DEFAULT, network_settings:typing.Optional[NetworkSettings] = _DEFAULT, parent:typing.Optional[str] = _DEFAULT, widen:typing.Optional[bool] = _DEFAULT, instance_type:typing.Optional[str] = _DEFAULT, region:typing.Optional[str] = _DEFAULT, children:typing.Optional[bool] = _DEFAULT, cloud_image_id:typing.Optional[str] = _DEFAULT):
         if image is _DEFAULT:
             self.image = None
         else:
@@ -25378,12 +25465,16 @@ class SpaceCreateOptions:
             self.children = None
         else:
             self.children = children
+        if cloud_image_id is _DEFAULT:
+            self.cloud_image_id = None
+        else:
+            self.cloud_image_id = cloud_image_id
 
 
 
 
     def __str__(self):
-        return "SpaceCreateOptions(image={}, on={}, kind={}, runtime={}, name={}, cpus={}, memory_mb={}, disk_gb={}, timeout_ms={}, wait={}, reuse={}, command={}, env={}, services={}, spacesd={}, gpu={}, create_id={}, durable={}, profile={}, headless={}, forkable={}, build={}, volumes={}, network={}, labels={}, egress={}, network_settings={}, parent={}, widen={}, instance_type={}, region={}, children={})".format(self.image, self.on, self.kind, self.runtime, self.name, self.cpus, self.memory_mb, self.disk_gb, self.timeout_ms, self.wait, self.reuse, self.command, self.env, self.services, self.spacesd, self.gpu, self.create_id, self.durable, self.profile, self.headless, self.forkable, self.build, self.volumes, self.network, self.labels, self.egress, self.network_settings, self.parent, self.widen, self.instance_type, self.region, self.children)
+        return "SpaceCreateOptions(image={}, on={}, kind={}, runtime={}, name={}, cpus={}, memory_mb={}, disk_gb={}, timeout_ms={}, wait={}, reuse={}, command={}, env={}, services={}, spacesd={}, gpu={}, create_id={}, durable={}, profile={}, headless={}, forkable={}, build={}, volumes={}, network={}, labels={}, egress={}, network_settings={}, parent={}, widen={}, instance_type={}, region={}, children={}, cloud_image_id={})".format(self.image, self.on, self.kind, self.runtime, self.name, self.cpus, self.memory_mb, self.disk_gb, self.timeout_ms, self.wait, self.reuse, self.command, self.env, self.services, self.spacesd, self.gpu, self.create_id, self.durable, self.profile, self.headless, self.forkable, self.build, self.volumes, self.network, self.labels, self.egress, self.network_settings, self.parent, self.widen, self.instance_type, self.region, self.children, self.cloud_image_id)
     def __eq__(self, other):
         if self.image != other.image:
             return False
@@ -25449,6 +25540,8 @@ class SpaceCreateOptions:
             return False
         if self.children != other.children:
             return False
+        if self.cloud_image_id != other.cloud_image_id:
+            return False
         return True
 
 class _UniffiFfiConverterTypeSpaceCreateOptions(_UniffiConverterRustBuffer):
@@ -25487,6 +25580,7 @@ class _UniffiFfiConverterTypeSpaceCreateOptions(_UniffiConverterRustBuffer):
             instance_type=_UniffiFfiConverterOptionalString.read(buf),
             region=_UniffiFfiConverterOptionalString.read(buf),
             children=_UniffiFfiConverterOptionalBoolean.read(buf),
+            cloud_image_id=_UniffiFfiConverterOptionalString.read(buf),
         )
 
     @staticmethod
@@ -25523,6 +25617,7 @@ class _UniffiFfiConverterTypeSpaceCreateOptions(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.instance_type)
         _UniffiFfiConverterOptionalString.check_lower(value.region)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.children)
+        _UniffiFfiConverterOptionalString.check_lower(value.cloud_image_id)
 
     @staticmethod
     def write(value, buf):
@@ -25558,6 +25653,7 @@ class _UniffiFfiConverterTypeSpaceCreateOptions(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.instance_type, buf)
         _UniffiFfiConverterOptionalString.write(value.region, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.children, buf)
+        _UniffiFfiConverterOptionalString.write(value.cloud_image_id, buf)
 
 @dataclass
 class SpaceCreateProgress:

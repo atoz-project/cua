@@ -291,6 +291,26 @@ mod tests {
         }
         assert!(probe_from_pb(&pb::ReadinessProbe::default()).is_err());
     }
+
+    #[test]
+    fn create_request_roundtrips_cloud_image_and_sizing() {
+        let req = crate::CreateRequest {
+            location: Some("aliyun-ecs".into()),
+            image: "windows".into(),
+            disk_gb: Some(80),
+            cloud_image_id: Some("m-win11-golden".into()),
+            instance_type: Some("ecs.c7.2xlarge".into()),
+            ..Default::default()
+        };
+        let pb = create_request_to_pb(req);
+        assert_eq!(pb.disk_gb, 80);
+        assert_eq!(pb.cloud_image_id, "m-win11-golden");
+        assert_eq!(pb.instance_type, "ecs.c7.2xlarge");
+        let back = create_request_from_pb(pb).unwrap();
+        assert_eq!(back.disk_gb, Some(80));
+        assert_eq!(back.cloud_image_id.as_deref(), Some("m-win11-golden"));
+        assert_eq!(back.instance_type.as_deref(), Some("ecs.c7.2xlarge"));
+    }
 }
 
 /// A sidecar from the wire (an empty name derives from the image).
@@ -592,6 +612,9 @@ pub fn create_request_from_pb(r: pb::CreateSandboxRequest) -> Result<crate::Crea
         spacesd: r.spacesd,
         profile: non_empty(r.profile),
         forkable: r.forkable,
+        disk_gb: (r.disk_gb > 0).then_some(r.disk_gb),
+        cloud_image_id: non_empty(r.cloud_image_id),
+        instance_type: non_empty(r.instance_type),
     };
     Ok(create)
 }
@@ -641,6 +664,9 @@ pub fn create_request_to_pb(r: crate::CreateRequest) -> pb::CreateSandboxRequest
         spacesd: r.spacesd,
         profile: r.profile.clone().unwrap_or_default(),
         forkable: r.forkable,
+        disk_gb: r.disk_gb.unwrap_or_default(),
+        cloud_image_id: r.cloud_image_id.clone().unwrap_or_default(),
+        instance_type: r.instance_type.clone().unwrap_or_default(),
     }
 }
 

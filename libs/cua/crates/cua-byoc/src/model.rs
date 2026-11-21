@@ -275,40 +275,65 @@ pub struct MaxSize {
     pub vcpu: u32,
     /// Memory, GiB.
     pub mem_gib: u32,
+    /// Optional disk size cap, GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
 }
 
 impl MaxSize {
-    /// Parses `4x16` (4 vCPUs, 16 GiB).
+    /// Parses `4x16` (4 vCPUs, 16 GiB) or `4x16x100` (plus 100 GiB disk cap).
     pub fn parse(s: &str) -> Option<MaxSize> {
-        let (c, m) = s
-            .trim()
-            .to_ascii_lowercase()
-            .split_once('x')
-            .map(|(a, b)| {
+        let lower = s.trim().to_ascii_lowercase();
+        let parts: Vec<&str> = lower.split('x').collect();
+        fn strip_gb(raw: &str) -> &str {
+            raw.trim()
+                .trim_end_matches("gib")
+                .trim_end_matches("gb")
+                .trim()
+        }
+        let (vcpu, mem_gib, disk_gib) = match parts.as_slice() {
+            [c, m] => (
+                c.trim().parse::<u32>().ok()?,
+                strip_gb(m).parse::<u32>().ok()?,
+                None,
+            ),
+            [c, m, d] => {
+                let d: u32 = strip_gb(d).parse().ok()?;
+                if d == 0 {
+                    return None;
+                }
                 (
-                    a.trim().to_string(),
-                    b.trim()
-                        .trim_end_matches("gb")
-                        .trim_end_matches("gib")
-                        .to_string(),
+                    c.trim().parse::<u32>().ok()?,
+                    strip_gb(m).parse::<u32>().ok()?,
+                    Some(d),
                 )
-            })?;
-        let m = MaxSize {
-            vcpu: c.parse().ok()?,
-            mem_gib: m.parse().ok()?,
+            }
+            _ => return None,
         };
-        (m.vcpu > 0 && m.mem_gib > 0).then_some(m)
+        (vcpu > 0 && mem_gib > 0).then_some(MaxSize {
+            vcpu,
+            mem_gib,
+            disk_gib,
+        })
     }
 
     /// Whether a machine of `vcpus` and `memory_mb` fits.
     pub fn fits(&self, vcpus: u32, memory_mb: u64) -> bool {
         vcpus <= self.vcpu && memory_mb <= u64::from(self.mem_gib) * 1024
     }
+
+    /// Whether a boot disk of `disk_gb` fits (always true when no disk cap is set).
+    pub fn fits_disk(&self, disk_gb: u32) -> bool {
+        self.disk_gib.is_none_or(|max| disk_gb <= max)
+    }
 }
 
 impl std::fmt::Display for MaxSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}x{}", self.vcpu, self.mem_gib)
+        match self.disk_gib {
+            Some(d) => write!(f, "{}x{}x{d}", self.vcpu, self.mem_gib),
+            None => write!(f, "{}x{}", self.vcpu, self.mem_gib),
+        }
     }
 }
 
@@ -374,6 +399,15 @@ pub struct Connection {
     /// `aliyun-ecs` only).
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -407,6 +441,9 @@ impl std::fmt::Debug for Connection {
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
             .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -615,6 +652,9 @@ pub struct ProvisionSpec {
     /// Direct VM (`windows`): generated Administrator password for AutoLogon
     /// and ECS `RunInstances` `Password`. Secret: never printed or logged.
     pub desktop_password: Option<String>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
 }
 
 impl std::fmt::Debug for ProvisionSpec {
@@ -633,6 +673,7 @@ impl std::fmt::Debug for ProvisionSpec {
             .field("ttl_secs", &self.ttl_secs)
             .field("role", &self.role)
             .field("region", &self.region)
+            .field("cloud_image_id", &self.cloud_image_id)
             .field(
                 "spacesd_download_url",
                 &self

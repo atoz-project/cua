@@ -362,6 +362,8 @@ Without auth it keeps how the cloud is linked already (an OIDC or sealed link st
 | `check` | `boolean` | none | `oidc`: run the check that proves the link works (a check token, the exchange with the cloud, a dry run; nothing is created). The link is saved only once it passes. |
 | `client_id` | `string` | none | Azure: the client id of the `cua-spaces` managed identity (its `clientId` output). |
 | `environment` | `string` | none | Modal environment (default: the profile's). |
+| `instance_type` | `string` | none | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
+| `linux_image_id` | `string` | none | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
 | `make_default` | `boolean` | `false` | Also make it the default location (`default.on`). Default false. |
 | `max_size` | `string` | none | The largest machine Cua may create there: `<vCPUs>x<GB>`, for example `4x16`. |
 | `no_public_ip` | `boolean` | none | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
@@ -383,6 +385,7 @@ Without auth it keeps how the cloud is linked already (an OIDC or sealed link st
 | `ttl_hours` | `integer` | `8` | Every Space created there deletes itself after this many hours (the instance or sandbox terminates, the sweeper removes what is left). Default 8; 0 keeps Spaces until you delete them (Modal caps a sandbox at 24). At least 0. |
 | `vpc_id` | `string` | none | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `vswitch_id`. |
 | `vswitch_id` | `string` | none | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `vpc_id`. |
+| `windows_image_id` | `string` | none | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
 | `zone` | `string` | none | GCP zone in the region (default: its `-a` zone). |
 
 #### Result
@@ -413,6 +416,8 @@ Creates nothing: it signs in with the cloud's own CLI credentials (or, for a lin
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `environment` | `string` | none | Modal environment (default: the profile's). |
+| `instance_type` | `string` | none | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
+| `linux_image_id` | `string` | none | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
 | `no_public_ip` | `boolean` | none | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
 | `profile` | `string` | none | AWS: the profile in `~/.aws/config` (default: `default`, or `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the active one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`. |
 | `project` | `string` | none | GCP project id (default: `gcloud config get project`). Hetzner and Modal with a sealed token: a name for the project or workspace (default `default`), to tell several apart. |
@@ -425,6 +430,7 @@ Creates nothing: it signs in with the cloud's own CLI credentials (or, for a lin
 | `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua credential store). |
 | `vpc_id` | `string` | none | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `vswitch_id`. |
 | `vswitch_id` | `string` | none | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `vpc_id`. |
+| `windows_image_id` | `string` | none | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
 | `zone` | `string` | none | GCP zone in the region (default: its `-a` zone). |
 
 #### Result

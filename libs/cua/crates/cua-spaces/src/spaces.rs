@@ -144,6 +144,9 @@ pub struct SpaceCreate {
     /// is signed in and sharing (the `relay.spaces` setting), and a child
     /// follows its parent's `off`.
     pub relay: Option<bool>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
 }
 
 impl std::fmt::Debug for SpaceCreate {
@@ -183,6 +186,7 @@ impl std::fmt::Debug for SpaceCreate {
             .field("instance_type", &self.instance_type)
             .field("region", &self.region)
             .field("relay", &self.relay)
+            .field("cloud_image_id", &self.cloud_image_id)
             .finish()
     }
 }
@@ -3166,6 +3170,17 @@ impl Spaces {
 
     async fn create_inner_body(&self, mut opts: SpaceCreate) -> Result<SpaceCreated> {
         use cua_sandbox_core::placement;
+        if opts.disk_gb == Some(0) {
+            return Err(Error::invalid("disk_gb must be greater than 0"));
+        }
+        opts.cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            opts.cloud_image_id.as_deref(),
+        )?;
+        opts.instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            opts.instance_type.as_deref(),
+        )?;
         let omitted = opts.on.is_none();
         // A child made on another of your computers joins its parent's tree
         // there: the computer gets the tree's id, qualified with this one.
@@ -3181,6 +3196,11 @@ impl Spaces {
                 .and_then(|s| s.default_on())
                 .map_err(|e| Error::invalid(e.to_string()))?,
         };
+        if opts.cloud_image_id.is_some() && matches!(on, On::Local | On::Host(_) | On::Cloud) {
+            return Err(Error::invalid(
+                "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
+            ));
+        }
         // No location given and none configured: this machine first, then
         // the linked clouds when it is full and a budget is set
         // (`placement.overflow`). An explicit `local` never overflows.
@@ -3225,6 +3245,11 @@ impl Spaces {
             // Spaces reserve (idle capacity is reclaimed before a refusal).
             if self.elastic_has_clouds().await {
                 return boxed(move || self.create_on_auto_elastic(opts)).await;
+            }
+            if opts.cloud_image_id.is_some() {
+                return Err(Error::invalid(
+                    "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
+                ));
             }
             return boxed(move || self.create_on_auto(opts)).await;
         }
@@ -3313,6 +3338,15 @@ impl Spaces {
                 boxed(|| self.reusable(provider, &opts.services, expect_env)).await?
         {
             return Ok(SpaceCreated::Ready { info, reused: true });
+        }
+        if opts
+            .cloud_image_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err(Error::invalid(
+                "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
+            ));
         }
         let name = sanitize_label(&opts.name.unwrap_or_else(|| self.fresh_name()));
         let local = LocalProvision {
@@ -3411,7 +3445,10 @@ impl Spaces {
             create.cpus,
             create.memory_mb,
         );
-        create.disk_gb = opts.disk_gb.filter(|g| *g > 0);
+        if opts.disk_gb == Some(0) {
+            return Err(Error::invalid("disk_gb must be greater than 0"));
+        }
+        create.disk_gb = opts.disk_gb;
         create.env = opts.env.clone();
         create.env.insert("CUA_ENV_TOKEN".into(), token.clone());
         create.env_token = Some(token.clone());
@@ -5028,6 +5065,65 @@ mod tests {
             "my-space-000000002a",
         ] {
             assert!(!is_generated_name(other), "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_cloud_image_id_on_non_provider_routes_and_whitespace() {
+        let home = tempfile::tempdir().unwrap();
+        let spaces = Spaces::builder().home(home.path()).build();
+        for (on, reuse) in [
+            (Some(On::Local), false),
+            (Some(On::Local), true),
+            (Some(On::Auto), false),
+            (Some(On::Host("remote-mac".into())), false),
+        ] {
+            let err = spaces
+                .create(SpaceCreate {
+                    on: on.clone(),
+                    reuse,
+                    cloud_image_id: Some("m-win11".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "expected InvalidArgument for on={on:?} reuse={reuse}, got: {err:?}"
+            );
+        }
+        for bad in ["", "   ", "m-foo bar"] {
+            let err = spaces
+                .create(SpaceCreate {
+                    on: Some(On::Provider("aliyun-ecs".into())),
+                    cloud_image_id: Some(bad.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "cloud_image_id {bad:?}: {err:?}"
+            );
+        }
+        for on in [
+            Some(On::Local),
+            Some(On::Auto),
+            Some(On::Host("remote-mac".into())),
+            Some(On::Provider("aliyun-ecs".into())),
+        ] {
+            let err = spaces
+                .create(SpaceCreate {
+                    on: on.clone(),
+                    disk_gb: Some(0),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "disk_gb=Some(0) for on={on:?}: {err:?}"
+            );
         }
     }
 }

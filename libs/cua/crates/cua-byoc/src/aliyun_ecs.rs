@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 
 use crate::aliyun_net::{self, NetLocks, NetworkConfig};
 use crate::api::{
-    CloudApi, Result, Secret, Target, Tested, cloud_err, retry_backoff, retryable_status,
+    CloudApi, ResolvedSizing, Result, Secret, Target, Tested, cloud_err, retry_backoff,
+    retryable_status,
 };
 use crate::model::{self, Capabilities, Connection, ProvisionSpec, Resource, Tier, tag};
 
@@ -55,6 +56,131 @@ pub const LINUX_INSTANCE_TYPE: &str = "ecs.e-c1m2.large";
 pub const SLIM_INSTANCE_TYPE: &str = "ecs.e-c1m1.large";
 /// Default baseline Windows Direct VM instance type (4 vCPU, 8 GiB).
 pub const WINDOWS_INSTANCE_TYPE: &str = "ecs.c7.xlarge";
+
+/// Minimum ECS `cloud_essd` system disk size in GiB.
+pub const MIN_DISK_GB: u32 = 20;
+/// Maximum ECS `cloud_essd` system disk size in GiB.
+pub const MAX_DISK_GB: u32 = 32_768;
+/// Default Linux ECS system disk size in GiB (`cloud_essd`).
+pub const LINUX_DEFAULT_DISK_GB: u32 = 40;
+/// Default Windows Direct VM ECS system disk size in GiB (`cloud_essd`).
+pub const WINDOWS_DEFAULT_DISK_GB: u32 = 60;
+/// Estimated hourly USD cost per GiB of `cloud_essd` storage (~$0.10/GB/month).
+pub const ESSD_USD_PER_GB_HOUR: f64 = 0.00014;
+
+/// Built-in Alibaba Cloud ECS instance type specs: `(vcpus, memory_mb, usd_per_hour)`.
+pub fn ecs_instance_spec(instance_type: &str) -> Option<(u32, u64, f64)> {
+    match instance_type.trim() {
+        "ecs.e-c1m1.large" => Some((2, 2048, 0.030)),
+        "ecs.e-c1m2.large" => Some((2, 4096, 0.043)),
+        "ecs.e-c1m2.xlarge" => Some((4, 8192, 0.086)),
+        "ecs.e-c1m4.large" => Some((2, 8192, 0.056)),
+        "ecs.c7.large" => Some((2, 4096, 0.063)),
+        "ecs.c7.xlarge" => Some((4, 8192, 0.125)),
+        "ecs.c7.2xlarge" => Some((8, 16384, 0.250)),
+        "ecs.c7.4xlarge" => Some((16, 32768, 0.500)),
+        "ecs.g7.large" => Some((2, 8192, 0.085)),
+        "ecs.g7.xlarge" => Some((4, 16384, 0.170)),
+        "ecs.g7.2xlarge" => Some((8, 32768, 0.340)),
+        "ecs.g7.4xlarge" => Some((16, 65536, 0.680)),
+        "ecs.r7.large" => Some((2, 16384, 0.110)),
+        "ecs.r7.xlarge" => Some((4, 32768, 0.220)),
+        "ecs.u1-c1m2.large" => Some((2, 4096, 0.048)),
+        "ecs.u1-c1m2.xlarge" => Some((4, 8192, 0.096)),
+        _ => None,
+    }
+}
+
+/// Validates ECS `cloud_essd` system disk size bounds (`20..=32768` GiB).
+pub fn validate_disk_gb(disk_gb: u32) -> Result<u32> {
+    if !(MIN_DISK_GB..=MAX_DISK_GB).contains(&disk_gb) {
+        return Err(Error::InvalidArgument(format!(
+            "aliyun-ecs: disk size {disk_gb} GiB is out of range ({MIN_DISK_GB}..={MAX_DISK_GB} GiB for cloud_essd)"
+        )));
+    }
+    Ok(disk_gb)
+}
+
+fn pick_official_image(arr: &[Value], is_windows: bool) -> Option<&Value> {
+    fn is_en(img: &Value) -> bool {
+        let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
+        let en = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
+        name.contains("en-us") || name.contains("_en_") || en.contains("english")
+    }
+    fn pick_best<'a>(candidates: &[&'a Value], prefer_en: bool) -> Option<&'a Value> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|img| {
+                img["Status"].as_str() == Some("Available")
+                    && img["ImageId"]
+                        .as_str()
+                        .is_some_and(|s| !s.trim().is_empty())
+            })
+            .max_by(|a, b| {
+                let ea = prefer_en && is_en(a);
+                let eb = prefer_en && is_en(b);
+                ea.cmp(&eb).then_with(|| {
+                    let ta = a["CreationTime"].as_str().unwrap_or("");
+                    let tb = b["CreationTime"].as_str().unwrap_or("");
+                    ta.cmp(tb).then_with(|| {
+                        a["ImageId"]
+                            .as_str()
+                            .unwrap_or("")
+                            .cmp(b["ImageId"].as_str().unwrap_or(""))
+                    })
+                })
+            })
+    }
+
+    let all: Vec<&Value> = arr.iter().collect();
+    if is_windows {
+        let is_win_server = |img: &Value, needle: &str| {
+            let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
+            let id = img["ImageId"].as_str().unwrap_or("").to_ascii_lowercase();
+            let os_name = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
+            let platform = img["Platform"].as_str().unwrap_or("").to_ascii_lowercase();
+            name.contains(needle)
+                || id.contains(needle)
+                || os_name.contains(needle)
+                || platform.contains(needle)
+        };
+        let win2022: Vec<&Value> = all
+            .iter()
+            .copied()
+            .filter(|i| is_win_server(i, "win2022") || is_win_server(i, "2022"))
+            .collect();
+        let win2019: Vec<&Value> = all
+            .iter()
+            .copied()
+            .filter(|i| is_win_server(i, "win2019") || is_win_server(i, "2019"))
+            .collect();
+        let server_any: Vec<&Value> = all
+            .iter()
+            .copied()
+            .filter(|i| is_win_server(i, "server") || is_win_server(i, "win20"))
+            .collect();
+        pick_best(&win2022, true)
+            .or_else(|| pick_best(&win2019, true))
+            .or_else(|| pick_best(&server_any, true))
+            .or_else(|| pick_best(&all, true))
+    } else {
+        pick_best(&all, false)
+    }
+}
+
+/// Resolved Alibaba Cloud ECS Cloud Image ID and metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedCloudImage {
+    /// Alibaba Cloud ECS `ImageId` (e.g. `m-...` or `ubuntu_24_04_x64_...vhd`).
+    pub image_id: String,
+    /// Guest `OSType` reported by `DescribeImages` (`linux` or `windows`).
+    pub os_type: String,
+    /// Image size in GiB when reported by `DescribeImages`.
+    pub size_gb: Option<u32>,
+    /// Precedence tier (`"per-create"`, `"connection-default"`, or `"official-fallback"`).
+    pub source: &'static str,
+}
 
 /// Where the Cua credential store keeps the AccessKey pair (and a fake in tests).
 pub trait TokenStore: Send + Sync + 'static {
@@ -729,56 +855,288 @@ impl AliyunEcs {
         }
     }
 
-    async fn resolve_ubuntu_image(&self, conn: &Connection, region: &str) -> Result<String> {
+    /// Validates an explicit Cloud Image ID (custom `m-xxx`, shared, marketplace, or official)
+    /// in `conn.region` via `ecs:DescribeImages` without `ImageOwnerAlias=system`.
+    pub async fn validate_image_id(
+        &self,
+        conn: &Connection,
+        image_id: &str,
+        expected_os: &str,
+    ) -> Result<ResolvedCloudImage> {
+        let image_id = image_id.trim();
+        if image_id.is_empty() {
+            return Err(Error::InvalidArgument(
+                "aliyun-ecs: Cloud Image ID cannot be empty".into(),
+            ));
+        }
         let profile_hint = self.profile_hint(conn);
         let v = self
             .call_ok(
-                &self.ecs_endpoint(region),
+                &self.ecs_endpoint(&conn.region),
                 "GET",
                 "DescribeImages",
                 ECS_API_VERSION,
                 &[
-                    ("RegionId".into(), region.to_string()),
-                    ("ImageOwnerAlias".into(), "system".into()),
-                    ("OSType".into(), "linux".into()),
-                    ("Status".into(), "Available".into()),
-                    ("ImageName".into(), "ubuntu_24_04_x64*".into()),
-                    ("Architecture".into(), "x86_64".into()),
-                    ("PageSize".into(), "50".into()),
+                    ("RegionId".into(), conn.region.clone()),
+                    ("ImageId".into(), image_id.to_string()),
                 ],
                 profile_hint,
             )
             .await?;
+        let images = v["Images"]["Image"].as_array();
+        let Some(img) = images.and_then(|arr| {
+            arr.iter()
+                .find(|i| i["ImageId"].as_str() == Some(image_id))
+                .or_else(|| arr.first())
+        }) else {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: Cloud Image ID {image_id:?} was not found in region {}",
+                conn.region
+            )));
+        };
+        let status = img["Status"].as_str().unwrap_or("");
+        if status != "Available" {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: Cloud Image ID {image_id:?} in region {} has status {status:?} (expected \"Available\")",
+                conn.region
+            )));
+        }
+        let os_type = img["OSType"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if os_type.is_empty() {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: Cloud Image ID {image_id:?} in region {} is missing OSType metadata (expected {expected_os:?})",
+                conn.region
+            )));
+        }
+        if !os_type.eq_ignore_ascii_case(expected_os) {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: Cloud Image ID {image_id:?} has OSType {os_type:?}, expected {expected_os:?}"
+            )));
+        }
+        let size_gb = img["Size"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0);
+        Ok(ResolvedCloudImage {
+            image_id: img["ImageId"]
+                .as_str()
+                .unwrap_or(image_id)
+                .trim()
+                .to_string(),
+            os_type,
+            size_gb,
+            source: "explicit",
+        })
+    }
 
-        let best = v["Images"]["Image"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|img| {
-                img["Status"]
-                    .as_str()
-                    .is_none_or(|s| s.eq_ignore_ascii_case("Available"))
-            })
-            .filter(|img| {
-                img["ImageId"]
-                    .as_str()
-                    .is_some_and(|id| !id.trim().is_empty())
-            })
-            .max_by(|a, b| {
-                let ca = a["CreationTime"].as_str().unwrap_or("");
-                let cb = b["CreationTime"].as_str().unwrap_or("");
-                ca.cmp(cb)
-            });
+    /// Looks up the newest available official Alibaba Cloud system image for `target_os`
+    /// (`"linux"` -> Ubuntu 24.04; `"windows"` -> Windows Server 2022/2019).
+    pub async fn resolve_official_image(
+        &self,
+        conn: &Connection,
+        target_os: &str,
+    ) -> Result<ResolvedCloudImage> {
+        let profile_hint = self.profile_hint(conn);
+        let ecs = self.ecs_endpoint(&conn.region);
+        let is_windows = target_os.eq_ignore_ascii_case("windows");
 
-        best.and_then(|img| img["ImageId"].as_str())
-            .map(|s| s.trim().to_string())
-            .ok_or_else(|| {
-                cloud_err(
-                    "aliyun-ecs",
-                    "DescribeImages",
-                    format!("no Ubuntu 24.04 system image found in {region}"),
+        let query_images = |image_name: Option<&'static str>| {
+            let mut params = vec![
+                ("RegionId".into(), conn.region.clone()),
+                ("ImageOwnerAlias".into(), "system".into()),
+                (
+                    "OSType".into(),
+                    if is_windows { "windows" } else { "linux" }.into(),
+                ),
+                ("Status".into(), "Available".into()),
+                ("Architecture".into(), "x86_64".into()),
+                ("PageSize".into(), "100".into()),
+            ];
+            if let Some(pat) = image_name {
+                params.push(("ImageName".into(), pat.into()));
+            }
+            let ecs = ecs.clone();
+            async move {
+                let v = self
+                    .call_ok(
+                        &ecs,
+                        "GET",
+                        "DescribeImages",
+                        ECS_API_VERSION,
+                        &params,
+                        profile_hint,
+                    )
+                    .await?;
+                Ok::<Vec<Value>, Error>(
+                    v["Images"]["Image"].as_array().cloned().unwrap_or_default(),
                 )
+            }
+        };
+
+        let chosen_val = if is_windows {
+            let mut picked = None;
+            for pat in [Some("win2022*"), Some("win2019*"), None] {
+                let arr = query_images(pat).await?;
+                if let Some(img) = pick_official_image(&arr, true) {
+                    picked = Some(img.clone());
+                    break;
+                }
+            }
+            picked
+        } else {
+            let arr = query_images(Some("ubuntu_24_04_x64*")).await?;
+            pick_official_image(&arr, false).cloned()
+        };
+
+        let Some(img) = chosen_val else {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: no official {} system image found in region {}",
+                if is_windows {
+                    "Windows Server"
+                } else {
+                    "Ubuntu 24.04"
+                },
+                conn.region
+            )));
+        };
+        let image_id = img["ImageId"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let size_gb = img["Size"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0);
+        Ok(ResolvedCloudImage {
+            image_id,
+            os_type: if is_windows { "windows" } else { "linux" }.into(),
+            size_gb,
+            source: "official-fallback",
+        })
+    }
+
+    /// Resolves Cloud Image ID in precedence order:
+    /// 1. per-create `spec.cloud_image_id` (`--cloud-image-id`)
+    /// 2. connection default (`conn.windows_image_id` for Windows, `conn.linux_image_id` for Linux)
+    /// 3. latest official Alibaba Cloud Windows Server or Ubuntu 24.04 image via `DescribeImages`.
+    pub async fn resolve_image_id(
+        &self,
+        conn: &Connection,
+        spec: &ProvisionSpec,
+    ) -> Result<ResolvedCloudImage> {
+        let target_os = if spec.family == "windows" {
+            "windows"
+        } else {
+            "linux"
+        };
+        let mut resolved = if let Some(per_create) = spec
+            .cloud_image_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut img = self.validate_image_id(conn, per_create, target_os).await?;
+            img.source = "per-create";
+            img
+        } else {
+            let conn_default = if target_os == "windows" {
+                conn.windows_image_id.as_deref()
+            } else {
+                conn.linux_image_id.as_deref()
+            };
+            if let Some(def_id) = conn_default.map(str::trim).filter(|s| !s.is_empty()) {
+                let mut img = self.validate_image_id(conn, def_id, target_os).await?;
+                img.source = "connection-default";
+                img
+            } else {
+                self.resolve_official_image(conn, target_os).await?
+            }
+        };
+        let requested_or_default = if spec.disk_gb > 0 {
+            spec.disk_gb
+        } else {
+            system_disk_for(spec).0
+        };
+        if let Some(min_gb) = resolved.size_gb
+            && requested_or_default < min_gb
+        {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: requested disk size {requested_or_default} GiB is smaller than Cloud Image ID {:?} minimum size ({min_gb} GiB)",
+                resolved.image_id
+            )));
+        }
+        if resolved.os_type.is_empty() {
+            resolved.os_type = target_os.to_string();
+        }
+        Ok(resolved)
+    }
+
+    /// Resolves `(vcpus, memory_mb, instance_usd_per_hour)` from the built-in ECS
+    /// catalog or `ecs:DescribeInstanceTypes`.
+    pub async fn lookup_instance_type(
+        &self,
+        conn: &Connection,
+        instance_type: &str,
+    ) -> Result<(u32, u64, f64)> {
+        let instance_type = instance_type.trim();
+        if instance_type.is_empty() {
+            return Err(Error::InvalidArgument(
+                "aliyun-ecs: instance_type cannot be empty".into(),
+            ));
+        }
+        if let Some(spec) = ecs_instance_spec(instance_type) {
+            return Ok(spec);
+        }
+        let profile_hint = self.profile_hint(conn);
+        let ids_json = serde_json::to_string(&[instance_type]).unwrap_or_default();
+        let v = self
+            .call_ok(
+                &self.ecs_endpoint(&conn.region),
+                "GET",
+                "DescribeInstanceTypes",
+                ECS_API_VERSION,
+                &[("InstanceTypes".into(), ids_json)],
+                profile_hint,
+            )
+            .await?;
+        let Some(item) = v["InstanceTypes"]["InstanceType"]
+            .as_array()
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|it| it["InstanceTypeId"].as_str() == Some(instance_type))
+                    .or_else(|| arr.first())
             })
+        else {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: unknown instance type {instance_type:?} in region {}",
+                conn.region
+            )));
+        };
+        let vcpus = item["CpuCoreCount"]
+            .as_u64()
+            .and_then(|c| u32::try_from(c).ok())
+            .filter(|&c| c > 0)
+            .ok_or_else(|| {
+                Error::Cloud(format!(
+                    "aliyun-ecs: DescribeInstanceTypes returned invalid CpuCoreCount for {instance_type:?}"
+                ))
+            })?;
+        let mem_gib = item["MemorySize"]
+            .as_f64()
+            .filter(|&m| m > 0.0)
+            .ok_or_else(|| {
+                Error::Cloud(format!(
+                    "aliyun-ecs: DescribeInstanceTypes returned invalid MemorySize for {instance_type:?}"
+                ))
+            })?;
+        let memory_mb = (mem_gib * 1024.0).round() as u64;
+        let est_usd_per_hour = (f64::from(vcpus) * 0.025 + mem_gib * 0.005).max(0.01);
+        Ok((vcpus, memory_mb, est_usd_per_hour))
     }
 
     async fn guard(
@@ -963,76 +1321,12 @@ pub fn instance_type_for(spec: &ProvisionSpec) -> &str {
 
 /// Resolves the `(size_gib, category)` system disk parameters for `spec`.
 pub fn system_disk_for(spec: &ProvisionSpec) -> (u32, &'static str) {
-    let min_gb = if spec.family == "windows" { 60 } else { 40 };
+    let min_gb = if spec.family == "windows" {
+        WINDOWS_DEFAULT_DISK_GB
+    } else {
+        LINUX_DEFAULT_DISK_GB
+    };
     (spec.disk_gb.max(min_gb), "cloud_essd")
-}
-
-impl AliyunEcs {
-    async fn discover_windows_image(
-        &self,
-        ecs: &str,
-        region: &str,
-        profile_hint: Option<&str>,
-    ) -> Result<String> {
-        let v = self
-            .call_ok(
-                ecs,
-                "GET",
-                "DescribeImages",
-                ECS_API_VERSION,
-                &[
-                    ("RegionId".into(), region.into()),
-                    ("ImageOwnerAlias".into(), "system".into()),
-                    ("OSType".into(), "windows".into()),
-                    ("Status".into(), "Available".into()),
-                    ("Architecture".into(), "x86_64".into()),
-                    ("PageSize".into(), "50".into()),
-                ],
-                profile_hint,
-            )
-            .await?;
-        let imgs = v["Images"]["Image"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let score = |img: &Value| -> u8 {
-            let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
-            let en = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
-            let is_2022 = name.contains("2022") || en.contains("2022");
-            let is_en = name.contains("en-us") || name.contains("_en_") || en.contains("english");
-            match (is_2022, is_en) {
-                (true, true) => 3,
-                (true, false) => 2,
-                (false, true) => 1,
-                (false, false) => 0,
-            }
-        };
-        imgs.iter()
-            .filter(|img| {
-                img["Status"]
-                    .as_str()
-                    .is_none_or(|s| s.eq_ignore_ascii_case("Available"))
-            })
-            .filter(|img| {
-                img["ImageId"]
-                    .as_str()
-                    .is_some_and(|s| !s.trim().is_empty())
-            })
-            .max_by(|a, b| {
-                score(a).cmp(&score(b)).then_with(|| {
-                    let ca = a["CreationTime"].as_str().unwrap_or("");
-                    let cb = b["CreationTime"].as_str().unwrap_or("");
-                    ca.cmp(cb)
-                })
-            })
-            .and_then(|img| img["ImageId"].as_str())
-            .map(|s| s.trim().to_string())
-            .ok_or_else(|| {
-                Error::Cloud(format!(
-                    "aliyun-ecs: no official Windows Server x86_64 image found in {region}"
-                ))
-            })
-    }
 }
 
 #[async_trait]
@@ -1064,10 +1358,18 @@ impl CloudApi for AliyunEcs {
         &["linux", "windows"]
     }
 
+    fn supports_image_defaults(&self) -> bool {
+        true
+    }
+
+    fn supports_custom_image_and_sizing(&self) -> bool {
+        true
+    }
+
     fn default_disk_gb(&self, family: &str) -> u32 {
         match family {
-            "windows" => 60,
-            "linux" | "linux-slim" => 40,
+            "windows" => WINDOWS_DEFAULT_DISK_GB,
+            "linux" | "linux-slim" => LINUX_DEFAULT_DISK_GB,
             _ => crate::provider::disk_for(family),
         }
     }
@@ -1172,6 +1474,18 @@ impl CloudApi for AliyunEcs {
             Some((v, w)) => (Some(v), Some(w)),
             None => (None, None),
         };
+        let windows_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "aliyun-ecs: --windows-image-id",
+            t.windows_image_id.as_deref(),
+        )?;
+        let linux_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "aliyun-ecs: --linux-image-id",
+            t.linux_image_id.as_deref(),
+        )?;
+        let instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "aliyun-ecs: --instance-type",
+            t.instance_type.as_deref(),
+        )?;
 
         Ok(Connection {
             provider: "aliyun-ecs".into(),
@@ -1181,6 +1495,9 @@ impl CloudApi for AliyunEcs {
             vpc_id,
             vswitch_id,
             no_public_ip: t.no_public_ip,
+            windows_image_id,
+            linux_image_id,
+            instance_type,
             ..Default::default()
         })
     }
@@ -1218,31 +1535,37 @@ impl CloudApi for AliyunEcs {
         *self.staged.lock().unwrap() = None;
     }
 
-    fn kinds(&self, _: &Connection) -> Vec<CloudKind> {
+    fn kinds(&self, conn: &Connection) -> Vec<CloudKind> {
+        let custom_type = conn
+            .instance_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let custom_usd = custom_type.and_then(|t| ecs_instance_spec(t).map(|(_, _, u)| u));
         vec![
             CloudKind {
                 image: "linux".into(),
                 kind: "container".into(),
                 supported: true,
                 reason: "one ECS VM running Docker on Ubuntu 24.04".into(),
-                machine_type: LINUX_INSTANCE_TYPE.into(),
-                usd_per_hour: 0.043,
+                machine_type: custom_type.unwrap_or(LINUX_INSTANCE_TYPE).into(),
+                usd_per_hour: custom_usd.unwrap_or(0.043),
             },
             CloudKind {
                 image: "linux-slim".into(),
                 kind: "container".into(),
                 supported: true,
                 reason: "one ECS VM running Docker on Ubuntu 24.04".into(),
-                machine_type: SLIM_INSTANCE_TYPE.into(),
-                usd_per_hour: 0.030,
+                machine_type: custom_type.unwrap_or(SLIM_INSTANCE_TYPE).into(),
+                usd_per_hour: custom_usd.unwrap_or(0.030),
             },
             CloudKind {
                 image: "windows".into(),
                 kind: "vm".into(),
                 supported: true,
                 reason: "Windows Direct VM Sandbox".into(),
-                machine_type: WINDOWS_INSTANCE_TYPE.into(),
-                usd_per_hour: 0.125,
+                machine_type: custom_type.unwrap_or(WINDOWS_INSTANCE_TYPE).into(),
+                usd_per_hour: custom_usd.unwrap_or(0.125),
             },
             CloudKind {
                 image: "omarchy".into(),
@@ -1405,23 +1728,69 @@ impl CloudApi for AliyunEcs {
                     );
                     return t;
                 }
-                if let Some(preferred) = available_types
-                    .iter()
-                    .find(|x| x.as_str() == LINUX_INSTANCE_TYPE)
-                    .or_else(|| available_types.first())
-                {
-                    discovered_type = preferred.clone();
+                if let Some(ref custom_type) = conn.instance_type {
+                    if !available_types.iter().any(|x| x == custom_type) {
+                        t.check(
+                            "machine",
+                            false,
+                            format!(
+                                "instance type {custom_type:?} is not available for PostPaid ECS in {}",
+                                conn.region
+                            ),
+                        );
+                        return t;
+                    }
+                    let (vcpus, mem_mb, usd) =
+                        match self.lookup_instance_type(conn, custom_type).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                t.check("machine", false, e.to_string());
+                                return t;
+                            }
+                        };
+                    if let Some(max) = conn.max_size
+                        && !max.fits(vcpus, mem_mb)
+                    {
+                        t.check(
+                            "machine",
+                            false,
+                            format!(
+                                "instance type {custom_type:?} ({vcpus} vCPU, {} GB) exceeds --max-size {max}",
+                                mem_mb.div_ceil(1024)
+                            ),
+                        );
+                        return t;
+                    }
+                    discovered_type = custom_type.clone();
+                    t.check(
+                        "machine",
+                        true,
+                        format!(
+                            "{} instance types in {}; configured {custom_type} ({vcpus} vCPU, {} GB, ~${usd:.3}/h)",
+                            available_types.len(),
+                            conn.region,
+                            mem_mb.div_ceil(1024),
+                        ),
+                    );
+                } else {
+                    if let Some(preferred) = available_types
+                        .iter()
+                        .find(|x| x.as_str() == LINUX_INSTANCE_TYPE)
+                        .or_else(|| available_types.first())
+                    {
+                        discovered_type = preferred.clone();
+                    }
+                    t.check(
+                        "machine",
+                        true,
+                        format!(
+                            "{} instance types in {}; baseline {} (~$0.043/h)",
+                            available_types.len(),
+                            conn.region,
+                            discovered_type
+                        ),
+                    );
                 }
-                t.check(
-                    "machine",
-                    true,
-                    format!(
-                        "{} instance types in {}; baseline {} (~$0.043/h)",
-                        available_types.len(),
-                        conn.region,
-                        discovered_type
-                    ),
-                );
             }
             Err(e) => {
                 t.check("machine", false, e.to_string());
@@ -1429,11 +1798,11 @@ impl CloudApi for AliyunEcs {
             }
         }
 
-        // 4. Image lookup: ecs:DescribeImages (Ubuntu 24.04)
-        let discovered_image = match self.resolve_ubuntu_image(conn, &conn.region).await {
-            Ok(img_id) => {
-                t.check("image", true, format!("Ubuntu 24.04 ({img_id})"));
-                img_id
+        // 4. Image lookup: ecs:DescribeImages (official Ubuntu 24.04 + configured defaults)
+        let discovered_image = match self.resolve_official_image(conn, "linux").await {
+            Ok(img) => {
+                t.check("image", true, format!("Ubuntu 24.04 ({})", img.image_id));
+                img.image_id
             }
             Err(e) => {
                 t.check("image", false, e.to_string());
@@ -1473,6 +1842,42 @@ impl CloudApi for AliyunEcs {
                     return t;
                 }
             }
+        }
+
+        // 4c. Custom Cloud Image ID validation when configured (#6).
+        let mut custom_images_ok = true;
+        if let Some(ref win_id) = conn.windows_image_id {
+            match self.validate_image_id(conn, win_id, "windows").await {
+                Ok(img) => t.check(
+                    "windows_image",
+                    true,
+                    format!("Windows Cloud Image ID {} available", img.image_id),
+                ),
+                Err(e) => {
+                    t.check("windows_image", false, e.to_string());
+                    custom_images_ok = false;
+                }
+            }
+        }
+        let mut dry_run_image = discovered_image;
+        if let Some(ref lin_id) = conn.linux_image_id {
+            match self.validate_image_id(conn, lin_id, "linux").await {
+                Ok(img) => {
+                    t.check(
+                        "linux_image",
+                        true,
+                        format!("Linux Cloud Image ID {} available", img.image_id),
+                    );
+                    dry_run_image = img.image_id;
+                }
+                Err(e) => {
+                    t.check("linux_image", false, e.to_string());
+                    custom_images_ok = false;
+                }
+            }
+        }
+        if !custom_images_ok {
+            return t;
         }
 
         // 5. Permissions: DescribeInstances, DescribeVpcs, DescribeVSwitches, DescribeSecurityGroups,
@@ -1734,7 +2139,7 @@ impl CloudApi for AliyunEcs {
 
         let mut run_params = vec![
             ("RegionId".into(), conn.region.clone()),
-            ("ImageId".into(), discovered_image),
+            ("ImageId".into(), dry_run_image),
             ("InstanceType".into(), discovered_type),
             ("Tag.1.Key".into(), tag::MANAGED.into()),
             ("Tag.1.Value".into(), "true".into()),
@@ -1803,6 +2208,31 @@ impl CloudApi for AliyunEcs {
         t
     }
 
+    async fn resolve_machine_sizing(
+        &self,
+        conn: &Connection,
+        spec: &ProvisionSpec,
+    ) -> Result<Option<ResolvedSizing>> {
+        validate_disk_gb(spec.disk_gb)?;
+        let (vcpus, memory_mb, inst_usd) =
+            self.lookup_instance_type(conn, &spec.machine_type).await?;
+        let disk_usd = f64::from(spec.disk_gb) * ESSD_USD_PER_GB_HOUR;
+        Ok(Some(ResolvedSizing {
+            vcpus,
+            memory_mb,
+            usd_per_hour: inst_usd + disk_usd,
+        }))
+    }
+
+    async fn resolve_provision_image(
+        &self,
+        conn: &Connection,
+        spec: &ProvisionSpec,
+    ) -> Result<Option<String>> {
+        let resolved = self.resolve_image_id(conn, spec).await?;
+        Ok(Some(resolved.image_id))
+    }
+
     async fn provision(&self, conn: &Connection, spec: &ProvisionSpec) -> Result<Vec<Resource>> {
         match spec.family.as_str() {
             "windows" => {
@@ -1844,17 +2274,18 @@ impl CloudApi for AliyunEcs {
         let profile_hint = self.profile_hint(conn);
         let ecs_ep = self.ecs_endpoint(&region);
 
+        let (disk_gb, disk_category) = system_disk_for(spec);
+        validate_disk_gb(disk_gb)?;
         let instance_type = instance_type_for(spec).to_string();
-        let image_id = if spec.family == "windows" {
-            self.discover_windows_image(&ecs_ep, &region, profile_hint)
-                .await?
-        } else {
-            self.resolve_ubuntu_image(conn, &region).await?
-        };
-        let net_cfg = NetworkConfig::from_connection(conn)?;
+        let mut effective_conn = conn.clone();
+        if !region.is_empty() && effective_conn.region != region {
+            effective_conn.region = region.clone();
+        }
+        let image_id = self.resolve_image_id(&effective_conn, spec).await?.image_id;
+        let net_cfg = NetworkConfig::from_connection(&effective_conn)?;
         let net = aliyun_net::prepare_network(
             self,
-            conn,
+            &effective_conn,
             &region,
             &owner,
             &instance_type,
@@ -1864,13 +2295,12 @@ impl CloudApi for AliyunEcs {
         .await?;
 
         if net.candidates.is_empty() {
-            aliyun_net::rollback_made(self, conn, &net.made).await;
+            aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
             return Err(Error::Cloud(format!(
                 "aliyun-ecs: no availability zone in {region} supports {instance_type}"
             )));
         }
 
-        let (disk_gb, disk_category) = system_disk_for(spec);
         let host_name = sanitize_hostname(&spec.name);
         let auto_release =
             (spec.ttl_secs > 0).then(|| model::rfc3339(model::now() + spec.ttl_secs.max(1860)));
@@ -1883,7 +2313,7 @@ impl CloudApi for AliyunEcs {
                 Some(id) => (id.clone(), None),
                 None => match aliyun_net::ensure_vswitch_for_zone(
                     self,
-                    conn,
+                    &effective_conn,
                     &region,
                     &owner,
                     &net.vpc_id,
@@ -1894,7 +2324,7 @@ impl CloudApi for AliyunEcs {
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        aliyun_net::rollback_made(self, conn, &net.made).await;
+                        aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
                         return Err(e);
                     }
                 },
@@ -1962,9 +2392,9 @@ impl CloudApi for AliyunEcs {
                 Ok((status, body)) if status.is_success() => {
                     let ApiBody::Json(v) = body else {
                         if let Some(ref vsw) = made_vsw {
-                            let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                            let _ = aliyun_net::delete_part(self, &effective_conn, vsw).await;
                         }
-                        aliyun_net::rollback_made(self, conn, &net.made).await;
+                        aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
                         return Err(cloud_err(
                             "aliyun-ecs",
                             "RunInstances",
@@ -1979,9 +2409,9 @@ impl CloudApi for AliyunEcs {
                         .filter(|s| !s.is_empty())
                     else {
                         if let Some(ref vsw) = made_vsw {
-                            let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                            let _ = aliyun_net::delete_part(self, &effective_conn, vsw).await;
                         }
-                        aliyun_net::rollback_made(self, conn, &net.made).await;
+                        aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
                         return Err(cloud_err(
                             "aliyun-ecs",
                             "RunInstances",
@@ -2023,26 +2453,26 @@ impl CloudApi for AliyunEcs {
                     };
                     let err = map_api_error("RunInstances", ECS_API_VERSION, status, &body);
                     if let Some(ref vsw) = made_vsw {
-                        let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                        let _ = aliyun_net::delete_part(self, &effective_conn, vsw).await;
                     }
                     if is_zone_capacity_error(&code) {
                         tried.push(format!("{} ({vswitch_id}): {err}", cand.zone_id));
                         continue;
                     }
-                    aliyun_net::rollback_made(self, conn, &net.made).await;
+                    aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
                     return Err(err);
                 }
                 Err(e) => {
                     if let Some(ref vsw) = made_vsw {
-                        let _ = aliyun_net::delete_part(self, conn, vsw).await;
+                        let _ = aliyun_net::delete_part(self, &effective_conn, vsw).await;
                     }
-                    aliyun_net::rollback_made(self, conn, &net.made).await;
+                    aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
                     return Err(e);
                 }
             }
         }
 
-        aliyun_net::rollback_made(self, conn, &net.made).await;
+        aliyun_net::rollback_made(self, &effective_conn, &net.made).await;
         Err(cloud_err(
             "aliyun-ecs",
             &format!("start a {instance_type} in {region}"),
@@ -2442,5 +2872,24 @@ mod tests {
         assert!(!msg.contains('\x07'), "{msg}");
         assert!(snippet.ends_with("..."), "{msg}");
         assert_eq!(snippet.chars().count(), 203, "{msg}");
+    }
+
+    #[test]
+    fn pick_official_image_requires_explicit_available_status() {
+        let images = vec![
+            serde_json::json!({
+                "ImageId": "ubuntu_missing_status",
+                "ImageName": "ubuntu_24_04_x64_missing",
+                "CreationTime": "2026-01-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "ImageId": "ubuntu_available",
+                "ImageName": "ubuntu_24_04_x64_ok",
+                "Status": "Available",
+                "CreationTime": "2025-01-01T00:00:00Z"
+            }),
+        ];
+        let picked = pick_official_image(&images, false).unwrap();
+        assert_eq!(picked["ImageId"].as_str(), Some("ubuntu_available"));
     }
 }

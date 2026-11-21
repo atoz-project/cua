@@ -88,6 +88,8 @@ Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
     cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
   Optional existing VPC attachment and private-only networking (--no-public-ip):
     cua cloud connect aliyun-ecs --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
+  Optional default Cloud Image IDs and instance type:
+    cua cloud connect aliyun-ecs --windows-image-id m-win11 --linux-image-id m-ubuntu --instance-type ecs.c7.2xlarge
   Verify: cua cloud status aliyun-ecs
 
 Self-hosted relay (per connection, default https://relay.cua.ai in Account Relay Mode):
@@ -189,6 +191,17 @@ pub struct TargetArgs {
     /// `aliyun-ecs` only).
     #[arg(long)]
     pub no_public_ip: bool,
+    /// Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g.
+    /// golden Windows 10/11/Server image) for Windows sandboxes.
+    #[arg(long, value_name = "IMAGE_ID")]
+    pub windows_image_id: Option<String>,
+    /// Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux
+    /// sandboxes.
+    #[arg(long, value_name = "IMAGE_ID")]
+    pub linux_image_id: Option<String>,
+    /// Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`).
+    #[arg(long, value_name = "TYPE")]
+    pub instance_type: Option<String>,
 }
 
 impl TargetArgs {
@@ -219,6 +232,9 @@ impl TargetArgs {
             vpc_id: self.vpc_id.clone(),
             vswitch_id: self.vswitch_id.clone(),
             no_public_ip: self.no_public_ip,
+            windows_image_id: self.windows_image_id.clone(),
+            linux_image_id: self.linux_image_id.clone(),
+            instance_type: self.instance_type.clone(),
         }
     }
 }
@@ -1421,6 +1437,15 @@ fn limits_line(p: &cua_sdk::CloudProvider) -> Option<String> {
     if p.no_public_ip {
         parts.push("Private-only (--no-public-ip).".into());
     }
+    if let Some(id) = p.windows_image_id.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("Windows Cloud Image ID: {id}."));
+    }
+    if let Some(id) = p.linux_image_id.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("Linux Cloud Image ID: {id}."));
+    }
+    if let Some(t) = p.instance_type.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("Default instance type: {t}."));
+    }
     match p.approval.as_str() {
         "connection" => parts.push("A person approves it in Cua Spaces.".into()),
         "limits" => parts.push("A person approves the new limits in Cua Spaces.".into()),
@@ -1501,11 +1526,13 @@ fn usd(v: f64) -> String {
     }
 }
 
-/// "4 vCPU and 16 GB" of "4x16".
+/// "4 vCPU and 16 GB" of "4x16" (or "4 vCPU, 16 GB, and 100 GB disk" of "4x16x100").
 fn size_words(s: &str) -> String {
-    match s.split_once('x') {
-        Some((c, m)) => format!("{c} vCPU and {m} GB"),
-        None => s.to_string(),
+    let parts: Vec<&str> = s.split('x').collect();
+    match parts.as_slice() {
+        [c, m] => format!("{c} vCPU and {m} GB"),
+        [c, m, d] => format!("{c} vCPU, {m} GB, and {d} GB disk"),
+        _ => s.to_string(),
     }
 }
 
@@ -1557,6 +1584,15 @@ fn connect_lines(c: &cua_sdk::CloudConnected) -> Vec<String> {
         }
         if p.no_public_ip {
             out.push("Public IP: disabled (--no-public-ip)".into());
+        }
+        if let Some(id) = p.windows_image_id.as_deref().filter(|s| !s.is_empty()) {
+            out.push(format!("Windows Cloud Image ID: {id}"));
+        }
+        if let Some(id) = p.linux_image_id.as_deref().filter(|s| !s.is_empty()) {
+            out.push(format!("Linux Cloud Image ID: {id}"));
+        }
+        if let Some(t) = p.instance_type.as_deref().filter(|s| !s.is_empty()) {
+            out.push(format!("Default instance type: {t}"));
         }
     }
     for ch in &c.checks {
@@ -1629,6 +1665,9 @@ fn provider_json(p: &cua_sdk::CloudProvider) -> serde_json::Value {
         "vpc_id": p.vpc_id,
         "vswitch_id": p.vswitch_id,
         "no_public_ip": p.no_public_ip,
+        "windows_image_id": p.windows_image_id,
+        "linux_image_id": p.linux_image_id,
+        "instance_type": p.instance_type,
         "kinds": p.kinds.iter().map(|k| serde_json::json!({
             "image": k.image, "kind": k.kind, "supported": k.supported, "reason": k.reason,
             "machine_type": k.machine_type, "usd_per_hour": k.usd_per_hour,
@@ -2496,5 +2535,78 @@ mod tests {
         assert_eq!(j["vpc_id"], "vpc-user-1");
         assert_eq!(j["vswitch_id"], "vsw-user-1");
         assert_eq!(j["no_public_ip"], true);
+    }
+
+    #[test]
+    fn cloud_connect_and_test_parse_image_id_and_instance_type_defaults() {
+        match parse(&[
+            "connect",
+            "aliyun-ecs",
+            "--region",
+            "cn-hangzhou",
+            "--windows-image-id",
+            "m-win11",
+            "--linux-image-id",
+            "m-ubuntu",
+            "--instance-type",
+            "ecs.c7.2xlarge",
+            "--max-size",
+            "8x32x120",
+        ]) {
+            CloudCmd::Connect {
+                target, max_size, ..
+            } => {
+                assert_eq!(max_size.as_deref(), Some("8x32x120"));
+                let wire = target.target_with_stdin(String::new);
+                assert_eq!(wire.windows_image_id.as_deref(), Some("m-win11"));
+                assert_eq!(wire.linux_image_id.as_deref(), Some("m-ubuntu"));
+                assert_eq!(wire.instance_type.as_deref(), Some("ecs.c7.2xlarge"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        match parse(&[
+            "test",
+            "aliyun-ecs",
+            "--windows-image-id",
+            "m-win10",
+            "--linux-image-id",
+            "m-lin",
+            "--instance-type",
+            "ecs.g7.large",
+        ]) {
+            CloudCmd::Test { target } => {
+                let wire = target.target_with_stdin(String::new);
+                assert_eq!(wire.windows_image_id.as_deref(), Some("m-win10"));
+                assert_eq!(wire.linux_image_id.as_deref(), Some("m-lin"));
+                assert_eq!(wire.instance_type.as_deref(), Some("ecs.g7.large"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        assert_eq!(size_words("4x16"), "4 vCPU and 16 GB");
+        assert_eq!(size_words("8x32x120"), "8 vCPU, 32 GB, and 120 GB disk");
+
+        let p = cua_sdk::CloudProvider {
+            name: "aliyun-ecs".into(),
+            title: "Alibaba Cloud ECS".into(),
+            connected: true,
+            status: "connected".into(),
+            windows_image_id: Some("m-win11".into()),
+            linux_image_id: Some("m-ubuntu".into()),
+            instance_type: Some("ecs.c7.2xlarge".into()),
+            ..Default::default()
+        };
+        let lim = limits_line(&p).unwrap();
+        assert!(lim.contains("Windows Cloud Image ID: m-win11"), "{lim}");
+        assert!(lim.contains("Linux Cloud Image ID: m-ubuntu"), "{lim}");
+        assert!(
+            lim.contains("Default instance type: ecs.c7.2xlarge"),
+            "{lim}"
+        );
+        let j = provider_json(&p);
+        assert_eq!(j["windows_image_id"], "m-win11");
+        assert_eq!(j["linux_image_id"], "m-ubuntu");
+        assert_eq!(j["instance_type"], "ecs.c7.2xlarge");
     }
 }

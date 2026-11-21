@@ -159,6 +159,18 @@ impl Spaces {
         if let Some(m) = opts.memory_mb {
             create.memory_mb = m;
         }
+        if opts.disk_gb == Some(0) {
+            return Err(Error::invalid("disk_gb must be greater than 0"));
+        }
+        create.disk_gb = opts.disk_gb;
+        create.cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            opts.cloud_image_id.as_deref(),
+        )?;
+        create.instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            opts.instance_type.as_deref(),
+        )?;
         if let Some(t) = opts.timeout {
             create.ready_timeout = t;
             create.ready_timeout_given = true;

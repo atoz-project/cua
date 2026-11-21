@@ -130,6 +130,14 @@ pub struct ProviderCapabilities {
     /// A type the account cannot use now (no quota, over budget) is listed
     /// with `supported: false` and the reason.
     pub gpus: Vec<crate::gpu::GpuOption>,
+    /// Guest OSes the provider runs (`["linux"]` by default; `aliyun-ecs`
+    /// also runs `"windows"`). Empty means `["linux"]`.
+    pub oses: Vec<&'static str>,
+    /// Whether the provider honors per-create `disk_gb` overrides.
+    pub custom_disk_gb: bool,
+    /// Whether the provider honors per-create `cloud_image_id` and
+    /// `instance_type` overrides.
+    pub custom_cloud_image: bool,
 }
 
 /// The image the core resolved for a provider.
@@ -158,6 +166,8 @@ pub struct ProviderCreate {
     pub name: String,
     /// Image.
     pub image: ProviderImage,
+    /// Effective guest OS (`"linux"`, `"windows"`, `"macos"`).
+    pub os: String,
     /// vCPUs.
     pub cpus: u32,
     /// Memory (MiB).
@@ -192,6 +202,13 @@ pub struct ProviderCreate {
     /// a provider that takes network rules keeps "internet only" even when
     /// `egress` is empty.
     pub protect: bool,
+    /// Requested boot disk size in GiB (`None`: provider/OS default).
+    pub disk_gb: Option<u32>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
+    /// Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+    pub instance_type: Option<String>,
 }
 
 /// A sandbox on a provider.

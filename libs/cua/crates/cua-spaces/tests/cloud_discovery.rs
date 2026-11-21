@@ -55,6 +55,9 @@ impl Provider for Cloud {
             max_memory_mb: None,
             credential_env: &[],
             gpus: vec![],
+            oses: vec!["linux"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
         }
     }
     fn check_configured(&self) -> Result<()> {

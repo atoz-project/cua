@@ -184,13 +184,28 @@ pub struct CloudProvider {
     pub spacesd_download_url: Option<String>,
     /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
     #[serde(default)]
+    #[uniffi(default = None)]
     pub vpc_id: Option<String>,
     /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
     #[serde(default)]
+    #[uniffi(default = None)]
     pub vswitch_id: Option<String>,
     /// Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
     #[serde(default)]
+    #[uniffi(default = false)]
     pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CloudProvider {
@@ -234,6 +249,9 @@ impl std::fmt::Debug for CloudProvider {
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
             .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -524,6 +542,15 @@ pub struct CloudTarget {
     /// `aliyun-ecs` only).
     #[uniffi(default = false)]
     pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[uniffi(default = None)]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[uniffi(default = None)]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[uniffi(default = None)]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -549,6 +576,9 @@ impl std::fmt::Debug for CloudTarget {
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
             .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -570,6 +600,9 @@ impl CloudTarget {
             "vpc_id": self.vpc_id,
             "vswitch_id": self.vswitch_id,
             "no_public_ip": self.no_public_ip,
+            "windows_image_id": self.windows_image_id,
+            "linux_image_id": self.linux_image_id,
+            "instance_type": self.instance_type,
         })
     }
 
@@ -582,6 +615,9 @@ impl CloudTarget {
             ("vpc_id", self.vpc_id.is_some()),
             ("vswitch_id", self.vswitch_id.is_some()),
             ("no_public_ip", self.no_public_ip),
+            ("windows_image_id", self.windows_image_id.is_some()),
+            ("linux_image_id", self.linux_image_id.is_some()),
+            ("instance_type", self.instance_type.is_some()),
         ]
         .into_iter()
         .filter_map(|(k, set)| set.then_some(k))
@@ -712,7 +748,7 @@ impl Spaces {
                 host.require_fields(
                     "cloud_connect",
                     &asked,
-                    "connect a cloud with a custom/static relay or existing VPC",
+                    "connect a cloud with a custom/static relay, existing VPC, or default Cloud Image IDs",
                 )
                 .await?;
             }
@@ -745,7 +781,7 @@ impl Spaces {
                 host.require_fields(
                     "cloud_test",
                     &asked,
-                    "test a cloud with a custom/static relay or existing VPC",
+                    "test a cloud with a custom/static relay, existing VPC, or default Cloud Image IDs",
                 )
                 .await?;
             }

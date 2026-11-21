@@ -211,6 +211,9 @@ fn cloud_target(kind: Kind, region: &Option<String>) -> cua_sdk::CloudTarget {
         vpc_id: None,
         vswitch_id: None,
         no_public_ip: false,
+        windows_image_id: None,
+        linux_image_id: None,
+        instance_type: None,
     }
 }
 

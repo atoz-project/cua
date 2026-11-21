@@ -3153,3 +3153,1268 @@ async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind(
     assert!(s.lock().unwrap().instances.is_empty());
     drop(mock_holder);
 }
+
+#[tokio::test]
+async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsupported_clouds() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        f.images.push(json!({
+            "ImageId": "m-win11-golden",
+            "ImageName": "win11-golden",
+            "ImageOwnerAlias": "self",
+            "OSType": "windows",
+            "Status": "Available",
+            "Size": 50
+        }));
+        f.images.push(json!({
+            "ImageId": "m-ubuntu-golden",
+            "ImageName": "ubuntu-golden",
+            "ImageOwnerAlias": "self",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 25
+        }));
+        f.images.push(json!({
+            "ImageId": "m-creating-win",
+            "ImageName": "win-creating",
+            "ImageOwnerAlias": "self",
+            "OSType": "windows",
+            "Status": "Creating",
+            "Size": 50
+        }));
+        f.available_instance_types.push("ecs.c7.2xlarge".into());
+        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = cua_host::testing::FakeRelay::start().await;
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let api_arc = Arc::new(api);
+    let mut apis: Vec<Arc<dyn CloudApi>> = vec![api_arc.clone()];
+    let fake_other = cua_byoc::testing::FakeProvider::new("hetzner", model::Tier::Vm);
+    apis.push(fake_other);
+    let (_, clouds) = cua_byoc::clouds(dir.path(), apis, access);
+
+    use cua_sandbox_core::byoc::CloudManager as _;
+
+    // 1. Non-supporting provider rejects --windows-image-id, --linux-image-id, --instance-type.
+    for bad in [
+        Target {
+            provider: "hetzner".into(),
+            windows_image_id: Some("m-win11-golden".into()),
+            ..Default::default()
+        },
+        Target {
+            provider: "hetzner".into(),
+            linux_image_id: Some("m-ubuntu-golden".into()),
+            ..Default::default()
+        },
+        Target {
+            provider: "hetzner".into(),
+            instance_type: Some("ecs.c7.2xlarge".into()),
+            ..Default::default()
+        },
+    ] {
+        let err = clouds.test(&bad).await.unwrap_err();
+        assert!(
+            matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
+
+    // 2. Empty/whitespace explicit values rejected cleanly.
+    let err = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            windows_image_id: Some("   ".into()),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+
+    // 3. Wrong-OS, unavailable, and nonexistent image IDs fail `clouds.test` with zero instances.
+    let wrong_os = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            windows_image_id: Some("m-ubuntu-golden".into()),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!wrong_os.ok, "{:?}", wrong_os.checks);
+    assert!(
+        wrong_os
+            .checks
+            .iter()
+            .any(|c| c.name == "windows_image" && !c.ok && c.detail.contains("OSType")),
+        "{:?}",
+        wrong_os.checks
+    );
+
+    let unavail = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            windows_image_id: Some("m-creating-win".into()),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!unavail.ok);
+    assert!(
+        unavail
+            .checks
+            .iter()
+            .any(|c| c.name == "windows_image" && !c.ok && c.detail.contains("Creating")),
+        "{:?}",
+        unavail.checks
+    );
+
+    let missing_inst = clouds
+        .test(&Target {
+            provider: "aliyun-ecs".into(),
+            instance_type: Some("ecs.does-not-exist".into()),
+            token: Some("LTAI_TEST_AK:secret123".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!missing_inst.ok);
+    assert!(
+        missing_inst
+            .checks
+            .iter()
+            .any(|c| c.name == "machine" && !c.ok),
+        "{:?}",
+        missing_inst.checks
+    );
+
+    // 4. Valid custom Windows + Linux Cloud Image IDs and instance type pass `test` & `connect`.
+    let valid = Target {
+        provider: "aliyun-ecs".into(),
+        windows_image_id: Some(" m-win11-golden ".into()),
+        linux_image_id: Some(" m-ubuntu-golden ".into()),
+        instance_type: Some(" ecs.c7.2xlarge ".into()),
+        token: Some("LTAI_TEST_AK:secret123".into()),
+        ..Default::default()
+    };
+    let report = clouds.test(&valid).await.unwrap();
+    assert!(report.ok, "{:?}", report.checks);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "windows_image" && c.ok)
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "linux_image" && c.ok)
+    );
+    {
+        let f = s.lock().unwrap();
+        assert!(f.instances.is_empty(), "test must create zero instances");
+        let img_call = f
+            .calls
+            .iter()
+            .find(|c| {
+                c.action == "DescribeImages"
+                    && c.params.get("ImageId").map(String::as_str) == Some("m-win11-golden")
+            })
+            .expect("DescribeImages for custom windows_image_id");
+        assert!(
+            !img_call.params.contains_key("ImageOwnerAlias"),
+            "custom image lookup must not filter ImageOwnerAlias=system: {:?}",
+            img_call.params
+        );
+    }
+
+    let connected = clouds
+        .connect_with(&ConnectRequest {
+            target: valid,
+            budget_usd_month: Some(200.0),
+            max_size: Some("8x32x200".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        connected.provider.windows_image_id.as_deref(),
+        Some("m-win11-golden")
+    );
+    assert_eq!(
+        connected.provider.linux_image_id.as_deref(),
+        Some("m-ubuntu-golden")
+    );
+    assert_eq!(
+        connected.provider.instance_type.as_deref(),
+        Some("ecs.c7.2xlarge")
+    );
+    assert!(store.load().is_some());
+
+    // 5. Reconnecting with only `--budget` preserves existing image/type defaults.
+    let updated = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                ..Default::default()
+            },
+            budget_usd_month: Some(300.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.provider.windows_image_id.as_deref(),
+        Some("m-win11-golden")
+    );
+    assert_eq!(
+        updated.provider.linux_image_id.as_deref(),
+        Some("m-ubuntu-golden")
+    );
+    assert_eq!(
+        updated.provider.instance_type.as_deref(),
+        Some("ecs.c7.2xlarge")
+    );
+    assert_eq!(updated.provider.budget_usd_month, Some(300.0));
+    assert_eq!(updated.provider.max_size, "8x32x200");
+}
+
+#[tokio::test]
+async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_on_reconnect() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        f.images.push(json!({
+            "ImageId": "m-win11",
+            "ImageName": "win11",
+            "OSType": "windows",
+            "Status": "Available",
+            "Size": 60
+        }));
+        f.images.push(json!({
+            "ImageId": "m-lin1",
+            "ImageName": "lin1",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 40
+        }));
+        f.available_instance_types.push("ecs.c7.2xlarge".into());
+        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let relay = cua_host::testing::FakeRelay::start().await;
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let (_, clouds) = cua_byoc::clouds(dir.path(), vec![Arc::new(api)], access);
+    use cua_sandbox_core::byoc::CloudManager as _;
+
+    // 1. Oversized instance_type + smaller --max-size fails BEFORE persisting credentials or state.json.
+    let err = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                instance_type: Some("ecs.g7.4xlarge".into()),
+                ..Default::default()
+            },
+            max_size: Some("4x16".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("--max-size 4x16"),
+        "expected max-size rejection, got: {err}"
+    );
+    assert!(
+        store.load().is_none(),
+        "credentials must NOT be persisted when max_size check fails"
+    );
+    assert!(
+        cua_byoc::Store::new(dir.path())
+            .connection("aliyun-ecs")
+            .unwrap()
+            .is_none(),
+        "state.json must NOT persist a connection whose instance_type exceeds max_size"
+    );
+
+    // 2. Valid connect persists limits and image/type defaults.
+    let connected = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                windows_image_id: Some("m-win11".into()),
+                linux_image_id: Some("m-lin1".into()),
+                instance_type: Some("ecs.c7.2xlarge".into()),
+                ..Default::default()
+            },
+            budget_usd_month: Some(200.0),
+            max_size: Some("8x32x200".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(connected.provider.budget_usd_month, Some(200.0));
+    assert_eq!(connected.provider.max_size, "8x32x200");
+
+    // 3. Reconnect with only --budget preserves max_size and defaults.
+    let updated_budget = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                ..Default::default()
+            },
+            budget_usd_month: Some(300.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated_budget.provider.budget_usd_month, Some(300.0));
+    assert_eq!(updated_budget.provider.max_size, "8x32x200");
+    assert_eq!(
+        updated_budget.provider.windows_image_id.as_deref(),
+        Some("m-win11")
+    );
+    assert_eq!(
+        updated_budget.provider.linux_image_id.as_deref(),
+        Some("m-lin1")
+    );
+    assert_eq!(
+        updated_budget.provider.instance_type.as_deref(),
+        Some("ecs.c7.2xlarge")
+    );
+
+    // 4. Reconnect with only --windows-image-id preserves both budget_usd_month and max_size.
+    let updated_img = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                windows_image_id: Some("m-win11".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated_img.provider.budget_usd_month, Some(300.0));
+    assert_eq!(updated_img.provider.max_size, "8x32x200");
+
+    // 5. Reconnect tightening --max-size below existing saved instance_type fails without overwriting saved limits.
+    let err = clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                ..Default::default()
+            },
+            max_size: Some("4x16".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--max-size 4x16"), "{err}");
+    let saved = cua_byoc::Store::new(dir.path())
+        .connection("aliyun-ecs")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.max_size.map(|m| m.to_string()).as_deref(),
+        Some("8x32x200")
+    );
+}
+
+#[tokio::test]
+async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_provisioning() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        // Multiple official system images with different CreationTime to verify newest wins.
+        f.images.push(json!({
+            "ImageId": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
+            "ImageName": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "linux",
+            "Status": "Available",
+            "CreationTime": "2025-06-01T00:00:00Z",
+            "Size": 20
+        }));
+        f.images.push(json!({
+            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
+            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "windows",
+            "Status": "Available",
+            "CreationTime": "2025-09-01T00:00:00Z",
+            "Size": 40
+        }));
+        f.images.push(json!({
+            "ImageId": "win2019_1809_x64_dtc_en-us_40G_alibase_20251001.vhd",
+            "ImageName": "win2019_1809_x64_dtc_en-us_40G_alibase_20251001.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "windows",
+            "Status": "Available",
+            "CreationTime": "2025-10-01T00:00:00Z",
+            "Size": 40
+        }));
+        f.images.push(json!({
+            "ImageId": "m-conn-win",
+            "ImageName": "conn-win",
+            "ImageOwnerAlias": "self",
+            "OSType": "windows",
+            "Status": "Available",
+            "Size": 50
+        }));
+        f.images.push(json!({
+            "ImageId": "m-create-win",
+            "ImageName": "create-win",
+            "ImageOwnerAlias": "self",
+            "OSType": "windows",
+            "Status": "Available",
+            "Size": 50
+        }));
+        f.images.push(json!({
+            "ImageId": "m-conn-lin",
+            "ImageName": "conn-lin",
+            "ImageOwnerAlias": "self",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 20
+        }));
+        f.images.push(json!({
+            "ImageId": "m-create-lin",
+            "ImageName": "create-lin",
+            "ImageOwnerAlias": "self",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 20
+        }));
+        // Custom instance type only discoverable via DescribeInstanceTypes.
+        f.instance_types
+            .insert("ecs.custom.8c32g".into(), (8, 32.0));
+        f.available_instance_types.push("ecs.custom.8c32g".into());
+    }
+
+    let base_conn = Connection {
+        provider: "aliyun-ecs".into(),
+        region: "cn-hangzhou".into(),
+        ..Default::default()
+    };
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+
+    // 1. Official fallback (newest Ubuntu 24.04 for Linux, win2022 over win2019 for Windows).
+    let lin_spec = model::ProvisionSpec {
+        family: "linux".into(),
+        disk_gb: 40,
+        ..Default::default()
+    };
+    let resolved_lin = api.resolve_image_id(&base_conn, &lin_spec).await.unwrap();
+    assert_eq!(
+        resolved_lin.image_id,
+        "ubuntu_24_04_x64_20G_alibase_20250601.vhd"
+    );
+    assert_eq!(resolved_lin.source, "official-fallback");
+
+    let win_spec = model::ProvisionSpec {
+        family: "windows".into(),
+        disk_gb: 60,
+        ..Default::default()
+    };
+    let resolved_win = api.resolve_image_id(&base_conn, &win_spec).await.unwrap();
+    assert_eq!(
+        resolved_win.image_id,
+        "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd"
+    );
+    assert_eq!(resolved_win.source, "official-fallback");
+
+    // 2. Connection defaults override official fallback; per-create overrides connection defaults.
+    let conn_with_defaults = Connection {
+        windows_image_id: Some("m-conn-win".into()),
+        linux_image_id: Some("m-conn-lin".into()),
+        ..base_conn.clone()
+    };
+    assert_eq!(
+        api.resolve_image_id(&conn_with_defaults, &win_spec)
+            .await
+            .unwrap()
+            .image_id,
+        "m-conn-win"
+    );
+    assert_eq!(
+        api.resolve_image_id(&conn_with_defaults, &lin_spec)
+            .await
+            .unwrap()
+            .image_id,
+        "m-conn-lin"
+    );
+    let win_override = model::ProvisionSpec {
+        cloud_image_id: Some("m-create-win".into()),
+        ..win_spec.clone()
+    };
+    assert_eq!(
+        api.resolve_image_id(&conn_with_defaults, &win_override)
+            .await
+            .unwrap()
+            .image_id,
+        "m-create-win"
+    );
+    let lin_override = model::ProvisionSpec {
+        cloud_image_id: Some("m-create-lin".into()),
+        ..lin_spec.clone()
+    };
+    assert_eq!(
+        api.resolve_image_id(&conn_with_defaults, &lin_override)
+            .await
+            .unwrap()
+            .image_id,
+        "m-create-lin"
+    );
+
+    // 3. End-to-end Sandboxes + Clouds preflight checks: max-size, disk bounds, budget, and invalid image.
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(cua_host::testing::FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let api_arc = Arc::new(api);
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![api_arc.clone()],
+        access,
+    )
+    .build();
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                windows_image_id: Some("m-conn-win".into()),
+                linux_image_id: Some("m-conn-lin".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            budget_usd_month: Some(0.50),
+            max_size: Some("4x16x80".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    s.lock().unwrap().calls.clear();
+
+    // 3a. Custom instance_type exceeding --max-size (catalog type ecs.g7.4xlarge = 16c64g) fails before API calls.
+    let mut big_inst =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
+    big_inst.contrib = Some("aliyun-ecs".into());
+    big_inst.os = "windows".into();
+    big_inst.instance_type = Some("ecs.g7.4xlarge".into());
+    let err = sbx.create(big_inst).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("up to 4 vCPU and 16 GB"), "{err}");
+
+    // 3b. Custom instance_type resolved via DescribeInstanceTypes (8c32g) exceeding --max-size fails before RunInstances.
+    let mut custom_big = cua_sandbox_core::CreateOptions::new(
+        cua_sandbox_core::ProviderKind::Contrib,
+        "ghcr.io/trycua/linux:24.04",
+    );
+    custom_big.contrib = Some("aliyun-ecs".into());
+    custom_big.instance_type = Some("ecs.custom.8c32g".into());
+    let err = sbx.create(custom_big).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("8 vCPU"), "{err}");
+
+    // 3c. Disk size exceeding --max-size disk cap (120 > 80) fails before provisioning.
+    let mut big_disk =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
+    big_disk.contrib = Some("aliyun-ecs".into());
+    big_disk.os = "windows".into();
+    big_disk.disk_gb = Some(120);
+    let err = sbx.create(big_disk).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("allows disks up to 80 GB"),
+        "{err}"
+    );
+
+    // 3d. Disk size below image Size (30 < 50 for m-conn-win) fails before provisioning.
+    let mut small_disk =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
+    small_disk.contrib = Some("aliyun-ecs".into());
+    small_disk.os = "windows".into();
+    small_disk.disk_gb = Some(30);
+    let err = sbx.create(small_disk).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("smaller than Cloud Image ID"),
+        "{err}"
+    );
+
+    // 3e. Budget exceeded by instance + disk hourly cost fails with Error::Cloud before provisioning.
+    // Lower budget to $0.05/mo so ecs.c7.xlarge ($0.125/h) fails preflight.
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                ..Default::default()
+            },
+            budget_usd_month: Some(0.05),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.lock().unwrap().calls.clear();
+    let mut over_budget =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
+    over_budget.contrib = Some("aliyun-ecs".into());
+    over_budget.os = "windows".into();
+    let err = sbx.create(over_budget).await.unwrap_err();
+    assert!(matches!(err, cua_sandbox_core::Error::Cloud(_)), "{err:?}");
+    assert!(err.to_string().contains("budget"), "{err}");
+
+    // Raise budget and verify invalid/wrong-OS per-create --cloud-image-id fails before RunInstances/relay.
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                ..Default::default()
+            },
+            budget_usd_month: Some(100.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.lock().unwrap().calls.clear();
+    let mut wrong_os_create =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
+    wrong_os_create.contrib = Some("aliyun-ecs".into());
+    wrong_os_create.os = "windows".into();
+    wrong_os_create.cloud_image_id = Some("m-conn-lin".into());
+    let err = sbx.create(wrong_os_create).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("OSType"), "{err}");
+
+    // Also test missing/non-existent per-create Cloud Image ID fails preflight before provisioning.
+    let mut missing_img =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
+    missing_img.contrib = Some("aliyun-ecs".into());
+    missing_img.os = "windows".into();
+    missing_img.cloud_image_id = Some("m-does-not-exist".into());
+    let err = sbx.create(missing_img).await.unwrap_err();
+    assert!(matches!(err, cua_sandbox_core::Error::Cloud(_)), "{err:?}");
+
+    // Verify zero RunInstances and zero network-creation calls were made by any of these preflight rejections.
+    let f = s.lock().unwrap();
+    for forbidden in [
+        "RunInstances",
+        "CreateVpc",
+        "CreateVSwitch",
+        "CreateSecurityGroup",
+    ] {
+        assert!(
+            !f.calls.iter().any(|c| c.action == forbidden),
+            "preflight rejections must never reach {forbidden}: {:?}",
+            f.calls
+        );
+    }
+    assert!(f.instances.is_empty());
+    assert_eq!(relay.register_calls(), 0);
+    assert!(
+        cua_byoc::Store::new(dir.path())
+            .resources()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_id_and_official_fallback_require_ostype_and_available_status() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        // Remove default Windows image so we control official fallback candidates cleanly.
+        f.images
+            .retain(|img| img["OSType"].as_str() != Some("windows"));
+        f.images.push(json!({
+            "ImageId": "m-missing-ostype",
+            "ImageName": "missing-ostype",
+            "Status": "Available",
+            "Size": 40
+        }));
+        f.images.push(json!({
+            "ImageId": "m-empty-ostype",
+            "ImageName": "empty-ostype",
+            "OSType": "   ",
+            "Status": "Available",
+            "Size": 40
+        }));
+        // Add >100 non-win2022 system Windows images BEFORE the win2022 image so an unfiltered
+        // PageSize=50 or PageSize=100 query truncates win2022 unless ImageName=win2022* is queried.
+        for i in 0..105 {
+            f.images.push(json!({
+                "ImageId": format!("win2016_x64_dtc_{i:03}.vhd"),
+                "ImageName": format!("win2016_x64_dtc_{i:03}.vhd"),
+                "ImageOwnerAlias": "system",
+                "OSType": "windows",
+                "Status": "Available",
+                "CreationTime": "2024-01-01T00:00:00Z",
+                "Size": 40
+            }));
+        }
+        // Newer Ubuntu image WITHOUT Status must NOT be picked over Available older Ubuntu image.
+        f.images.push(json!({
+            "ImageId": "ubuntu_24_04_x64_missing_status.vhd",
+            "ImageName": "ubuntu_24_04_x64_missing_status.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "linux",
+            "CreationTime": "2026-01-01T00:00:00Z",
+            "Size": 20
+        }));
+        f.images.push(json!({
+            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
+            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "windows",
+            "Status": "Available",
+            "CreationTime": "2025-09-01T00:00:00Z",
+            "Size": 40
+        }));
+    }
+    let conn = Connection {
+        provider: "aliyun-ecs".into(),
+        region: "cn-hangzhou".into(),
+        ..Default::default()
+    };
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+
+    for bad_id in ["m-missing-ostype", "m-empty-ostype"] {
+        let err = api
+            .validate_image_id(&conn, bad_id, "windows")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("OSType"),
+            "missing/empty OSType must fail: {err}"
+        );
+    }
+
+    let win = api.resolve_official_image(&conn, "windows").await.unwrap();
+    assert_eq!(
+        win.image_id,
+        "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd"
+    );
+
+    let lin = api.resolve_official_image(&conn, "linux").await.unwrap();
+    assert_eq!(lin.image_id, "ubuntu_24_04_x64_20G_alibase_20250101.vhd");
+}
+
+#[tokio::test]
+async fn os_vs_image_family_and_linux_image_with_windows_substring() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        f.images.push(json!({
+            "ImageId": "m-lin-tools",
+            "ImageName": "linux-tools",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 40
+        }));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(cua_host::testing::FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    s.lock().unwrap().calls.clear();
+
+    // 1. Conflicting os="windows" + image="linux" fails InvalidArgument with zero API calls.
+    let mut mismatch =
+        cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "linux");
+    mismatch.contrib = Some("aliyun-ecs".into());
+    mismatch.os = "windows".into();
+    mismatch.cloud_image_id = Some("m-lin-tools".into());
+    let err = sbx.create(mismatch).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(s.lock().unwrap().calls.is_empty());
+
+    // 2. Linux OCI image whose repo contains "windows" (myorg/windows-tools:1) with os="linux"
+    // must stay Linux (not misclassified as Windows VM) and validate m-lin-tools against OSType="linux"
+    // and pass m-lin-tools to RunInstances.
+    let mock_spacesd = cua_spacesd_client::testing::MockServer::start(
+        cua_spacesd_client::testing::MockAuth::default(),
+    )
+    .await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+    let mut lin_win_name = cua_sandbox_core::CreateOptions::new(
+        cua_sandbox_core::ProviderKind::Contrib,
+        "myorg/windows-tools:1",
+    );
+    lin_win_name.contrib = Some("aliyun-ecs".into());
+    lin_win_name.os = "linux".into();
+    lin_win_name.cloud_image_id = Some("m-lin-tools".into());
+    lin_win_name.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(lin_win_name).await.unwrap();
+    sb.delete().await.unwrap();
+    let run_call = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        run_call.params.get("ImageId").map(String::as_str),
+        Some("m-lin-tools")
+    );
+    let ud = decode_b64_str(run_call.params.get("UserData").unwrap());
+    assert!(ud.starts_with("#cloud-config"), "{ud}");
+}
+
+#[tokio::test]
+async fn run_instances_receives_resolved_image_instance_type_and_disk_across_precedence() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    {
+        let mut f = s.lock().unwrap();
+        f.images.push(json!({
+            "ImageId": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
+            "ImageName": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "linux",
+            "Status": "Available",
+            "CreationTime": "2025-06-01T00:00:00Z",
+            "Size": 20
+        }));
+        f.images.push(json!({
+            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
+            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
+            "ImageOwnerAlias": "system",
+            "OSType": "windows",
+            "Status": "Available",
+            "CreationTime": "2025-09-01T00:00:00Z",
+            "Size": 40
+        }));
+        f.images.push(json!({
+            "ImageId": "m-conn-win",
+            "ImageName": "conn-win",
+            "OSType": "windows",
+            "Status": "Available",
+            "Size": 50
+        }));
+        f.images.push(json!({
+            "ImageId": "m-create-win",
+            "ImageName": "create-win",
+            "OSType": "windows",
+            "Status": "Available",
+            "Size": 50
+        }));
+        f.images.push(json!({
+            "ImageId": "m-conn-lin",
+            "ImageName": "conn-lin",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 20
+        }));
+        f.images.push(json!({
+            "ImageId": "m-create-lin",
+            "ImageName": "create-lin",
+            "OSType": "linux",
+            "Status": "Available",
+            "Size": 20
+        }));
+        f.available_instance_types.push("ecs.c7.2xlarge".into());
+        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+        f.available_instance_types.push("ecs.custom.8c32g".into());
+        f.instance_types
+            .insert("ecs.custom.8c32g".into(), (8, 32.0));
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(cua_host::testing::FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = cua_spacesd_client::testing::MockServer::start(
+        cua_spacesd_client::testing::MockAuth::default(),
+    )
+    .await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    // Helper to extract the most recent non-DryRun RunInstances call.
+    let last_run = |s: &S| {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+
+    // Phase 1: Official fallback (no connection defaults, no per-create overrides).
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut lin_official = sb_create_opts("lin-official");
+    lin_official.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(lin_official).await.unwrap();
+    sb.delete().await.unwrap();
+    let r = last_run(&s);
+    assert_eq!(
+        r.params.get("ImageId").map(String::as_str),
+        Some("ubuntu_24_04_x64_20G_alibase_20250601.vhd")
+    );
+    assert_eq!(
+        r.params.get("InstanceType").map(String::as_str),
+        Some("ecs.e-c1m2.large")
+    );
+    assert_eq!(
+        r.params.get("SystemDisk.Size").map(String::as_str),
+        Some("40")
+    );
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
+
+    let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_official.contrib = Some("aliyun-ecs".into());
+    win_official.name = Some("win-official".into());
+    win_official.os = "windows".into();
+    win_official.runtime = Runtime::Other("native".into());
+    win_official.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_official).await.unwrap();
+    sb.delete().await.unwrap();
+    let r = last_run(&s);
+    assert_eq!(
+        r.params.get("ImageId").map(String::as_str),
+        Some("win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd")
+    );
+    assert_eq!(
+        r.params.get("InstanceType").map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    assert_eq!(
+        r.params.get("SystemDisk.Size").map(String::as_str),
+        Some("60")
+    );
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+
+    // Phase 2: Connection defaults (--windows-image-id, --linux-image-id, --instance-type).
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                windows_image_id: Some("m-conn-win".into()),
+                linux_image_id: Some("m-conn-lin".into()),
+                instance_type: Some("ecs.c7.2xlarge".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut lin_conn = sb_create_opts("lin-conn");
+    lin_conn.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(lin_conn).await.unwrap();
+    sb.delete().await.unwrap();
+    let r = last_run(&s);
+    assert_eq!(
+        r.params.get("ImageId").map(String::as_str),
+        Some("m-conn-lin")
+    );
+    assert_eq!(
+        r.params.get("InstanceType").map(String::as_str),
+        Some("ecs.c7.2xlarge")
+    );
+    assert_eq!(
+        r.params.get("SystemDisk.Size").map(String::as_str),
+        Some("40")
+    );
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
+
+    let mut win_conn = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_conn.contrib = Some("aliyun-ecs".into());
+    win_conn.name = Some("win-conn".into());
+    win_conn.os = "windows".into();
+    win_conn.runtime = Runtime::Other("native".into());
+    win_conn.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_conn).await.unwrap();
+    sb.delete().await.unwrap();
+    let r = last_run(&s);
+    assert_eq!(
+        r.params.get("ImageId").map(String::as_str),
+        Some("m-conn-win")
+    );
+    assert_eq!(
+        r.params.get("InstanceType").map(String::as_str),
+        Some("ecs.c7.2xlarge")
+    );
+    assert_eq!(
+        r.params.get("SystemDisk.Size").map(String::as_str),
+        Some("60")
+    );
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+
+    // Phase 3: Per-create overrides (--cloud-image-id, --instance-type, --disk) beat connection defaults.
+    let mut lin_over = sb_create_opts("lin-override");
+    lin_over.cloud_image_id = Some("m-create-lin".into());
+    lin_over.instance_type = Some("ecs.g7.large".into());
+    lin_over.disk_gb = Some(80);
+    lin_over.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(lin_over).await.unwrap();
+    sb.delete().await.unwrap();
+    let r = last_run(&s);
+    assert_eq!(
+        r.params.get("ImageId").map(String::as_str),
+        Some("m-create-lin")
+    );
+    assert_eq!(
+        r.params.get("InstanceType").map(String::as_str),
+        Some("ecs.g7.large")
+    );
+    assert_eq!(
+        r.params.get("SystemDisk.Size").map(String::as_str),
+        Some("80")
+    );
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
+
+    let mut win_over = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_over.contrib = Some("aliyun-ecs".into());
+    win_over.name = Some("win-override".into());
+    win_over.os = "windows".into();
+    win_over.runtime = Runtime::Other("native".into());
+    win_over.cloud_image_id = Some("m-create-win".into());
+    win_over.instance_type = Some("ecs.custom.8c32g".into());
+    win_over.disk_gb = Some(120);
+    win_over.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_over).await.unwrap();
+    sb.delete().await.unwrap();
+    let r = last_run(&s);
+    assert_eq!(
+        r.params.get("ImageId").map(String::as_str),
+        Some("m-create-win")
+    );
+    assert_eq!(
+        r.params.get("InstanceType").map(String::as_str),
+        Some("ecs.custom.8c32g")
+    );
+    assert_eq!(
+        r.params.get("SystemDisk.Size").map(String::as_str),
+        Some("120")
+    );
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+}
+
+#[tokio::test]
+async fn cloud_sandboxes_create_rejects_disk_zero_and_whitespace_directly() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(cua_host::testing::FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let (providers, clouds) = cua_byoc::clouds(dir.path(), vec![Arc::new(api)], access);
+    use cua_sandbox_core::byoc::CloudManager as _;
+    clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let provider = providers.into_iter().next().unwrap();
+    s.lock().unwrap().calls.clear();
+
+    let base_spec = || cua_sandbox_core::ProviderCreate {
+        name: "test-direct".into(),
+        image: cua_sandbox_core::ProviderImage {
+            reference: "windows".into(),
+            pinned_ref: "windows".into(),
+            digest: String::new(),
+            kind: cua_sandbox_core::RunKind::Vm,
+            arch: "amd64".into(),
+            spacesd: Some(true),
+        },
+        os: "windows".into(),
+        cpus: 4,
+        memory_mb: 8192,
+        env: Default::default(),
+        command: None,
+        ports: vec![],
+        ttl: None,
+        labels: Default::default(),
+        registry_credentials: None,
+        timeout: std::time::Duration::from_secs(60),
+        runtime: cua_sandbox_core::placement::Runtime::Auto,
+        gpu: None,
+        egress: Default::default(),
+        no_network: false,
+        protect: false,
+        disk_gb: None,
+        cloud_image_id: None,
+        instance_type: None,
+    };
+
+    let mut zero = base_spec();
+    zero.disk_gb = Some(0);
+    let err = provider.create(&zero).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+
+    for bad in ["", "   ", "m-foo bar"] {
+        let mut s1 = base_spec();
+        s1.cloud_image_id = Some(bad.into());
+        let err = provider.create(&s1).await.unwrap_err();
+        assert!(
+            matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+            "{err:?}"
+        );
+
+        let mut s2 = base_spec();
+        s2.instance_type = Some(bad.into());
+        let err = provider.create(&s2).await.unwrap_err();
+        assert!(
+            matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
+    assert!(s.lock().unwrap().calls.is_empty());
+}

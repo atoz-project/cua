@@ -1221,6 +1221,10 @@ pub struct SpaceCreateOptions {
     /// `None`: off. Only a Space the machine of the runtime runs itself.
     #[uniffi(default = None)]
     pub children: Option<bool>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    #[uniffi(default = None)]
+    pub cloud_image_id: Option<String>,
 }
 
 impl SpaceCreateOptions {
@@ -3869,6 +3873,9 @@ mod require_fields_tests {
             "vpc_id",
             "vswitch_id",
             "no_public_ip",
+            "windows_image_id",
+            "linux_image_id",
+            "instance_type",
         ];
         assert!(missing_fields(&ours, "cloud_connect", &all).is_empty());
         assert!(
@@ -3883,10 +3890,60 @@ mod require_fields_tests {
                     "vpc_id",
                     "vswitch_id",
                     "no_public_ip",
+                    "windows_image_id",
+                    "linux_image_id",
+                    "instance_type",
                 ]
             )
             .is_empty()
         );
+        assert!(missing_fields(&ours, "create_space", &["cloud_image_id"]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn space_create_rejects_disk_zero_and_whitespace_cloud_image_or_instance_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = crate::Cua::embedded(crate::CuaConfig {
+            state_dir: Some(dir.path().join("sandboxes").display().to_string()),
+            spaces_home: Some(dir.path().display().to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .spaces();
+        let zero = super::SpaceCreateOptions {
+            on: Some("aliyun-ecs".into()),
+            disk_gb: Some(0),
+            ..Default::default()
+        };
+        let err = spaces.create(zero).await.unwrap_err();
+        assert!(
+            matches!(err, crate::CuaError::InvalidArgument(_)),
+            "{err:?}"
+        );
+
+        for bad in ["", "   ", "m-foo bar"] {
+            let img = super::SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                cloud_image_id: Some(bad.into()),
+                ..Default::default()
+            };
+            let err = spaces.create(img).await.unwrap_err();
+            assert!(
+                matches!(err, crate::CuaError::InvalidArgument(_)),
+                "{err:?}"
+            );
+
+            let inst = super::SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                instance_type: Some(bad.into()),
+                ..Default::default()
+            };
+            let err = spaces.create(inst).await.unwrap_err();
+            assert!(
+                matches!(err, crate::CuaError::InvalidArgument(_)),
+                "{err:?}"
+            );
+        }
     }
 
     struct Nothing;
@@ -4439,6 +4496,19 @@ impl Spaces {
                     .into(),
             ));
         }
+        if options.disk_gb == Some(0) {
+            return Err(CuaError::InvalidArgument(
+                "disk_gb must be greater than 0".into(),
+            ));
+        }
+        let cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            options.cloud_image_id.as_deref(),
+        )?;
+        let instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            options.instance_type.as_deref(),
+        )?;
         let host = self.host.clone();
         run(async move {
             match &host {
@@ -4477,10 +4547,11 @@ impl Spaces {
                             network_settings: network_settings.clone(),
                             parent: text(&options.parent),
                             widen: options.widen.unwrap_or(false),
-                            instance_type: text(&options.instance_type),
+                            instance_type: instance_type.clone(),
                             region: text(&options.region),
                             tree: None,
                             relay: None,
+                            cloud_image_id: cloud_image_id.clone(),
                         })
                         .await?;
                     if options.children == Some(true)
@@ -4537,9 +4608,10 @@ impl Spaces {
                         network_settings: network_settings.as_ref().map(cua_spaces::network::to_pb),
                         parent: options.parent.clone().unwrap_or_default(),
                         widen: options.widen.unwrap_or(false),
-                        instance_type: options.instance_type.clone().unwrap_or_default(),
+                        instance_type: instance_type.clone().unwrap_or_default(),
                         region: options.region.clone().unwrap_or_default(),
                         children: options.children,
+                        cloud_image_id: cloud_image_id.clone().unwrap_or_default(),
                     };
                     let r = match listener {
                         Some(l) => daemon_create_streaming(d, request, l).await?,

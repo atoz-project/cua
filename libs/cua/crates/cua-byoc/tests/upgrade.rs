@@ -161,6 +161,7 @@ fn every_new_link_key_is_kept_in_links_json() {
         max_size: Some(MaxSize {
             vcpu: 1,
             mem_gib: 1,
+            disk_gib: Some(100),
         }),
         relay_url: Some("https://relay.example.com".into()),
         relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
@@ -168,6 +169,9 @@ fn every_new_link_key_is_kept_in_links_json() {
         vpc_id: Some("vpc-123".into()),
         vswitch_id: Some("vsw-456".into()),
         no_public_ip: true,
+        windows_image_id: Some("m-win-default".into()),
+        linux_image_id: Some("m-lin-default".into()),
+        instance_type: Some("ecs.c7.xlarge".into()),
     };
     let link = Link {
         account: "a".into(),
@@ -182,6 +186,9 @@ fn every_new_link_key_is_kept_in_links_json() {
         vpc_id: full.vpc_id.clone(),
         vswitch_id: full.vswitch_id.clone(),
         no_public_ip: full.no_public_ip,
+        windows_image_id: full.windows_image_id.clone(),
+        linux_image_id: full.linux_image_id.clone(),
+        instance_type: full.instance_type.clone(),
     };
     let link_keys = keys(&serde_json::to_value(&link).unwrap());
     let now = keys(&serde_json::to_value(&full).unwrap());
@@ -476,6 +483,7 @@ fn oidc_aws() -> Connection {
         max_size: Some(MaxSize {
             vcpu: 4,
             mem_gib: 16,
+            disk_gib: None,
         }),
         ..Default::default()
     }

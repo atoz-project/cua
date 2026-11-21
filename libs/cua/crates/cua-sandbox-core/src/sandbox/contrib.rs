@@ -28,6 +28,46 @@ pub(super) fn contrib_of(s: &SandboxState) -> Option<(&str, &str)> {
     Some((provider, id))
 }
 
+fn supports_os(caps: &ProviderCapabilities, supported_oses: &[&str], os: &str) -> bool {
+    if caps.oses.is_empty() {
+        supported_oses
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(os))
+    } else {
+        caps.oses
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(os))
+    }
+}
+
+fn is_windows_ref(raw: &str) -> bool {
+    let (_, r) = split_kind(raw);
+    let lower = r.trim().to_ascii_lowercase();
+    lower == "windows"
+        || lower.starts_with("windows:")
+        || lower.contains("/windows:")
+        || lower.ends_with("/windows")
+}
+
+fn is_linux_ref(raw: &str) -> bool {
+    let (_, r) = split_kind(raw);
+    let lower = r.trim().to_ascii_lowercase();
+    lower == "linux"
+        || lower.starts_with("linux:")
+        || lower == "linux-slim"
+        || lower.starts_with("linux-slim:")
+        || lower.starts_with("ghcr.io/trycua/linux")
+        || lower.starts_with("ghcr.io/trycua/omarchy")
+}
+
+fn effective_os(o: &CreateOptions) -> &str {
+    if o.os.eq_ignore_ascii_case("linux") && is_windows_ref(&o.image) {
+        "windows"
+    } else {
+        o.os.as_str()
+    }
+}
+
 /// Refuses what `caps` cannot run, before any API call.
 fn check_request(
     word: &str,
@@ -48,24 +88,29 @@ fn check_request(
     if !o.sidecars.is_empty() {
         return Err(unsupported("sidecars".into()));
     }
-    if !supported_oses
-        .iter()
-        .any(|os| os.eq_ignore_ascii_case(&o.os))
-    {
-        if supported_oses == ["linux"] {
+    let effective_os = effective_os(o);
+    if !supports_os(caps, supported_oses, effective_os) {
+        if supported_oses == ["linux"] && (caps.oses.is_empty() || caps.oses == ["linux"]) {
             return Err(Error::UnsupportedImage(format!(
-                "{word} runs Linux sandboxes only (asked for {}); run {} guests with --on local",
-                o.os, o.os
+                "{word} runs Linux sandboxes only (asked for {effective_os}); run {effective_os} guests with --on local",
             )));
         }
+        let os_list = if caps.oses.is_empty() {
+            supported_oses.join(", ")
+        } else {
+            caps.oses.join(", ")
+        };
         return Err(Error::UnsupportedImage(format!(
-            "{word} runs {} sandboxes only (asked for {}); run {} guests with --on local",
-            supported_oses.join(", "),
-            o.os,
-            o.os
+            "{word} does not run {effective_os} sandboxes (it runs: {os_list})"
         )));
     }
-    if o.os.eq_ignore_ascii_case("windows")
+    if effective_os.eq_ignore_ascii_case("windows") && is_linux_ref(&o.image) {
+        return Err(Error::InvalidArgument(format!(
+            "conflicting os {:?} and Linux image {:?} (use image \"windows\" for Windows sandboxes)",
+            o.os, o.image
+        )));
+    }
+    if effective_os.eq_ignore_ascii_case("windows")
         && (o.runtime.as_str() == "docker" || o.kind == Kind::Container)
     {
         return Err(Error::UnsupportedImage(format!(
@@ -76,6 +121,31 @@ fn check_request(
                 "--kind container"
             }
         )));
+    }
+    if o.disk_gb == Some(0) {
+        return Err(Error::InvalidArgument(
+            "disk_gb must be greater than 0".into(),
+        ));
+    }
+    if o.disk_gb.is_some() && !caps.custom_disk_gb {
+        return Err(Error::InvalidArgument(
+            "disk_gb sizes local VMs only: provider sandboxes boot the image's disk".into(),
+        ));
+    }
+    if crate::byoc::normalize_optional_token("cloud_image_id", o.cloud_image_id.as_deref())?
+        .is_some()
+        && !caps.custom_cloud_image
+    {
+        return Err(unsupported(
+            "custom Cloud Image IDs (--cloud-image-id)".into(),
+        ));
+    }
+    if crate::byoc::normalize_optional_token("instance_type", o.instance_type.as_deref())?.is_some()
+        && !caps.custom_cloud_image
+    {
+        return Err(unsupported(
+            "custom instance types (--instance-type)".into(),
+        ));
     }
     if o.command.as_ref().is_some_and(|c| !c.is_empty()) && !caps.command {
         return Err(unsupported(
@@ -166,15 +236,29 @@ pub(super) async fn resolve_image(
         None => caps.kinds.clone(),
     };
     let arch = caps.arches.first().copied().unwrap_or("amd64");
+    let is_windows = effective_os(o).eq_ignore_ascii_case("windows") || is_windows_ref(&reference);
+    let is_native_vm = o.runtime == crate::placement::Runtime::Other("native".into());
+    let has_cloud_image = o
+        .cloud_image_id
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
     // Direct VM (--runtime native or Windows on a VM-capable provider) boots a
     // cloud OS image rather than a GHCR OCI containerdisk.
     if caps.kinds.contains(&RunKind::Vm)
-        && supported_oses
-            .iter()
-            .any(|os| os.eq_ignore_ascii_case(&o.os))
-        && (o.runtime.as_str() == "native" || o.os.eq_ignore_ascii_case("windows"))
+        && supports_os(caps, supported_oses, effective_os(o))
+        && (is_native_vm || is_windows)
     {
-        return Ok((unpinned(&reference, RunKind::Vm, arch), None));
+        return Ok((
+            ProviderImage {
+                reference: reference.clone(),
+                pinned_ref: reference,
+                digest: String::new(),
+                kind: RunKind::Vm,
+                arch: arch.to_string(),
+                spacesd: Some(true),
+            },
+            None,
+        ));
     }
     let backend = match kinds.as_slice() {
         [RunKind::Container] => cua_image::Backend::Container,
@@ -211,6 +295,19 @@ pub(super) async fn resolve_image(
         Ok(Err(
             e @ (cua_image::ImageError::NotFound(_) | cua_image::ImageError::Unauthorized(_)),
         )) => {
+            if has_cloud_image && caps.custom_cloud_image {
+                return Ok((
+                    ProviderImage {
+                        reference: reference.clone(),
+                        pinned_ref: reference,
+                        digest: String::new(),
+                        kind: kinds[0],
+                        arch: arch.to_string(),
+                        spacesd: Some(true),
+                    },
+                    None,
+                ));
+            }
             return Err(Error::UnsupportedImage(format!("{reference}: {e}")));
         }
         Ok(Err(e)) => {
@@ -242,10 +339,7 @@ pub(super) async fn resolve_image(
                 .join(", ")
         )));
     }
-    if !supported_oses
-        .iter()
-        .any(|os| os.eq_ignore_ascii_case(&r.os))
-    {
+    if !supports_os(caps, supported_oses, &r.os) {
         if supported_oses == ["linux"] {
             return Err(Error::UnsupportedImage(format!(
                 "{reference} is a {} image; {word} runs Linux sandboxes only",
@@ -373,6 +467,7 @@ impl Sandboxes {
         let spec = ProviderCreate {
             name: name.clone(),
             image,
+            os: effective_os(o).to_ascii_lowercase(),
             cpus: o.cpus,
             memory_mb: o.memory_mb,
             env,
@@ -387,6 +482,15 @@ impl Sandboxes {
             egress: o.egress.clone(),
             no_network: o.network == NetworkMode::None,
             protect: cua_vmm::network::protects(o.network_settings.as_ref()),
+            disk_gb: o.disk_gb,
+            cloud_image_id: crate::byoc::normalize_optional_token(
+                "cloud_image_id",
+                o.cloud_image_id.as_deref(),
+            )?,
+            instance_type: crate::byoc::normalize_optional_token(
+                "instance_type",
+                o.instance_type.as_deref(),
+            )?,
         };
         let instance = provider.create(&spec).await?;
         let sandbox = Sandbox {

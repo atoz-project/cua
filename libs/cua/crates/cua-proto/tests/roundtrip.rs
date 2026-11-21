@@ -486,6 +486,16 @@ fn daemon_messages_roundtrip() {
         name: "dev".into(),
         wait: Some(false),
         reuse: true,
+        cloud_image_id: "m-custom-space".into(),
+        ..Default::default()
+    });
+    roundtrip(&daemon::CreateSandboxRequest {
+        name: "dev".into(),
+        image: "windows".into(),
+        location: "aliyun-ecs".into(),
+        disk_gb: 80,
+        cloud_image_id: "m-win11-golden".into(),
+        instance_type: "ecs.c7.2xlarge".into(),
         ..Default::default()
     });
     roundtrip(&daemon::CreatePublicUrlResponse {

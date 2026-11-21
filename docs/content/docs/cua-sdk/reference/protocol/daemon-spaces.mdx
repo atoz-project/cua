@@ -1129,6 +1129,7 @@ Request for `SpaceService.CreateSpace`.
 | `parent` | 29 | `string` | Create it as a child of this Space (id or name): its network is no more open than the parent's. |
 | `widen` | 32 | `bool` | With `parent`: let it be more open than its parent (recorded on the Space). (30 and 31 are kept for other create options.) |
 | `children` | 33 | optional `bool` | Let the Space make child Spaces of its own (`SetSpaceChildren`). Unset: off. |
+| `cloud_image_id` | 34 | `string` | Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`), distinct from `image` (the Sandbox Image). |
 
 ### SetSpaceChildrenRequest
 

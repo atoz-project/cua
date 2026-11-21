@@ -1584,6 +1584,9 @@ their own CLI sign-in; Hetzner takes its API token in `token` (or
 | `vpc_id` / `vpcId` | `Option<String>` | `None` | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `vswitch_id`. |
 | `vswitch_id` / `vswitchId` | `Option<String>` | `None` | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `vpc_id`. |
 | `no_public_ip` / `noPublicIp` | `bool` | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
+| `windows_image_id` / `windowsImageId` | `Option<String>` | `None` | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
+| `linux_image_id` / `linuxImageId` | `Option<String>` | `None` | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
+| `instance_type` / `instanceType` | `Option<String>` | `None` | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
 
 ## `CloudStatus` record
 
@@ -1637,9 +1640,12 @@ Returned by [`Spaces.cloud_approve`](#spacescloud_approve).
 | `relay_url` / `relayUrl` | `Option<String>` |  | Per-connection relay base URL (`https://relay.cua.ai` by default), or `None` when not connected. |
 | `relay_mode` / `relayMode` | `Option<String>` | `None` | Relay authentication mode (`account` or `static`), or `None` when not connected. |
 | `spacesd_download_url` / `spacesdDownloadUrl` | `Option<String>` | `None` | Optional custom `cua-spacesd` binary mirror URL. |
-| `vpc_id` / `vpcId` | `Option<String>` |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`. |
-| `vswitch_id` / `vswitchId` | `Option<String>` |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`. |
-| `no_public_ip` / `noPublicIp` | `bool` |  | Whether public IPv4 assignment is disabled (`aliyun-ecs` only). |
+| `vpc_id` / `vpcId` | `Option<String>` | `None` | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`. |
+| `vswitch_id` / `vswitchId` | `Option<String>` | `None` | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`. |
+| `no_public_ip` / `noPublicIp` | `bool` | `false` | Whether public IPv4 assignment is disabled (`aliyun-ecs` only). |
+| `windows_image_id` / `windowsImageId` | `Option<String>` | `None` | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
+| `linux_image_id` / `linuxImageId` | `Option<String>` | `None` | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
+| `instance_type` / `instanceType` | `Option<String>` | `None` | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
 
 ## `CloudKind` record
 

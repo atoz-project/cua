@@ -171,6 +171,27 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Validates and trims an optional identifier or token (`cloud_image_id`,
+/// `instance_type`, `--windows-image-id`, etc.), rejecting empty/whitespace-only
+/// values and values containing internal whitespace.
+pub fn normalize_optional_token(label: &str, raw: Option<&str>) -> Result<Option<String>> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "{label} cannot be empty"
+        )));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "{label} {trimmed:?} must not contain whitespace"
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// One cloud as `cloud_status` lists it.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudProvider {
@@ -296,6 +317,15 @@ pub struct CloudProvider {
     /// on `aliyun-ecs`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CloudProvider {
@@ -339,6 +369,9 @@ impl std::fmt::Debug for CloudProvider {
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
             .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -852,6 +885,15 @@ pub struct CloudTarget {
     /// `aliyun-ecs` only).
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -877,6 +919,9 @@ impl std::fmt::Debug for CloudTarget {
             .field("vpc_id", &self.vpc_id)
             .field("vswitch_id", &self.vswitch_id)
             .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }

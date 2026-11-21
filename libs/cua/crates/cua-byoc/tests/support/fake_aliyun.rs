@@ -52,6 +52,10 @@ pub struct FakeAliyun {
     pub security_groups: Vec<Value>,
     /// Security group rules keyed by `SecurityGroupId`.
     pub security_group_rules: BTreeMap<String, Vec<Value>>,
+    /// Instance type specs (`DescribeInstanceTypes`: `type_id -> (vcpu, mem_gib)`).
+    pub instance_types: BTreeMap<String, (u32, f64)>,
+    /// Catalog of ECS images (`DescribeImages`).
+    pub images: Vec<Value>,
     /// Existing instances keyed by `InstanceId`.
     pub instances: BTreeMap<String, Value>,
     /// Raw console output keyed by `InstanceId` (`GetInstanceConsoleOutput`).
@@ -95,8 +99,61 @@ impl Default for FakeAliyun {
             zones: Vec::new(),
             available_instance_types: vec![
                 "ecs.e-c1m2.large".into(),
+                "ecs.e-c1m1.large".into(),
                 "ecs.c7.xlarge".into(),
                 "ecs.g7.large".into(),
+                "ecs.g7.4xlarge".into(),
+            ],
+            instance_types: BTreeMap::from([
+                ("ecs.e-c1m1.large".into(), (2, 2.0)),
+                ("ecs.e-c1m2.large".into(), (2, 4.0)),
+                ("ecs.c7.xlarge".into(), (4, 8.0)),
+                ("ecs.g7.large".into(), (2, 8.0)),
+                ("ecs.g7.4xlarge".into(), (16, 64.0)),
+            ]),
+            images: vec![
+                json!({
+                    "ImageId": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
+                    "ImageName": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
+                    "ImageOwnerAlias": "system",
+                    "OSType": "linux",
+                    "Architecture": "x86_64",
+                    "Status": "Available",
+                    "CreationTime": "2024-06-01T00:00:00Z",
+                    "Size": 20
+                }),
+                json!({
+                    "ImageId": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
+                    "ImageName": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
+                    "ImageOwnerAlias": "system",
+                    "OSType": "linux",
+                    "Architecture": "x86_64",
+                    "Status": "Available",
+                    "CreationTime": "2025-01-01T00:00:00Z",
+                    "Size": 20
+                }),
+                json!({
+                    "ImageId": "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
+                    "ImageName": "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
+                    "OSNameEn": "Windows Server 2019 Datacenter Edition 64bit Chinese",
+                    "ImageOwnerAlias": "system",
+                    "OSType": "windows",
+                    "Architecture": "x86_64",
+                    "Status": "Available",
+                    "CreationTime": "2024-06-01T00:00:00Z",
+                    "Size": 40
+                }),
+                json!({
+                    "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250201.vhd",
+                    "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250201.vhd",
+                    "OSNameEn": "Windows Server 2022 Datacenter Edition 64bit",
+                    "ImageOwnerAlias": "system",
+                    "OSType": "windows",
+                    "Architecture": "x86_64",
+                    "Status": "Available",
+                    "CreationTime": "2025-02-01T00:00:00Z",
+                    "Size": 40
+                }),
             ],
             sold_out_zones: BTreeMap::new(),
             run_fail_zones: BTreeMap::new(),
@@ -653,57 +710,91 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeImages") => {
-                let os = params
-                    .get("OSType")
-                    .map(|s| s.to_ascii_lowercase())
-                    .unwrap_or_else(|| "linux".into());
-                let images = if os == "windows" {
-                    vec![
-                        json!({
-                            "ImageId": "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
-                            "ImageName": "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
-                            "OSNameEn": "Windows Server 2019 Datacenter Edition 64bit Chinese",
-                            "OSType": "windows",
-                            "Architecture": "x86_64",
-                            "Status": "Available",
-                            "CreationTime": "2024-06-01T00:00:00Z"
-                        }),
-                        json!({
-                            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250101.vhd",
-                            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250101.vhd",
-                            "OSNameEn": "Windows Server 2022 Datacenter Edition 64bit",
-                            "OSType": "windows",
-                            "Architecture": "x86_64",
-                            "Status": "Available",
-                            "CreationTime": "2025-01-01T00:00:00Z"
-                        }),
-                    ]
-                } else {
-                    vec![
-                        json!({
-                            "ImageId": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
-                            "ImageName": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
-                            "OSType": "linux",
-                            "Architecture": "x86_64",
-                            "Status": "Available",
-                            "CreationTime": "2024-06-01T00:00:00Z"
-                        }),
-                        json!({
-                            "ImageId": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
-                            "ImageName": "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
-                            "OSType": "linux",
-                            "Architecture": "x86_64",
-                            "Status": "Available",
-                            "CreationTime": "2025-01-01T00:00:00Z"
-                        }),
-                    ]
-                };
+                let id_filter = params.get("ImageId").cloned();
+                let owner_filter = params.get("ImageOwnerAlias").cloned();
+                let os_filter = params.get("OSType").cloned();
+                let status_filter = params.get("Status").cloned();
+                let name_filter = params.get("ImageName").cloned();
+                let mut items: Vec<Value> = f
+                    .images
+                    .iter()
+                    .filter(|img| {
+                        if let Some(ref id) = id_filter
+                            && img["ImageId"].as_str() != Some(id.as_str())
+                        {
+                            return false;
+                        }
+                        if let Some(ref owner) = owner_filter
+                            && img["ImageOwnerAlias"].as_str() != Some(owner.as_str())
+                        {
+                            return false;
+                        }
+                        if let Some(ref os) = os_filter
+                            && !img["OSType"]
+                                .as_str()
+                                .unwrap_or("")
+                                .eq_ignore_ascii_case(os)
+                        {
+                            return false;
+                        }
+                        if let Some(ref status) = status_filter
+                            && img["Status"].as_str() != Some(status.as_str())
+                        {
+                            return false;
+                        }
+                        if let Some(ref pat) = name_filter {
+                            let name = img["ImageName"].as_str().unwrap_or("");
+                            if let Some(prefix) = pat.strip_suffix('*') {
+                                if !name.starts_with(prefix) {
+                                    return false;
+                                }
+                            } else if name != pat {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
+                let total = items.len();
+                if let Some(ps) = params.get("PageSize").and_then(|s| s.parse::<usize>().ok()) {
+                    items.truncate(ps);
+                }
                 (
                     StatusCode::OK,
                     axum::Json(json!({
-                        "Images": { "Image": images },
-                        "TotalCount": images.len(),
+                        "Images": { "Image": items },
+                        "TotalCount": total,
                         "RequestId": "req-images-1"
+                    })),
+                )
+                    .into_response()
+            }
+            ("2014-05-26", "DescribeInstanceTypes") => {
+                let requested: Option<Vec<String>> = params
+                    .get("InstanceTypes")
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+                let items: Vec<Value> = f
+                    .instance_types
+                    .iter()
+                    .filter(|(id, _)| {
+                        requested
+                            .as_ref()
+                            .is_none_or(|reqs| reqs.iter().any(|r| r == *id))
+                    })
+                    .map(|(id, (vcpu, mem_gib))| {
+                        json!({
+                            "InstanceTypeId": id,
+                            "CpuCoreCount": vcpu,
+                            "MemorySize": mem_gib
+                        })
+                    })
+                    .collect();
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "InstanceTypes": { "InstanceType": items },
+                        "RequestId": "req-inst-types-1"
                     })),
                 )
                     .into_response()

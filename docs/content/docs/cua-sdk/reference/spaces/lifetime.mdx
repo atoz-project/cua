@@ -169,6 +169,7 @@ as sandboxes.
 | `instance_type` / `instanceType` | `Option<String>` | `None` | With `on` a linked cloud (`aws`, `hetzner`, ...): the machine type its host must be (`c7g.xlarge`, `cax41`), a pin of the elastic pool's solve. `None`: the pool picks the cheapest that fits. |
 | `region` | `Option<String>` | `None` | With `on` a linked cloud: the region its host must be in. |
 | `children` | `Option<bool>` | `None` | Lets the Space make child Spaces of its own (`Spaces.set_children`). `None`: off. Only a Space the machine of the runtime runs itself. |
+| `cloud_image_id` / `cloudImageId` | `Option<String>` | `None` | Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`), distinct from `image` (the Sandbox Image). |
 
 ## `EgressPolicy` record
 

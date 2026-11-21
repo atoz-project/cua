@@ -410,6 +410,9 @@ impl Provider for E2b {
             credential_env: E2B_ENV,
             // E2B sandboxes are CPU-only.
             gpus: vec![],
+            oses: vec!["linux"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
         }
     }
 
