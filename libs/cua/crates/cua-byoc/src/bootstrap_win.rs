@@ -410,9 +410,9 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
 
     s.push_str(
         "} finally {\n\
-         \x20 Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue\n\
-         \x20 Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue\n\
-         \x20 Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue\n\
+         \x20 if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }\n\
+         \x20 if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }\n\
+         \x20 if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }\n\
          }\n",
     );
 
@@ -877,6 +877,74 @@ mod tests {
             assert!(
                 ps.contains("Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord")
             );
+        }
+    }
+
+    #[test]
+    fn finally_cleanup_guards_nullable_temp_paths_against_null_binding() {
+        let j = static_join();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_finally".to_string(),
+        )]);
+        let pw = "WinPass!1234Abcd";
+        let pinned_mirror = format!(
+            "https://mirror.example.com/cua-spacesd.exe#sha256={}",
+            "ab".repeat(32)
+        );
+        for spacesd_download_url in [None, Some(pinned_mirror.as_str())] {
+            let boot = WindowsVmBoot {
+                join: &j,
+                env: &env,
+                expires: 1_900_000_000,
+                ttl_secs: 8 * 3600,
+                provider: "aliyun-ecs",
+                spacesd_download_url,
+                desktop_user: "Administrator",
+                desktop_password: pw,
+            };
+            for ps in [
+                windows_user_data(&boot),
+                windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
+            ] {
+                assert!(
+                    ps.len() < MAX_USER_DATA_BYTES,
+                    "raw UserData {} >= 16 KiB",
+                    ps.len()
+                );
+                let finally_idx = ps.find("} finally {").expect("missing finally block");
+                let finally_block = &ps[finally_idx..];
+                for (var, expected) in [
+                    (
+                        "$dlTmp",
+                        "if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }",
+                    ),
+                    (
+                        "$sumTmp",
+                        "if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }",
+                    ),
+                    (
+                        "$stg",
+                        "if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }",
+                    ),
+                ] {
+                    assert!(
+                        finally_block.contains(expected),
+                        "missing null-guard for {var} in finally block (url={spacesd_download_url:?}):\n{finally_block}"
+                    );
+                }
+                for line in ps.lines() {
+                    for stmt in line.split(';') {
+                        let trimmed = stmt.trim_start();
+                        assert!(
+                            !trimmed.starts_with("Remove-Item -LiteralPath $dlTmp")
+                                && !trimmed.starts_with("Remove-Item -LiteralPath $sumTmp")
+                                && !trimmed.starts_with("Remove-Item -LiteralPath $stg"),
+                            "unguarded Remove-Item -LiteralPath at statement start: {line}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
