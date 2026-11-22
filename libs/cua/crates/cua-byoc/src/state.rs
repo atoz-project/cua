@@ -70,7 +70,7 @@ pub struct Links {
 
 /// One link's keys an older cua does not know, plus what identifies the
 /// link they belong to.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Link {
     /// The link they belong to: the account it reached...
     #[serde(default)]
@@ -123,22 +123,38 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+impl std::fmt::Debug for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Link")
+            .field("account", &self.account)
+            .field("connected_at", &self.connected_at)
+            .field("profile", &self.profile)
+            .field("auth", &self.auth)
+            .field("budget_usd_month", &self.budget_usd_month)
+            .field("max_size", &self.max_size)
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
+            .finish()
+    }
+}
+
 impl Link {
     /// What `c` has that an older cua would drop, if anything.
     fn of(c: &Connection) -> Option<Link> {
-        if c.auth.is_cli()
-            && c.budget_usd_month.is_none()
-            && c.max_size.is_none()
-            && c.relay_url.is_none()
-            && c.relay_mode.is_none()
-            && c.spacesd_download_url.is_none()
-            && c.vpc_id.is_none()
-            && c.vswitch_id.is_none()
-            && !c.no_public_ip
-            && c.windows_image_id.is_none()
-            && c.linux_image_id.is_none()
-            && c.instance_type.is_none()
-        {
+        if !c.has_extended_options() {
             return None;
         }
         Some(Link {
@@ -163,18 +179,7 @@ impl Link {
     /// Whether `c` is this link after an older cua wrote it back: its new
     /// keys gone, the rest as it was.
     fn stripped(&self, c: &Connection) -> bool {
-        c.auth.is_cli()
-            && c.budget_usd_month.is_none()
-            && c.max_size.is_none()
-            && c.relay_url.is_none()
-            && c.relay_mode.is_none()
-            && c.spacesd_download_url.is_none()
-            && c.vpc_id.is_none()
-            && c.vswitch_id.is_none()
-            && !c.no_public_ip
-            && c.windows_image_id.is_none()
-            && c.linux_image_id.is_none()
-            && c.instance_type.is_none()
+        !c.has_extended_options()
             && c.account == self.account
             && c.connected_at == self.connected_at
     }
@@ -945,5 +950,21 @@ mod tests {
         let left = s.resources().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, "sg-2");
+    }
+
+    #[test]
+    fn link_debug_redacts_spacesd_download_url_secrets() {
+        let link = Link {
+            account: "123456789012".into(),
+            spacesd_download_url: Some(
+                "https://user:SuperSecretPass@mirror.example.com/bin/cua-spacesd.exe?sig=SecretSig99#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let dbg = format!("{link:?}");
+        assert!(!dbg.contains("SuperSecretPass"), "{dbg}");
+        assert!(!dbg.contains("SecretSig99"), "{dbg}");
+        assert!(dbg.contains("mirror.example.com"), "{dbg}");
     }
 }

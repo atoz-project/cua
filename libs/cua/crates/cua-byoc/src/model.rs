@@ -474,6 +474,24 @@ impl Connection {
             .unwrap_or(default)
     }
 
+    /// Whether this connection carries any extended options (federated auth,
+    /// limits, custom relay, mirror URL, existing VPC, or image/sizing defaults)
+    /// that an older cua would drop when rewriting `state.json`.
+    pub fn has_extended_options(&self) -> bool {
+        !self.auth.is_cli()
+            || self.budget_usd_month.is_some()
+            || self.max_size.is_some()
+            || self.relay_url.is_some()
+            || self.relay_mode.is_some()
+            || self.spacesd_download_url.is_some()
+            || self.vpc_id.is_some()
+            || self.vswitch_id.is_some()
+            || self.no_public_ip
+            || self.windows_image_id.is_some()
+            || self.linux_image_id.is_some()
+            || self.instance_type.is_some()
+    }
+
     /// "AWS · us-west-2", "Google Cloud · my-project", "Modal · main".
     pub fn label(&self, title: &str) -> String {
         let place = [&self.region, &self.project, &self.environment]
@@ -601,7 +619,7 @@ pub struct ProvisionSpec {
     /// `container` or `vm` (what the Space is).
     pub kind: String,
     /// The machine type Cua picked ([`crate::Provider::kinds`]), or empty
-    /// to let [`crate::CloudApi::resolve_machine_sizing`] pick an available default.
+    /// to let [`crate::CloudApi::prepare_provision`] pick an available default.
     pub machine_type: String,
     /// Whether `machine_type` was explicitly requested by the user/connection
     /// (`--instance-type`), disabling automatic availability fallback.
@@ -659,6 +677,9 @@ pub struct ProvisionSpec {
     /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
     /// distinct from `image` (the Sandbox Image).
     pub cloud_image_id: Option<String>,
+    /// Opaque provider-specific plan produced by [`crate::CloudApi::prepare_provision`]
+    /// and consumed by [`crate::CloudApi::provision`] without re-querying the cloud.
+    pub provider_plan: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for ProvisionSpec {

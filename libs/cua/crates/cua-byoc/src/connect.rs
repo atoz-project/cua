@@ -42,6 +42,7 @@ use cua_sandbox_core::byoc::{CloudConnected, CloudNext, CloudProvider, ConnectRe
 use crate::api::{CloudApi, Result, Tested};
 use crate::manager::Clouds;
 use crate::model::{self, Connection, MaxSize};
+use crate::target::PreparedTarget;
 
 /// The checked inputs every path shares.
 struct Limits {
@@ -72,42 +73,38 @@ fn limits_of(req: &ConnectRequest) -> Result<Limits> {
 /// `cloud_connect`.
 pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Result<CloudConnected> {
     let p = clouds.api(&req.target.provider)?.clone();
-    crate::manager::validate_target_network_flags(p.name(), &req.target)?;
     let limits = limits_of(req)?;
     let existing = clouds.store().connection(p.name()).map_err(Error::Io)?;
-    let _ = crate::manager::merge_image_defaults(p.as_ref(), &req.target, existing.as_ref())?;
-    let _ = crate::manager::resolve_target_spacesd_download_url(&req.target, existing.as_ref())?;
-    let relay = crate::manager::resolve_target_relay(
+    let prep = PreparedTarget::prepare(
         clouds.store().home().as_deref(),
-        p.name(),
+        p.as_ref(),
         &req.target,
-        existing.as_ref(),
+        existing,
     )?;
-    // Asked, or implied (Azure; Google Cloud with a project number), else
-    // how it is linked already or the default for the cloud.
     let explicit = req
         .auth
         .as_deref()
         .map(str::trim)
         .is_some_and(|a| !a.is_empty());
     let implied = req.auth_word();
-    let auth = if explicit || implied != "cli" {
+    let mut auth = if explicit || implied != "cli" {
         implied
-    } else if relay.mode == cua_sandbox_core::byoc::RelayMode::Static {
+    } else if prep.relay.mode == cua_sandbox_core::byoc::RelayMode::Static {
         "cli".into()
     } else {
         default_auth(clouds, p.as_ref(), &limits).await.into()
     };
-    if relay.mode == cua_sandbox_core::byoc::RelayMode::Static && auth != "cli" {
+    if auth == "cli" && p.name() == "azure" {
+        auth = "oidc".into();
+    }
+    if prep.relay.mode == cua_sandbox_core::byoc::RelayMode::Static && auth != "cli" {
         return Err(Error::InvalidArgument(
             "--relay-mode static cannot be combined with --oidc or --sealed".into(),
         ));
     }
     match auth.as_str() {
-        // Azure is linked through Cua's issuer only.
-        "cli" if p.name() == "azure" => connect_oidc(clouds, p.as_ref(), req, &limits).await,
         "cli" => {
-            if p.name() == "modal" && req.target.token.is_some() {
+            if p.name() == "modal" && prep.target.token.is_some() {
                 return Err(Error::InvalidArgument(
                     "a Modal token given to cua is sealed to your devices (add --budget, or \
                      --sealed); without sealing, Modal signs in on this device with \
@@ -115,10 +112,10 @@ pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Resul
                         .into(),
                 ));
             }
-            connect_cli(clouds, p.as_ref(), req, &limits).await
+            connect_cli(clouds, p.as_ref(), req, prep, &limits).await
         }
-        "oidc" => connect_oidc(clouds, p.as_ref(), req, &limits).await,
-        "sealed" => connect_sealed(clouds, p.as_ref(), req, &limits).await,
+        "oidc" => connect_oidc(clouds, p.as_ref(), req, prep, &limits).await,
+        "sealed" => connect_sealed(clouds, p.as_ref(), req, prep, &limits).await,
         other => Err(Error::InvalidArgument(format!(
             "auth {other:?} is not cli, oidc or sealed"
         ))),
@@ -207,6 +204,7 @@ async fn connect_sealed(
     clouds: &Clouds,
     p: &dyn CloudApi,
     _req: &ConnectRequest,
+    _prep: PreparedTarget,
     _limits: &Limits,
 ) -> Result<CloudConnected> {
     Ok(outcome(
@@ -239,6 +237,7 @@ async fn connect_sealed(
     clouds: &Clouds,
     p: &dyn CloudApi,
     req: &ConnectRequest,
+    prep: PreparedTarget,
     limits: &Limits,
 ) -> Result<CloudConnected> {
     use crate::federation::{IssuerError, IssuerLimits, IssuerMaxSize, NewConnection};
@@ -301,13 +300,13 @@ async fn connect_sealed(
         return Ok(failed(e.to_string(), None));
     }
     let store = clouds.store();
-    let local = store.connection(name).map_err(Error::Io)?;
+    let local = prep.existing.clone();
     let servers = match issuer.connections().await {
         Ok(v) => v,
         Err(e) => return Ok(issuer_failed(&e)),
     };
     let key = sealed_key(name);
-    let named = req
+    let named = prep
         .target
         .project
         .as_deref()
@@ -336,7 +335,7 @@ async fn connect_sealed(
 
     // Where, and the limits (asked now, else the account's, else this
     // device's).
-    let mut target = req.target.clone();
+    let mut target = prep.target.clone();
     target.token = None;
     if target.region.as_deref().is_none_or(|r| r.trim().is_empty()) {
         target.region = server
@@ -348,6 +347,7 @@ async fn connect_sealed(
     let mut candidate = p.resolve(&target)?;
     // A sealed link signs in with its own token, never a profile.
     candidate.profile = String::new();
+    prep.apply_to(&mut candidate);
     let budget = limits
         .budget
         .or_else(|| server.as_ref().and_then(|s| s.limits.budget_usd_month))
@@ -406,9 +406,9 @@ async fn connect_sealed(
 
     // 2. The token: given now; else the account's (sealed already); else
     // the one this device has (`--sealed` seals it).
-    let given = req.target.token.is_some();
+    let given = prep.target.token.is_some();
     let (token, fresh) = if given {
-        match p.local_secret(&req.target) {
+        match p.local_secret(&prep.target) {
             Some(t) => (t, true),
             None => {
                 return Err(Error::InvalidArgument(format!(
@@ -428,7 +428,7 @@ async fn connect_sealed(
             Err(e) => return Ok(failed(e.to_string(), None)),
         }
     } else {
-        match p.local_secret(&req.target) {
+        match p.local_secret(&prep.target) {
             Some(t) => (t, true),
             None => {
                 return Ok(failed(
@@ -452,8 +452,28 @@ async fn connect_sealed(
     if let Some(t) = staged.token.as_mut() {
         zeroize::Zeroize::zeroize(t);
     }
-    let tested = p.test(&candidate).await;
+    let mut tested = p.test(&candidate).await;
     drop(unstage);
+    // Probe custom relay BEFORE mutating the issuer (create_connection / set_limits / tokens.put).
+    if let Some(url) = prep.relay.probe_url.as_deref() {
+        let check = crate::relay::probe_relay_check(url, prep.relay.mode).await;
+        if !check.ok {
+            tested.checks.push(check.clone());
+            return Ok(outcome(
+                clouds,
+                p,
+                None,
+                status::FAILED,
+                Some(CloudNext {
+                    run: Some(line(budget)),
+                    why: check.detail,
+                    ..Default::default()
+                }),
+                tested.checks,
+            ));
+        }
+        tested.checks.push(check);
+    }
     if !tested.ok() {
         return Ok(outcome(
             clouds,
@@ -527,22 +547,6 @@ async fn connect_sealed(
     drop(token);
 
     // 5. Linked on this device (no token stored here).
-    let relay = crate::manager::resolve_target_relay(
-        store.home().as_deref(),
-        name,
-        &req.target,
-        local.as_ref(),
-    )?;
-    if let Some(url) = relay.probe_url.as_deref() {
-        let check = crate::relay::probe_relay_check(url, relay.mode).await;
-        if !check.ok {
-            return Ok(failed(check.detail, Some(line(budget))));
-        }
-    }
-    candidate.relay_url = relay.url;
-    candidate.relay_mode = relay.stored_mode;
-    candidate.spacesd_download_url =
-        crate::manager::resolve_target_spacesd_download_url(&req.target, local.as_ref())?;
     candidate.account = tested.account.clone();
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
@@ -628,11 +632,13 @@ async fn connect_cli(
     clouds: &Clouds,
     p: &dyn CloudApi,
     req: &ConnectRequest,
+    prep: PreparedTarget,
     limits: &Limits,
 ) -> Result<CloudConnected> {
     let mut c = clouds
-        .connect_with_limits(
-            &req.target,
+        .connect_prepared_with_limits(
+            p,
+            prep,
             req.make_default,
             req.ttl_hours,
             limits.budget,
@@ -676,6 +682,7 @@ async fn connect_oidc(
     clouds: &Clouds,
     p: &dyn CloudApi,
     _req: &ConnectRequest,
+    _prep: PreparedTarget,
     _limits: &Limits,
 ) -> Result<CloudConnected> {
     Ok(outcome(
@@ -1242,6 +1249,7 @@ async fn connect_oidc(
     clouds: &Clouds,
     p: &dyn CloudApi,
     req: &ConnectRequest,
+    prep: PreparedTarget,
     limits: &Limits,
 ) -> Result<CloudConnected> {
     use crate::federation::{
@@ -1288,7 +1296,7 @@ async fn connect_oidc(
     // The link this device has: an OIDC one (this flow, run again), or the
     // CLI sign-in it replaces, whose region, limits and lifetime carry over
     // (and which stays in force until the check passes).
-    let linked = store.connection(p.name()).map_err(Error::Io)?;
+    let linked = prep.existing.clone();
     let local = linked.clone().filter(|c| !c.auth.is_cli());
     let cli_link = linked.filter(|c| c.auth.is_cli());
     let carried = local.as_ref().or(cli_link.as_ref());
@@ -1325,7 +1333,7 @@ async fn connect_oidc(
     }
     ids.extend(given_ids.clone());
     fed.complete(&mut ids);
-    let region = req
+    let region = prep
         .target
         .region
         .clone()
@@ -1357,7 +1365,7 @@ async fn connect_oidc(
         .unwrap_or(model::DEFAULT_TTL_HOURS);
     // Google Cloud: the project id people know (the script takes it).
     let project = match fed {
-        Fed::Gcp => given(&req.target.project).or_else(|| {
+        Fed::Gcp => given(&prep.target.project).or_else(|| {
             local
                 .as_ref()
                 .map(|l| l.project.clone())
@@ -1505,18 +1513,7 @@ async fn connect_oidc(
         })
         .or(max_size);
     let mut candidate = fed.candidate(&server.id, &recorded, &region, req, local.as_ref());
-    let relay = crate::manager::resolve_target_relay(
-        store.home().as_deref(),
-        p.name(),
-        &req.target,
-        local.as_ref().or(cli_link.as_ref()),
-    )?;
-    candidate.relay_url = relay.url;
-    candidate.relay_mode = relay.stored_mode;
-    candidate.spacesd_download_url = crate::manager::resolve_target_spacesd_download_url(
-        &req.target,
-        local.as_ref().or(cli_link.as_ref()),
-    )?;
+    prep.apply_to(&mut candidate);
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
     candidate.budget_usd_month = budget;
@@ -1575,10 +1572,10 @@ async fn connect_oidc(
         );
         t
     };
-    if let Some(url) = relay.probe_url.as_deref() {
+    if let Some(url) = prep.relay.probe_url.as_deref() {
         tested
             .checks
-            .push(crate::relay::probe_relay_check(url, relay.mode).await);
+            .push(crate::relay::probe_relay_check(url, prep.relay.mode).await);
     }
     if !tested.ok() {
         let untrusted = tested

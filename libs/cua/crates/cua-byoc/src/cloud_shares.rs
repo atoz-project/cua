@@ -31,15 +31,7 @@ use crate::state::Store;
 
 /// The plain name of a cloud (`AWS`).
 pub fn cloud_title(provider: &str) -> String {
-    match provider {
-        "aws" => "AWS".into(),
-        "gcp" => "Google Cloud".into(),
-        "azure" => "Azure".into(),
-        "hetzner" => "Hetzner".into(),
-        "modal" => "Modal".into(),
-        "aliyun-ecs" => "Alibaba Cloud".into(),
-        other => other.to_owned(),
-    }
+    crate::alerts::title_of(provider).to_owned()
 }
 
 /// A host-route share as opened: where people connect, and what the daemon

@@ -272,24 +272,13 @@ pub async fn sweep_provider(
                         let _ = store.forget(rec);
                     }
                     if let Some(m) = machine {
-                        if conn.is_static_relay() {
-                            let _ = crate::relay::remove_env_token(
-                                store.home().as_deref(),
-                                &r.provider,
-                                &m,
-                            );
-                        } else {
-                            let _ = store.record(Resource {
-                                provider: r.provider.clone(),
-                                id: m.clone(),
-                                resource_type: model::RELAY_MACHINE.into(),
-                                name: m.clone(),
-                                machine: m,
-                                created: t,
-                                state: "orphaned".into(),
-                                ..Default::default()
-                            });
-                        }
+                        crate::relay::ConnectionRelay::cleanup_deleted_machine(
+                            conn,
+                            store,
+                            &r.provider,
+                            &m,
+                            t,
+                        );
                     }
                 }
                 Err(e) => {
@@ -391,6 +380,129 @@ pub(crate) fn same(a: &Resource, b: &Resource) -> bool {
 /// A report from the rows of every provider.
 pub fn report(dry_run: bool, resources: Vec<CloudSweepItem>) -> CloudSweepReport {
     CloudSweepReport { dry_run, resources }
+}
+
+/// One resource `live_resources` found, and why it could not be confirmed (if it could not).
+pub(crate) struct Live {
+    pub resource: Resource,
+    pub unverified: Option<String>,
+}
+
+/// What to do about resources the connection cannot see.
+pub(crate) fn unverified_hint(rs: &[Live]) -> String {
+    if rs.iter().all(|l| l.unverified.is_none()) {
+        return String::new();
+    }
+    " An unverified one is recorded but this connection cannot see it (another region, \
+     or the cloud did not answer): it was NOT assumed deleted. Connect the cloud again \
+     with the region it is in (`cua cloud connect <cloud> --region <region>`) and delete it there."
+        .to_string()
+}
+
+/// "instance i-1, instance i-2 (unverified: recorded in eu-west-1, ...) and 3 more".
+pub(crate) fn describe_live(rs: &[Live]) -> String {
+    const SHOWN: usize = 5;
+    let mut s = rs
+        .iter()
+        .take(SHOWN)
+        .map(|l| {
+            let r = &l.resource;
+            let id = if r.id.is_empty() { &r.name } else { &r.id };
+            match &l.unverified {
+                Some(why) => format!("{} {id} (unverified: {why})", r.resource_type),
+                None => format!("{} {id}", r.resource_type),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if rs.len() > SHOWN {
+        s.push_str(&format!(" and {} more", rs.len() - SHOWN));
+    }
+    s
+}
+
+/// Every Cua resource of `provider` that may still be there: what the cloud
+/// lists by this owner's tags, plus recorded ones it did not list.
+pub(crate) async fn live_resources(
+    store: &Store,
+    has_relay: bool,
+    p: &dyn CloudApi,
+    conn: &Connection,
+    shared: bool,
+) -> Result<Vec<Live>> {
+    let owner = store.owner_id().map_err(cua_sandbox_core::Error::Io)?;
+    let listed = p.list_owned(conn, &owner).await?;
+    let wanted =
+        |r: &Resource| shared || matches!(r.resource_type.as_str(), "instance" | "sandbox");
+    let t = now();
+    let mut out: Vec<Live> = listed
+        .iter()
+        .filter(|r| r.state != "terminated" && wanted(r))
+        .map(|r| Live {
+            resource: r.clone(),
+            unverified: None,
+        })
+        .collect();
+    for rec in store
+        .resources()
+        .map_err(cua_sandbox_core::Error::Io)?
+        .into_iter()
+        .filter(|r| r.provider == p.name())
+    {
+        if listed.iter().any(|r| same(&rec, r)) {
+            continue;
+        }
+        if rec.resource_type == model::RELAY_MACHINE {
+            if shared && has_relay {
+                out.push(Live {
+                    resource: rec,
+                    unverified: None,
+                });
+            }
+            continue;
+        }
+        if !wanted(&rec) {
+            continue;
+        }
+        if rec.id.is_empty() {
+            if t.saturating_sub(rec.created) < GRACE_SECS {
+                out.push(Live {
+                    resource: rec,
+                    unverified: None,
+                });
+            }
+            continue;
+        }
+        let unverified = if rec.region.is_empty() && !in_scope(&rec, conn) {
+            Some(format!(
+                "recorded in an unknown region, outside this connection's {}",
+                conn.region
+            ))
+        } else {
+            let mut there = conn.clone();
+            if !rec.region.is_empty() && rec.region != conn.region {
+                there.region = rec.region.clone();
+                there.zone = String::new();
+            }
+            match p.describe(&there, &rec).await {
+                Ok(Some((state, tags)))
+                    if state != "terminated" && model::is_ours(&tags, &owner) =>
+                {
+                    None
+                }
+                Ok(_) => continue,
+                Err(e) => Some(format!(
+                    "recorded in {}, could not be checked: {e}",
+                    there.region
+                )),
+            }
+        };
+        out.push(Live {
+            resource: rec,
+            unverified,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

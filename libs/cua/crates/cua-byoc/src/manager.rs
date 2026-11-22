@@ -19,9 +19,10 @@ use cua_sandbox_core::byoc::{
 use crate::api::{CloudApi, Result, UnstageGuard};
 use crate::audit;
 use crate::model::{self, Connection, Resource};
-use crate::relay::RelayAccess;
+use crate::relay::{ConnectionRelay, RelayAccess};
 use crate::state::Store;
 use crate::sweep;
+use crate::target::PreparedTarget;
 
 /// The clouds of one cua home.
 #[derive(Clone)]
@@ -166,37 +167,30 @@ impl Clouds {
                 reason: "a relay computer a failed create left".into(),
             };
             if !dry_run {
-                if conn.as_ref().is_some_and(Connection::is_static_relay) {
-                    let _ = crate::relay::remove_env_token(
-                        self.store.home().as_deref(),
-                        provider,
-                        &rec.id,
-                    );
-                    let _ = self.store.forget(&rec);
-                    item.action = "deleted".into();
-                    self.store.audit(audit::of_resource(
-                        "resource_deleted",
-                        &rec,
-                        actor,
-                        "ok",
-                        &item.reason,
-                    ));
+                let conn_relay = match (&conn, &self.relay) {
+                    (Some(c), _) if c.is_static_relay() => Some(ConnectionRelay::Static {
+                        relay_url: c
+                            .effective_relay_url(cua_sandbox_core::byoc::DEFAULT_RELAY_URL)
+                            .to_string(),
+                        relay_token: None,
+                    }),
+                    (Some(c), Some(r)) => Some(
+                        ConnectionRelay::for_connection(c, r)
+                            .unwrap_or_else(|_| ConnectionRelay::Account(r.clone())),
+                    ),
+                    (None, Some(r)) => Some(ConnectionRelay::Account(r.clone())),
+                    (_, None) => None,
+                };
+                let Some(conn_relay) = conn_relay else {
+                    item.action = "failed".into();
+                    item.reason = "no relay account in this process".into();
                     out.push(item);
                     continue;
-                }
-                let relay = match (&self.relay, &conn) {
-                    (Some(r), Some(c)) => r
-                        .rebind(c.effective_relay_url(&r.url))
-                        .unwrap_or_else(|_| r.clone()),
-                    (Some(r), None) => r.clone(),
-                    (None, _) => {
-                        item.action = "failed".into();
-                        item.reason = "no relay account in this process".into();
-                        out.push(item);
-                        continue;
-                    }
                 };
-                match relay.forget(&rec.id).await {
+                match conn_relay
+                    .forget_or_err(self.store.home().as_deref(), provider, &rec.id)
+                    .await
+                {
                     Ok(()) => {
                         let _ = self.store.forget(&rec);
                         item.action = "deleted".into();
@@ -226,92 +220,13 @@ impl Clouds {
         Ok(out)
     }
 
-    /// Every Cua resource of `provider` that may still be there: what the
-    /// cloud lists by this owner's tags, plus recorded ones it did not
-    /// list. A recorded one is dropped only when the cloud, asked in the
-    /// record's own region, says it is gone; one the cloud cannot be asked
-    /// about (another region than the connection's, or a failed lookup) is
-    /// kept and marked unverified, never assumed deleted. Without
-    /// `shared`, only what runs and bills: instances and sandboxes.
-    async fn live(&self, p: &dyn CloudApi, conn: &Connection, shared: bool) -> Result<Vec<Live>> {
-        let owner = self.store.owner_id().map_err(Error::Io)?;
-        let listed = p.list_owned(conn, &owner).await?;
-        let wanted =
-            |r: &Resource| shared || matches!(r.resource_type.as_str(), "instance" | "sandbox");
-        let t = model::now();
-        let mut out: Vec<Live> = listed
-            .iter()
-            .filter(|r| r.state != "terminated" && wanted(r))
-            .map(|r| Live {
-                resource: r.clone(),
-                unverified: None,
-            })
-            .collect();
-        for rec in self
-            .store
-            .resources()
-            .map_err(Error::Io)?
-            .into_iter()
-            .filter(|r| r.provider == p.name())
-        {
-            if listed.iter().any(|r| sweep::same(&rec, r)) {
-                continue;
-            }
-            if rec.resource_type == model::RELAY_MACHINE {
-                if shared && self.relay.is_some() {
-                    out.push(Live {
-                        resource: rec,
-                        unverified: None,
-                    });
-                }
-                continue;
-            }
-            if !wanted(&rec) {
-                continue;
-            }
-            if rec.id.is_empty() {
-                // A create under way (an older one is stale: the sweeper
-                // forgets it).
-                if t.saturating_sub(rec.created) < sweep::GRACE_SECS {
-                    out.push(Live {
-                        resource: rec,
-                        unverified: None,
-                    });
-                }
-                continue;
-            }
-            // Asked where the record says it lives (its own region), so a
-            // host in another region is seen running, or confirmed gone.
-            let unverified = if rec.region.is_empty() && !sweep::in_scope(&rec, conn) {
-                Some(format!(
-                    "recorded in an unknown region, outside this connection's {}",
-                    conn.region
-                ))
-            } else {
-                let mut there = conn.clone();
-                if !rec.region.is_empty() && rec.region != conn.region {
-                    there.region = rec.region.clone();
-                    there.zone = String::new();
-                }
-                match p.describe(&there, &rec).await {
-                    Ok(Some((state, tags)))
-                        if state != "terminated" && model::is_ours(&tags, &owner) =>
-                    {
-                        None
-                    }
-                    Ok(_) => continue,
-                    Err(e) => Some(format!(
-                        "recorded in {}, could not be checked: {e}",
-                        there.region
-                    )),
-                }
-            };
-            out.push(Live {
-                resource: rec,
-                unverified,
-            });
-        }
-        Ok(out)
+    async fn live(
+        &self,
+        p: &dyn CloudApi,
+        conn: &Connection,
+        shared: bool,
+    ) -> Result<Vec<sweep::Live>> {
+        sweep::live_resources(&self.store, self.relay.is_some(), p, conn, shared).await
     }
 
     /// The sweep behind `sweep`, `auto_sweep` and `disconnect --delete`;
@@ -536,179 +451,6 @@ impl Clouds {
     }
 }
 
-pub(crate) fn normalize_spacesd_download_url(raw: &str) -> Result<String> {
-    let trimmed = cua_sandbox_core::byoc::validate_spacesd_download_url(raw)?;
-    let (url_part, frag) = match trimmed.split_once('#') {
-        Some((u, f)) => (u, Some(f)),
-        None => (trimmed.as_str(), None),
-    };
-    if let Some(f) = frag {
-        let Some(hex) = f.strip_prefix("sha256=") else {
-            return Err(Error::InvalidArgument(
-                "--spacesd-download-url fragment must be `#sha256=<64 hex>`".into(),
-            ));
-        };
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::InvalidArgument(
-                "--spacesd-download-url `#sha256=` must be 64 hex characters".into(),
-            ));
-        }
-        return Ok(format!("{url_part}#sha256={}", hex.to_ascii_lowercase()));
-    }
-    let parsed = url::Url::parse(url_part).map_err(|_| {
-        Error::InvalidArgument("--spacesd-download-url must be a valid http(s) URL".into())
-    })?;
-    if parsed.query().is_some() {
-        return Err(Error::InvalidArgument(
-            "--spacesd-download-url with a query string must include `#sha256=<64 hex>` (sidecar `.sha256` cannot be appended to a signed query)"
-                .into(),
-        ));
-    }
-    Ok(url_part.to_string())
-}
-
-pub(crate) fn resolve_target_spacesd_download_url(
-    target: &CloudTarget,
-    existing: Option<&Connection>,
-) -> Result<Option<String>> {
-    match target.spacesd_download_url.as_deref() {
-        Some(raw) => Ok(Some(normalize_spacesd_download_url(raw)?)),
-        None => Ok(existing.and_then(|c| c.spacesd_download_url.clone())),
-    }
-}
-
-pub(crate) fn validate_target_network_flags(provider: &str, target: &CloudTarget) -> Result<()> {
-    if provider != "aliyun-ecs"
-        && (target.vpc_id.is_some() || target.vswitch_id.is_some() || target.no_public_ip)
-    {
-        return Err(Error::InvalidArgument(format!(
-            "--vpc-id, --vswitch-id, and --no-public-ip apply only to aliyun-ecs (not {provider})"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn merge_image_defaults(
-    p: &dyn CloudApi,
-    target: &CloudTarget,
-    existing: Option<&Connection>,
-) -> Result<CloudTarget> {
-    if !p.supports_image_defaults() {
-        if target.windows_image_id.is_some() {
-            return Err(Error::InvalidArgument(format!(
-                "--windows-image-id is not supported for {} (supported on: aliyun-ecs)",
-                p.name()
-            )));
-        }
-        if target.linux_image_id.is_some() {
-            return Err(Error::InvalidArgument(format!(
-                "--linux-image-id is not supported for {} (supported on: aliyun-ecs)",
-                p.name()
-            )));
-        }
-        if target.instance_type.is_some() {
-            return Err(Error::InvalidArgument(format!(
-                "--instance-type is not supported for {} (supported on: aliyun-ecs)",
-                p.name()
-            )));
-        }
-        return Ok(target.clone());
-    }
-    let mut merged = target.clone();
-    if merged.windows_image_id.is_none() {
-        merged.windows_image_id = existing.and_then(|c| c.windows_image_id.clone());
-    }
-    if merged.linux_image_id.is_none() {
-        merged.linux_image_id = existing.and_then(|c| c.linux_image_id.clone());
-    }
-    if merged.instance_type.is_none() {
-        merged.instance_type = existing.and_then(|c| c.instance_type.clone());
-    }
-    Ok(merged)
-}
-
-pub(crate) struct ResolvedTargetRelay {
-    pub mode: cua_sandbox_core::byoc::RelayMode,
-    pub url: Option<String>,
-    pub stored_mode: Option<cua_sandbox_core::byoc::RelayMode>,
-    pub staged_token: Option<crate::api::Secret>,
-    pub probe_url: Option<String>,
-}
-
-pub(crate) fn resolve_target_relay(
-    home: Option<&Path>,
-    provider: &str,
-    target: &CloudTarget,
-    existing: Option<&Connection>,
-) -> Result<ResolvedTargetRelay> {
-    use cua_sandbox_core::byoc::RelayMode;
-    let mode = target
-        .relay_mode
-        .or_else(|| existing.and_then(|c| c.relay_mode))
-        .unwrap_or(RelayMode::Account);
-    let mut staged_token = None;
-    match mode {
-        RelayMode::Account => {
-            if target.relay_token.is_some() {
-                return Err(Error::InvalidArgument(
-                    "--relay-token-stdin applies only to --relay-mode static".into(),
-                ));
-            }
-        }
-        RelayMode::Static => match target.relay_token.as_deref() {
-            Some(raw) => {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    return Err(Error::InvalidArgument(
-                        "--relay-token-stdin was empty; expected a static relay token".into(),
-                    ));
-                }
-                staged_token = Some(crate::api::Secret::new(trimmed));
-            }
-            None => {
-                if crate::relay::load_static_relay_token(home, provider)?.is_none() {
-                    return Err(Error::InvalidArgument(
-                        "Static Relay Mode requires --relay-token-stdin (or a previously saved \
-                         static relay token)"
-                            .into(),
-                    ));
-                }
-            }
-        },
-    }
-    let url = match target.relay_url.as_deref() {
-        Some(raw) => Some(
-            cua_host::relay::normalize_base(raw)
-                .map_err(|e| Error::InvalidArgument(e.to_string()))?,
-        ),
-        None if target.relay_mode.is_none() => existing.and_then(|c| c.relay_url.clone()),
-        None if mode == RelayMode::Static => existing
-            .filter(|c| c.is_static_relay())
-            .and_then(|c| c.relay_url.clone()),
-        None => None,
-    };
-    if mode == RelayMode::Static && url.is_none() {
-        return Err(Error::InvalidArgument(
-            "--relay-url is required in Static Relay Mode".into(),
-        ));
-    }
-    let stored_mode = match mode {
-        RelayMode::Account if url.is_none() => None,
-        m => Some(m),
-    };
-    let probe_url = match mode {
-        RelayMode::Static => url.clone(),
-        RelayMode::Account => url.clone(),
-    };
-    Ok(ResolvedTargetRelay {
-        mode,
-        url,
-        stored_mode,
-        staged_token,
-        probe_url,
-    })
-}
-
 impl Clouds {
     pub(crate) async fn connect_with_limits(
         &self,
@@ -718,31 +460,42 @@ impl Clouds {
         budget_usd_month: Option<f64>,
         max_size: Option<model::MaxSize>,
     ) -> Result<CloudConnected> {
-        let p = self.api(&target.provider)?;
-        validate_target_network_flags(p.name(), target)?;
+        let p = self.api(&target.provider)?.clone();
         let existing = self.store.connection(p.name()).map_err(Error::Io)?;
-        let merged = merge_image_defaults(p.as_ref(), target, existing.as_ref())?;
-        let relay = resolve_target_relay(
-            self.store.home().as_deref(),
-            p.name(),
-            &merged,
-            existing.as_ref(),
-        )?;
-        let spacesd_download_url = resolve_target_spacesd_download_url(&merged, existing.as_ref())?;
-        p.stage_secret(&merged);
-        let _unstage = UnstageGuard(p.as_ref());
-        let mut conn = p.resolve(&merged)?;
-        conn.relay_url = relay.url;
-        conn.relay_mode = relay.stored_mode;
-        conn.spacesd_download_url = spacesd_download_url;
+        let prep =
+            PreparedTarget::prepare(self.store.home().as_deref(), p.as_ref(), target, existing)?;
+        self.connect_prepared_with_limits(
+            p.as_ref(),
+            prep,
+            make_default,
+            ttl_hours,
+            budget_usd_month,
+            max_size,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_prepared_with_limits(
+        &self,
+        p: &dyn CloudApi,
+        prep: PreparedTarget,
+        make_default: bool,
+        ttl_hours: Option<u32>,
+        budget_usd_month: Option<f64>,
+        max_size: Option<model::MaxSize>,
+    ) -> Result<CloudConnected> {
+        p.stage_secret(&prep.target);
+        let _unstage = UnstageGuard(p);
+        let mut conn = p.resolve(&prep.target)?;
+        prep.apply_to(&mut conn);
         conn.budget_usd_month =
-            budget_usd_month.or_else(|| existing.as_ref().and_then(|c| c.budget_usd_month));
-        conn.max_size = max_size.or_else(|| existing.as_ref().and_then(|c| c.max_size));
+            budget_usd_month.or_else(|| prep.existing.as_ref().and_then(|c| c.budget_usd_month));
+        conn.max_size = max_size.or_else(|| prep.existing.as_ref().and_then(|c| c.max_size));
         let mut tested = p.test(&conn).await;
-        if let Some(url) = relay.probe_url.as_deref() {
+        if let Some(url) = prep.relay.probe_url.as_deref() {
             tested
                 .checks
-                .push(crate::relay::probe_relay_check(url, relay.mode).await);
+                .push(crate::relay::probe_relay_check(url, prep.relay.mode).await);
         }
         if !tested.ok() {
             let failed: Vec<String> = tested
@@ -771,9 +524,9 @@ impl Clouds {
         conn.connected_at = model::rfc3339(model::now());
         p.persist_secret()?;
         let home = self.store.home();
-        match relay.mode {
+        match prep.relay.mode {
             cua_sandbox_core::byoc::RelayMode::Static => {
-                if let Some(tok) = relay.staged_token {
+                if let Some(tok) = prep.relay.staged_token {
                     crate::relay::save_static_relay_token(home.as_deref(), p.name(), tok.expose())?;
                 }
             }
@@ -790,7 +543,7 @@ impl Clouds {
         }
         let default_on = self.default_on();
         Ok(CloudConnected {
-            provider: self.row(p.as_ref(), Some(&conn), &default_on),
+            provider: self.row(p, Some(&conn), &default_on),
             checks: tested.checks,
             next: None,
             verify: format!("cua cloud status {}", p.name()),
@@ -890,27 +643,18 @@ impl CloudManager for Clouds {
 
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
-        validate_target_network_flags(p.name(), target)?;
         let existing = self.store.connection(p.name()).map_err(Error::Io)?;
-        let merged = merge_image_defaults(p.as_ref(), target, existing.as_ref())?;
-        let relay = resolve_target_relay(
-            self.store.home().as_deref(),
-            p.name(),
-            &merged,
-            existing.as_ref(),
-        )?;
-        let spacesd_download_url = resolve_target_spacesd_download_url(&merged, existing.as_ref())?;
-        p.stage_secret(&merged);
+        let prep =
+            PreparedTarget::prepare(self.store.home().as_deref(), p.as_ref(), target, existing)?;
+        p.stage_secret(&prep.target);
         let _unstage = UnstageGuard(p.as_ref());
-        let mut conn = p.resolve(&merged)?;
-        conn.relay_url = relay.url;
-        conn.relay_mode = relay.stored_mode;
-        conn.spacesd_download_url = spacesd_download_url;
-        conn.max_size = existing.as_ref().and_then(|c| c.max_size);
+        let mut conn = p.resolve(&prep.target)?;
+        prep.apply_to(&mut conn);
+        conn.max_size = prep.existing.as_ref().and_then(|c| c.max_size);
         let mut t = p.test(&conn).await;
-        if let Some(url) = relay.probe_url.as_deref() {
+        if let Some(url) = prep.relay.probe_url.as_deref() {
             t.checks
-                .push(crate::relay::probe_relay_check(url, relay.mode).await);
+                .push(crate::relay::probe_relay_check(url, prep.relay.mode).await);
         }
         Ok(CloudTestReport {
             provider: p.name().into(),
@@ -960,9 +704,9 @@ impl CloudManager for Clouds {
                          The connection is kept so you can retry `cua cloud disconnect {} --delete`.",
                         p.title(),
                         left.len(),
-                        describe(&left),
+                        sweep::describe_live(&left),
                         p.name()
-                    ) + &unverified_hint(&left);
+                    ) + &sweep::unverified_hint(&left);
                     let mut a = audit::entry("disconnect", p.name(), "user");
                     a.outcome = "failed".into();
                     a.detail = format!("delete left {}", left.len());
@@ -990,9 +734,9 @@ impl CloudManager for Clouds {
                             } else {
                                 format!("{} resources", live.len())
                             },
-                            describe(&live),
+                            sweep::describe_live(&live),
                             p.name()
-                        ) + &unverified_hint(&live),
+                        ) + &sweep::unverified_hint(&live),
                     ));
                 }
             }
@@ -1169,131 +913,5 @@ fn env_words() -> Vec<String> {
         vec![]
     } else {
         vec![format!("CUA_ENV={}", env.name())]
-    }
-}
-
-/// What to do about resources the connection cannot see.
-fn unverified_hint(rs: &[Live]) -> String {
-    if rs.iter().all(|l| l.unverified.is_none()) {
-        return String::new();
-    }
-    " An unverified one is recorded but this connection cannot see it (another region, \
-     or the cloud did not answer): it was NOT assumed deleted. Connect the cloud again \
-     with the region it is in (`cua cloud connect <cloud> --region <region>`) and delete it there."
-        .to_string()
-}
-
-/// One resource `live` found, and why it could not be confirmed (if it
-/// could not).
-struct Live {
-    resource: Resource,
-    unverified: Option<String>,
-}
-
-/// "instance i-1, instance i-2 (unverified: recorded in eu-west-1, ...) and 3 more".
-fn describe(rs: &[Live]) -> String {
-    const SHOWN: usize = 5;
-    let mut s = rs
-        .iter()
-        .take(SHOWN)
-        .map(|l| {
-            let r = &l.resource;
-            let id = if r.id.is_empty() { &r.name } else { &r.id };
-            match &l.unverified {
-                Some(why) => format!("{} {id} (unverified: {why})", r.resource_type),
-                None => format!("{} {id}", r.resource_type),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    if rs.len() > SHOWN {
-        s.push_str(&format!(" and {} more", rs.len() - SHOWN));
-    }
-    s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spacesd_download_url_validation_and_preservation() {
-        assert_eq!(
-            normalize_spacesd_download_url("  https://mirror.example.com/cua-spacesd.exe  ")
-                .unwrap(),
-            "https://mirror.example.com/cua-spacesd.exe"
-        );
-        assert_eq!(
-            normalize_spacesd_download_url("http://10.0.0.5:8080/cua-spacesd.exe").unwrap(),
-            "http://10.0.0.5:8080/cua-spacesd.exe"
-        );
-        let hex = "A".repeat(64);
-        assert_eq!(
-            normalize_spacesd_download_url(&format!(
-                "https://mirror.example.com/cua-spacesd.exe#sha256={hex}"
-            ))
-            .unwrap(),
-            format!(
-                "https://mirror.example.com/cua-spacesd.exe#sha256={}",
-                "a".repeat(64)
-            )
-        );
-        for bad in [
-            "",
-            "   ",
-            "ftp://mirror.example/a.exe",
-            "https:///no-host.exe",
-            "https://user:pass@/cua-spacesd.exe",
-            "https://@/cua-spacesd.exe",
-            "https://mirror.example.com:notaport/cua-spacesd.exe",
-            "https://mirror.example/with space.exe",
-            "https://mirror.example/with'quote.exe",
-            "https://mirror.example.com/cua\u{2018}.exe",
-            "https://mirror.example.com/cua\u{2019};Invoke-Expression(whoami);#sha256=abababababababababababababababababababababababababababababababab",
-            "https://mirror.example.com/cua\u{201A}.exe",
-            "https://mirror.example.com/cua\u{201B}.exe",
-            "https://bucket.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988",
-            "https://mirror.example/a.exe#sha256=short",
-            "https://mirror.example/a.exe#other=123",
-            &format!(
-                "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={hex}"
-            ),
-        ] {
-            let err = normalize_spacesd_download_url(bad).unwrap_err();
-            assert!(!err.to_string().contains("DeadBeefCafe9988"), "{err}");
-            assert!(!err.to_string().contains("MyPass998877"), "{err}");
-        }
-        assert_eq!(
-            normalize_spacesd_download_url(&format!(
-                "https://mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={hex}"
-            ))
-            .unwrap(),
-            format!(
-                "https://mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
-                "a".repeat(64)
-            )
-        );
-
-        let existing = Connection {
-            spacesd_download_url: Some("https://old.example/cua-spacesd.exe".into()),
-            ..Default::default()
-        };
-        let omitted = CloudTarget {
-            provider: "aliyun-ecs".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_target_spacesd_download_url(&omitted, Some(&existing)).unwrap(),
-            Some("https://old.example/cua-spacesd.exe".into())
-        );
-        let updated = CloudTarget {
-            provider: "aliyun-ecs".into(),
-            spacesd_download_url: Some("https://new.example/cua-spacesd.exe".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_target_spacesd_download_url(&updated, Some(&existing)).unwrap(),
-            Some("https://new.example/cua-spacesd.exe".into())
-        );
     }
 }
