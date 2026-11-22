@@ -263,7 +263,7 @@ cua cloud connect aliyun-ecs \
   --windows-image-id m-windows-custom \
   --linux-image-id m-linux-custom \
   --instance-type ecs.c7.xlarge \
-  --spacesd-download-url https://mirror.example.com/cua-spacesd
+  --spacesd-download-url https://mirror.example.com/cua-spacesd/
 
 cua cloud connect aliyun-ecs \
   --region cn-hangzhou \
@@ -273,6 +273,15 @@ cua cloud connect aliyun-ecs \
 
 cua sb create windows --on aliyun-ecs --cloud-image-id m-windows-custom --name custom-win
 ```
+
+`--spacesd-download-url` (a **Spacesd Mirror URL**) applies to both Linux and
+Windows Direct VM Sandboxes (`--runtime native`). It supports `{version}` and
+`{arch}` placeholders as well as a trailing `/` directory prefix: when the path
+ends with `/`, Linux fetches `cua-spacesd-linux-<arch>.tar.gz` and Windows
+fetches `cua-spacesd-x86_64-pc-windows-msvc.exe`, each verified against its
+`.sha256` sidecar. A single-file URL can pin its digest inline with
+`#sha256=<64 hex>`, whereas a trailing-slash directory URL cannot carry a
+single-file `#sha256=` fragment and uses per-asset `.sha256` sidecars instead.
 
 When `--vpc-id` and `--vswitch-id` are both provided (in the same region), Cua
 places ECS instances in your VSwitch and creates or reuses only a Cua-tagged

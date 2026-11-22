@@ -35,3 +35,7 @@ _Avoid_: hosted-only relay
 **Static Relay Mode**:
 A self-hosted relay connection authenticated by a shared registration token and per-sandbox environment tokens, requiring no account sign-in or identity provider.
 _Avoid_: unauthenticated relay, tokenless relay
+
+**Spacesd Mirror URL**:
+The connection-level location from which Linux and Windows Direct VM Sandboxes download `cua-spacesd` when it is not pre-installed in the image, given as either a directory prefix ending in `/` or a single-file URL, with optional `{version}` and `{arch}` placeholders.
+_Avoid_: binary override, custom download link, artifact base URL
