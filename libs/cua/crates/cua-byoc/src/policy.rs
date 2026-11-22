@@ -38,9 +38,17 @@ mod tests {
     const AWSNET_SOURCE: &str = include_str!("awsnet.rs");
     const AWS_SHARES_SOURCE: &str = include_str!("aws_shares.rs");
     const GCP_SOURCE: &str = include_str!("gcp.rs");
-    const ALIYUN_ECS_SOURCE: &str = include_str!("aliyun_ecs.rs");
-    const ALIYUN_NET_SOURCE: &str = include_str!("aliyun_net.rs");
-    const ALIYUN_EXISTING_VPC_SOURCE: &str = include_str!("aliyun_existing_vpc.rs");
+    const ALIYUN_MOD_SOURCE: &str = include_str!("aliyun/mod.rs");
+    const ALIYUN_AUTH_SOURCE: &str = include_str!("aliyun/auth.rs");
+    const ALIYUN_CLIENT_SOURCE: &str = include_str!("aliyun/client.rs");
+    const ALIYUN_LIFECYCLE_SOURCE: &str = include_str!("aliyun/lifecycle.rs");
+    const ALIYUN_SIZING_SOURCE: &str = include_str!("aliyun/sizing.rs");
+    const ALIYUN_IMAGE_SOURCE: &str = include_str!("aliyun/image.rs");
+    const ALIYUN_NET_SOURCE: &str = include_str!("aliyun/net.rs");
+    const ALIYUN_NET_ZONES_SOURCE: &str = include_str!("aliyun/net_zones.rs");
+    const ALIYUN_NET_LIFECYCLE_SOURCE: &str = include_str!("aliyun/net_lifecycle.rs");
+    const ALIYUN_PREFLIGHT_SOURCE: &str = include_str!("aliyun/preflight.rs");
+    const ALIYUN_EXISTING_VPC_SOURCE: &str = include_str!("aliyun/existing_vpc.rs");
     const DOCS: &str =
         include_str!("../../../../../docs/content/docs/cua-sdk/guides/your-cloud-safety.mdx");
 
@@ -502,8 +510,16 @@ mod tests {
     #[test]
     fn every_aliyun_call_the_provider_makes_is_allowed() {
         let used = used_aliyun_actions(&[
-            ALIYUN_ECS_SOURCE,
+            ALIYUN_MOD_SOURCE,
+            ALIYUN_AUTH_SOURCE,
+            ALIYUN_CLIENT_SOURCE,
+            ALIYUN_LIFECYCLE_SOURCE,
+            ALIYUN_SIZING_SOURCE,
+            ALIYUN_IMAGE_SOURCE,
             ALIYUN_NET_SOURCE,
+            ALIYUN_NET_ZONES_SOURCE,
+            ALIYUN_NET_LIFECYCLE_SOURCE,
+            ALIYUN_PREFLIGHT_SOURCE,
             ALIYUN_EXISTING_VPC_SOURCE,
         ]);
         for known in [

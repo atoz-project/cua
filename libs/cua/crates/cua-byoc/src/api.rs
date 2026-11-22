@@ -63,7 +63,7 @@ pub fn target_of(c: &Connection) -> Target {
 }
 
 /// Resolved effective machine sizing (vCPUs, RAM, effective disk GiB, total
-/// hourly price including disk) returned by [`CloudApi::resolve_machine_sizing`]
+/// hourly price including disk) returned by [`CloudApi::prepare_provision`]
 /// before `--max-size` and `--budget` preflight checks.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedSizing {
@@ -72,6 +72,47 @@ pub struct ResolvedSizing {
     pub memory_mb: u64,
     pub disk_gb: Option<u32>,
     pub usd_per_hour: f64,
+}
+
+/// Line-1 script header for Windows Direct VM `UserData`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowsInitHeader {
+    /// `#ps1_sysnative` for `cloudbase-init` (custom Windows 10/11 images).
+    #[default]
+    CloudbaseSysnative,
+    /// `[powershell]` for Alibaba Cloud `vminit` (official Windows Server images).
+    AliyunVminit,
+}
+
+impl WindowsInitHeader {
+    /// The exact line-1 header string expected by the Windows guest init agent.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowsInitHeader::CloudbaseSysnative => crate::bootstrap_win::CLOUDBASE_HEADER,
+            WindowsInitHeader::AliyunVminit => crate::bootstrap_win::ALIYUN_VMINIT_HEADER,
+        }
+    }
+}
+
+/// Single-pass resolved sizing, Cloud Image ID, Windows init header, and
+/// opaque provider-specific launch plan returned by [`CloudApi::prepare_provision`].
+#[derive(Clone, Default)]
+pub struct PreparedProvision {
+    pub sizing: Option<ResolvedSizing>,
+    pub cloud_image_id: Option<String>,
+    pub windows_header: Option<WindowsInitHeader>,
+    pub provider_plan: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for PreparedProvision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedProvision")
+            .field("sizing", &self.sizing)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("windows_header", &self.windows_header)
+            .field("has_provider_plan", &self.provider_plan.is_some())
+            .finish()
+    }
 }
 
 /// A cloud API token in memory: never printed (`Debug` says `redacted`),
@@ -205,24 +246,25 @@ pub trait CloudApi: Send + Sync + 'static {
         false
     }
 
-    /// Resolves effective machine sizing (vCPUs, memory, hourly cost including
-    /// disk) and validates disk bounds before `--max-size`/`--budget` checks.
-    async fn resolve_machine_sizing(
-        &self,
-        _conn: &Connection,
-        _spec: &ProvisionSpec,
-    ) -> Result<Option<ResolvedSizing>> {
-        Ok(None)
+    /// Whether this cloud supports attaching to an existing VPC/VSwitch and
+    /// suppressing public IP assignment (`--vpc-id`, `--vswitch-id`, `--no-public-ip`).
+    fn supports_custom_vpc(&self) -> bool {
+        false
     }
 
-    /// Resolves and validates the Cloud Image ID for `spec` (precedence:
-    /// per-create -> connection default -> official fallback) before provisioning.
-    async fn resolve_provision_image(
+    /// Scopes any home-backed credential store to `home` (set by [`crate::clouds`]
+    /// and [`crate::install`]). Default: no-op.
+    fn scope_home(&self, _home: &std::path::Path) {}
+
+    /// Resolves effective machine sizing, Cloud Image ID, Windows init header,
+    /// and any provider-specific launch plan in a single pass before limit
+    /// checks and [`CloudApi::provision`].
+    async fn prepare_provision(
         &self,
         _conn: &Connection,
         _spec: &ProvisionSpec,
-    ) -> Result<Option<String>> {
-        Ok(None)
+    ) -> Result<PreparedProvision> {
+        Ok(PreparedProvision::default())
     }
 
     /// Whether this machine has the cloud's CLI sign-in or config, and

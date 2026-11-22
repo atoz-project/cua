@@ -31,11 +31,13 @@ use std::sync::Arc;
 
 pub mod alerts;
 #[cfg(feature = "aliyun-ecs")]
-pub mod aliyun_ecs;
+pub mod aliyun;
 #[cfg(feature = "aliyun-ecs")]
-pub mod aliyun_existing_vpc;
+pub use aliyun as aliyun_ecs;
 #[cfg(feature = "aliyun-ecs")]
-pub mod aliyun_net;
+pub use aliyun::existing_vpc as aliyun_existing_vpc;
+#[cfg(feature = "aliyun-ecs")]
+pub use aliyun::net as aliyun_net;
 pub mod api;
 pub mod audit;
 pub mod autosweep;
@@ -79,12 +81,15 @@ pub mod share_net;
 pub mod spend;
 pub mod state;
 pub mod sweep;
+pub(crate) mod target;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod trust;
 pub mod usage;
 
-pub use api::{CloudApi, Result, Secret, SecretSource, Target, Tested};
+pub use api::{
+    CloudApi, PreparedProvision, Result, Secret, SecretSource, Target, Tested, WindowsInitHeader,
+};
 /// Routes of public TCP shares (they live in `cua-share`; this path stays
 /// for the cloud modules).
 pub use cua_share::route as share_route;
@@ -94,12 +99,16 @@ pub use model::{
     Tier,
 };
 pub use provider::CloudSandboxes;
-pub use relay::{Join, RelayAccess};
+pub use relay::{ConnectionRelay, Join, RelayAccess};
 pub use state::Store;
 
 /// Every cloud this build includes (its cargo features).
-#[allow(clippy::vec_init_then_push)]
 pub fn builtin_apis() -> Vec<Arc<dyn CloudApi>> {
+    builtin_apis_for(None)
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn builtin_apis_for(home: Option<&Path>) -> Vec<Arc<dyn CloudApi>> {
     #[allow(unused_mut)]
     let mut v: Vec<Arc<dyn CloudApi>> = Vec::new();
     #[cfg(feature = "aws")]
@@ -113,7 +122,10 @@ pub fn builtin_apis() -> Vec<Arc<dyn CloudApi>> {
     #[cfg(feature = "azure")]
     v.push(Arc::new(azure::Azure::new()));
     #[cfg(feature = "aliyun-ecs")]
-    v.push(Arc::new(aliyun_ecs::AliyunEcs::new()));
+    v.push(Arc::new(match home {
+        Some(h) => aliyun::AliyunEcs::for_home(h),
+        None => aliyun::AliyunEcs::new(),
+    }));
     v
 }
 
@@ -124,6 +136,9 @@ pub fn clouds(
     apis: Vec<Arc<dyn CloudApi>>,
     relay: RelayAccess,
 ) -> (Vec<Arc<dyn cua_sandbox_core::Provider>>, Arc<Clouds>) {
+    for a in &apis {
+        a.scope_home(home);
+    }
     let store = Arc::new(Store::new(home));
     let providers = apis
         .iter()
@@ -145,7 +160,12 @@ pub fn install(
     builder: cua_sandbox_core::SandboxesBuilder,
     home: &Path,
 ) -> cua_sandbox_core::SandboxesBuilder {
-    install_with(builder, home, builtin_apis(), RelayAccess::from_env())
+    install_with(
+        builder,
+        home,
+        builtin_apis_for(Some(home)),
+        RelayAccess::from_env(),
+    )
 }
 
 /// [`install`] with explicit clouds and relay (tests, fixtures).

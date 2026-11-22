@@ -44,7 +44,7 @@ pub fn title_of(provider: &str) -> &str {
         "aws" => "AWS",
         "gcp" => "Google Cloud",
         "azure" => "Microsoft Azure",
-        "hetzner" => "Hetzner",
+        "hetzner" => "Hetzner Cloud",
         "modal" => "Modal",
         "aliyun-ecs" => "Alibaba Cloud ECS",
         other => other,

@@ -2,16 +2,17 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! Existing VPC / VSwitch attachment and private-only (`--no-public-ip`)
-//! validation and safety guards for `aliyun-ecs` (`#8`).
+//! validation and safety guards for `aliyun-ecs`.
 //!
 //! Keeps user-owned VPCs, VSwitches, and security groups untouched while
-//! validating existence/region/ownership and ensuring [`crate::aliyun_net`]
-//! manages only a dedicated Cua-tagged zero-ingress security group
+//! validating existence/region/ownership and ensuring [`super::net`] manages
+//! only a dedicated Cua-tagged zero-ingress security group
 //! (`cua-sandboxes-<owner>`).
 
 use cua_sandbox_core::Error;
 
-use crate::aliyun_ecs::{AliyunEcs, VPC_API_VERSION};
+use super::AliyunEcs;
+use super::client::VPC_API_VERSION;
 use crate::api::Result;
 use crate::model::{Connection, Resource};
 
@@ -191,12 +192,6 @@ pub fn is_existing_vpc_connection(conn: &Connection) -> bool {
 }
 
 /// Refuses deleting a user-owned VPC or VSwitch even if somehow passed or tagged.
-///
-/// Always refuses `conn.vpc_id` / `conn.vswitch_id` and, in existing-VPC mode,
-/// any named VPC/VSwitch that does not carry Cua's isolated network prefix
-/// (`cua-sb-`). Live cloud ownership/name/default verification in
-/// [`crate::aliyun_net::describe_part`] and [`crate::aliyun_net::delete_part`]
-/// enforces the full tag + `IsDefault` + exact Cua-name check before deletion.
 pub fn guard_user_network_untouched(conn: &Connection, r: &Resource) -> Result<()> {
     if matches!(r.resource_type.as_str(), "vpc" | "vswitch" | "subnet")
         && (conn.vpc_id.as_deref() == Some(r.id.as_str())
