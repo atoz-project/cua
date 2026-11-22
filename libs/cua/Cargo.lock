@@ -3159,6 +3159,7 @@ dependencies = [
  "cua-image",
  "cua-repo-cache",
  "cua-sandbox-core",
+ "cua-spaces-contract",
  "cua-spacesd-client",
  "cua-vmm",
  "futures-util",

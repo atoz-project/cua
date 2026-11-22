@@ -876,18 +876,11 @@ impl Sandboxes {
                 "disk_gb sizes local VMs only: provider sandboxes boot the image's disk".into(),
             ));
         }
-        if options.provider != ProviderKind::Contrib {
-            if options.cloud_image_id.is_some() {
-                return Err(Error::InvalidArgument(
-                    "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)".into(),
-                ));
-            }
-            if options.instance_type.is_some() {
-                return Err(Error::InvalidArgument(
-                    "instance_type applies to cloud providers only (--on aliyun-ecs)".into(),
-                ));
-            }
-        }
+        crate::byoc::validate_cloud_vm_overrides(
+            options.provider == ProviderKind::Contrib,
+            options.cloud_image_id.as_deref(),
+            options.instance_type.as_deref(),
+        )?;
         let options = self.build_image(options).await?;
         let preexisting = match (&options.provider, options.name.as_deref()) {
             (ProviderKind::Local, Some(name)) if !name.is_empty() => {

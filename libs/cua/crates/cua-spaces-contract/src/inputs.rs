@@ -2186,72 +2186,7 @@ pub fn provider_title(name: &str) -> &str {
     }
 }
 
-fn redact_url(raw: &str) -> String {
-    let s = raw.trim();
-    if s.is_empty() {
-        return String::new();
-    }
-    if !s.is_ascii()
-        || s.chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"' | '\\'))
-    {
-        return "<redacted>".into();
-    }
-    let Some((scheme, rest)) = s.split_once("://") else {
-        return "<redacted>".into();
-    };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return "<redacted>".into();
-    }
-    let (auth, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    let hp = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
-    let port_part = hp.strip_prefix('[').map_or_else(
-        || hp.split_once(':').map(|(_, p)| p),
-        |r| r.split_once(']').and_then(|(_, t)| t.strip_prefix(':')),
-    );
-    let ok_port =
-        |p: &str| !p.is_empty() && !p.starts_with('0') && p.parse::<u16>().is_ok_and(|n| n > 0);
-    if auth.bytes().filter(|&b| b == b'@').count() > 1
-        || port_part.is_some_and(|p| !ok_port(p))
-        || tail.contains("?@")
-        || tail.contains("#@")
-    {
-        return "<redacted>".into();
-    }
-    let Ok(parsed) = url::Url::parse(s) else {
-        return "<redacted>".into();
-    };
-    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
-        return "<redacted>".into();
-    };
-    let qualified = matches!(parsed.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)))
-        || host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
-        || host.contains('.');
-    if tail.contains('@')
-        && ((port_part.is_some() && !qualified)
-            || (!tail.starts_with('/') && (auth.contains('@') || !qualified)))
-    {
-        return "<redacted>".into();
-    }
-    let path = if tail.starts_with('/') {
-        &tail[..tail.find(['?', '#']).unwrap_or(tail.len())]
-    } else {
-        ""
-    };
-    let mut out = match parsed.port() {
-        Some(p) => format!("{}://{host}:{p}{path}", parsed.scheme()),
-        None => format!("{}://{host}{path}", parsed.scheme()),
-    };
-    if let Some(frag) = parsed.fragment()
-        && let Some(hex) = frag.strip_prefix("sha256=")
-        && !hex.is_empty()
-        && hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        out.push('#');
-        out.push_str(frag);
-    }
-    out
-}
+pub use crate::url_redact::redact_url;
 
 impl std::fmt::Debug for CloudTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

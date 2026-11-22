@@ -35,6 +35,23 @@ pub fn is_cloud_machine(m: &RelayMachine) -> bool {
     m.meta.get(meta::PROVIDER).is_some_and(|p| !p.is_empty())
 }
 
+/// Normalized relay origin of `url` when it differs from `default_relay_url`.
+pub(crate) fn custom_relay_origin(url: &str, default_relay_url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let origin = cua_spacesd_client::ConnectOptions::parse(url)
+        .ok()?
+        .endpoint
+        .origin();
+    let default_origin = cua_spacesd_client::ConnectOptions::parse(default_relay_url)
+        .ok()
+        .map(|o| o.endpoint.origin())
+        .unwrap_or_else(|| default_relay_url.trim_end_matches('/').to_string());
+    (origin.trim_end_matches('/') != default_origin.trim_end_matches('/')).then_some(origin)
+}
+
 impl Spaces {
     /// Deletes a Space in your cloud that another device of the account
     /// created: that device does it through its own ownership records when
@@ -208,21 +225,11 @@ impl Spaces {
                 Ok(svc) => svc.endpoint().await.ok().map(|e| e.url),
                 Err(_) => None,
             };
-            let custom_account_relay = match (&default_relay_url, endpoint_url.as_deref()) {
-                (Some(default_url), Some(ep)) => {
-                    let default_origin = cua_spacesd_client::ConnectOptions::parse(default_url)
-                        .ok()
-                        .map(|o| o.endpoint.origin())
-                        .unwrap_or_else(|| default_url.trim_end_matches('/').to_string());
-                    cua_spacesd_client::ConnectOptions::parse(ep)
-                        .ok()
-                        .map(|o| o.endpoint.origin())
-                        .is_some_and(|origin| {
-                            origin.trim_end_matches('/') != default_origin.trim_end_matches('/')
-                        })
-                }
-                _ => false,
-            };
+            let custom_account_relay = default_relay_url
+                .as_deref()
+                .zip(endpoint_url.as_deref())
+                .and_then(|(default_url, ep)| custom_relay_origin(ep, default_url))
+                .is_some();
             let needs_registry = static_relay || custom_account_relay;
             if needs_registry {
                 let endpoint_url = endpoint_url.ok_or_else(|| {

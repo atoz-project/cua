@@ -4,191 +4,10 @@
 //! URL validation and redaction helpers for BYOC download mirrors and boot logs.
 
 use crate::Result;
-
-fn is_valid_port(port: &str) -> bool {
-    !port.is_empty()
-        && !port.starts_with('0')
-        && port.bytes().all(|b| b.is_ascii_digit())
-        && port.parse::<u16>().is_ok_and(|p| p > 0)
-}
-
-fn is_valid_ipv4_or_dns_host(host: &str) -> bool {
-    if host.is_empty() || !host.is_ascii() {
-        return false;
-    }
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return true;
-    }
-    let h = host.strip_suffix('.').unwrap_or(host);
-    if h.is_empty() || h.len() > 253 {
-        return false;
-    }
-    let labels_ok = h.split('.').all(|l| {
-        !l.is_empty()
-            && l.len() <= 63
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    });
-    labels_ok
-        && !h
-            .rsplit('.')
-            .next()
-            .unwrap_or(h)
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-}
-
-/// Returns `true` when `auth` is a strict RFC-3986 `host` or `host:port`
-/// (IPv4, bracketed IPv6, or ASCII DNS hostname, with optional `1..=65535` port
-/// without leading `'0'`).
-pub fn is_valid_host_or_hostport(auth: &str) -> bool {
-    if auth.is_empty() || !auth.is_ascii() {
-        return false;
-    }
-    if let Some(rest) = auth.strip_prefix('[') {
-        let Some((ip, tail)) = rest.split_once(']') else {
-            return false;
-        };
-        return ip.parse::<std::net::Ipv6Addr>().is_ok()
-            && (tail.is_empty() || tail.strip_prefix(':').is_some_and(is_valid_port));
-    }
-    if auth.contains(['[', ']']) {
-        return false;
-    }
-    match auth.split_once(':') {
-        Some((host, port)) => is_valid_ipv4_or_dns_host(host) && is_valid_port(port),
-        None => is_valid_ipv4_or_dns_host(auth),
-    }
-}
-
-/// Returns `true` when `host_port` is a valid IPv4/IPv6 literal, `localhost`,
-/// or a dotted domain name (as opposed to a bare single-label name such as
-/// `user:8080`).
-pub fn is_qualified_host(host_port: &str) -> bool {
-    if !is_valid_host_or_hostport(host_port) {
-        return false;
-    }
-    if host_port.starts_with('[') {
-        return true;
-    }
-    let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
-    host.parse::<std::net::Ipv4Addr>().is_ok()
-        || host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
-        || host.contains('.')
-}
-
-enum UrlReject {
-    BadChars,
-    MissingScheme,
-    UnsupportedScheme(String),
-    Backslash,
-    InvalidHostOrPort,
-    UrlParse(url::ParseError),
-    EmptyHost,
-}
-
-struct ParsedHttpUrl<'a> {
-    parsed: url::Url,
-    raw_path: &'a str,
-    has_userinfo: bool,
-    multi_at: bool,
-    ambiguous_at: bool,
-}
-
-fn parse_http_url(trimmed: &str) -> std::result::Result<ParsedHttpUrl<'_>, UrlReject> {
-    if !trimmed.is_ascii()
-        || trimmed
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"'))
-    {
-        return Err(UrlReject::BadChars);
-    }
-    let Some((scheme_raw, after_scheme)) = trimmed.split_once("://") else {
-        return Err(UrlReject::MissingScheme);
-    };
-    let scheme_lower = scheme_raw.to_ascii_lowercase();
-    if !matches!(scheme_lower.as_str(), "http" | "https") {
-        return Err(UrlReject::UnsupportedScheme(scheme_lower));
-    }
-    let delim = after_scheme
-        .find(['/', '\\', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let (raw_authority, raw_tail) = after_scheme.split_at(delim);
-    if raw_tail.starts_with('\\') {
-        return Err(UrlReject::Backslash);
-    }
-    let at_count = raw_authority.bytes().filter(|&b| b == b'@').count();
-    let has_userinfo = at_count > 0;
-    let raw_hp = raw_authority
-        .rsplit_once('@')
-        .map_or(raw_authority, |(_, hp)| hp);
-    if !is_valid_host_or_hostport(raw_hp) {
-        return Err(UrlReject::InvalidHostOrPort);
-    }
-    let has_port = raw_hp.strip_prefix('[').map_or_else(
-        || raw_hp.contains(':'),
-        |r| r.split_once(']').is_some_and(|(_, t)| t.starts_with(':')),
-    );
-    let parsed = url::Url::parse(trimmed).map_err(UrlReject::UrlParse)?;
-    if parsed.host_str().is_none_or(str::is_empty) {
-        return Err(UrlReject::EmptyHost);
-    }
-    if parsed.port() == Some(0) {
-        return Err(UrlReject::InvalidHostOrPort);
-    }
-    let qualified = is_qualified_host(raw_hp);
-    let ambiguous_at = raw_tail.contains("?@")
-        || raw_tail.contains("#@")
-        || (raw_tail.contains('@')
-            && ((has_port && !qualified)
-                || (!raw_tail.starts_with('/') && (has_userinfo || !qualified))));
-    let raw_path = if raw_tail.starts_with('/') {
-        &raw_tail[..raw_tail.find(['?', '#']).unwrap_or(raw_tail.len())]
-    } else {
-        ""
-    };
-    Ok(ParsedHttpUrl {
-        parsed,
-        raw_path,
-        has_userinfo,
-        multi_at: at_count > 1,
-        ambiguous_at,
-    })
-}
-
-/// Strips URL userinfo (`user:pass@`), `?query` parameters, and non-`#sha256=`
-/// fragments from `raw` so credentials and signed tokens never appear in logs,
-/// error messages, or `Debug` output.
-pub fn redact_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let Ok(u) = parse_http_url(trimmed) else {
-        return "<redacted>".into();
-    };
-    if u.multi_at || u.ambiguous_at {
-        return "<redacted>".into();
-    }
-    let Some(host) = u.parsed.host_str() else {
-        return "<redacted>".into();
-    };
-    let mut out = match u.parsed.port() {
-        Some(port) => format!("{}://{host}:{port}{}", u.parsed.scheme(), u.raw_path),
-        None => format!("{}://{host}{}", u.parsed.scheme(), u.raw_path),
-    };
-    if let Some(frag) = u.parsed.fragment()
-        && let Some(hex) = frag.strip_prefix("sha256=")
-        && !hex.is_empty()
-        && hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        out.push('#');
-        out.push_str(frag);
-    }
-    out
-}
+use cua_spaces_contract::url_redact::{UrlReject, parse_http_url};
+pub use cua_spaces_contract::url_redact::{
+    is_qualified_host, is_valid_host_or_hostport, redact_url,
+};
 
 /// Validates a custom `cua-spacesd` binary/archive download URL: must be
 /// `https://`, loopback `http://` (`localhost` / `127.0.0.1` / `[::1]`), or
@@ -272,11 +91,6 @@ pub fn validate_spacesd_url_for_os(raw: &str, os_family: &str) -> std::result::R
     let (before_frag, frag) = trimmed
         .split_once('#')
         .map_or((trimmed.as_str(), None), |(b, f)| (b, Some(f)));
-    if before_frag.ends_with('/') && frag.is_some_and(|f| f.starts_with("sha256=")) {
-        return Err(format!(
-            "--spacesd-download-url {safe:?}: a directory mirror URL cannot carry a single-file #sha256= fragment; publish per-file .sha256 sidecars instead"
-        ));
-    }
     let before_query = before_frag.split_once('?').map_or(before_frag, |(p, _)| p);
     let path = before_query
         .split_once("://")
@@ -284,6 +98,11 @@ pub fn validate_spacesd_url_for_os(raw: &str, os_family: &str) -> std::result::R
         .unwrap_or("")
         .to_ascii_lowercase();
     if path.ends_with('/') {
+        if frag.is_some_and(|f| f.starts_with("sha256=")) {
+            return Err(format!(
+                "--spacesd-download-url {safe:?}: a directory mirror URL cannot carry a single-file #sha256= fragment; publish per-file .sha256 sidecars instead"
+            ));
+        }
         return Ok(());
     }
     let os = os_family.trim().to_ascii_lowercase();
@@ -575,5 +394,36 @@ mod tests {
             )
             .is_ok()
         );
+
+        let dir_query_hash = format!("https://mirror.example.com/releases/?sig=tok#sha256={sha64}");
+        let err = validate_spacesd_url_for_os(&dir_query_hash, "windows").unwrap_err();
+        assert!(err.contains(".sha256"), "{err}");
+        assert!(!err.contains("sig=tok"), "{err}");
+        assert!(validate_spacesd_url_for_os(&dir_query_hash, "linux").is_err());
+    }
+
+    #[test]
+    fn malformed_scheme_with_later_delimiter_does_not_leak_secrets() {
+        let bad = "https:/mirror.example.com/x?sig=SuperSecret&next=https://cdn.example.com";
+        assert_eq!(redact_url(bad), "<redacted>");
+        let err = validate_spacesd_download_url(bad).expect_err(bad);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing URL scheme"),
+            "expected missing URL scheme error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("SuperSecret"),
+            "secret leaked in error message: {msg}"
+        );
+        assert_eq!(
+            redact_url("https://user:secret@host:badport/path"),
+            "<redacted>"
+        );
+        assert_eq!(
+            cua_spaces_contract::inputs::redact_url("https://user:secret@host:badport/path"),
+            "<redacted>"
+        );
+        assert_eq!(cua_spaces_contract::inputs::redact_url(bad), "<redacted>");
     }
 }

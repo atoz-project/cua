@@ -517,11 +517,11 @@ pub fn month_start(at: u64) -> u64 {
 }
 
 fn reject_pool_host_cloud_image_id(opts: &SpaceCreate) -> Result<()> {
-    if opts.cloud_image_id.is_some() {
-        return Err(Error::invalid(
-            "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-        ));
-    }
+    cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+        false,
+        opts.cloud_image_id.as_deref(),
+        None,
+    )?;
     Ok(())
 }
 

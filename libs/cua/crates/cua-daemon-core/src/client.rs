@@ -362,35 +362,47 @@ impl DaemonClient {
     /// the daemon does not advertise [`crate::FEATURE_CLOUD_IMAGE_AND_SIZING`]
     /// (or predates `GetInfo`).
     pub async fn require_cloud_image_and_sizing(&self, fields: &[&str]) -> Result<()> {
-        self.require_feature_for_fields(crate::FEATURE_CLOUD_IMAGE_AND_SIZING, fields)
+        self.require_daemon_features(&[(crate::FEATURE_CLOUD_IMAGE_AND_SIZING, fields)])
             .await
     }
 
-    async fn require_feature_for_fields(&self, feature: &str, fields: &[&str]) -> Result<()> {
-        if fields.is_empty() {
+    async fn require_daemon_features(&self, checks: &[(&str, &[&str])]) -> Result<()> {
+        if checks.iter().all(|(_, fields)| fields.is_empty()) {
             return Ok(());
         }
+        let format_err = |missing: Vec<&str>, version: &str| {
+            let suffix = if version.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({version})")
+            };
+            Error::CapabilityMissing(format!(
+                "{}: the cua daemon{suffix} is too old to enforce it (these sandbox options \
+                 would be ignored); update cua and restart its daemon",
+                missing.join(", ")
+            ))
+        };
         match self.info().await {
             Ok(info) => {
-                if info.features.iter().any(|f| f == feature) {
-                    return Ok(());
+                let mut missing = Vec::new();
+                for &(feature, fields) in checks {
+                    if !fields.is_empty() && !info.features.iter().any(|f| f == feature) {
+                        missing.extend_from_slice(fields);
+                    }
                 }
-                let version = if info.version.trim().is_empty() {
-                    String::new()
+                if missing.is_empty() {
+                    Ok(())
                 } else {
-                    format!(" ({})", info.version)
-                };
-                Err(Error::CapabilityMissing(format!(
-                    "{}: the cua daemon{version} is too old to enforce it (these sandbox \
-                     options would be ignored); update cua and restart its daemon",
-                    fields.join(", ")
-                )))
+                    Err(format_err(missing, &info.version))
+                }
             }
-            Err(Error::Unsupported(_)) => Err(Error::CapabilityMissing(format!(
-                "{}: the cua daemon is too old to enforce it (these sandbox options would be \
-                 ignored); update cua and restart its daemon",
-                fields.join(", ")
-            ))),
+            Err(Error::Unsupported(_)) => {
+                let missing: Vec<&str> = checks
+                    .iter()
+                    .flat_map(|(_, fields)| fields.iter().copied())
+                    .collect();
+                Err(format_err(missing, ""))
+            }
             Err(e) => Err(e),
         }
     }
@@ -406,56 +418,12 @@ impl DaemonClient {
         if r.disk_gb.is_some() {
             sizing_fields.push("disk_gb");
         }
-        let needs_ttl = r.ttl.is_some();
-        if sizing_fields.is_empty() && !needs_ttl {
-            return Ok(());
-        }
-        match self.info().await {
-            Ok(info) => {
-                let mut missing = Vec::new();
-                if !sizing_fields.is_empty()
-                    && !info
-                        .features
-                        .iter()
-                        .any(|f| f == crate::FEATURE_CLOUD_IMAGE_AND_SIZING)
-                {
-                    missing.extend(sizing_fields);
-                }
-                if needs_ttl
-                    && !info
-                        .features
-                        .iter()
-                        .any(|f| f == crate::FEATURE_SANDBOX_TTL)
-                {
-                    missing.push("ttl");
-                }
-                if missing.is_empty() {
-                    return Ok(());
-                }
-                let version = if info.version.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", info.version)
-                };
-                Err(Error::CapabilityMissing(format!(
-                    "{}: the cua daemon{version} is too old to enforce it (these sandbox \
-                     options would be ignored); update cua and restart its daemon",
-                    missing.join(", ")
-                )))
-            }
-            Err(Error::Unsupported(_)) => {
-                let mut missing = sizing_fields;
-                if needs_ttl {
-                    missing.push("ttl");
-                }
-                Err(Error::CapabilityMissing(format!(
-                    "{}: the cua daemon is too old to enforce it (these sandbox options would be \
-                     ignored); update cua and restart its daemon",
-                    missing.join(", ")
-                )))
-            }
-            Err(e) => Err(e),
-        }
+        let ttl_fields: &[&str] = if r.ttl.is_some() { &["ttl"] } else { &[] };
+        self.require_daemon_features(&[
+            (crate::FEATURE_CLOUD_IMAGE_AND_SIZING, &sizing_fields),
+            (crate::FEATURE_SANDBOX_TTL, ttl_fields),
+        ])
+        .await
     }
 
     /// `CreateSandbox`.

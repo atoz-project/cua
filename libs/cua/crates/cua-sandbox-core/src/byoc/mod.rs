@@ -15,13 +15,12 @@
 //! [`DETAIL_RELAY_MACHINE`], which is how Spaces shows it as
 //! `relay:<machine>`.
 
-#[path = "byoc_reports.rs"]
-mod byoc_reports;
-#[path = "byoc_url.rs"]
-mod byoc_url;
+mod reports;
+mod url;
 
-pub use byoc_reports::*;
-pub use byoc_url::*;
+pub use cua_spaces_contract::inputs::provider_title;
+pub use reports::*;
+pub use url::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,17 +52,27 @@ pub mod meta {
 /// us-west-2"), shown next to its Space.
 pub const DETAIL_PLACE: &str = "place";
 
-/// Human-readable title for a cloud provider location (`aws` -> `"AWS"`).
-pub fn provider_title(name: &str) -> &str {
-    match name {
-        "aliyun-ecs" => "Alibaba Cloud ECS",
-        "aws" => "AWS",
-        "gcp" => "Google Cloud",
-        "azure" => "Microsoft Azure",
-        "hetzner" => "Hetzner Cloud",
-        "modal" => "Modal",
-        _ => name,
+/// Refuses cloud-only create overrides (`cloud_image_id`, `instance_type`) on
+/// non-cloud targets with a consistent provider-neutral message.
+pub fn validate_cloud_vm_overrides(
+    is_cloud_target: bool,
+    cloud_image_id: Option<&str>,
+    instance_type: Option<&str>,
+) -> Result<()> {
+    if is_cloud_target {
+        return Ok(());
     }
+    if cloud_image_id.is_some() {
+        return Err(crate::Error::InvalidArgument(
+            "cloud_image_id applies to cloud providers only (--on <cloud>)".into(),
+        ));
+    }
+    if instance_type.is_some() {
+        return Err(crate::Error::InvalidArgument(
+            "instance_type applies to cloud providers only (--on <cloud>)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Where a cloud's credentials were found on this machine.

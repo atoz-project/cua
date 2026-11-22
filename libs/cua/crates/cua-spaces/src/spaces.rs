@@ -1135,19 +1135,18 @@ impl Spaces {
     /// Custom Account-mode relay origin recorded for `machine_id`, when a
     /// registry credential stores a relay URL without a static env token and
     /// its origin differs from `default_url`.
-    fn custom_account_relay_origin(&self, machine_id: &str, default_url: &str) -> Option<String> {
+    pub(crate) fn custom_account_relay_origin(
+        &self,
+        machine_id: &str,
+        default_url: &str,
+    ) -> Option<String> {
         let key = format!("relay:{machine_id}");
         let cred = self.inner.registry.credential(&key).ok().flatten()?;
         if cred.token.is_some() {
             return None;
         }
-        let url = cred.url.as_deref().filter(|u| !u.is_empty())?;
-        let origin = ConnectOptions::parse(url).ok()?.endpoint.origin();
-        let default_origin = ConnectOptions::parse(default_url)
-            .ok()
-            .map(|o| o.endpoint.origin())
-            .unwrap_or_else(|| default_url.trim_end_matches('/').to_string());
-        (origin.trim_end_matches('/') != default_origin.trim_end_matches('/')).then_some(origin)
+        let url = cred.url.as_deref()?;
+        crate::cloud::custom_relay_origin(url, default_url)
     }
 
     pub(crate) async fn relay_directory(
@@ -1156,7 +1155,7 @@ impl Spaces {
     ) -> Result<Vec<crate::relay::RelayMachine>> {
         let mut relay = self.relay()?;
         if let Some(origin) = want.and_then(|id| self.custom_account_relay_origin(id, &relay.url)) {
-            relay.url = origin;
+            relay = relay.rebind(&origin)?;
             let token = relay.tokens.access_token().await?;
             let client = cua_host::RelayClient::new(&relay.url)?;
             let machines = match &relay.device {
@@ -2427,7 +2426,10 @@ impl Spaces {
                 } else {
                     let mut relay = self.relay()?;
                     if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
-                        relay.url = ConnectOptions::parse(url)?.endpoint.origin();
+                        let _ = ConnectOptions::parse(url)?;
+                        if let Some(origin) = crate::cloud::custom_relay_origin(url, &relay.url) {
+                            relay = relay.rebind(&origin)?;
+                        }
                     }
                     // A Space one of your own machines provides prefers the mesh
                     // (often a LAN neighbour); others follow `CUA_MESH`.
@@ -3243,11 +3245,11 @@ impl Spaces {
                 .and_then(|s| s.default_on())
                 .map_err(|e| Error::invalid(e.to_string()))?,
         };
-        if opts.cloud_image_id.is_some() && matches!(on, On::Local | On::Host(_) | On::Cloud) {
-            return Err(Error::invalid(
-                "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-            ));
-        }
+        cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+            !matches!(on, On::Local | On::Host(_) | On::Cloud),
+            opts.cloud_image_id.as_deref(),
+            None,
+        )?;
         // No location given and none configured: this machine first, then
         // the linked clouds when it is full and a budget is set
         // (`placement.overflow`). An explicit `local` never overflows.
@@ -3293,11 +3295,11 @@ impl Spaces {
             if self.elastic_has_clouds().await {
                 return boxed(move || self.create_on_auto_elastic(opts)).await;
             }
-            if opts.cloud_image_id.is_some() {
-                return Err(Error::invalid(
-                    "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-                ));
-            }
+            cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+                false,
+                opts.cloud_image_id.as_deref(),
+                None,
+            )?;
             return boxed(move || self.create_on_auto(opts)).await;
         }
         if let On::Host(query) = &on {
@@ -3386,15 +3388,11 @@ impl Spaces {
         {
             return Ok(SpaceCreated::Ready { info, reused: true });
         }
-        if opts
-            .cloud_image_id
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            return Err(Error::invalid(
-                "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-            ));
-        }
+        cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+            false,
+            opts.cloud_image_id.as_deref(),
+            None,
+        )?;
         let name = sanitize_label(&opts.name.unwrap_or_else(|| self.fresh_name()));
         let local = LocalProvision {
             image: opts.image,
