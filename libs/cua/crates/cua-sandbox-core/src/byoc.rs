@@ -2,18 +2,26 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! Your own cloud account as a sandbox location (`--on aws`, `gcp`,
-//! `modal`, `hetzner`): the records every surface shares (`cua cloud`, the SDK, the
-//! Spaces `cloud_*` tools, the apps) and [`CloudManager`], the service that
-//! connects, checks and sweeps the clouds. The providers themselves are
-//! ordinary [`crate::Provider`]s registered like the contrib ones; they live
-//! in the `cua-byoc` crate.
+//! `modal`, `hetzner`, `aliyun-ecs`): the records every surface shares
+//! (`cua cloud`, the SDK, the Spaces `cloud_*` tools, the apps) and
+//! [`CloudManager`], the service that connects, checks and sweeps the clouds.
+//! The providers themselves are ordinary [`crate::Provider`]s registered like
+//! the contrib ones; they live in the `cua-byoc` crate.
 //!
-//! Every cloud sandbox is a relay machine of the signed-in cua.ai account:
-//! the guest's cua-spacesd dials out to the relay (no inbound port), and the
-//! SDK reaches it there with the account's credentials
+//! Every cloud sandbox is a relay machine of the signed-in cua.ai account (or
+//! a self-hosted relay in Static Relay Mode): the guest's cua-spacesd dials
+//! out to the relay (no inbound port), and the SDK reaches it there
 //! ([`crate::Provider::connect_options`]). Its instance details carry
 //! [`DETAIL_RELAY_MACHINE`], which is how Spaces shows it as
 //! `relay:<machine>`.
+
+#[path = "byoc_reports.rs"]
+mod byoc_reports;
+#[path = "byoc_url.rs"]
+mod byoc_url;
+
+pub use byoc_reports::*;
+pub use byoc_url::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +34,7 @@ pub const DETAIL_RELAY_MACHINE: &str = "relay_machine";
 /// with, so every device of the account can label it and knows where it
 /// can be deleted. No secrets.
 pub mod meta {
-    /// The provider word (`aws`, `gcp`, `hetzner`, `modal`).
+    /// The provider word (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
     pub const PROVIDER: &str = "cua.cloud.provider";
     /// Where it runs, for people ("AWS · us-west-2").
     pub const PLACE: &str = "cua.cloud.place";
@@ -44,6 +52,19 @@ pub mod meta {
 /// The instance detail naming where a cloud sandbox runs ("AWS ·
 /// us-west-2"), shown next to its Space.
 pub const DETAIL_PLACE: &str = "place";
+
+/// Human-readable title for a cloud provider location (`aws` -> `"AWS"`).
+pub fn provider_title(name: &str) -> &str {
+    match name {
+        "aliyun-ecs" => "Alibaba Cloud ECS",
+        "aws" => "AWS",
+        "gcp" => "Google Cloud",
+        "azure" => "Microsoft Azure",
+        "hetzner" => "Hetzner Cloud",
+        "modal" => "Modal",
+        _ => name,
+    }
+}
 
 /// Where a cloud's credentials were found on this machine.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -123,202 +144,24 @@ impl std::fmt::Display for RelayMode {
 /// The default official Cua relay URL.
 pub const DEFAULT_RELAY_URL: &str = "https://relay.cua.ai";
 
-fn is_valid_port(port: &str) -> bool {
-    !port.is_empty()
-        && !port.starts_with('0')
-        && port.bytes().all(|b| b.is_ascii_digit())
-        && port.parse::<u16>().is_ok_and(|p| p > 0)
-}
-
-fn is_valid_ipv4_or_dns_host(host: &str) -> bool {
-    if host.is_empty() || !host.is_ascii() {
-        return false;
-    }
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return true;
-    }
-    let h = host.strip_suffix('.').unwrap_or(host);
-    if h.is_empty() || h.len() > 253 {
-        return false;
-    }
-    for label in h.split('.') {
-        if label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return false;
-        }
-    }
-    let last_label = h.rsplit('.').next().unwrap_or(h);
-    !last_label.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Returns `true` when `auth` is a strict RFC-3986 `host` or `host:port`
-/// (IPv4, bracketed IPv6, or ASCII DNS hostname, with optional `1..=65535` port
-/// without leading `'0'`).
-pub fn is_valid_host_or_hostport(auth: &str) -> bool {
-    if auth.is_empty() || !auth.is_ascii() {
-        return false;
-    }
-    if let Some(rest) = auth.strip_prefix('[') {
-        let Some((ip, tail)) = rest.split_once(']') else {
-            return false;
-        };
-        if ip.parse::<std::net::Ipv6Addr>().is_err() {
-            return false;
-        }
-        return tail.is_empty() || tail.strip_prefix(':').is_some_and(is_valid_port);
-    }
-    if auth.contains(['[', ']']) {
-        return false;
-    }
-    match auth.split_once(':') {
-        Some((host, port)) => is_valid_ipv4_or_dns_host(host) && is_valid_port(port),
-        None => is_valid_ipv4_or_dns_host(auth),
-    }
-}
-
-/// Returns `true` when `host_port` is a valid IPv4/IPv6 literal, `localhost`,
-/// or a dotted domain name (as opposed to a bare single-label name such as
-/// `user:8080`).
-pub fn is_qualified_host(host_port: &str) -> bool {
-    if !is_valid_host_or_hostport(host_port) {
-        return false;
-    }
-    if host_port.starts_with('[') {
-        return true;
-    }
-    let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return true;
-    }
-    let h = host.trim_end_matches('.');
-    h.eq_ignore_ascii_case("localhost") || h.contains('.')
-}
-
-enum UrlReject {
-    BadChars,
-    MissingScheme,
-    UnsupportedScheme(String),
-    BackslashInAuthority,
-    InvalidHostOrPort,
-    UrlParse(url::ParseError),
-    EmptyHost,
-}
-
-struct ParsedHttpUrl<'a> {
-    parsed: url::Url,
-    raw_path: &'a str,
-    has_userinfo: bool,
-    multi_at: bool,
-    ambiguous_at: bool,
-}
-
-fn parse_http_url_structural(trimmed: &str) -> std::result::Result<ParsedHttpUrl<'_>, UrlReject> {
-    if !trimmed.is_ascii()
-        || trimmed
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"'))
-    {
-        return Err(UrlReject::BadChars);
-    }
-    let Some((scheme_raw, after_scheme)) = trimmed.split_once("://") else {
-        return Err(UrlReject::MissingScheme);
-    };
-    let scheme_lower = scheme_raw.to_ascii_lowercase();
-    if !matches!(scheme_lower.as_str(), "http" | "https") {
-        return Err(UrlReject::UnsupportedScheme(scheme_lower));
-    }
-    let delim_pos = after_scheme
-        .find(['/', '\\', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let raw_authority = &after_scheme[..delim_pos];
-    let raw_tail = &after_scheme[delim_pos..];
-    if raw_tail.starts_with('\\') {
-        return Err(UrlReject::BackslashInAuthority);
-    }
-    let at_count = raw_authority.bytes().filter(|&b| b == b'@').count();
-    let has_userinfo = at_count > 0;
-    let multi_at = at_count > 1;
-    let raw_host_port = raw_authority
-        .rsplit_once('@')
-        .map_or(raw_authority, |(_, hp)| hp);
-    if !is_valid_host_or_hostport(raw_host_port) {
-        return Err(UrlReject::InvalidHostOrPort);
-    }
-    let has_port_colon = if let Some(rest) = raw_host_port.strip_prefix('[') {
-        rest.split_once(']')
-            .is_some_and(|(_, t)| t.starts_with(':'))
-    } else {
-        raw_host_port.contains(':')
-    };
-    let parsed = url::Url::parse(trimmed).map_err(UrlReject::UrlParse)?;
-    if parsed.host_str().is_none_or(str::is_empty) {
-        return Err(UrlReject::EmptyHost);
-    }
-    if parsed.port() == Some(0) {
-        return Err(UrlReject::InvalidHostOrPort);
-    }
-    let ambiguous_at = raw_tail.contains("?@")
-        || raw_tail.contains("#@")
-        || (raw_tail.starts_with("/@") && has_port_colon && !is_qualified_host(raw_host_port))
-        || (!raw_tail.starts_with('/')
-            && raw_tail.contains('@')
-            && (has_userinfo || has_port_colon || !is_qualified_host(raw_host_port)))
-        || (raw_tail.contains('@') && has_port_colon && !is_qualified_host(raw_host_port));
-    let raw_path = if raw_tail.starts_with('/') {
-        let end = raw_tail.find(['?', '#']).unwrap_or(raw_tail.len());
-        &raw_tail[..end]
-    } else {
-        ""
-    };
-    Ok(ParsedHttpUrl {
-        parsed,
-        raw_path,
-        has_userinfo,
-        multi_at,
-        ambiguous_at,
-    })
-}
-
-/// Strips URL userinfo (`user:pass@`), `?query` parameters, and non-`#sha256=`
-/// fragments from `raw` so credentials and signed tokens never appear in logs,
-/// error messages, or `Debug` output.
-pub fn redact_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let Ok(u) = parse_http_url_structural(trimmed) else {
-        return "<redacted>".into();
-    };
-    if u.multi_at || u.ambiguous_at {
-        return "<redacted>".into();
-    }
-    let Some(host) = u.parsed.host_str() else {
-        return "<redacted>".into();
-    };
-    let mut out = match u.parsed.port() {
-        Some(port) => format!("{}://{}:{}{}", u.parsed.scheme(), host, port, u.raw_path),
-        None => format!("{}://{}{}", u.parsed.scheme(), host, u.raw_path),
-    };
-    if let Some(frag) = u.parsed.fragment()
-        && let Some(hex) = frag.strip_prefix("sha256=")
-        && !hex.is_empty()
-        && hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        out.push('#');
-        out.push_str(frag);
-    }
-    out
-}
-
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn redact_opt_url(url: &Option<String>) -> Option<String> {
+    url.as_deref().map(redact_url)
+}
+
+fn redact_secret(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
+macro_rules! debug_fields {
+    ($ds:expr, $self:expr; $($field:ident),* $(,)?) => {{
+        let mut d = $ds;
+        $(d.field(stringify!($field), &$self.$field);)*
+        d
+    }};
 }
 
 /// Validates and trims an optional identifier or token (`cloud_image_id`,
@@ -345,9 +188,9 @@ pub fn normalize_optional_token(label: &str, raw: Option<&str>) -> Result<Option
 /// One cloud as `cloud_status` lists it.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudProvider {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
+    /// `aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`.
     pub name: String,
-    /// `AWS`, `Google Cloud`, `Hetzner Cloud`, `Modal`.
+    /// `AWS`, `Google Cloud`, `Hetzner Cloud`, `Modal`, `Alibaba Cloud ECS`.
     pub title: String,
     /// `vm` (one VM per sandbox) or `sandbox` (one platform sandbox each).
     pub tier: String,
@@ -480,49 +323,18 @@ pub struct CloudProvider {
 
 impl std::fmt::Debug for CloudProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CloudProvider")
-            .field("name", &self.name)
-            .field("title", &self.title)
-            .field("tier", &self.tier)
-            .field("connected", &self.connected)
-            .field("default", &self.default)
-            .field("credentials", &self.credentials)
-            .field("account", &self.account)
-            .field("profile", &self.profile)
-            .field("region", &self.region)
-            .field("zone", &self.zone)
-            .field("project", &self.project)
-            .field("environment", &self.environment)
-            .field("label", &self.label)
-            .field("ttl_hours", &self.ttl_hours)
-            .field("kinds", &self.kinds)
-            .field("auth", &self.auth)
-            .field("status", &self.status)
-            .field("budget_usd_month", &self.budget_usd_month)
-            .field("max_size", &self.max_size)
-            .field("spent_month", &self.spent_month)
-            .field("running", &self.running)
-            .field("approval", &self.approval)
-            .field("approval_agent", &self.approval_agent)
-            .field("pending_budget_usd_month", &self.pending_budget_usd_month)
-            .field("pending_max_size", &self.pending_max_size)
-            .field("can_approve", &self.can_approve)
-            .field("suggest_auth", &self.suggest_auth)
-            .field("issue", &self.issue)
-            .field("holders", &self.holders)
-            .field("relay_url", &self.relay_url)
-            .field("relay_mode", &self.relay_mode)
-            .field(
-                "spacesd_download_url",
-                &self.spacesd_download_url.as_deref().map(redact_url),
-            )
-            .field("vpc_id", &self.vpc_id)
-            .field("vswitch_id", &self.vswitch_id)
-            .field("no_public_ip", &self.no_public_ip)
-            .field("windows_image_id", &self.windows_image_id)
-            .field("linux_image_id", &self.linux_image_id)
-            .field("instance_type", &self.instance_type)
-            .finish()
+        debug_fields!(f.debug_struct("CloudProvider"), self;
+            name, title, tier, connected, default, credentials, account, profile, region, zone,
+            project, environment, label, ttl_hours, kinds, auth, status, budget_usd_month,
+            max_size, spent_month, running, approval, approval_agent, pending_budget_usd_month,
+            pending_max_size, can_approve, suggest_auth, issue, holders, relay_url, relay_mode,
+            vpc_id, vswitch_id, no_public_ip, windows_image_id, linux_image_id, instance_type
+        )
+        .field(
+            "spacesd_download_url",
+            &redact_opt_url(&self.spacesd_download_url),
+        )
+        .finish()
     }
 }
 
@@ -690,299 +502,6 @@ impl ConnectRequest {
     }
 }
 
-/// One thing Cua created in a cloud.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudResource {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
-    pub provider: String,
-    /// The cloud's id (`i-0abc...`, the instance name, `sb-...`).
-    pub id: String,
-    /// `instance`, `security_group`, `firewall`, `sandbox`, ...
-    #[serde(rename = "type")]
-    pub resource_type: String,
-    /// The sandbox it belongs to (`aws:<name>`), empty for shared
-    /// resources (a security group).
-    #[serde(default)]
-    pub sandbox: String,
-    /// The relay machine the sandbox joined as (its Space is
-    /// `relay:<machine>`), when it has one.
-    #[serde(default)]
-    pub machine: String,
-    /// Region (or zone).
-    #[serde(default)]
-    pub region: String,
-    /// The cloud's state (`running`, `stopped`, `terminated`, `gone`).
-    #[serde(default)]
-    pub state: String,
-    /// When Cua created it (RFC 3339).
-    #[serde(default)]
-    pub created: String,
-    /// When it expires (RFC 3339; empty: never).
-    #[serde(default)]
-    pub expires: String,
-    /// Whether it is past `expires`.
-    #[serde(default)]
-    pub expired: bool,
-    /// Who started it: the agent's name, or `user`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub started_by: String,
-    /// Estimated US dollars it cost so far (list price times runtime).
-    #[serde(default)]
-    pub cost_usd: f64,
-}
-
-/// `cloud_status`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudStatusReport {
-    /// The default location (`default.on`), for example `aws`.
-    #[serde(default)]
-    pub default_on: String,
-    /// Every cloud this build supports.
-    pub providers: Vec<CloudProvider>,
-    /// What Cua created in them.
-    #[serde(default)]
-    pub resources: Vec<CloudResource>,
-}
-
-/// One check of `cloud_test`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudCheck {
-    /// `credentials`, `permissions`, `quota`, `region`, ...
-    pub name: String,
-    /// Whether it passed.
-    pub ok: bool,
-    /// What was found, or what to fix.
-    #[serde(default)]
-    pub detail: String,
-}
-
-/// `cloud_test`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudTestReport {
-    /// The cloud.
-    pub provider: String,
-    /// Whether every check passed.
-    pub ok: bool,
-    /// The account, project or workspace the credentials reach.
-    #[serde(default)]
-    pub account: String,
-    /// The checks, in order.
-    pub checks: Vec<CloudCheck>,
-}
-
-/// `cloud_connect`: the cloud as `cloud_status` lists it (its `status`
-/// is the outcome), the checks it ran, the next step and how to verify.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudConnected {
-    /// The cloud, as `cloud_status` lists it.
-    #[serde(flatten)]
-    pub provider: CloudProvider,
-    /// The checks it ran.
-    #[serde(default)]
-    pub checks: Vec<CloudCheck>,
-    /// What to do next (`None`: nothing, it is connected).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next: Option<CloudNext>,
-    /// The command that confirms it (`cua cloud status aws`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub verify: String,
-}
-
-/// `cloud_disconnect`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudDisconnected {
-    /// The cloud.
-    pub provider: String,
-    /// Whether a connection was forgotten.
-    pub disconnected: bool,
-    /// Resources Cua still records there.
-    #[serde(default)]
-    pub left: Vec<CloudResource>,
-    /// With `delete`: what was deleted from the account first (the
-    /// receipt), each resource as `cloud_status` lists it.
-    #[serde(default)]
-    pub deleted: Vec<CloudResource>,
-}
-
-/// One line of the cloud audit log (`cloud_audit`): something Cua did in a
-/// cloud account. Never carries a secret or a token.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudAuditEntry {
-    /// When (RFC 3339, UTC).
-    pub ts: String,
-    /// `connect`, `disconnect`, `resource_recorded`, `resource_created`,
-    /// `resource_confirmed` or `resource_deleted`.
-    pub action: String,
-    /// `aws`, `gcp`, `modal`.
-    pub provider: String,
-    /// The resource type (`instance`, `sandbox`, `security_group`, ...);
-    /// empty for `connect` and `disconnect`.
-    #[serde(default)]
-    pub kind: String,
-    /// The cloud id (the name Cua chose while a create is under way).
-    #[serde(default)]
-    pub id: String,
-    /// The sandbox (Space) it belongs to; empty for shared resources.
-    #[serde(default)]
-    pub space: String,
-    /// Who did it: `user`, `sweep`, `auto-sweep`, `disconnect` or
-    /// `rollback`.
-    #[serde(default)]
-    pub actor: String,
-    /// `ok`, `failed` or `refused`.
-    #[serde(default)]
-    pub outcome: String,
-    /// A short note (the reason, or the error).
-    #[serde(default)]
-    pub detail: String,
-    /// Where it was recorded: `device` (this cua home's log) or `account`
-    /// (Cua's issuer, for clouds linked to the account: tokens issued or
-    /// refused, approvals, limit changes). Empty from an older cua: this
-    /// device.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source: String,
-}
-
-/// How `cloud_cost` groups the spend.
-pub mod cost_by {
-    /// One row per Space.
-    pub const SPACE: &str = "space";
-    /// One row per agent (`user` for what a person started).
-    pub const AGENT: &str = "agent";
-    /// One row per UTC day (`YYYY-MM-DD`).
-    pub const DAY: &str = "day";
-    /// One row per cloud.
-    pub const CLOUD: &str = "cloud";
-    /// Every grouping, in the order the docs list them.
-    pub const ALL: &[&str] = &[SPACE, AGENT, DAY, CLOUD];
-}
-
-/// One row of `cloud_cost`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudCostRow {
-    /// The Space, agent, day (`YYYY-MM-DD`) or cloud.
-    pub key: String,
-    /// Estimated US dollars (list price times runtime), to the cent.
-    pub usd: f64,
-    /// Machine hours, to the hundredth.
-    pub hours: f64,
-    /// How many machines ran.
-    pub machines: u32,
-}
-
-/// `cloud_cost`: what the machines Cua created cost, estimated from list
-/// price times runtime (the cloud's bill is the final word).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudCostReport {
-    /// `space`, `agent`, `day` or `cloud`.
-    pub by: String,
-    /// The first day counted (`YYYY-MM-DD`, UTC).
-    pub since: String,
-    /// Up to when (RFC 3339).
-    pub until: String,
-    /// The rows: by day oldest first, otherwise the costliest first.
-    pub rows: Vec<CloudCostRow>,
-    /// The sum of the rows, to the cent.
-    pub total_usd: f64,
-}
-
-/// A cloud's spend crossed a share of its monthly budget.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudBudgetAlert {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
-    pub provider: String,
-    /// `AWS`, `Google Cloud`, ...
-    pub title: String,
-    /// 50, 80 or 100.
-    pub percent: u32,
-    /// `YYYY-MM` (UTC).
-    pub month: String,
-    /// Estimated US dollars spent this month.
-    pub spent_usd: f64,
-    /// The monthly budget.
-    pub budget_usd: f64,
-}
-
-impl CloudBudgetAlert {
-    /// "AWS reached 80% of its budget".
-    pub fn title_line(&self) -> String {
-        if self.percent >= 100 {
-            format!("{} reached its monthly budget", self.title)
-        } else {
-            format!("{} reached {}% of its budget", self.title, self.percent)
-        }
-    }
-
-    /// One plain sentence with the figures and what happens next.
-    pub fn body_line(&self) -> String {
-        let figures = format!(
-            "About ${:.2} of ${:.2} spent this month.",
-            self.spent_usd, self.budget_usd
-        );
-        if self.percent >= 100 {
-            format!(
-                "{figures} New machines there are refused until next month; stopping and \
-                 deleting still work. Raise it with `cua cloud connect {} --budget <usd>`.",
-                self.provider
-            )
-        } else {
-            figures
-        }
-    }
-}
-
-/// Where budget alerts go besides the audit log: the app's notification
-/// feed, registered by the Spaces runtime. Takes the cua home and the alert.
-pub type BudgetAlertSink =
-    std::sync::Arc<dyn Fn(&std::path::Path, &CloudBudgetAlert) + Send + Sync>;
-
-fn alert_sink() -> &'static std::sync::RwLock<Option<BudgetAlertSink>> {
-    static SINK: std::sync::OnceLock<std::sync::RwLock<Option<BudgetAlertSink>>> =
-        std::sync::OnceLock::new();
-    SINK.get_or_init(Default::default)
-}
-
-/// Sets where budget alerts are posted (the last call wins).
-pub fn set_budget_alert_sink(sink: BudgetAlertSink) {
-    *alert_sink().write().expect("alert sink") = Some(sink);
-}
-
-/// Posts `alert` for the cua home `home` to the registered sink, if any;
-/// whether one was registered.
-pub fn post_budget_alert(home: &std::path::Path, alert: &CloudBudgetAlert) -> bool {
-    let sink = alert_sink().read().expect("alert sink").clone();
-    match sink {
-        Some(f) => {
-            f(home, alert);
-            true
-        }
-        None => false,
-    }
-}
-
-/// One row of `cloud_sweep`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudSweepItem {
-    /// The resource.
-    #[serde(flatten)]
-    pub resource: CloudResource,
-    /// `delete` (dry run), `deleted`, `keep`, `forget`, `forgotten` or
-    /// `failed`.
-    pub action: String,
-    /// Why.
-    #[serde(default)]
-    pub reason: String,
-}
-
-/// `cloud_sweep`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudSweepReport {
-    /// Whether nothing was deleted.
-    pub dry_run: bool,
-    /// What was found.
-    pub resources: Vec<CloudSweepItem>,
-}
-
 /// Where in a cloud account sandboxes go (`cloud_connect`, `cloud_test`).
 /// Clouds with a CLI sign-in (AWS, Google Cloud, Hetzner, Modal) use it, and Cua
 /// stores only these names. A cloud that has only an API token (Hetzner)
@@ -991,7 +510,7 @@ pub struct CloudSweepReport {
 /// logs or the connection record.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudTarget {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
+    /// `aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`.
     pub provider: String,
     /// AWS or Modal profile.
     #[serde(default)]
@@ -1048,253 +567,18 @@ pub struct CloudTarget {
 
 impl std::fmt::Debug for CloudTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CloudTarget")
-            .field("provider", &self.provider)
-            .field("profile", &self.profile)
-            .field("region", &self.region)
-            .field("zone", &self.zone)
-            .field("project", &self.project)
-            .field("environment", &self.environment)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .field("relay_url", &self.relay_url)
-            .field("relay_mode", &self.relay_mode)
-            .field(
-                "relay_token",
-                &self.relay_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "spacesd_download_url",
-                &self.spacesd_download_url.as_deref().map(redact_url),
-            )
-            .field("vpc_id", &self.vpc_id)
-            .field("vswitch_id", &self.vswitch_id)
-            .field("no_public_ip", &self.no_public_ip)
-            .field("windows_image_id", &self.windows_image_id)
-            .field("linux_image_id", &self.linux_image_id)
-            .field("instance_type", &self.instance_type)
-            .finish()
+        debug_fields!(f.debug_struct("CloudTarget"), self;
+            provider, profile, region, zone, project, environment, relay_url, relay_mode,
+            vpc_id, vswitch_id, no_public_ip, windows_image_id, linux_image_id, instance_type
+        )
+        .field("token", &redact_secret(&self.token))
+        .field("relay_token", &redact_secret(&self.relay_token))
+        .field(
+            "spacesd_download_url",
+            &redact_opt_url(&self.spacesd_download_url),
+        )
+        .finish()
     }
-}
-
-/// Validates a custom `cua-spacesd` binary/archive download URL: must be
-/// `https://`, loopback `http://` (`localhost` / `127.0.0.1` / `[::1]`), or
-/// RFC 1918 private-IPv4 `http://`, without embedded URL userinfo
-/// credentials, backslashes in authority, quotes, non-ASCII, or whitespace; an
-/// optional `#sha256=<64 hex>` fragment is checked if present.
-pub fn validate_spacesd_download_url(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(crate::Error::InvalidArgument(
-            "--spacesd-download-url cannot be empty".into(),
-        ));
-    }
-    let safe = redact_url(trimmed);
-    let u = match parse_http_url_structural(trimmed) {
-        Ok(u) => u,
-        Err(UrlReject::BadChars) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url {safe:?} must be an ASCII URL without whitespace or quotes"
-            )));
-        }
-        Err(UrlReject::MissingScheme) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url {safe:?}: missing URL scheme (use https://)"
-            )));
-        }
-        Err(UrlReject::UnsupportedScheme(other)) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url scheme {other:?} is not supported (use https://)"
-            )));
-        }
-        Err(UrlReject::BackslashInAuthority) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url {safe:?} cannot contain '\\\\' in host"
-            )));
-        }
-        Err(UrlReject::EmptyHost) => {
-            return Err(crate::Error::InvalidArgument(
-                "--spacesd-download-url must include a host".into(),
-            ));
-        }
-        Err(UrlReject::InvalidHostOrPort) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url {safe:?} has an invalid host or port"
-            )));
-        }
-        Err(UrlReject::UrlParse(e)) => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url {safe:?}: {e}"
-            )));
-        }
-    };
-    if u.has_userinfo
-        || u.ambiguous_at
-        || !u.parsed.username().is_empty()
-        || u.parsed.password().is_some()
-    {
-        return Err(crate::Error::InvalidArgument(
-            "--spacesd-download-url cannot include embedded username or password credentials"
-                .into(),
-        ));
-    }
-    let is_local_http = match u.parsed.host() {
-        Some(url::Host::Domain(d)) => {
-            let d = d.trim_end_matches('.').to_ascii_lowercase();
-            d == "localhost" || d.ends_with(".localhost")
-        }
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
-    match u.parsed.scheme() {
-        "https" => {}
-        "http" if is_local_http => {}
-        "http" => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url {safe:?}: use https:// (plain http is only allowed for localhost/127.0.0.1 or RFC1918 private IPs)"
-            )));
-        }
-        other => {
-            return Err(crate::Error::InvalidArgument(format!(
-                "--spacesd-download-url scheme {other:?} is not supported (use https://)"
-            )));
-        }
-    }
-    if let Some(frag) = u.parsed.fragment()
-        && let Some(hex) = frag.strip_prefix("sha256=")
-        && (hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err(crate::Error::InvalidArgument(format!(
-            "--spacesd-download-url #sha256= fragment must be 64 hex characters (got {} chars)",
-            hex.len()
-        )));
-    }
-    Ok(trimmed.to_string())
-}
-
-/// What a linked cloud supplies to the elastic pool.
-pub mod supplies {
-    /// Machines the pool controls: each runs cua-spacesd as a host and many
-    /// Spaces run on it (AWS, GCP, Hetzner).
-    pub const HOSTS: &str = "hosts";
-    /// Spaces directly, one platform sandbox each (Modal).
-    pub const SPACES: &str = "spaces";
-}
-
-/// One machine type a linked cloud offers to the elastic pool, in one
-/// region: what the solver may add (`cua cloud plan` lists them).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct HostTypeOffer {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
-    pub provider: String,
-    /// The cloud's type name (`cx33`, `c7g.xlarge`; for a Spaces supplier
-    /// a size word such as `2x4`).
-    pub type_name: String,
-    /// Region or location.
-    pub region: String,
-    /// `amd64` or `arm64`.
-    pub arch: String,
-    /// vCPUs.
-    pub vcpus: u32,
-    /// Memory, MiB.
-    pub memory_mb: u64,
-    /// Boot disk, GiB.
-    #[serde(default)]
-    pub disk_gb: u32,
-    /// It has `/dev/kvm` (runs `vm` and `microvm` Spaces).
-    #[serde(default)]
-    pub kvm: bool,
-    /// Kinds its hosts create.
-    #[serde(default)]
-    pub kinds: Vec<String>,
-    /// Accelerator, or empty.
-    #[serde(default)]
-    pub gpu: String,
-    /// On-demand USD per hour, with what every machine of it carries.
-    pub usd_per_hour: f64,
-    /// Billed in steps of this many seconds.
-    pub billing_step_secs: u64,
-    /// Minimum billed seconds.
-    pub billing_min_secs: u64,
-    /// Typical seconds from add to ready (learned when measured).
-    pub boot_secs: u32,
-    /// [`supplies::HOSTS`] or [`supplies::SPACES`].
-    pub supplies: String,
-    /// How many more machines this provider allows now.
-    #[serde(default)]
-    pub max_new: u32,
-    /// The quota pool its vCPUs count against (`hetzner/shared`); empty:
-    /// none.
-    #[serde(default)]
-    pub quota: String,
-    /// That pool's vCPU limit when the cloud says it (0: unknown).
-    #[serde(default)]
-    pub quota_vcpus: u32,
-    /// 0 in the region you linked; n > 0 in the provider's n-th nearby
-    /// region, which the pool uses only when every type it could use in the
-    /// linked region has just failed (the cloud had no capacity there).
-    #[serde(default)]
-    pub fallback: u8,
-}
-
-/// A cloud host the elastic pool added (or `cua cloud hosts add`).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudHost {
-    /// Its pool name (`hetzner-3`).
-    pub name: String,
-    /// Provider.
-    pub provider: String,
-    /// Machine type.
-    pub type_name: String,
-    /// Region.
-    pub region: String,
-    /// The cloud's id.
-    #[serde(default)]
-    pub id: String,
-    /// Its relay machine once joined (empty before).
-    #[serde(default)]
-    pub machine: String,
-    /// `creating`, `booting`, `joined`, `cordoned`, `removing`, `gone`.
-    pub state: String,
-    /// Unix seconds it was created (billing starts).
-    pub started: u64,
-    /// Unix seconds it ends on its own at the latest (its TTL).
-    #[serde(default)]
-    pub expires: u64,
-    /// USD per hour.
-    pub usd_per_hour: f64,
-    /// Billing step, seconds.
-    pub billing_step_secs: u64,
-    /// Minimum billed, seconds.
-    pub billing_min_secs: u64,
-    /// Added by hand (`cua cloud hosts add`): the scaler never removes it.
-    #[serde(default)]
-    pub pinned: bool,
-}
-
-/// Adds one host.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct AddHost {
-    /// Provider.
-    pub provider: String,
-    /// Machine type.
-    pub type_name: String,
-    /// Region (empty: the connection's).
-    #[serde(default)]
-    pub region: String,
-    /// Pool name (empty: `<provider>-<n>`).
-    #[serde(default)]
-    pub name: String,
-    /// Added by hand: never removed by the scaler.
-    #[serde(default)]
-    pub pinned: bool,
-    /// Seconds until it ends on its own (0: the default, 24 h).
-    #[serde(default)]
-    pub ttl_secs: u64,
-    /// Images it pulls as soon as it joined (the ones it is added for), so
-    /// its first Spaces start without a pull.
-    #[serde(default)]
-    pub prepull: Vec<String>,
 }
 
 /// Connects, checks and sweeps your clouds (implemented in `cua-byoc`).
@@ -1388,6 +672,7 @@ pub trait CloudManager: Send + Sync + 'static {
     async fn cordon_host(&self, _name: &str, _cordoned: bool) -> Result<()> {
         Err(not_built())
     }
+
     /// The automatic sweep the daemon schedules: deletes what
     /// `cloud_sweep` with `dry_run: false` (and not `all`) deletes, in
     /// every connected cloud; one failing cloud does not stop the others.
@@ -1438,6 +723,17 @@ pub fn not_built() -> crate::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_title_maps_known_clouds_and_falls_back_to_name() {
+        assert_eq!(provider_title("aliyun-ecs"), "Alibaba Cloud ECS");
+        assert_eq!(provider_title("aws"), "AWS");
+        assert_eq!(provider_title("gcp"), "Google Cloud");
+        assert_eq!(provider_title("azure"), "Microsoft Azure");
+        assert_eq!(provider_title("hetzner"), "Hetzner Cloud");
+        assert_eq!(provider_title("modal"), "Modal");
+        assert_eq!(provider_title("custom-cloud"), "custom-cloud");
+    }
 
     #[test]
     fn azure_and_named_google_trust_link_through_the_issuer() {
@@ -1504,48 +800,6 @@ mod tests {
     }
 
     #[test]
-    fn redact_url_strips_userinfo_query_and_non_sha_fragments() {
-        assert_eq!(
-            redact_url(
-                "https://dluser:MyPass998877@mirror.example.com:8443/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab"
-            ),
-            "https://mirror.example.com:8443/cua-spacesd.exe#sha256=abab"
-        );
-        assert_eq!(
-            redact_url("https://mirror.example.com/cua.exe#token=secret"),
-            "https://mirror.example.com/cua.exe"
-        );
-        assert_eq!(redact_url("https://user:pass@/cua.exe"), "<redacted>");
-
-        let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua.exe?sig=DeadBeefCafe9988#sha256=abab";
-        let t = CloudTarget {
-            provider: "aliyun-ecs".into(),
-            spacesd_download_url: Some(secret_url.into()),
-            ..Default::default()
-        };
-        let t_dbg = format!("{t:?}");
-        assert!(!t_dbg.contains("MyPass998877"), "{t_dbg}");
-        assert!(!t_dbg.contains("DeadBeefCafe9988"), "{t_dbg}");
-        assert!(
-            t_dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
-            "{t_dbg}"
-        );
-
-        let p = CloudProvider {
-            name: "aliyun-ecs".into(),
-            spacesd_download_url: Some(secret_url.into()),
-            ..Default::default()
-        };
-        let p_dbg = format!("{p:?}");
-        assert!(!p_dbg.contains("MyPass998877"), "{p_dbg}");
-        assert!(!p_dbg.contains("DeadBeefCafe9988"), "{p_dbg}");
-        assert!(
-            p_dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
-            "{p_dbg}"
-        );
-    }
-
-    #[test]
     fn existing_vpc_fields_default_and_skip_serializing_when_unset() {
         let t = CloudTarget {
             provider: "aliyun-ecs".into(),
@@ -1570,229 +824,5 @@ mod tests {
         assert!(!serialized.contains("vpc_id"), "{serialized}");
         assert!(!serialized.contains("vswitch_id"), "{serialized}");
         assert!(!serialized.contains("no_public_ip"), "{serialized}");
-    }
-
-    #[test]
-    fn spacesd_download_url_allows_https_and_loopback_or_private_http_only() {
-        assert_eq!(
-            validate_spacesd_download_url("  https://mirror.example.cn/cua/cua-spacesd.tar.gz  ")
-                .unwrap(),
-            "https://mirror.example.cn/cua/cua-spacesd.tar.gz"
-        );
-        let hex = "0123456789abcdef".repeat(4);
-        assert!(
-            validate_spacesd_download_url(&format!("https://mirror.example.cn/bin#sha256={hex}"))
-                .is_ok()
-        );
-        assert!(validate_spacesd_download_url("http://127.0.0.1:8080/cua-spacesd").is_ok());
-        assert!(validate_spacesd_download_url("http://localhost:9000/cua-spacesd.tar.gz").is_ok());
-        assert!(validate_spacesd_download_url("http://[::1]:9000/cua-spacesd").is_ok());
-        assert!(validate_spacesd_download_url("http://10.0.0.5:8080/cua-spacesd.exe").is_ok());
-
-        for bad in [
-            "",
-            "   ",
-            "http://mirror.example.cn/cua-spacesd",
-            "http://100.100.100.200/latest/meta-data",
-            "http://169.254.169.254/latest/meta-data",
-            "ftp://mirror.example.cn/cua-spacesd",
-            "https:///no-host.exe",
-            "https://mirror.example.cn/bad'quote",
-            "https://mirror.example.cn/bad space",
-            "https://mirror.example.cn/cua\u{2018}.exe",
-            "https://mirror.example.cn/bin#sha256=nothex",
-        ] {
-            assert!(validate_spacesd_download_url(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn spacesd_download_url_rejects_userinfo_and_redacts_errors() {
-        for bad in [
-            "https://user:secret@mirror.example.com/cua-spacesd.tar.gz",
-            "http://user:secret@localhost:8080/cua-spacesd",
-            "https://127.0.0.1@evil.com/bin",
-            "https://user@mirror.example.com/bin",
-            "https://:secret@mirror.example.com/bin",
-            "https://@mirror.example.com/bin",
-            "http://user:secret@mirror.example.com/cua-spacesd.tar.gz",
-            "https://user:secret@mirror.example.com/bad space",
-            "https://user:secret@[invalid/cua-spacesd",
-            "https://user:s3cr3t\\@mirror.example.com/bin",
-            "https://s3cr3t\\@mirror.example.com/bin",
-            "https://user:8443\\@mirror.example.com/bin",
-            "https://user:12345\\@mirror.example.com/bin",
-            "https://mirror.example.com\\@s3cr3t@evil.com/bin",
-            "https://user:s3cr3t/@mirror.example.com/bin",
-            "https://user:s3cr3t/@mirror.example.com/bad space",
-            "https://user:s3cr3t/@mirror.example.com/bad space?sig=DeadBeefCafe9988",
-            "https://mirror.example.com\\evil.com/bin",
-        ] {
-            let err = validate_spacesd_download_url(bad).expect_err(bad);
-            assert!(
-                matches!(err, crate::Error::InvalidArgument(_)),
-                "{bad:?} -> {err:?}"
-            );
-            let msg = err.to_string();
-            assert!(!msg.contains("secret"), "secret leaked for {bad:?}: {msg}");
-            assert!(!msg.contains("s3cr3t"), "s3cr3t leaked for {bad:?}: {msg}");
-            assert!(
-                !msg.contains("DeadBeefCafe9988"),
-                "query leaked for {bad:?}: {msg}"
-            );
-            assert!(!msg.contains("user:"), "userinfo leaked for {bad:?}: {msg}");
-            assert!(!msg.contains("8443"), "port/pass leaked for {bad:?}: {msg}");
-            assert!(
-                !msg.contains("12345"),
-                "port/pass leaked for {bad:?}: {msg}"
-            );
-            assert!(
-                !msg.contains("127.0.0.1@"),
-                "userinfo leaked for {bad:?}: {msg}"
-            );
-            assert!(!msg.contains("user@"), "userinfo leaked for {bad:?}: {msg}");
-        }
-        // Legitimate `@` in URL path, query, and fragment is still accepted.
-        for ok in [
-            "https://mirror.example.com/@cua/cua-spacesd.tar.gz",
-            "https://mirror.example.com/@path/cua-spacesd.tar.gz",
-            "http://localhost:8080/@cua/cua-spacesd",
-            "https://mirror.example.com/bin?user=ada@example.com",
-            "https://mirror.example.com/bin#owner=ada@example.com",
-        ] {
-            assert!(validate_spacesd_download_url(ok).is_ok(), "{ok:?}");
-        }
-    }
-
-    #[test]
-    fn redact_url_and_rejected_url_scrub_adversarial_authority_leaks() {
-        for bad in [
-            "https://user:s3cr3t secret/@evil.com/bin?sig=DeadBeef",
-            "https://user:s3cr3t?@evil.com/bin",
-            "https://user:s3cr3t @mirror.example.com/bin",
-        ] {
-            let redacted = redact_url(bad);
-            assert!(
-                !redacted.contains("user:s3cr3t"),
-                "redact_url leaked userinfo for {bad:?}: {redacted}"
-            );
-            assert!(
-                !redacted.contains("s3cr3t"),
-                "redact_url leaked secret for {bad:?}: {redacted}"
-            );
-            assert!(
-                !redacted.contains("DeadBeef"),
-                "redact_url leaked query for {bad:?}: {redacted}"
-            );
-
-            let err = validate_spacesd_download_url(bad).expect_err(bad);
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("user:s3cr3t"),
-                "error leaked userinfo for {bad:?}: {msg}"
-            );
-            assert!(
-                !msg.contains("s3cr3t"),
-                "error leaked secret for {bad:?}: {msg}"
-            );
-            assert!(
-                !msg.contains("DeadBeef"),
-                "error leaked query for {bad:?}: {msg}"
-            );
-        }
-        assert_eq!(
-            redact_url("https://mirror.example.com/@org/cua-spacesd?sig=DeadBeef"),
-            "https://mirror.example.com/@org/cua-spacesd"
-        );
-    }
-
-    #[test]
-    fn structural_url_redaction_blocks_port_and_delimiter_at_confusion_bypasses() {
-        for bad in [
-            "https://user:123456#@evil.com/bin",
-            "https://user:123456?x=@evil.com/bin",
-            "https://user:8080#@evil.com/bin",
-            "https://user:8080?x=@evil.com/bin",
-            "https://user:s3cr3t?@evil.com/bin",
-            "https://user:s3cr3t#@evil.com/bin",
-            "https://user:s3cr3t?x=@evil.com/bin",
-            "https://user:s3cr3t secret/@evil.com/bin?sig=DeadBeef",
-            "https://user:8080 foo/@evil.com/bin",
-            "https://user:s3cr3t @mirror.example.com/bin",
-            "https://user:8080/@evil.com/bin",
-            "https://ada@org:p4ssw0rd/@evil.com/bin",
-            "https://ada@org:8080/@evil.com/bin",
-            "https://ada@org:secret@mirror.example.com/bin",
-            "https://user:s3cr3t\\@mirror.example.com/bin",
-            "https://user:8443\\@mirror.example.com/bin",
-            "https://mirror.example.com\\@s3cr3t@evil.com/bin",
-            "https://example.com:0/bin",
-            "https://example.com:/bin",
-            "https://example.com:08080/bin",
-        ] {
-            let redacted = redact_url(bad);
-            assert_eq!(
-                redacted, "<redacted>",
-                "redact_url must fail closed for {bad:?}, got {redacted:?}"
-            );
-            let err = validate_spacesd_download_url(bad).expect_err(bad);
-            assert!(
-                matches!(err, crate::Error::InvalidArgument(_)),
-                "{bad:?} -> {err:?}"
-            );
-            let msg = err.to_string();
-            for leak in [
-                "user:", "123456", "8080", "8443", "08080", "s3cr3t", "p4ssw0rd", "ada@org",
-                "DeadBeef", "secret", "evil.com",
-            ] {
-                assert!(
-                    !msg.contains(leak),
-                    "validate_spacesd_download_url leaked {leak:?} for {bad:?}: {msg}"
-                );
-            }
-        }
-
-        let bad_sha = "https://mirror.example.com/bin#sha256=user:s3cr3t@evil.com";
-        let err = validate_spacesd_download_url(bad_sha).expect_err(bad_sha);
-        let msg = err.to_string();
-        assert!(!msg.contains("s3cr3t") && !msg.contains("user:"), "{msg}");
-
-        // Preserve valid URLs, templates, localhost/@org, and query @ parameters.
-        assert_eq!(
-            redact_url("https://mirror.example.com/cua-{version}-{arch}.tar.gz"),
-            "https://mirror.example.com/cua-{version}-{arch}.tar.gz"
-        );
-        assert_eq!(
-            redact_url("http://localhost:8080/@cua/cua-spacesd"),
-            "http://localhost:8080/@cua/cua-spacesd"
-        );
-        assert_eq!(
-            redact_url("https://cdn.example.com/pkg/@v1/spacesd"),
-            "https://cdn.example.com/pkg/@v1/spacesd"
-        );
-        let sha64 = "0123456789abcdef".repeat(4);
-        assert_eq!(
-            redact_url(&format!(
-                "https://mirror.example.com/bin?user=ada@example.com&sig=AbCd#sha256={sha64}"
-            )),
-            format!("https://mirror.example.com/bin#sha256={sha64}")
-        );
-        assert_eq!(
-            redact_url(&format!(
-                "https://mirror.example.com?user=ada@example.com&sig=AbCd#sha256={sha64}"
-            )),
-            format!("https://mirror.example.com#sha256={sha64}")
-        );
-        for ok in [
-            "https://mirror.example.com/@org/cua-spacesd",
-            "https://cdn.example.com/pkg/@v1/spacesd",
-            "http://10.0.0.5:8080/cua-spacesd",
-            "http://[::1]:8080/cua-spacesd",
-            "http://localhost:9000/cua-spacesd",
-            "http://localhost:8080/@cua/cua-spacesd",
-            &format!("https://mirror.example.com?user=ada@example.com&sig=AbCd#sha256={sha64}"),
-        ] {
-            assert!(validate_spacesd_download_url(ok).is_ok(), "{ok:?}");
-        }
     }
 }

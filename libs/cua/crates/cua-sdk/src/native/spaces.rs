@@ -3971,6 +3971,47 @@ mod require_fields_tests {
 
 // ------------------------------------------------------------ Machine health
 
+/// Returns `true` when `s` is a generic Cua size preset (`small`, `medium`,
+/// `large`, `xlarge`) or `NxM` / `NxMxD` dimensions rather than a provider
+/// instance type (such as `ecs.g7.large` or `t3.medium`).
+fn is_generic_size_word(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "small" | "medium" | "large" | "xlarge") {
+        return true;
+    }
+    let parts: Vec<&str> = lower.split('x').collect();
+    matches!(parts.len(), 2 | 3)
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u64>().is_ok_and(|n| n > 0)
+        })
+}
+
+#[cfg(test)]
+mod size_word_tests {
+    use super::is_generic_size_word;
+
+    #[test]
+    fn distinguishes_generic_sizes_from_provider_instance_types() {
+        for generic in [
+            "small", "medium", "large", "xlarge", "LARGE", "2x4", "4x16x80",
+        ] {
+            assert!(is_generic_size_word(generic), "{generic}");
+        }
+        for provider_type in [
+            "ecs.g7.large",
+            "t3.medium",
+            "cx33",
+            "e2-standard-4",
+            "0x4",
+            "4x",
+        ] {
+            assert!(!is_generic_size_word(provider_type), "{provider_type}");
+        }
+    }
+}
+
 /// One check of a machine's health ([`Spaces::machine_health`]).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MachineHealthCheck {
@@ -4606,14 +4647,11 @@ impl Spaces {
                             .require_fields("create_space", &required, what)
                             .await?;
                     }
-                    if instance_type.is_some()
-                        && matches!(
-                            on,
-                            Some(cua_sandbox_core::placement::On::Provider(ref p)) if p == "aliyun-ecs"
-                        )
+                    if let Some(ref inst) = instance_type
+                        && matches!(on, Some(cua_sandbox_core::placement::On::Provider(_)))
+                        && !is_generic_size_word(inst)
                     {
-                        d.require_cloud_image_and_sizing(&["instance_type"])
-                            .await?;
+                        d.require_cloud_image_and_sizing(&["instance_type"]).await?;
                     }
                     let request = dpb::CreateSpaceRequest {
                         image: options.image.unwrap_or_default(),

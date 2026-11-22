@@ -1132,11 +1132,47 @@ impl Spaces {
 
     const RELAY_MAX_AGE: Duration = Duration::from_secs(10);
 
+    /// Custom Account-mode relay origin recorded for `machine_id`, when a
+    /// registry credential stores a relay URL without a static env token and
+    /// its origin differs from `default_url`.
+    fn custom_account_relay_origin(&self, machine_id: &str, default_url: &str) -> Option<String> {
+        let key = format!("relay:{machine_id}");
+        let cred = self.inner.registry.credential(&key).ok().flatten()?;
+        if cred.token.is_some() {
+            return None;
+        }
+        let url = cred.url.as_deref().filter(|u| !u.is_empty())?;
+        let origin = ConnectOptions::parse(url).ok()?.endpoint.origin();
+        let default_origin = ConnectOptions::parse(default_url)
+            .ok()
+            .map(|o| o.endpoint.origin())
+            .unwrap_or_else(|| default_url.trim_end_matches('/').to_string());
+        (origin.trim_end_matches('/') != default_origin.trim_end_matches('/')).then_some(origin)
+    }
+
     pub(crate) async fn relay_directory(
         &self,
         want: Option<&str>,
     ) -> Result<Vec<crate::relay::RelayMachine>> {
-        let relay = self.relay()?;
+        let mut relay = self.relay()?;
+        if let Some(origin) = want.and_then(|id| self.custom_account_relay_origin(id, &relay.url)) {
+            relay.url = origin;
+            let token = relay.tokens.access_token().await?;
+            let client = cua_host::RelayClient::new(&relay.url)?;
+            let machines = match &relay.device {
+                Some(d) => d.machines_for(&client, &token).await?,
+                None => client.machines(&token).await?,
+            };
+            let mut cache = self.inner.relay_cache.lock().expect("relay cache");
+            for m in &machines {
+                if let Some(existing) = cache.iter_mut().find(|e| e.id == m.id) {
+                    *existing = m.clone();
+                } else {
+                    cache.push(m.clone());
+                }
+            }
+            return Ok(machines);
+        }
         let mut read_at = self.inner.relay_read.lock().await;
         let cached = self.inner.relay_cache.lock().expect("relay cache").clone();
         let listed = want.is_some_and(|id| cached.iter().any(|m| m.id == id));
@@ -1248,10 +1284,17 @@ impl Spaces {
         let id = self.resolve(space)?;
         let key = id.to_string();
         if let SpaceId::Relay { machine_id } = &id
-            && self.relay_account().is_some()
-            && self.inner.registry.get(&key)?.is_none()
+            && let Some(account) = self.relay_account()
         {
-            self.relay_directory(Some(machine_id)).await?;
+            if self.inner.registry.get(&key)?.is_none() {
+                self.relay_directory(Some(machine_id)).await?;
+            } else if self
+                .custom_account_relay_origin(machine_id, &account.url)
+                .is_some()
+                && let Err(e) = self.relay_directory(Some(machine_id)).await
+            {
+                tracing::debug!(machine = %machine_id, error = %e, "custom relay directory not read");
+            }
         }
         self.list()?
             .into_iter()
@@ -2349,39 +2392,43 @@ impl Spaces {
                         image = Some((i.reference.clone(), i.digest.clone()));
                     }
                 }
-                if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
+                if let (Some(url), Some(token)) = (
+                    credential.url.as_deref().filter(|u| !u.is_empty()),
+                    credential.token.as_deref(),
+                ) {
                     let mut o = ConnectOptions::parse(url)?;
-                    o.token = credential.token.clone();
+                    o.token = Some(token.to_string());
                     let relay_url = o.endpoint.origin();
                     let mut route = Some(crate::ChannelRoute::Relay(relay_url.clone()));
-                    if let Some(token) = credential.token.as_deref() {
-                        let via = crate::mesh::Via::Static {
+                    let via = crate::mesh::Via::Static {
+                        relay: &relay_url,
+                        token,
+                    };
+                    match crate::mesh::connect_options(
+                        &self.inner.mesh,
+                        crate::mesh::Via::Static {
                             relay: &relay_url,
                             token,
-                        };
-                        match crate::mesh::connect_options(
-                            &self.inner.mesh,
-                            crate::mesh::Via::Static {
-                                relay: &relay_url,
-                                token,
-                            },
-                            machine_id,
-                            crate::mesh::policy(),
-                        )
-                        .await?
-                        {
-                            crate::mesh::Route::Mesh(m, via_mesh) => {
-                                tracing::info!(machine = %machine_id, "relay Space over the mesh");
-                                self.inner.mesh.note_routed(&id.to_string(), &via, false);
-                                o = *m;
-                                route = Some(via_mesh);
-                            }
-                            crate::mesh::Route::Relay { fallback: why } => fallback = why,
+                        },
+                        machine_id,
+                        crate::mesh::policy(),
+                    )
+                    .await?
+                    {
+                        crate::mesh::Route::Mesh(m, via_mesh) => {
+                            tracing::info!(machine = %machine_id, "relay Space over the mesh");
+                            self.inner.mesh.note_routed(&id.to_string(), &via, false);
+                            o = *m;
+                            route = Some(via_mesh);
                         }
+                        crate::mesh::Route::Relay { fallback: why } => fallback = why,
                     }
                     (Some(o), None, route)
                 } else {
-                    let relay = self.relay()?;
+                    let mut relay = self.relay()?;
+                    if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
+                        relay.url = ConnectOptions::parse(url)?.endpoint.origin();
+                    }
                     // A Space one of your own machines provides prefers the mesh
                     // (often a LAN neighbour); others follow `CUA_MESH`.
                     // ... and so does a host whose routed Spaces ride its channel.

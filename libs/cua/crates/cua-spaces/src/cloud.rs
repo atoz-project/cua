@@ -120,9 +120,11 @@ impl Spaces {
             .ok()
             .and_then(|c| c.relay_mode(word))
             == Some(cua_sandbox_core::byoc::RelayMode::Static);
-        if !static_relay {
-            self.relay()?;
-        }
+        let default_relay_url = if static_relay {
+            None
+        } else {
+            Some(self.relay()?.url)
+        };
         let image = opts
             .image
             .clone()
@@ -190,68 +192,107 @@ impl Spaces {
         create.command = opts.command.clone();
         create.services = opts.services.clone();
         let sandbox = self.inner.sandboxes.create(create).await?;
-        let machine = sandbox
-            .provider_details()
-            .get(DETAIL_RELAY_MACHINE)
-            .cloned()
-            .ok_or_else(|| {
-                Error::invalid(format!(
-                    "{word} sandbox {} did not join the relay (no relay computer)",
-                    sandbox.name()
-                ))
-            })?;
-        let id = format!("relay:{machine}");
-        if static_relay {
+        let sb_name = sandbox.name().to_string();
+        let record_result: Result<String> = async {
+            let machine = sandbox
+                .provider_details()
+                .get(DETAIL_RELAY_MACHINE)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid(format!(
+                        "{word} sandbox {sb_name} did not join the relay (no relay computer)"
+                    ))
+                })?;
+            let id = format!("relay:{machine}");
             let endpoint_url = match sandbox.service("env") {
                 Ok(svc) => svc.endpoint().await.ok().map(|e| e.url),
                 Err(_) => None,
+            };
+            let custom_account_relay = match (&default_relay_url, endpoint_url.as_deref()) {
+                (Some(default_url), Some(ep)) => {
+                    let default_origin = cua_spacesd_client::ConnectOptions::parse(default_url)
+                        .ok()
+                        .map(|o| o.endpoint.origin())
+                        .unwrap_or_else(|| default_url.trim_end_matches('/').to_string());
+                    cua_spacesd_client::ConnectOptions::parse(ep)
+                        .ok()
+                        .map(|o| o.endpoint.origin())
+                        .is_some_and(|origin| {
+                            origin.trim_end_matches('/') != default_origin.trim_end_matches('/')
+                        })
+                }
+                _ => false,
+            };
+            let needs_registry = static_relay || custom_account_relay;
+            if needs_registry {
+                let endpoint_url = endpoint_url.ok_or_else(|| {
+                    Error::invalid(format!("{word} sandbox {sb_name} has no relay endpoint"))
+                })?;
+                let env_token = if static_relay {
+                    sandbox.env_token()
+                } else {
+                    None
+                };
+                let (image, image_digest) = sandbox
+                    .image_info()
+                    .map(|i| (i.reference.clone(), i.digest.clone()))
+                    .unwrap_or_default();
+                let kind = sandbox
+                    .image_info()
+                    .map(|i| i.variant.clone())
+                    .unwrap_or_else(|| match sandbox.placement().0 {
+                        Kind::Vm => "vm".into(),
+                        Kind::MicroVm => "microvm".into(),
+                        _ => "container".into(),
+                    });
+                let arch = sandbox
+                    .image_info()
+                    .and_then(|i| i.arch.clone())
+                    .unwrap_or_default();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let record = cua_proto::daemon::v1::Space {
+                    id: id.clone(),
+                    name: sb_name.clone(),
+                    kind,
+                    arch,
+                    image,
+                    image_digest,
+                    added_at: Some(pbjson_types::Timestamp {
+                        seconds: now.as_secs() as i64,
+                        nanos: now.subsec_nanos() as i32,
+                    }),
+                    ..Default::default()
+                };
+                let cred = crate::registry::Credential {
+                    url: Some(endpoint_url),
+                    token: env_token,
+                    service_urls: Default::default(),
+                };
+                self.inner.registry.upsert(record, cred)?;
             }
-            .ok_or_else(|| {
-                Error::invalid(format!(
-                    "{word} sandbox {} has no relay endpoint",
-                    sandbox.name()
-                ))
-            })?;
-            let env_token = sandbox.env_token();
-            let (image, image_digest) = sandbox
-                .image_info()
-                .map(|i| (i.reference.clone(), i.digest.clone()))
-                .unwrap_or_default();
-            let kind = sandbox
-                .image_info()
-                .map(|i| i.variant.clone())
-                .unwrap_or_else(|| match sandbox.placement().0 {
-                    Kind::Vm => "vm".into(),
-                    Kind::MicroVm => "microvm".into(),
-                    _ => "container".into(),
-                });
-            let arch = sandbox
-                .image_info()
-                .and_then(|i| i.arch.clone())
-                .unwrap_or_default();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let record = cua_proto::daemon::v1::Space {
-                id: id.clone(),
-                name: sandbox.name().to_string(),
-                kind,
-                arch,
-                image,
-                image_digest,
-                added_at: Some(pbjson_types::Timestamp {
-                    seconds: now.as_secs() as i64,
-                    nanos: now.subsec_nanos() as i32,
-                }),
-                ..Default::default()
-            };
-            let cred = crate::registry::Credential {
-                url: Some(endpoint_url),
-                token: env_token,
-                service_urls: Default::default(),
-            };
-            self.inner.registry.upsert(record, cred)?;
+            Ok(id)
         }
+        .await;
+        let id = match record_result {
+            Ok(id) => id,
+            Err(err) => {
+                if let Err(del_err) = sandbox.delete().await {
+                    tracing::warn!(
+                        sandbox = %sb_name,
+                        "rollback sandbox.delete() failed ({del_err}); retrying by name"
+                    );
+                    if let Err(fallback_err) = self.inner.sandboxes.delete(&sb_name).await {
+                        tracing::error!(
+                            sandbox = %sb_name,
+                            "rollback sandboxes.delete() failed: {fallback_err}"
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
         // Connect it once, as a local create does: the handshake records its
         // capabilities, and extensions start what a connected Space gets
         // (the Cua Volume mount in its guest).
@@ -402,5 +443,343 @@ mod tests {
         // The old default: no rules go anywhere, rules only where kept.
         assert!(cloud_network("c", &internet, false, false, Mode::Legacy).is_ok());
         assert!(cloud_network("c", &custom, false, false, Mode::Legacy).is_err());
+    }
+
+    struct FakeRelayProvider {
+        relay_base_url: String,
+        spacesd_url: String,
+        machine_id: String,
+        created: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        deleted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeRelayProvider {
+        fn instance(&self, name: &str) -> cua_sandbox_core::ProviderInstance {
+            let mut inst = cua_sandbox_core::ProviderInstance::new(
+                "inst-1",
+                name,
+                cua_sandbox_core::Status::Running,
+            );
+            inst.details
+                .insert(DETAIL_RELAY_MACHINE.into(), self.machine_id.clone());
+            inst.details.insert(
+                cua_sandbox_core::byoc::DETAIL_PLACE.into(),
+                "AWS · us-west-2".into(),
+            );
+            inst.endpoints.insert(
+                cua_sandbox_core::ENV_PORT,
+                cua_sandbox_core::ServiceEndpoint {
+                    url: format!(
+                        "{}/m/{}",
+                        self.relay_base_url.trim_end_matches('/'),
+                        self.machine_id
+                    ),
+                    headers: vec![],
+                },
+            );
+            inst
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cua_sandbox_core::Provider for FakeRelayProvider {
+        fn name(&self) -> &'static str {
+            "aws"
+        }
+
+        fn capabilities(&self) -> cua_sandbox_core::ProviderCapabilities {
+            cua_sandbox_core::ProviderCapabilities {
+                kinds: vec![cua_sandbox_core::RunKind::Container],
+                runtime: "fake",
+                arches: vec!["amd64"],
+                image_mode: cua_sandbox_core::ImageMode::Direct,
+                ports: cua_sandbox_core::PortExposure::Https,
+                command: false,
+                env_to_entrypoint: true,
+                private_registry: false,
+                suspend: false,
+                max_cpus: None,
+                max_memory_mb: None,
+                credential_env: &[],
+                gpus: vec![],
+                oses: vec!["linux"],
+                custom_disk_gb: false,
+                custom_cloud_image: false,
+            }
+        }
+
+        fn check_configured(&self) -> cua_sandbox_core::Result<()> {
+            Ok(())
+        }
+
+        async fn create(
+            &self,
+            spec: &cua_sandbox_core::ProviderCreate,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::ProviderInstance> {
+            self.created
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.instance(&spec.name))
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::ProviderInstance> {
+            Ok(self.instance("fake"))
+        }
+
+        async fn list(&self) -> cua_sandbox_core::Result<Vec<cua_sandbox_core::ProviderInstance>> {
+            Ok(vec![])
+        }
+
+        async fn delete(&self, _id: &str) -> cua_sandbox_core::Result<()> {
+            self.deleted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn endpoint(
+            &self,
+            instance: &cua_sandbox_core::ProviderInstance,
+            port: u16,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::ServiceEndpoint> {
+            instance
+                .endpoints
+                .get(&port)
+                .cloned()
+                .ok_or_else(|| cua_sandbox_core::Error::NotFound(format!("port {port}")))
+        }
+
+        fn connect_options(
+            &self,
+            _instance: &cua_sandbox_core::ProviderInstance,
+            _port: u16,
+        ) -> Option<cua_sandbox_core::Result<cua_spacesd_client::ConnectOptions>> {
+            Some(
+                cua_spacesd_client::ConnectOptions::parse(&self.spacesd_url)
+                    .map_err(|e| cua_sandbox_core::Error::InvalidArgument(e.to_string())),
+            )
+        }
+
+        fn joins_relay(&self) -> bool {
+            true
+        }
+
+        fn keeps_internet_only(&self) -> bool {
+            true
+        }
+    }
+
+    async fn spawn_mock_relay(
+        machine_id: String,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_bg = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_conn = seen_bg.clone();
+                let machine_id = machine_id.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let mut lines = req.lines();
+                    let first = lines.next().unwrap_or_default();
+                    let path = first
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let auth = lines.find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("authorization")
+                            .then(|| v.trim().to_string())
+                    });
+                    seen_conn.lock().unwrap().push((path.clone(), auth));
+                    let (status, body) = if path == "/v1/machines" {
+                        (
+                            "200 OK",
+                            serde_json::json!([{
+                                "id": machine_id,
+                                "name": "custom-sb",
+                                "online": true,
+                                "role": "owner",
+                                "meta": {
+                                    "cua.cloud.provider": "aws",
+                                    "cua.cloud.place": "AWS · us-west-2"
+                                }
+                            }])
+                            .to_string(),
+                        )
+                    } else {
+                        ("404 Not Found", r#"{"error":"not found"}"#.into())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn custom_account_relay_persists_url_without_token_and_routes_via_account_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock_env = cua_spacesd_client::testing::MockServer::start(Default::default()).await;
+        let (default_relay_url, default_seen) = spawn_mock_relay("m-other".into()).await;
+        let (custom_relay_url, custom_seen) = spawn_mock_relay("m-custom".into()).await;
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = std::sync::Arc::new(FakeRelayProvider {
+            relay_base_url: custom_relay_url.clone(),
+            spacesd_url: format!("http://{}", mock_env.addr),
+            machine_id: "m-custom".into(),
+            created: created.clone(),
+            deleted: deleted.clone(),
+        });
+        let sandboxes = cua_sandbox_core::Sandboxes::builder()
+            .state_dir(dir.path().join("sandboxes"))
+            .provider(provider)
+            .build();
+        let spaces = Spaces::builder()
+            .home(dir.path())
+            .sandboxes(sandboxes)
+            .relay(crate::relay::RelayAccount::new(
+                &default_relay_url,
+                std::sync::Arc::new(crate::relay::StaticToken("acct-bearer-custom".into())),
+            ))
+            .build();
+
+        let mut o = opts();
+        o.name = Some("custom-sb".into());
+        let info = spaces.create_in_cloud("aws", o).await.unwrap();
+        assert_eq!(info.id, "relay:m-custom");
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Persisted in registry with custom relay URL and token: None (Account mode, not Static).
+        let cred = spaces
+            .inner
+            .registry
+            .credential("relay:m-custom")
+            .unwrap()
+            .expect("custom account relay credential persisted");
+        assert_eq!(
+            cred.url.as_deref(),
+            Some(format!("{custom_relay_url}/m/m-custom").as_str())
+        );
+        assert_eq!(cred.token, None);
+
+        // Listed and findable without hitting NotFound.
+        assert!(
+            spaces
+                .list()
+                .unwrap()
+                .iter()
+                .any(|s| s.id == "relay:m-custom")
+        );
+        assert_eq!(
+            spaces.find("relay:m-custom").await.unwrap().id,
+            "relay:m-custom"
+        );
+
+        // Dialing `space()` routes through Account auth (RelayBearer) to the custom relay.
+        let _ = spaces.space("relay:m-custom").await;
+        let custom_reqs = custom_seen.lock().unwrap().clone();
+        assert!(
+            custom_reqs.iter().any(|(path, auth)| {
+                path == "/v1/machines" && auth.as_deref() == Some("Bearer acct-bearer-custom")
+            }),
+            "expected custom relay /v1/machines with Account bearer, got {custom_reqs:?}"
+        );
+        assert!(
+            custom_reqs.iter().any(|(path, auth)| {
+                path.starts_with("/m/m-custom")
+                    && auth.as_deref() == Some("Bearer acct-bearer-custom")
+            }),
+            "expected custom relay /m/m-custom with Account bearer, got {custom_reqs:?}"
+        );
+        assert!(
+            default_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(path, _)| !path.starts_with("/m/m-custom")),
+            "default relay must not receive custom-relay machine traffic"
+        );
+
+        // Delete cleans up both the cloud sandbox and the registry record.
+        spaces.delete("relay:m-custom").await.unwrap();
+        assert_eq!(deleted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            spaces
+                .inner
+                .registry
+                .get("relay:m-custom")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_in_cloud_deletes_sandbox_when_registry_upsert_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Force `registry.upsert` to fail by making `spaces.json` an unreadable directory.
+        std::fs::create_dir_all(dir.path().join(crate::registry::SPACES_FILE)).unwrap();
+
+        let mock_env = cua_spacesd_client::testing::MockServer::start(Default::default()).await;
+        let (default_relay_url, _) = spawn_mock_relay("m-other".into()).await;
+        let (custom_relay_url, _) = spawn_mock_relay("m-orphan".into()).await;
+        let created = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = std::sync::Arc::new(FakeRelayProvider {
+            relay_base_url: custom_relay_url,
+            spacesd_url: format!("http://{}", mock_env.addr),
+            machine_id: "m-orphan".into(),
+            created: created.clone(),
+            deleted: deleted.clone(),
+        });
+        let sandboxes = cua_sandbox_core::Sandboxes::builder()
+            .state_dir(dir.path().join("sandboxes"))
+            .provider(provider)
+            .build();
+        let spaces = Spaces::builder()
+            .home(dir.path())
+            .sandboxes(sandboxes)
+            .relay(crate::relay::RelayAccount::new(
+                &default_relay_url,
+                std::sync::Arc::new(crate::relay::StaticToken("acct-bearer".into())),
+            ))
+            .build();
+
+        let mut o = opts();
+        o.name = Some("no-orphan-sb".into());
+        let err = spaces.create_in_cloud("aws", o).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "expected registry I/O error, got {err:?}"
+        );
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "created sandbox must be deleted on post-create registry failure"
+        );
     }
 }

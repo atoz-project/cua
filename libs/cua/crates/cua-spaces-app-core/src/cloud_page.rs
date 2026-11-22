@@ -430,14 +430,12 @@ pub fn input_from_status(status: &serde_json::Value, now: u64, can_approve: bool
 }
 
 /// "AWS", "Google Cloud", ...; empty for a cloud this build does not know.
-pub fn cloud_name(id: &str) -> &'static str {
+pub fn cloud_name(id: &str) -> &str {
     match id {
-        "aws" => "AWS",
-        "gcp" => "Google Cloud",
-        "azure" => "Microsoft Azure",
         "hetzner" => "Hetzner",
-        "modal" => "Modal",
-        "aliyun-ecs" => "Alibaba Cloud ECS",
+        "aws" | "gcp" | "azure" | "modal" | "aliyun-ecs" => {
+            cua_spaces_contract::inputs::provider_title(id)
+        }
         _ => "",
     }
 }
@@ -1529,5 +1527,23 @@ mod tests {
             false,
         );
         assert!(!old.providers[0].can_approve && old.providers[0].suggest_auth.is_empty());
+    }
+
+    #[test]
+    fn cloud_name_matches_byoc_provider_title_for_all_cloud_locations() {
+        for &id in cua_sandbox_core::CLOUD_LOCATIONS {
+            let expected = if id == "hetzner" {
+                "Hetzner"
+            } else {
+                cua_sandbox_core::byoc::provider_title(id)
+            };
+            assert_eq!(cloud_name(id), expected, "{id}");
+            assert_eq!(
+                cua_spaces_contract::inputs::provider_title(id),
+                cua_sandbox_core::byoc::provider_title(id),
+                "{id}"
+            );
+        }
+        assert_eq!(cloud_name("unknown"), "");
     }
 }

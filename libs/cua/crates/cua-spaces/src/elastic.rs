@@ -516,6 +516,15 @@ pub fn month_start(at: u64) -> u64 {
     (at - (d as u64 - 1) * 86_400) / 86_400 * 86_400
 }
 
+fn reject_pool_host_cloud_image_id(opts: &SpaceCreate) -> Result<()> {
+    if opts.cloud_image_id.is_some() {
+        return Err(Error::invalid(
+            "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
+        ));
+    }
+    Ok(())
+}
+
 /// The canonical Linux image (what a create that names none runs).
 fn default_linux_image() -> String {
     cua_image::canonical::canonical_image_or_linux("linux")
@@ -1519,10 +1528,8 @@ impl Spaces {
                         else {
                             return Err(Error::LimitExceeded("the plan placed nothing".into()));
                         };
-                        if matches!(a.target, Target::New { .. }) && opts.cloud_image_id.is_some() {
-                            return Err(Error::invalid(
-                                "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-                            ));
+                        if matches!(a.target, Target::New { .. }) {
+                            reject_pool_host_cloud_image_id(&opts)?;
                         }
                         // About to buy a machine: let the rest of the burst
                         // arrive first (once, holding the turn), then solve
@@ -1549,11 +1556,6 @@ impl Spaces {
                     };
                     let added = match &a.target {
                         Target::New { .. } => {
-                            if opts.cloud_image_id.is_some() {
-                                return Err(Error::invalid(
-                                    "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-                                ));
-                            }
                             let image = if req.image.is_empty() {
                                 default_linux_image()
                             } else {
@@ -1618,31 +1620,20 @@ impl Spaces {
                     in_cloud.then(|| CloudInflight::new(&self.inner.elastic.cloud_inflight));
                 (target, label, guard)
             };
+            if matches!(target, Placed::Host { .. } | Placed::NewHost { .. }) {
+                reject_pool_host_cloud_image_id(&opts)?;
+            }
             let r = match target {
                 Placed::Host { name, id } => {
-                    if opts.cloud_image_id.is_some() {
-                        Err(Error::invalid(
-                            "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-                        ))
-                    } else {
-                        self.create_on_pool_host_settling(&name, &id, &opts).await
-                    }
+                    self.create_on_pool_host_settling(&name, &id, &opts).await
                 }
-                Placed::NewHost { host } => {
-                    if opts.cloud_image_id.is_some() {
-                        Err(Error::invalid(
-                            "cloud_image_id applies to cloud VM providers only (--on aliyun-ecs)",
-                        ))
-                    } else {
-                        match self.wait_joined(&host).await {
-                            Ok(machine) => {
-                                self.create_on_pool_host_settling(&host.name, &machine, &opts)
-                                    .await
-                            }
-                            Err(e) => Err(e),
-                        }
+                Placed::NewHost { host } => match self.wait_joined(&host).await {
+                    Ok(machine) => {
+                        self.create_on_pool_host_settling(&host.name, &machine, &opts)
+                            .await
                     }
-                }
+                    Err(e) => Err(e),
+                },
                 Placed::Provider {
                     provider,
                     cpus,
