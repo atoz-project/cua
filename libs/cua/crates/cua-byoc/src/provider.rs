@@ -696,12 +696,13 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .spent_for_limits(&conn, now())
             .await
             .map_err(Self::io)?;
-        if self.api.name() == "aliyun-ecs" {
+        if self.api.supports_custom_image_and_sizing() {
             let (min_cpus, min_mem_mb) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
             let min_usd_floor = if machine_type_explicit {
                 0.0
             } else {
-                f64::from(min_cpus.unwrap_or(2)) * 0.01 + f64::from(disk_gb) * 0.00014
+                f64::from(min_cpus.unwrap_or(2)) * 0.01
+                    + f64::from(disk_gb) * self.api.disk_usd_per_gb_hour()
             };
             crate::limits::check_new_machine_with_disk(
                 &conn,

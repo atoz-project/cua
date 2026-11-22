@@ -168,6 +168,11 @@ pub trait CloudApi: Send + Sync + 'static {
         crate::provider::disk_for(family)
     }
 
+    /// Estimated hourly USD cost per GiB of boot disk storage.
+    fn disk_usd_per_gb_hour(&self) -> f64 {
+        0.0
+    }
+
     /// Effective `(vcpus, memory_mb)` checked against `--max-size` when
     /// creating `family`.
     fn check_size_for(

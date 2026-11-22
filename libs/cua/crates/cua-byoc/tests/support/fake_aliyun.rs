@@ -54,8 +54,12 @@ pub struct FakeAliyun {
     pub security_group_rules: BTreeMap<String, Vec<Value>>,
     /// Instance type specs (`DescribeInstanceTypes`: `type_id -> (vcpu, mem_gib)`).
     pub instance_types: BTreeMap<String, (u32, f64)>,
-    /// Optional per-instance-type extra fields (`CpuArchitecture`, `GpuAmount`, etc.) for `DescribeInstanceTypes`.
+    /// Optional per-instance-type extra fields (`CpuArchitecture`, `GPUAmount`, etc.) for `DescribeInstanceTypes`.
     pub instance_type_details: BTreeMap<String, Value>,
+    /// Optional page size for `DescribeInstanceTypes` `NextToken` pagination in tests.
+    pub instance_types_page_size: Option<usize>,
+    /// When true, `DescribeInstanceTypes` ignores `InstanceTypes.*` filters (simulating server filter mismatch).
+    pub ignore_instance_types_filter: bool,
     /// Optional custom `AvailableZone` payload for `DescribeAvailableResource`.
     pub available_zones_override: Option<Vec<Value>>,
     /// Catalog of ECS images (`DescribeImages`).
@@ -116,6 +120,8 @@ impl Default for FakeAliyun {
                 ("ecs.g7.4xlarge".into(), (16, 64.0)),
             ]),
             instance_type_details: BTreeMap::new(),
+            instance_types_page_size: None,
+            ignore_instance_types_filter: false,
             available_zones_override: None,
             images: vec![
                 json!({
@@ -786,9 +792,18 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeInstanceTypes") => {
-                let requested: Option<Vec<String>> = params
-                    .get("InstanceTypes")
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+                let repeat_list: Vec<String> = (1..=10)
+                    .filter_map(|i| params.get(&format!("InstanceTypes.{i}")).cloned())
+                    .collect();
+                let requested: Option<Vec<String>> = if f.ignore_instance_types_filter {
+                    None
+                } else if !repeat_list.is_empty() {
+                    Some(repeat_list)
+                } else {
+                    params
+                        .get("InstanceTypes")
+                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                };
                 let items: Vec<Value> = f
                     .instance_types
                     .iter()
@@ -814,10 +829,33 @@ pub async fn handle(
                         item
                     })
                     .collect();
+                let offset = params
+                    .get("NextToken")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let (page_items, next_token) = if let Some(ps) = f.instance_types_page_size
+                    && ps > 0
+                {
+                    let end = offset.saturating_add(ps).min(items.len());
+                    let slice = if offset < items.len() {
+                        items[offset..end].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let next = if end < items.len() {
+                        end.to_string()
+                    } else {
+                        String::new()
+                    };
+                    (slice, next)
+                } else {
+                    (items, String::new())
+                };
                 (
                     StatusCode::OK,
                     axum::Json(json!({
-                        "InstanceTypes": { "InstanceType": items },
+                        "InstanceTypes": { "InstanceType": page_items },
+                        "NextToken": next_token,
                         "RequestId": "req-inst-types-1"
                     })),
                 )

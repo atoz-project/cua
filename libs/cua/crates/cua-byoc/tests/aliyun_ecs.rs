@@ -5965,3 +5965,279 @@ async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock
     );
     sb3.delete().await.unwrap();
 }
+
+#[tokio::test]
+async fn lookup_instance_type_sends_repeat_list_and_requires_exact_match() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+    {
+        let mut f = s.lock().unwrap();
+        f.instance_types.insert("ecs.t1.xsmall".into(), (1, 0.5));
+        f.instance_types
+            .insert("ecs.u2a-c1m2.xlarge".into(), (4, 8.0));
+    }
+
+    let (cpus, mem_mb, _) = api
+        .lookup_instance_type(&c, "ecs.u2a-c1m2.xlarge")
+        .await
+        .unwrap();
+    assert_eq!((cpus, mem_mb), (4, 8192));
+    {
+        let f = s.lock().unwrap();
+        let call = f
+            .calls
+            .iter()
+            .rfind(|call| call.action == "DescribeInstanceTypes")
+            .unwrap();
+        assert_eq!(
+            call.params.get("InstanceTypes.1").map(String::as_str),
+            Some("ecs.u2a-c1m2.xlarge")
+        );
+        assert!(
+            !call.params.contains_key("InstanceTypes"),
+            "must use RepeatList InstanceTypes.1 instead of JSON InstanceTypes: {:?}",
+            call.params
+        );
+    }
+
+    // Even if the server ignores the filter and returns [ecs.t1.xsmall, ...],
+    // lookup_instance_type must NOT fall back to arr.first().
+    s.lock().unwrap().ignore_instance_types_filter = true;
+    let err = api
+        .lookup_instance_type(&c, "ecs.missing-page2.xlarge")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "expected InvalidArgument for missing instance type, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_token_and_excludes_gpu_amount()
+ {
+    use cua_sandbox_core::placement::Runtime;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.zones = vec!["ap-southeast-1a".into()];
+        // 14 candidates (<= 20): must be queried as RepeatList chunks of 10 + 4.
+        let mut supported = Vec::new();
+        for idx in 1..=10 {
+            let id = format!("ecs.d10-{idx:02}.xlarge");
+            f.instance_types.insert(id.clone(), (2, 4.0)); // Too small for 4c8g Windows
+            f.instance_type_details
+                .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
+            supported.push(json!({
+                "Value": id,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        // Include GPU (uppercase GPUAmount), unexcluded-prefix GPU, ARM c6r, and target u2a.
+        for (id, details) in [
+            (
+                "ecs.ga1.xlarge",
+                json!({ "CpuArchitecture": "X86", "GPUAmount": 1 }),
+            ),
+            (
+                "ecs.custom-gpu.xlarge",
+                json!({ "CpuArchitecture": "X86", "GPUAmount": 1 }),
+            ),
+            ("ecs.c6r.xlarge", json!({ "CpuArchitecture": "ARM" })),
+            (
+                "ecs.u2a-c1m2.xlarge",
+                json!({ "CpuArchitecture": "X86", "GPUAmount": 0 }),
+            ),
+        ] {
+            f.instance_types.insert(id.into(), (4, 8.0));
+            f.instance_type_details.insert(id.into(), details);
+            supported.push(json!({
+                "Value": id,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        f.available_zones_override = Some(vec![json!({
+            "RegionId": "ap-southeast-1",
+            "ZoneId": "ap-southeast-1a",
+            "Status": "Available",
+            "AvailableResources": {
+                "AvailableResource": [{
+                    "Type": "InstanceType",
+                    "SupportedResources": {
+                        "SupportedResource": supported
+                    }
+                }]
+            }
+        })]);
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("ap-southeast-1".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            max_size: Some("4x8x80".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    s.lock().unwrap().calls.clear();
+
+    let mut opts1 = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts1.contrib = Some("aliyun-ecs".into());
+    opts1.name = Some("win-chunk10-gpu".into());
+    opts1.os = "windows".into();
+    opts1.runtime = Runtime::Other("native".into());
+    opts1.ready_timeout = std::time::Duration::from_secs(10);
+    let sb1 = sbx.create(opts1).await.unwrap();
+    assert_eq!(
+        sb1.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.u2a-c1m2.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let dt_calls: Vec<_> = f
+            .calls
+            .iter()
+            .filter(|c| c.action == "DescribeInstanceTypes")
+            .collect();
+        assert_eq!(dt_calls.len(), 2, "14 candidates must split into 10 + 4");
+        assert!(dt_calls[0].params.contains_key("InstanceTypes.10"));
+        assert!(!dt_calls[0].params.contains_key("InstanceTypes.11"));
+        assert!(dt_calls[1].params.contains_key("InstanceTypes.4"));
+        assert!(!dt_calls[1].params.contains_key("InstanceTypes.5"));
+    }
+    sb1.delete().await.unwrap();
+
+    // Part B (> 20 candidates + NextToken pagination): 24 candidates, page_size = 6 -> 4 pages.
+    {
+        let mut f = s.lock().unwrap();
+        f.instance_types_page_size = Some(6);
+        let mut supported = Vec::new();
+        for idx in 1..=21 {
+            let id = format!("ecs.a-small-{idx:02}.large");
+            f.instance_types.insert(id.clone(), (2, 4.0));
+            f.instance_type_details
+                .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
+            supported.push(json!({
+                "Value": id,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        // Page-last target ecs.c9a.xlarge (comes after ecs.a-* and ecs.c6r/custom-gpu).
+        f.instance_types.insert("ecs.c9a.xlarge".into(), (4, 8.0));
+        f.instance_type_details.insert(
+            "ecs.c9a.xlarge".into(),
+            json!({ "CpuArchitecture": "X86", "GPUAmount": 0 }),
+        );
+        for extra in [
+            "ecs.ga1.xlarge",
+            "ecs.custom-gpu.xlarge",
+            "ecs.c6r.xlarge",
+            "ecs.c9a.xlarge",
+        ] {
+            supported.push(json!({
+                "Value": extra,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        f.available_zones_override = Some(vec![json!({
+            "RegionId": "ap-southeast-1",
+            "ZoneId": "ap-southeast-1a",
+            "Status": "Available",
+            "AvailableResources": {
+                "AvailableResource": [{
+                    "Type": "InstanceType",
+                    "SupportedResources": {
+                        "SupportedResource": supported
+                    }
+                }]
+            }
+        })]);
+        f.calls.clear();
+    }
+
+    let mut opts2 = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts2.contrib = Some("aliyun-ecs".into());
+    opts2.name = Some("win-next-token".into());
+    opts2.os = "windows".into();
+    opts2.runtime = Runtime::Other("native".into());
+    opts2.ready_timeout = std::time::Duration::from_secs(10);
+    let sb2 = sbx.create(opts2).await.unwrap();
+    assert_eq!(
+        sb2.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c9a.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let dt_calls: Vec<_> = f
+            .calls
+            .iter()
+            .filter(|c| c.action == "DescribeInstanceTypes")
+            .collect();
+        assert!(
+            dt_calls.len() >= 2 && dt_calls.iter().any(|c| c.params.contains_key("NextToken")),
+            "expected paginated DescribeInstanceTypes calls with NextToken: {dt_calls:?}"
+        );
+        assert!(
+            dt_calls
+                .iter()
+                .all(|c| !c.params.contains_key("InstanceTypes.1")),
+            "> 20 candidates must query unfiltered paginated DescribeInstanceTypes"
+        );
+    }
+    sb2.delete().await.unwrap();
+}

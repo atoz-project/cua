@@ -1117,14 +1117,13 @@ impl AliyunEcs {
             return Ok(spec);
         }
         let profile_hint = self.profile_hint(conn);
-        let ids_json = serde_json::to_string(&[instance_type]).unwrap_or_default();
         let v = self
             .call_ok(
                 &self.ecs_endpoint(&conn.region),
                 "GET",
                 "DescribeInstanceTypes",
                 ECS_API_VERSION,
-                &[("InstanceTypes".into(), ids_json)],
+                &[("InstanceTypes.1".into(), instance_type.to_string())],
                 profile_hint,
             )
             .await?;
@@ -1133,7 +1132,6 @@ impl AliyunEcs {
             .and_then(|arr| {
                 arr.iter()
                     .find(|it| it["InstanceTypeId"].as_str() == Some(instance_type))
-                    .or_else(|| arr.first())
             })
         else {
             return Err(Error::InvalidArgument(format!(
@@ -1475,19 +1473,37 @@ fn is_excluded_instance_family(id: &str, cpu_arch: Option<&str>, gpu_amount: Opt
     if base.is_empty() {
         return true;
     }
-    // Alibaba Cloud Yitian ARM families (e.g. c8y, g8y, r8y, c9y).
-    if base.ends_with('y')
+    // Alibaba Cloud ARM families:
+    // - Yitian ARM / newer ARM families ending in `y` or `m` (e.g. c8y, g8y, r8y, c8m, g8m, r8m, av8m)
+    // - Ampere Altra / ARM families ending in `r` under c/g/r prefixes (e.g. c6r, g6r, r6r);
+    //   preserves X86 storage family `ecs.i4r`.
+    if (base.ends_with('y') || base.ends_with('m'))
         && base.len() >= 2
         && base[..base.len() - 1].bytes().any(|b| b.is_ascii_digit())
     {
         return true;
     }
-    // GPU / FPGA families (gn*, sgn*, vgn*, ebmgn*, f1/f3/f5...).
+    if (base.starts_with('c') || base.starts_with('g') || base.starts_with('r'))
+        && base.ends_with('r')
+        && base.len() >= 3
+        && base[1..base.len() - 1].bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    // GPU / FPGA / video-transcoding / internal test families
+    // (gn*, sgn*, vgn*, cgn*, hfgn*, ebmgn*, ga<digit>*, gp<digit>*, f<digit>*, video*, poc-test, e-test).
     if base.starts_with("gn")
         || base.starts_with("sgn")
         || base.starts_with("vgn")
+        || base.starts_with("cgn")
+        || base.starts_with("hfgn")
         || base.starts_with("ebmgn")
+        || (base.starts_with("ga") && base[2..].starts_with(|c: char| c.is_ascii_digit()))
+        || (base.starts_with("gp") && base[2..].starts_with(|c: char| c.is_ascii_digit()))
         || (base.starts_with('f') && base[1..].starts_with(|c: char| c.is_ascii_digit()))
+        || fam.starts_with("video")
+        || fam == "poc-test"
+        || fam == "e-test"
     {
         return true;
     }
@@ -1709,6 +1725,54 @@ impl AliyunEcs {
             .collect())
     }
 
+    fn collect_instance_type_metas(v: &Value, out: &mut BTreeMap<String, InstanceTypeMeta>) {
+        for item in v["InstanceTypes"]["InstanceType"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = item["InstanceTypeId"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let Some(vcpus) = item["CpuCoreCount"]
+                .as_u64()
+                .and_then(|c| u32::try_from(c).ok())
+                .filter(|&c| c > 0)
+            else {
+                continue;
+            };
+            let Some(mem_gib) = item["MemorySize"].as_f64().filter(|&m| m > 0.0) else {
+                continue;
+            };
+            let memory_mb = (mem_gib * 1024.0).round() as u64;
+            let cpu_arch = item["CpuArchitecture"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let gpu_amount = item["GPUAmount"]
+                .as_u64()
+                .or_else(|| item["GpuAmount"].as_u64());
+            let usd_per_hour = ecs_instance_spec(id)
+                .map(|(_, _, u)| u)
+                .unwrap_or_else(|| estimate_usd_per_hour(vcpus, memory_mb));
+            out.insert(
+                id.to_string(),
+                InstanceTypeMeta {
+                    vcpus,
+                    memory_mb,
+                    cpu_arch,
+                    gpu_amount,
+                    usd_per_hour,
+                },
+            );
+        }
+    }
+
     async fn describe_instance_types_batch(
         &self,
         conn: &Connection,
@@ -1721,63 +1785,77 @@ impl AliyunEcs {
         }
         let profile_hint = self.profile_hint(conn);
         let ecs = self.ecs_endpoint(region);
-        for chunk in ids.chunks(100) {
-            let ids_json = serde_json::to_string(chunk).unwrap_or_default();
-            let Ok(v) = self
-                .call_ok(
-                    &ecs,
-                    "GET",
-                    "DescribeInstanceTypes",
-                    ECS_API_VERSION,
-                    &[("InstanceTypes".into(), ids_json)],
-                    profile_hint,
-                )
-                .await
-            else {
-                continue;
-            };
-            for item in v["InstanceTypes"]["InstanceType"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                let Some(id) = item["InstanceTypeId"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+        // Alibaba Cloud ECS caps DescribeInstanceTypes RepeatList (`InstanceTypes.N`) at 10 items.
+        // For <= 20 candidates, fetch in RepeatList chunks of 10; for larger candidate sets,
+        // paginate the unfiltered regional catalog via NextToken so all pages are covered.
+        if ids.len() <= 20 {
+            for chunk in ids.chunks(10) {
+                let base_params: Vec<(String, String)> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (format!("InstanceTypes.{}", i + 1), id.clone()))
+                    .collect();
+                let mut next_token: Option<String> = None;
+                for _page in 0..100 {
+                    let mut params = base_params.clone();
+                    if let Some(ref token) = next_token {
+                        params.push(("NextToken".into(), token.clone()));
+                    }
+                    let Ok(v) = self
+                        .call_ok(
+                            &ecs,
+                            "GET",
+                            "DescribeInstanceTypes",
+                            ECS_API_VERSION,
+                            &params,
+                            profile_hint,
+                        )
+                        .await
+                    else {
+                        break;
+                    };
+                    Self::collect_instance_type_metas(&v, &mut out);
+                    let next = v["NextToken"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    match next {
+                        Some(tok) if Some(&tok) != next_token.as_ref() => next_token = Some(tok),
+                        _ => break,
+                    }
+                }
+            }
+        } else {
+            let mut next_token: Option<String> = None;
+            for _page in 0..100 {
+                let mut params: Vec<(String, String)> = Vec::new();
+                if let Some(ref token) = next_token {
+                    params.push(("NextToken".into(), token.clone()));
+                }
+                let Ok(v) = self
+                    .call_ok(
+                        &ecs,
+                        "GET",
+                        "DescribeInstanceTypes",
+                        ECS_API_VERSION,
+                        &params,
+                        profile_hint,
+                    )
+                    .await
                 else {
-                    continue;
+                    break;
                 };
-                let Some(vcpus) = item["CpuCoreCount"]
-                    .as_u64()
-                    .and_then(|c| u32::try_from(c).ok())
-                    .filter(|&c| c > 0)
-                else {
-                    continue;
-                };
-                let Some(mem_gib) = item["MemorySize"].as_f64().filter(|&m| m > 0.0) else {
-                    continue;
-                };
-                let memory_mb = (mem_gib * 1024.0).round() as u64;
-                let cpu_arch = item["CpuArchitecture"]
+                Self::collect_instance_type_metas(&v, &mut out);
+                let next = v["NextToken"]
                     .as_str()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
-                let gpu_amount = item["GpuAmount"].as_u64();
-                let usd_per_hour = ecs_instance_spec(id)
-                    .map(|(_, _, u)| u)
-                    .unwrap_or_else(|| estimate_usd_per_hour(vcpus, memory_mb));
-                out.insert(
-                    id.to_string(),
-                    InstanceTypeMeta {
-                        vcpus,
-                        memory_mb,
-                        cpu_arch,
-                        gpu_amount,
-                        usd_per_hour,
-                    },
-                );
+                match next {
+                    Some(tok) if Some(&tok) != next_token.as_ref() => next_token = Some(tok),
+                    _ => break,
+                }
             }
         }
         out
@@ -1939,6 +2017,10 @@ impl CloudApi for AliyunEcs {
             "linux" | "linux-slim" => LINUX_DEFAULT_DISK_GB,
             _ => crate::provider::disk_for(family),
         }
+    }
+
+    fn disk_usd_per_gb_hour(&self) -> f64 {
+        ESSD_USD_PER_GB_HOUR
     }
 
     fn check_size_for(
@@ -3597,6 +3679,28 @@ mod tests {
         ));
         assert!(is_excluded_instance_family("ecs.g8y.large", None, None));
         assert!(is_excluded_instance_family("ecs.r8y.large", None, None));
+        assert!(is_excluded_instance_family("ecs.c6r.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.g6r.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.r6r.large", None, None));
+        assert!(is_excluded_instance_family("ecs.c8m.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.g8m.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.r8m.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.av8m.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.ga1.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.gp7.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.cgn8i.xlarge", None, None));
+        assert!(is_excluded_instance_family("ecs.hfgn6g.xlarge", None, None));
+        assert!(is_excluded_instance_family(
+            "ecs.video-trans.large",
+            None,
+            None
+        ));
+        assert!(is_excluded_instance_family(
+            "ecs.poc-test.large",
+            None,
+            None
+        ));
+        assert!(is_excluded_instance_family("ecs.e-test.large", None, None));
         assert!(is_excluded_instance_family(
             "ecs.gn7i-c8g1.2xlarge",
             Some("X86"),
@@ -3612,6 +3716,12 @@ mod tests {
             None
         ));
         assert!(is_excluded_instance_family("ecs.sccg7.large", None, None));
+        assert!(!is_excluded_instance_family(
+            "ecs.i4r.xlarge",
+            Some("X86"),
+            Some(0)
+        ));
+        assert!(!is_excluded_instance_family("ecs.i4r.xlarge", None, None));
         assert!(!is_excluded_instance_family(
             "ecs.hfc7.xlarge",
             Some("X86"),

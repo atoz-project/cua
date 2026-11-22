@@ -868,10 +868,17 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeInstanceTypes") => {
-                let requested: Option<Vec<String>> = params
-                    .get("InstanceTypes")
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                    .or_else(|| params.get("InstanceType").map(|id| vec![id.clone()]));
+                let repeat_list: Vec<String> = (1..=10)
+                    .filter_map(|i| params.get(&format!("InstanceTypes.{i}")).cloned())
+                    .collect();
+                let requested: Option<Vec<String>> = if !repeat_list.is_empty() {
+                    Some(repeat_list)
+                } else {
+                    params
+                        .get("InstanceTypes")
+                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                        .or_else(|| params.get("InstanceType").map(|id| vec![id.clone()]))
+                };
                 let items: Vec<Value> = f
                     .instance_types
                     .iter()
