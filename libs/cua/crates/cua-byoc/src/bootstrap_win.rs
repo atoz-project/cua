@@ -32,11 +32,23 @@ use base64::Engine as _;
 
 use crate::relay::Join;
 
-/// Current `cua-spacesd` release version (`libs/cua-spacesd/VERSION`).
-pub const DEFAULT_SPACESD_VERSION: &str = "0.16.5";
+/// Windows x86_64 release asset filename appended to trailing-slash mirror URLs.
+const WINDOWS_SPACESD_ASSET: &str = "cua-spacesd-x86_64-pc-windows-msvc.exe";
 
-/// Default GitHub Releases URL for Windows x86_64 `cua-spacesd.exe`.
-pub const DEFAULT_WINDOWS_SPACESD_URL: &str = "https://github.com/trycua/cua/releases/download/cua-spacesd-v0.16.5/cua-spacesd-x86_64-pc-windows-msvc.exe";
+/// Default `cua-spacesd` release version derived from `cua-host::driver`.
+pub fn default_spacesd_version() -> &'static str {
+    cua_host::driver::SPACESD_VERSION.trim()
+}
+
+/// Default GitHub Releases URL for Windows x86_64 `cua-spacesd.exe`, derived
+/// from `cua-host::driver`.
+pub fn default_windows_spacesd_url() -> String {
+    format!(
+        "https://github.com/{}/releases/download/cua-spacesd-v{}/{WINDOWS_SPACESD_ASSET}",
+        cua_host::driver::RELEASE_REPOSITORY,
+        default_spacesd_version(),
+    )
+}
 
 /// Maximum raw `UserData` length accepted by Alibaba Cloud ECS (16 KiB).
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
@@ -119,16 +131,30 @@ pub fn generate_desktop_password() -> String {
     String::from_utf8(out).expect("ASCII password")
 }
 
-/// Splits an optional download URL into `(url_without_fragment, optional_sha256_hex)`.
-pub fn split_download_url(raw: Option<&str>) -> (&str, Option<&str>) {
-    let url = raw
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .unwrap_or(DEFAULT_WINDOWS_SPACESD_URL);
-    match url.split_once('#') {
+/// Resolves an optional mirror URL into `(resolved_url_without_fragment, optional_sha256_hex)`.
+///
+/// Expands `{version}` -> [`default_spacesd_version()`] and `{arch}` -> `"x86_64"`.
+/// When the URL path (before `?`/`#`) ends with `/`, appends
+/// `cua-spacesd-x86_64-pc-windows-msvc.exe` while preserving any query string.
+pub fn split_download_url(raw: Option<&str>) -> (String, Option<&str>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|u| !u.is_empty()) else {
+        return (default_windows_spacesd_url(), None);
+    };
+    let (base, sha) = match trimmed.split_once('#') {
         Some((u, frag)) => (u, frag.strip_prefix("sha256=")),
-        None => (url, None),
-    }
+        None => (trimmed, None),
+    };
+    let expanded = base
+        .replace("{version}", default_spacesd_version())
+        .replace("{arch}", "x86_64");
+    let resolved = match expanded.split_once('?') {
+        Some((path, query)) if path.ends_with('/') => {
+            format!("{path}{WINDOWS_SPACESD_ASSET}?{query}")
+        }
+        None if expanded.ends_with('/') => format!("{expanded}{WINDOWS_SPACESD_ASSET}"),
+        _ => expanded,
+    };
+    (resolved, sha)
 }
 
 fn b64(s: &str) -> String {
@@ -194,23 +220,15 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         .then(|| b64(&serde_json::to_string(&extra_env).unwrap_or_else(|_| "{}".into())));
     let pass_b64 = b64(boot.desktop_password);
 
-    let launcher_ps = build_launcher_ps(
+    let launcher_b64 = b64(&build_launcher_ps(
         &boot.join.relay_url,
         &boot.join.machine_id,
         has_jwks,
         env_token.is_some(),
         extra_env_b64.is_some(),
-    );
-    let launcher_b64 = b64(&launcher_ps);
-
-    let tscon_ps = build_tscon_ps();
-    let tscon_b64 = b64(&tscon_ps);
-
-    let expire_ps = if boot.ttl_secs > 0 {
-        Some(b64(&build_expire_ps()))
-    } else {
-        None
-    };
+    ));
+    let tscon_b64 = b64(&build_tscon_ps());
+    let expire_ps = (boot.ttl_secs > 0).then(|| b64(&build_expire_ps()));
 
     let hdr = header.trim();
     let mut s = format!(
@@ -287,8 +305,8 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         Some(hex) => ps_single_quote(&hex.to_ascii_lowercase()),
         None => "$null".into(),
     };
-    let dl_url_b64 = b64(dl_url);
-    let dl_url_redacted = cua_sandbox_core::byoc::redact_url(dl_url);
+    let dl_url_b64 = b64(&dl_url);
+    let dl_url_redacted = cua_sandbox_core::byoc::redact_url(&dl_url);
     s.push_str(&format!(
         "  $exe = $null\n\
          \x20 foreach ($cand in @((Join-Path $bd 'cua-spacesd.exe'), (Join-Path $env:LOCALAPPDATA 'cua\\spacesd\\cua-spacesd.exe'))) {{\n\
@@ -316,7 +334,7 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20   $exe = Join-Path $bd 'cua-spacesd.exe'\n\
          \x20   Move-Item -LiteralPath $dlTmp -Destination $exe -Force\n\
          \x20 }} else {{ Log \"using pre-installed $exe\" }}\n\
-         \x20 Set-Content -LiteralPath (Join-Path $sd 'bin-path') -Value $exe -NoNewline -Encoding ASCII\n",
+         \x20 [IO.File]::WriteAllBytes((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8.GetBytes($exe))\n",
         dl_url_b64 = ps_single_quote(&dl_url_b64),
         dl_url_redacted = ps_single_quote(&dl_url_redacted),
         want_sha = expected_sha_ps,
@@ -431,10 +449,10 @@ fn build_launcher_ps(
          Remove-Item Env:CUA_DRIVER_POLICY_FILE,Env:CUA_DRIVER_SESSION_POLICY_FILE -ErrorAction SilentlyContinue\n\
          $sid = (Get-Process -Id $PID).SessionId\n\
          if ($sid -lt 1) { throw \"cua-spacesd must run in interactive Session >= 1, got $sid\" }\n\
-         $exe = (Get-Content -Raw -LiteralPath (Join-Path $sd 'bin-path')).Trim()\n".to_string();
+         $exe = [IO.File]::ReadAllText((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8).Trim()\n".to_string();
     if has_extra_env {
         ps.push_str(
-            "$extra = Get-Content -Raw -LiteralPath (Join-Path $sd 'extra-env.json') | ConvertFrom-Json\n\
+            "$extra = [IO.File]::ReadAllText((Join-Path $sd 'extra-env.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json\n\
              foreach ($p in $extra.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, [string]$p.Value, 'Process') }\n",
         );
     }
@@ -515,12 +533,41 @@ mod tests {
         }
     }
 
+    fn boot_cfg<'a>(
+        join: &'a Join,
+        env: &'a BTreeMap<String, String>,
+        ttl_secs: u64,
+        spacesd_download_url: Option<&'a str>,
+        desktop_password: &'a str,
+    ) -> WindowsVmBoot<'a> {
+        WindowsVmBoot {
+            join,
+            env,
+            expires: if ttl_secs > 0 { 1_900_000_000 } else { 0 },
+            ttl_secs,
+            provider: "aliyun-ecs",
+            spacesd_download_url,
+            desktop_user: "Administrator",
+            desktop_password,
+        }
+    }
+
     fn decode_put(script: &str, name: &str) -> Option<String> {
         let needle = format!("'{name}') '");
         let idx = script.find(&needle)? + needle.len();
         let rest = &script[idx..];
-        let end = rest.find('\'')?;
-        let raw_b64 = &rest[..end];
+        let raw_b64 = &rest[..rest.find('\'')?];
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw_b64)
+            .ok()?;
+        String::from_utf8(bytes).ok()
+    }
+
+    fn decode_dl_url(script: &str) -> Option<String> {
+        let needle = "$dlUrl = [Text.Encoding]::UTF8.GetString((Dec '";
+        let idx = script.find(needle)? + needle.len();
+        let rest = &script[idx..];
+        let raw_b64 = &rest[..rest.find('\'')?];
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(raw_b64)
             .ok()?;
@@ -528,17 +575,20 @@ mod tests {
     }
 
     #[test]
-    fn default_spacesd_version_matches_cua_spacesd_version_file() {
+    fn default_spacesd_version_pins_to_cua_host_driver_and_version_file() {
+        let ver = default_spacesd_version();
+        assert_eq!(ver, cua_host::driver::SPACESD_VERSION.trim());
         let p =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cua-spacesd/VERSION");
         if p.is_file() {
-            let v = std::fs::read_to_string(p).unwrap();
-            assert_eq!(DEFAULT_SPACESD_VERSION, v.trim());
+            assert_eq!(ver, std::fs::read_to_string(p).unwrap().trim());
         }
-        assert!(
-            DEFAULT_WINDOWS_SPACESD_URL
-                .contains(&format!("cua-spacesd-v{DEFAULT_SPACESD_VERSION}/"))
+        let expected = format!(
+            "https://github.com/{}/releases/download/cua-spacesd-v{ver}/{WINDOWS_SPACESD_ASSET}",
+            cua_host::driver::RELEASE_REPOSITORY,
         );
+        assert_eq!(default_windows_spacesd_url(), expected);
+        assert_eq!(split_download_url(None), (expected, None));
     }
 
     #[test]
@@ -546,26 +596,14 @@ mod tests {
         let j = account_join();
         let env = BTreeMap::from([("FOO_BAR".to_string(), "baz".to_string())]);
         let pw = "WinPass!1234Abcd";
-        let ps = windows_user_data(&WindowsVmBoot {
-            join: &j,
-            env: &env,
-            expires: 1_900_000_000,
-            ttl_secs: 8 * 3600,
-            provider: "aliyun-ecs",
-            spacesd_download_url: None,
-            desktop_user: "Administrator",
-            desktop_password: pw,
-        });
+        let ps = windows_user_data(&boot_cfg(&j, &env, 8 * 3600, None, pw));
         assert!(ps.starts_with("#ps1_sysnative\n"));
         assert!(
             ps.len() < MAX_USER_DATA_BYTES,
-            "raw UserData {} >= 16 KiB",
+            "UserData {} >= 16 KiB",
             ps.len()
         );
-        // Secrets must never appear in plaintext in the script.
-        assert!(!ps.contains(&j.machine_token));
-        assert!(!ps.contains(pw));
-        assert!(!ps.contains(&j.jwks_json));
+        assert!(!ps.contains(&j.machine_token) && !ps.contains(pw) && !ps.contains(&j.jwks_json));
 
         // ACL hardening with language-independent SIDs + direct $sd staging + $dd after /T + temp cleanup.
         assert!(ps.contains("*S-1-5-18:(OI)(CI)F"), "{ps}");
@@ -575,25 +613,14 @@ mod tests {
         let dd_create_pos = ps
             .find("New-Item -ItemType Directory -Force -Path $dd")
             .unwrap();
-        assert!(
-            dd_create_pos > icacls_pos,
-            "$dd must be created AFTER icacls /T on $sd"
-        );
-        assert!(
-            !ps.contains("Put (Join-Path $stg 'relay-token')"),
-            "secrets must be written directly to ACL-hardened $sd, not moved from $stg"
-        );
-        assert!(
-            !ps.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $sd"),
-            "must not same-volume Move-Item secret files from $stg into $sd"
-        );
-        assert!(ps.contains("Put (Join-Path $sd 'relay-token')"));
-        assert!(ps.contains("Put (Join-Path $sd 'machine-id')"));
-        assert!(ps.contains("Put (Join-Path $sd 'host-policy.json')"));
-        assert!(ps.contains("Put (Join-Path $sd 'jwks.json')"));
+        assert!(dd_create_pos > icacls_pos);
+        assert!(!ps.contains("Put (Join-Path $stg 'relay-token')"));
+        assert!(!ps.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $sd"));
+        for f in ["relay-token", "machine-id", "host-policy.json", "jwks.json"] {
+            assert!(ps.contains(&format!("Put (Join-Path $sd '{f}')")));
+        }
         assert!(ps.contains("Remove-Item -LiteralPath $stg -Recurse -Force"));
 
-        // Account mode stages jwks.json and owner in host-policy.json.
         assert_eq!(
             decode_put(&ps, "relay-token").as_deref(),
             Some("cmt_account_secret_token_999")
@@ -608,81 +635,58 @@ mod tests {
             serde_json::from_str(&decode_put(&ps, "host-policy.json").unwrap()).unwrap();
         assert_eq!(policy["owner"], "acct-1");
 
-        // Pre-installed check + GitHub default URL + SHA-256 verification.
         assert!(ps.contains("Cua\\spacesd") && ps.contains("cua-spacesd.exe"));
         assert!(ps.contains("cua\\spacesd\\cua-spacesd.exe"));
-        assert!(ps.contains(DEFAULT_WINDOWS_SPACESD_URL));
+        assert!(ps.contains(&default_windows_spacesd_url()));
         assert!(ps.contains("Get-FileHash -Algorithm SHA256"));
         assert!(ps.contains("SecurityProtocolType]::Tls12"));
         assert!(ps.contains("-UseBasicParsing"));
+        assert!(ps.contains("100.100.100.200") && ps.contains("New-NetFirewallRule"));
+        for want in [
+            "AutoAdminLogon",
+            "DisableLockWorkstation",
+            "NoLockScreen",
+            "ScreenSaveActive",
+            "standby-timeout-ac 0",
+            "-AtLogOn",
+            "-LogonType Interactive -RunLevel Highest",
+            "EventID=24",
+            "NT AUTHORITY\\SYSTEM",
+            "shutdown.exe /s /t 28800",
+        ] {
+            assert!(ps.contains(want), "missing {want:?}");
+        }
 
-        // Metadata firewall block.
-        assert!(ps.contains("100.100.100.200"));
-        assert!(ps.contains("New-NetFirewallRule"));
-
-        // AutoLogon + lock/screensaver/sleep disabled.
-        assert!(ps.contains("AutoAdminLogon"));
-        assert!(ps.contains("DisableLockWorkstation"));
-        assert!(ps.contains("NoLockScreen"));
-        assert!(ps.contains("ScreenSaveActive"));
-        assert!(ps.contains("standby-timeout-ac 0"));
-
-        // Interactive AtLogOn task & launcher script.
-        assert!(ps.contains("-AtLogOn"));
-        assert!(ps.contains("-LogonType Interactive -RunLevel Highest"));
         let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
         assert!(launcher.contains("CUA_DRIVER_POLICY_FILE"));
         assert!(launcher.contains(".SessionId") && launcher.contains("$sid -lt 1"));
-        assert!(launcher.contains("--relay-jwks"));
-        assert!(!launcher.contains("--token-file"));
+        assert!(launcher.contains("--relay-jwks") && !launcher.contains("--token-file"));
         assert!(launcher.contains("$cuaArgs"));
         assert!(!launcher.contains("$args =") && !launcher.contains("@args"));
 
-        // Event ID 24 tscon.exe recovery task under SYSTEM.
-        assert!(ps.contains("EventID=24"));
-        assert!(ps.contains("NT AUTHORITY\\SYSTEM"));
         let tscon = decode_put(&ps, "tscon-recover.ps1").unwrap();
-        assert!(tscon.contains("tscon.exe"));
-        assert!(tscon.contains("/dest:console"));
-        assert!(tscon.contains("$ErrorActionPreference = 'Continue'"));
-        assert!(tscon.contains("quser.exe"));
-
-        // TTL backstop.
-        assert!(ps.contains("shutdown.exe /s /t 28800"));
+        assert!(tscon.contains("tscon.exe") && tscon.contains("/dest:console"));
+        assert!(
+            tscon.contains("$ErrorActionPreference = 'Continue'") && tscon.contains("quser.exe")
+        );
         assert!(decode_put(&ps, "expire-check.ps1").is_some());
     }
 
     #[test]
     fn static_mode_custom_mirror_sha256_and_no_ttl() {
         let j = static_join();
-        let env = BTreeMap::from([(
-            "CUA_ENV_TOKEN".to_string(),
-            "env_secret_static_42".to_string(),
-        )]);
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_42".into())]);
         let pw = generate_desktop_password();
-        assert!(pw.len() >= 16);
-        assert!(!pw.contains('\''));
-        let mirror = format!(
-            "http://10.0.0.10:8080/mirror/cua-spacesd.exe#sha256={}",
-            "ab".repeat(32)
+        assert!(pw.len() >= 16 && !pw.contains('\''));
+        let hex = "ab".repeat(32);
+        let mirror = format!("http://10.0.0.10:8080/mirror/cua-spacesd.exe#sha256={hex}");
+        let ps = windows_user_data(&boot_cfg(&j, &env, 0, Some(&mirror), &pw));
+        assert!(ps.starts_with("#ps1_sysnative\n") && ps.len() < MAX_USER_DATA_BYTES);
+        assert!(
+            !ps.contains("static_relay_secret_token_777")
+                && !ps.contains("env_secret_static_42")
+                && !ps.contains(&pw)
         );
-        let ps = windows_user_data(&WindowsVmBoot {
-            join: &j,
-            env: &env,
-            expires: 0,
-            ttl_secs: 0,
-            provider: "aliyun-ecs",
-            spacesd_download_url: Some(&mirror),
-            desktop_user: "Administrator",
-            desktop_password: &pw,
-        });
-        assert!(ps.starts_with("#ps1_sysnative\n"));
-        assert!(ps.len() < MAX_USER_DATA_BYTES, "{}", ps.len());
-        assert!(!ps.contains("static_relay_secret_token_777"));
-        assert!(!ps.contains("env_secret_static_42"));
-        assert!(!ps.contains(&pw));
-
-        // Static mode omits jwks.json and owner, writes env-token and passes --token-file.
         assert!(decode_put(&ps, "jwks.json").is_none());
         assert_eq!(
             decode_put(&ps, "env-token").as_deref(),
@@ -693,137 +697,176 @@ mod tests {
         assert!(policy.get("owner").is_none());
 
         let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
-        assert!(!launcher.contains("--relay-jwks"));
-        assert!(launcher.contains("--token-file"));
-
-        // Custom mirror URL with fragment stripped and inline sha256 embedded.
+        assert!(!launcher.contains("--relay-jwks") && launcher.contains("--token-file"));
         assert!(ps.contains("http://10.0.0.10:8080/mirror/cua-spacesd.exe"));
-        assert!(!ps.contains("#sha256="));
-        assert!(ps.contains(&"ab".repeat(32)));
+        assert!(!ps.contains("#sha256=") && ps.contains(&hex));
+        assert!(!ps.contains("shutdown.exe /s") && decode_put(&ps, "expire-check.ps1").is_none());
+    }
 
-        // ttl_secs == 0 omits TTL shutdown backstop.
-        assert!(!ps.contains("shutdown.exe /s"));
-        assert!(decode_put(&ps, "expire-check.ps1").is_none());
+    #[test]
+    fn mirror_url_expands_version_arch_and_trailing_slash_preserving_query() {
+        let ver = default_spacesd_version();
+        let hex = "cd".repeat(32);
+
+        // {version} and {arch} expansion on a single-file URL with #sha256=.
+        let templated = format!(
+            "https://mirror.example.com/v{{version}}/cua-spacesd-{{arch}}.exe#sha256={hex}"
+        );
+        let (url, sha) = split_download_url(Some(&templated));
+        assert_eq!(
+            url,
+            format!("https://mirror.example.com/v{ver}/cua-spacesd-x86_64.exe")
+        );
+        assert_eq!(sha, Some(hex.as_str()));
+
+        // Trailing-slash directory prefix appends the Windows asset name.
+        let (dir_url, dir_sha) =
+            split_download_url(Some("https://mirror.example.com/cua-spacesd/"));
+        assert_eq!(
+            dir_url,
+            format!("https://mirror.example.com/cua-spacesd/{WINDOWS_SPACESD_ASSET}")
+        );
+        assert_eq!(dir_sha, None);
+
+        // Trailing-slash directory with {version}/{arch} and query string preserves the query.
+        let (q_url, q_sha) = split_download_url(Some(
+            "https://mirror.example.com/v{version}/{arch}/?sig=SecretToken99",
+        ));
+        assert_eq!(
+            q_url,
+            format!(
+                "https://mirror.example.com/v{ver}/x86_64/{WINDOWS_SPACESD_ASSET}?sig=SecretToken99"
+            )
+        );
+        assert_eq!(q_sha, None);
+
+        // Generated PowerShell fetches the resolved $dlUrl and "$dlUrl.sha256" and redacts the query in logs.
+        let j = static_join();
+        let env = BTreeMap::new();
+        let ps = windows_user_data(&boot_cfg(
+            &j,
+            &env,
+            0,
+            Some("https://mirror.example.com/v{version}/{arch}/?sig=SecretToken99"),
+            "WinPass!1234Abcd",
+        ));
+        assert_eq!(decode_dl_url(&ps).as_deref(), Some(q_url.as_str()));
+        assert!(!ps.contains("SecretToken99"), "query leaked in plaintext");
+        assert!(ps.contains(&format!(
+            "https://mirror.example.com/v{ver}/x86_64/{WINDOWS_SPACESD_ASSET}"
+        )));
+        assert!(ps.contains("Fetch $dlUrl $dlTmp"));
+        assert!(ps.contains("Fetch \"$dlUrl.sha256\" $sumTmp"));
+    }
+
+    #[test]
+    fn utf8_without_bom_for_bin_path_and_utf8_reads_in_launcher() {
+        let j = account_join();
+        let env = BTreeMap::from([("GREETING".to_string(), "你好世界".to_string())]);
+        let ps = windows_user_data(&boot_cfg(&j, &env, 0, None, "WinPass!1234Abcd"));
+
+        // bin-path is written as BOM-less UTF-8 bytes, never Set-Content -Encoding ASCII.
+        assert!(
+            ps.contains(
+                "[IO.File]::WriteAllBytes((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8.GetBytes($exe))"
+            ),
+            "{ps}"
+        );
+        assert!(!ps.contains("Set-Content -LiteralPath (Join-Path $sd 'bin-path')"));
+
+        // Launcher explicitly decodes bin-path and extra-env.json as UTF-8 (safe on CP936/GBK).
+        let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
+        assert!(
+            launcher.contains(
+                "[IO.File]::ReadAllText((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8).Trim()"
+            ),
+            "{launcher}"
+        );
+        assert!(
+            launcher.contains(
+                "[IO.File]::ReadAllText((Join-Path $sd 'extra-env.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json"
+            ),
+            "{launcher}"
+        );
+        assert!(
+            !launcher.contains("Get-Content"),
+            "launcher must not use bare Get-Content on BOM-less UTF-8 files: {launcher}"
+        );
+        let extra: serde_json::Value =
+            serde_json::from_str(&decode_put(&ps, "extra-env.json").unwrap()).unwrap();
+        assert_eq!(extra["GREETING"], "你好世界");
     }
 
     #[test]
     fn windows_vm_boot_debug_redacts_secrets_and_url_credentials_and_blocks_curly_quotes() {
         let mut j = static_join();
         j.relay_url = "https://relay.example\u{2019};Invoke-Expression(whoami)".into();
-        let env = BTreeMap::from([(
-            "CUA_ENV_TOKEN".to_string(),
-            "env_secret_static_99".to_string(),
-        )]);
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_99".into())]);
         let pw = "WinPass!Secret9988";
         let secret_mirror = format!(
             "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
             "ab".repeat(32)
         );
-        let boot = WindowsVmBoot {
-            join: &j,
-            env: &env,
-            expires: 0,
-            ttl_secs: 0,
-            provider: "aliyun-ecs",
-            spacesd_download_url: Some(&secret_mirror),
-            desktop_user: "Administrator",
-            desktop_password: pw,
-        };
+        let boot = boot_cfg(&j, &env, 0, Some(&secret_mirror), pw);
         let dbg = format!("{boot:?}");
-        assert!(!dbg.contains(pw), "Debug leaked desktop_password: {dbg}");
-        assert!(dbg.contains("<redacted>"), "{dbg}");
+        for secret in [
+            pw,
+            "MyPass998877",
+            "DeadBeefCafe9988",
+            "env_secret_static_99",
+        ] {
+            assert!(!dbg.contains(secret), "Debug leaked {secret}: {dbg}");
+        }
         assert!(
-            !dbg.contains("MyPass998877"),
-            "Debug leaked URL pass: {dbg}"
-        );
-        assert!(
-            !dbg.contains("DeadBeefCafe9988"),
-            "Debug leaked URL query: {dbg}"
-        );
-        assert!(
-            !dbg.contains("env_secret_static_99"),
-            "Debug leaked env token: {dbg}"
-        );
-        assert!(
-            dbg.contains("https://mirror.example.com/cua-spacesd.exe"),
-            "{dbg}"
+            dbg.contains("<redacted>")
+                && dbg.contains("https://mirror.example.com/cua-spacesd.exe")
         );
 
         let ps = windows_user_data(&boot);
-        // Secret URL userinfo & query must never appear in plaintext UserData/Log.
-        assert!(!ps.contains("MyPass998877"), "{ps}");
-        assert!(!ps.contains("DeadBeefCafe9988"), "{ps}");
-        assert!(!ps.contains("dluser"), "{ps}");
+        for secret in ["MyPass998877", "DeadBeefCafe9988", "dluser"] {
+            assert!(!ps.contains(secret), "{ps}");
+        }
         assert!(
             ps.contains("https://mirror.example.com/cua-spacesd.exe"),
             "{ps}"
         );
-        // Curly quotes must never appear unescaped in PowerShell single-quoted literals.
         for q in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
-            assert!(!ps.contains(q), "raw curly quote {q:?} in UserData: {ps}");
+            assert!(!ps.contains(q), "raw curly quote {q:?} in UserData");
             let j2 = static_join();
             let curly_url = format!(
                 "https://mirror.example.com/cua{q};Invoke-Expression(whoami);#sha256={}",
                 "ab".repeat(32)
             );
-            let ps2 = windows_user_data(&WindowsVmBoot {
-                join: &j2,
-                env: &env,
-                expires: 0,
-                ttl_secs: 0,
-                provider: "aliyun-ecs",
-                spacesd_download_url: Some(&curly_url),
-                desktop_user: "Administrator",
-                desktop_password: pw,
-            });
-            assert!(!ps2.contains(q), "raw curly quote {q:?} leaked: {ps2}");
-            assert!(
-                !ps2.contains("Invoke-Expression"),
-                "injection leaked: {ps2}"
-            );
+            let ps2 = windows_user_data(&boot_cfg(&j2, &env, 0, Some(&curly_url), pw));
+            assert!(!ps2.contains(q) && !ps2.contains("Invoke-Expression"));
         }
         let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
-        assert!(!launcher.contains('\u{2019}'), "{launcher}");
-        assert!(!launcher.contains("Invoke-Expression"), "{launcher}");
-        assert!(ps.contains("function Fetch("), "{ps}");
-        assert!(ps.contains("Fetch $dlUrl $dlTmp"), "{ps}");
+        assert!(!launcher.contains('\u{2019}') && !launcher.contains("Invoke-Expression"));
+        assert!(ps.contains("function Fetch(") && ps.contains("Fetch $dlUrl $dlTmp"));
     }
 
     #[test]
     fn aliyun_vminit_header_and_wow64_guard_contract() {
         let j = static_join();
-        let env = BTreeMap::from([(
-            "CUA_ENV_TOKEN".to_string(),
-            "env_secret_static_vminit".to_string(),
-        )]);
-        let pw = "WinPass!1234Abcd";
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_vminit".into())]);
         let ps = windows_user_data_with_header(
-            &WindowsVmBoot {
-                join: &j,
-                env: &env,
-                expires: 1_900_000_000,
-                ttl_secs: 8 * 3600,
-                provider: "aliyun-ecs",
-                spacesd_download_url: None,
-                desktop_user: "Administrator",
-                desktop_password: pw,
-            },
+            &boot_cfg(&j, &env, 8 * 3600, None, "WinPass!1234Abcd"),
             ALIYUN_VMINIT_HEADER,
         );
         let mut lines = ps.lines();
-        assert_eq!(
-            lines.next(),
-            Some("[powershell]"),
-            "line 1 must be exact [powershell] with no spaces"
-        );
+        assert_eq!(lines.next(), Some("[powershell]"));
         let guard_line = lines.next().unwrap();
-        assert!(guard_line.contains("Is64BitOperatingSystem"));
-        assert!(guard_line.contains("Is64BitProcess"));
-        assert!(guard_line.contains(r"Sysnative\WindowsPowerShell\v1.0\powershell.exe"));
-        assert!(guard_line.contains("$PSCommandPath"));
+        for want in [
+            "Is64BitOperatingSystem",
+            "Is64BitProcess",
+            r"Sysnative\WindowsPowerShell\v1.0\powershell.exe",
+            "$PSCommandPath",
+        ] {
+            assert!(guard_line.contains(want), "missing {want}");
+        }
         assert!(
             ps.len() < MAX_USER_DATA_BYTES,
-            "raw UserData {} >= 16 KiB",
+            "UserData {} >= 16 KiB",
             ps.len()
         );
     }
@@ -831,44 +874,25 @@ mod tests {
     #[test]
     fn registry_policy_keys_guard_new_item_with_test_path() {
         let j = static_join();
-        let env = BTreeMap::from([(
-            "CUA_ENV_TOKEN".to_string(),
-            "env_secret_static_reg".to_string(),
-        )]);
-        let pw = "WinPass!1234Abcd";
-        let boot = WindowsVmBoot {
-            join: &j,
-            env: &env,
-            expires: 1_900_000_000,
-            ttl_secs: 8 * 3600,
-            provider: "aliyun-ecs",
-            spacesd_download_url: None,
-            desktop_user: "Administrator",
-            desktop_password: pw,
-        };
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_reg".into())]);
+        let boot = boot_cfg(&j, &env, 8 * 3600, None, "WinPass!1234Abcd");
         for ps in [
             windows_user_data(&boot),
             windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
         ] {
-            assert!(
-                ps.len() < MAX_USER_DATA_BYTES,
-                "raw UserData {} >= 16 KiB",
-                ps.len()
-            );
-            assert!(
-                ps.contains("if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }"),
-                "missing Test-Path guard on $sp: {ps}"
-            );
-            assert!(
-                ps.contains("if (-not (Test-Path -LiteralPath $pp)) { New-Item -Path $pp -Force | Out-Null }"),
-                "missing Test-Path guard on $pp: {ps}"
-            );
+            assert!(ps.len() < MAX_USER_DATA_BYTES);
+            assert!(ps.contains(
+                "if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }"
+            ));
+            assert!(ps.contains(
+                "if (-not (Test-Path -LiteralPath $pp)) { New-Item -Path $pp -Force | Out-Null }"
+            ));
             for line in ps.lines() {
                 let trimmed = line.trim_start();
                 assert!(
                     !trimmed.starts_with("New-Item -Path $sp")
                         && !trimmed.starts_with("New-Item -Path $pp"),
-                    "unguarded New-Item on registry key: {line}"
+                    "unguarded New-Item: {line}"
                 );
             }
             assert!(ps.contains(
@@ -883,55 +907,25 @@ mod tests {
     #[test]
     fn finally_cleanup_guards_nullable_temp_paths_against_null_binding() {
         let j = static_join();
-        let env = BTreeMap::from([(
-            "CUA_ENV_TOKEN".to_string(),
-            "env_secret_static_finally".to_string(),
-        )]);
-        let pw = "WinPass!1234Abcd";
+        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_finally".into())]);
         let pinned_mirror = format!(
             "https://mirror.example.com/cua-spacesd.exe#sha256={}",
             "ab".repeat(32)
         );
-        for spacesd_download_url in [None, Some(pinned_mirror.as_str())] {
-            let boot = WindowsVmBoot {
-                join: &j,
-                env: &env,
-                expires: 1_900_000_000,
-                ttl_secs: 8 * 3600,
-                provider: "aliyun-ecs",
-                spacesd_download_url,
-                desktop_user: "Administrator",
-                desktop_password: pw,
-            };
+        for url in [None, Some(pinned_mirror.as_str())] {
+            let boot = boot_cfg(&j, &env, 8 * 3600, url, "WinPass!1234Abcd");
             for ps in [
                 windows_user_data(&boot),
                 windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
             ] {
-                assert!(
-                    ps.len() < MAX_USER_DATA_BYTES,
-                    "raw UserData {} >= 16 KiB",
-                    ps.len()
-                );
-                let finally_idx = ps.find("} finally {").expect("missing finally block");
-                let finally_block = &ps[finally_idx..];
-                for (var, expected) in [
-                    (
-                        "$dlTmp",
-                        "if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }",
-                    ),
-                    (
-                        "$sumTmp",
-                        "if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }",
-                    ),
-                    (
-                        "$stg",
-                        "if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }",
-                    ),
+                assert!(ps.len() < MAX_USER_DATA_BYTES);
+                let finally_block = &ps[ps.find("} finally {").expect("finally block")..];
+                for expected in [
+                    "if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }",
+                    "if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }",
+                    "if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }",
                 ] {
-                    assert!(
-                        finally_block.contains(expected),
-                        "missing null-guard for {var} in finally block (url={spacesd_download_url:?}):\n{finally_block}"
-                    );
+                    assert!(finally_block.contains(expected), "{finally_block}");
                 }
                 for line in ps.lines() {
                     for stmt in line.split(';') {
@@ -940,7 +934,7 @@ mod tests {
                             !trimmed.starts_with("Remove-Item -LiteralPath $dlTmp")
                                 && !trimmed.starts_with("Remove-Item -LiteralPath $sumTmp")
                                 && !trimmed.starts_with("Remove-Item -LiteralPath $stg"),
-                            "unguarded Remove-Item -LiteralPath at statement start: {line}"
+                            "unguarded Remove-Item: {line}"
                         );
                     }
                 }
