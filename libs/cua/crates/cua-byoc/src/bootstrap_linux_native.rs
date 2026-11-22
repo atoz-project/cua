@@ -197,9 +197,6 @@ shutdown -h +{minutes} 'cua: this sandbox reached its time limit' || true\n"
         None => (None, String::new()),
     };
 
-    // Expand `{version}` and trailing-slash directory prefixes on the host so
-    // the guest only substitutes `{arch}` and logs the host-redacted URL
-    // computed by `cua_sandbox_core::byoc::redact_url`.
     let (resolve_url, safe_dl_url) = match custom_url {
         Some(u) => {
             let expanded = u.replace("{version}", version);

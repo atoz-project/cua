@@ -676,7 +676,7 @@ async fn t3_10() {
         .ok();
 
     w.relay.add_static_token("static-relay-secret");
-    let win_mir = w.mirror.windows_url();
+    let dir_mir = format!("{}/", w.mirror.url);
     w.run_with_stdin(
         &[
             "cloud",
@@ -689,7 +689,7 @@ async fn t3_10() {
             &w.relay.url,
             "--relay-token-stdin",
             "--spacesd-download-url",
-            &win_mir,
+            &dir_mir,
             "--json",
         ],
         "LTAI_TEST_AK:secret123\nstatic-relay-secret\n",

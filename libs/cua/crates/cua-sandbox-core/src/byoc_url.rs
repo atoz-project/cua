@@ -530,13 +530,11 @@ mod tests {
     fn validate_spacesd_url_for_os_rejects_mismatches_and_dir_hashes() {
         let sha64 = "0123456789abcdef".repeat(4);
 
-        // Directory mirror with #sha256= is rejected regardless of OS.
         let dir_hash = format!("https://mirror.example.com/releases/#sha256={sha64}");
         let err = validate_spacesd_url_for_os(&dir_hash, "windows").unwrap_err();
         assert!(err.contains(".sha256"), "{err}");
         assert!(validate_spacesd_url_for_os(&dir_hash, "linux").is_err());
 
-        // Directory mirror without #sha256= is allowed for both OSes.
         assert!(
             validate_spacesd_url_for_os("https://mirror.example.com/releases/", "windows").is_ok()
         );
@@ -544,7 +542,6 @@ mod tests {
             validate_spacesd_url_for_os("https://mirror.example.com/releases/", "linux").is_ok()
         );
 
-        // Windows rejects Linux artifacts.
         for bad in [
             "https://mirror.example.com/cua-spacesd.tar.gz",
             "https://mirror.example.com/cua-spacesd.tgz?sig=1",
@@ -559,7 +556,6 @@ mod tests {
             assert!(validate_spacesd_url_for_os(bad, "linux").is_ok(), "{bad}");
         }
 
-        // Linux (and linux-slim) rejects Windows artifacts.
         for bad in [
             "https://mirror.example.com/cua-spacesd.exe",
             "https://mirror.example.com/cua-spacesd.msi?sig=1",
@@ -572,7 +568,6 @@ mod tests {
             assert!(validate_spacesd_url_for_os(bad, "windows").is_ok(), "{bad}");
         }
 
-        // Single-file binary with valid #sha256= passes for matching OS.
         assert!(
             validate_spacesd_url_for_os(
                 &format!("https://mirror.example.com/cua-spacesd.exe#sha256={sha64}"),

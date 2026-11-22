@@ -2416,7 +2416,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // Empty stdin for --relay-token-stdin produces Some("") so backend rejects it cleanly.
         let empty = TargetArgs {
             provider: "hetzner".into(),
             relay_token_stdin: true,
@@ -2430,7 +2429,6 @@ mod tests {
             Some("")
         );
 
-        // --token-stdin + --relay-token-stdin together read line 1 (cloud token) and line 2 (relay token).
         match parse(&[
             "connect",
             "aliyun-ecs",
@@ -2466,7 +2464,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // connect_lines / limits_line / provider_json show relay mode & URL without tokens.
         let p = cua_sdk::CloudProvider {
             name: "hetzner".into(),
             title: "Hetzner Cloud".into(),

@@ -3187,8 +3187,6 @@ mod quota_tests {
             })
             .unwrap();
 
-        // Request an oversized shape (12 vCPU, 16 GiB) so the local host cannot fit it and the
-        // elastic solver selects Target::New on the hetzner host offer.
         let err = spaces
             .create(crate::SpaceCreate {
                 on: Some(cua_sandbox_core::placement::On::Auto),

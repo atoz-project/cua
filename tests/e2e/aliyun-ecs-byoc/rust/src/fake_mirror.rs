@@ -117,16 +117,28 @@ async fn serve_file(
             format!("{}  cua-spacesd\n", st.linux_sha256),
         )
             .into_response(),
-        "cua-spacesd.exe" => {
+        f if f.ends_with(".tar.gz") => {
+            let mut body = st.linux_bytes.clone();
+            if st.corrupt_bytes {
+                body.extend_from_slice(b"-CORRUPTED");
+            }
+            (StatusCode::OK, body).into_response()
+        }
+        f if f.ends_with(".tar.gz.sha256") => (
+            StatusCode::OK,
+            format!("{}  {}\n", st.linux_sha256, f.trim_end_matches(".sha256")),
+        )
+            .into_response(),
+        f if f.ends_with(".exe") => {
             let mut body = st.windows_bytes.clone();
             if st.corrupt_bytes {
                 body.extend_from_slice(b"-CORRUPTED");
             }
             (StatusCode::OK, body).into_response()
         }
-        "cua-spacesd.exe.sha256" => (
+        f if f.ends_with(".exe.sha256") => (
             StatusCode::OK,
-            format!("{}  cua-spacesd.exe\n", st.windows_sha256),
+            format!("{}  {}\n", st.windows_sha256, f.trim_end_matches(".sha256")),
         )
             .into_response(),
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),

@@ -108,7 +108,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // Invalid mirror URL fails fast before persisting anything.
     let bad_err = clouds
         .connect(
             &Target {
@@ -124,7 +123,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
         .unwrap_err();
     assert!(matches!(bad_err, Error::InvalidArgument(_)), "{bad_err:?}");
 
-    // Connect with custom HTTPS mirror URL (Account Relay Mode).
     let mirror = "https://mirror.example.cn/cua/cua-spacesd-linux-x86_64.tar.gz";
     let connected = clouds
         .connect(
@@ -149,7 +147,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
         Some(mirror)
     );
 
-    // 1. Default (`auto`) on `linux` keeps Docker-on-VM (`docker`).
     let sb_docker = sandboxes
         .create(create_opts(
             "fake-direct",
@@ -171,7 +168,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
         decode_cloud_init_file(&spec_docker.user_data, "/usr/local/sbin/cua-first-boot").unwrap();
     assert!(boot_docker.contains("docker run -d"), "{boot_docker}");
 
-    // 2. `--runtime native` on `linux` produces Linux Direct VM `cloud-init` (no Docker).
     let mut o_native = create_opts(
         "fake-direct",
         "registry.invalid/trycua/linux:24.04",
@@ -229,7 +225,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
     assert!(starter.contains("join"));
     assert!(boot_native.contains("libxkbcommon0"));
 
-    // 3. `--runtime native` on `linux-slim` also works cleanly.
     let mut o_slim = create_opts(
         "fake-direct",
         "registry.invalid/trycua/linux:24.04-slim",
@@ -245,7 +240,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
         Some("native")
     );
 
-    // 4. Invalid runtime fails placement before creating relay/cloud resources.
     let before_calls = fake.calls().len();
     let mut o_bad = create_opts(
         "fake-direct",
@@ -260,7 +254,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
     );
     assert_eq!(fake.calls().len(), before_calls);
 
-    // 5. Invalid `--env` keys fail closed before creating relay/cloud resources.
     for bad_key in ["", "#COMMENT", "A=B", "A\nB", "A\rB", "A\0B", "BAD-KEY"] {
         let mut o_bad_env = create_opts(
             "fake-direct",
@@ -277,7 +270,6 @@ async fn linux_and_linux_slim_dispatch_docker_default_vs_native_direct_vm() {
     }
     assert_eq!(fake.calls().len(), before_calls);
 
-    // Lifecycle: suspend, resume, delete.
     let machine = sb_native.provider_details()[DETAIL_RELAY_MACHINE].clone();
     sandboxes.suspend("linux-native").await.unwrap();
     assert!(fake.calls().iter().any(|c| c.starts_with("stop fake-")));
@@ -326,7 +318,6 @@ async fn linux_native_static_relay_lifecycle_and_failed_boot_redaction() {
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // Connect via `connect_with` in Static Relay Mode + custom loopback mirror (no `cua auth login`).
     let mirror = "http://127.0.0.1:9999/cua-spacesd-linux-x86_64.tar.gz";
     let connected = clouds
         .connect_with(&ConnectRequest {
@@ -393,13 +384,11 @@ async fn linux_native_static_relay_lifecycle_and_failed_boot_redaction() {
     .unwrap();
     assert!(policy.get("owner").is_none());
 
-    // Suspend, resume, delete.
     sandboxes.suspend("static-native").await.unwrap();
     sandboxes.resume("static-native").await.unwrap();
     sandboxes.delete("static-native").await.unwrap();
     assert!(fake.account.lock().unwrap().resources.is_empty());
 
-    // Failed boot: captures boot_log, redacts secrets, rolls back instance & env_token.
     {
         let acct = fake.account.clone();
         fake.on_boot(Arc::new(move |spec, r| {
@@ -570,8 +559,6 @@ async fn credential_bearing_spacesd_download_url_fails_closed() {
     assert!(!dir.path().join("cloud/state.json").exists());
     assert!(!dir.path().join("cloud/links.json").exists());
 
-    // Even if a persisted state.json contains a credential-bearing URL (e.g.
-    // from an older version or manual edit), CloudSandboxes::create fails closed.
     clouds
         .connect(
             &Target {

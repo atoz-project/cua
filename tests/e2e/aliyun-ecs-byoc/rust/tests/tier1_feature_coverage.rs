@@ -188,7 +188,6 @@ async fn t1_f1_03() {
         ]
     }));
 
-    // 5. Fallback to active `current` profile and its region_id (cn-shanghai).
     w.run(&["cloud", "test", "aliyun-ecs", "--json"]).await.ok();
     {
         let f = w.aliyun.lock().unwrap();
@@ -203,7 +202,6 @@ async fn t1_f1_03() {
         );
     }
 
-    // Explicit --region overrides profile region_id.
     w.aliyun.lock().unwrap().calls.clear();
     w.run(&[
         "cloud",
@@ -226,7 +224,6 @@ async fn t1_f1_03() {
         );
     }
 
-    // 4. Saved TokenStore beats `current` profile.
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
         "LTAI_SAVED_AK:saved_secret_789\n",
@@ -240,7 +237,6 @@ async fn t1_f1_03() {
         "LTAI_SAVED_AK"
     );
 
-    // 3. Explicit --profile beats saved TokenStore and `current`.
     w.aliyun.lock().unwrap().calls.clear();
     w.run(&[
         "cloud",
@@ -264,7 +260,6 @@ async fn t1_f1_03() {
         );
     }
 
-    // 2. Env vars beat --profile and saved TokenStore.
     w.set_env("ALIBABA_CLOUD_ACCESS_KEY_ID", "LTAI_ENV_AK");
     w.set_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "env_secret_abc");
     w.aliyun.lock().unwrap().calls.clear();
@@ -283,7 +278,6 @@ async fn t1_f1_03() {
         "LTAI_ENV_AK"
     );
 
-    // 1. --token-stdin beats env vars, --profile, and TokenStore.
     w.aliyun.lock().unwrap().calls.clear();
     w.run_with_stdin(
         &[
@@ -352,13 +346,10 @@ async fn t1_f1_05() {
     w.assert_no_unexpected_egress();
 }
 
-// ---- Feature 2: Shared Per-Connection Self-Hosted Relay & Static Relay Mode (#3) ----
-
 #[tokio::test]
 async fn t1_f2_01() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
-    // Keep global CUA_RELAY_URL poisoned to prove per-connection --relay-url overrides it.
     w.set_env("CUA_RELAY_URL", "http://127.0.0.1:9");
 
     let conn = w
@@ -424,8 +415,6 @@ async fn t1_f2_02() {
     assert_eq!(machines.len(), 1);
     assert!(!machines[0].env_token.is_empty());
     w.assert_no_secrets_in_non_secret_files(&["secret123", "static-relay-secret"]);
-    // env_token lives in `byoc-env-tokens-aliyun-ecs` (0600) and sandbox state for `sb exec`,
-    // never in `cloud/*` or `config.toml`.
     for rel in [
         "cloud/state.json",
         "cloud/links.json",
@@ -535,8 +524,6 @@ async fn t1_f2_05() {
         .ok();
     w.assert_no_secrets_anywhere(&["secret123", "static-relay-secret"]);
 }
-
-// ---- Feature 3: Linux Docker-on-VM & Isolated VPC (#4) ----
 
 #[tokio::test]
 async fn t1_f3_01() {
@@ -778,7 +765,6 @@ async fn t1_f3_05() {
     w.run(&["sb", "rm", "life-box", "--force"]).await.ok();
     assert!(w.aliyun.lock().unwrap().instances.is_empty());
 
-    // Dry-run sweep (without --delete) must report dry_run=true and leave VPC/SG intact.
     let dry_default = w.run(&["cloud", "sweep", "aliyun-ecs", "--json"]).await;
     dry_default.ok();
     assert_eq!(dry_default.json()["dry_run"], true);
@@ -811,8 +797,6 @@ async fn t1_f3_05() {
     assert!(f.vswitches.is_empty());
     assert!(f.security_groups.is_empty());
 }
-
-// ---- Feature 4: Direct VM Runtime Dispatch & Windows Direct VM (#5) ----
 
 #[tokio::test]
 async fn t1_f4_01() {
@@ -1019,8 +1003,6 @@ async fn t1_f4_05() {
         .ok();
     w_static.run(&["sb", "rm", "win-st", "--force"]).await.ok();
 }
-
-// ---- Feature 5: Existing VPC/VSwitch & --no-public-ip (#8) ----
 
 fn seed_user_vpc(w: &AliyunWorld, region: &str) {
     let mut f = w.aliyun.lock().unwrap();
@@ -1293,8 +1275,6 @@ async fn t1_f5_05() {
     assert!(f.vswitches.contains_key("vsw-user-1"));
     assert!(f.security_groups.contains_key("sg-user-1"));
 }
-
-// ---- Feature 6: Custom Cloud Image IDs & Sizing Overrides (#6) ----
 
 fn seed_custom_images(w: &AliyunWorld) {
     let mut f = w.aliyun.lock().unwrap();
@@ -1637,8 +1617,6 @@ async fn t1_f6_05() {
     assert!(inst.image_id.contains("ubuntu_24_04"));
 }
 
-// ---- Feature 7: Linux Direct VM (--runtime native) (#7) ----
-
 #[tokio::test]
 async fn t1_f7_01() {
     let mut w = AliyunWorld::start().await;
@@ -1874,8 +1852,6 @@ async fn t1_f7_05() {
         .ok();
 }
 
-// ---- Feature 8: BYOC Docs, Least-Privilege RAM Policy & Sync Verification (#9) ----
-
 #[tokio::test]
 async fn t1_f8_01() {
     let policy_path = repo_root().join("libs/cua/crates/cua-byoc/policy/aliyun-ecs-policy.json");
@@ -2035,7 +2011,6 @@ async fn t1_f8_03() {
     w.aliyun.lock().unwrap().enforce_cua_managed_tag_condition = true;
     w.auth_login().await;
 
-    // 1. Linux Docker-on-VM + suspend/resume/rm + sweep + disconnect --delete
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
         "LTAI_TEST_AK:secret123\n",
@@ -2068,7 +2043,6 @@ async fn t1_f8_03() {
     .await
     .ok();
 
-    // 2. Boot-fail path (exercises GetInstanceConsoleOutput + rollback)
     w.aliyun.lock().unwrap().boot_fail = Some(BootFailMode::StopImmediately);
     let bf = w
         .run(&[
@@ -2084,7 +2058,6 @@ async fn t1_f8_03() {
     assert_ne!(bf.code, 0);
     w.aliyun.lock().unwrap().boot_fail = None;
 
-    // 3. Windows Direct VM + rm + disconnect --delete
     w.run(&[
         "sb",
         "create",
@@ -2102,7 +2075,6 @@ async fn t1_f8_03() {
         .await
         .ok();
 
-    // 4. Existing VPC/VSwitch + --no-public-ip + rm + disconnect --delete
     seed_user_vpc(&w, "cn-hangzhou");
     w.run_with_stdin(
         &[

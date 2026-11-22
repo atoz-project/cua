@@ -107,7 +107,6 @@ async fn build_connected_aliyun(
         .await
         .unwrap();
     assert_eq!(connected.provider.status, "connected", "{connected:?}");
-    // Clear preflight calls from `connect_with` so create-only counts are exact.
     s.lock().unwrap().calls.clear();
     (home, sandboxes, s, relay, mock_spacesd)
 }
@@ -128,7 +127,6 @@ fn install_online_hook(s: &S, relay: &Arc<FakeRelay>, mock_url: String) {
 
 #[tokio::test]
 async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls() {
-    // 1. Official Linux create: exactly 1 DescribeAvailableResource, 1 DescribeInstanceTypes, 1 DescribeImages.
     let (_home, sandboxes, s, relay, mock_spacesd) =
         build_connected_aliyun(None, None, None, vec![], Duration::from_millis(5)).await;
     install_online_hook(&s, &relay, mock_spacesd.url());
@@ -155,7 +153,6 @@ async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls()
         "expected single DescribeImages call during create"
     );
 
-    // 2. Official Windows fallback create: single pass AND `[powershell]` vminit header.
     s.lock().unwrap().calls.clear();
     let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
     win_official.contrib = Some("aliyun-ecs".into());
@@ -181,7 +178,6 @@ async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls()
         &official_ud[..official_ud.len().min(80)]
     );
 
-    // 3. Custom Windows image (connection-default): `#ps1_sysnative` header.
     let (_home2, sandboxes2, s2, relay2, mock_spacesd2) = build_connected_aliyun(
         None,
         None,
@@ -228,9 +224,6 @@ async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls()
 
 #[tokio::test]
 async fn budget_checked_against_exact_resolved_sku_and_blocks_pricier_fallback() {
-    // One-hour static estimate for a small Linux box (~$0.04/h) passes a $0.25 budget,
-    // while the only in-stock dynamic SKU (`ecs.g7.4xlarge`, 16 vCPU / 64 GiB, ~$0.95/h)
-    // exceeds $0.25 and must be refused before `RunInstances`.
     let (_home, sandboxes, s, relay, mock_spacesd) =
         build_connected_aliyun(Some(0.25), None, None, vec![], Duration::from_millis(5)).await;
     install_online_hook(&s, &relay, mock_spacesd.url());
@@ -326,8 +319,6 @@ async fn prepare_provision_uses_spec_region_and_preserves_sku_and_header() {
 
 #[tokio::test]
 async fn fast_rollback_short_circuits_immediately_when_cua_owned_peer_uses_network() {
-    // Use a long poll interval (5s): if rollback retried DependencyViolation instead
-    // of short-circuiting on tries==0, this test would take >5s (and 376s in production).
     let (api, s) = start_fake(Duration::from_secs(5)).await;
     api.stage_secret(&Target {
         provider: "aliyun-ecs".into(),
@@ -375,7 +366,6 @@ async fn fast_rollback_short_circuits_immediately_when_cua_owned_peer_uses_netwo
                 { "Key": model::tag::OWNER, "Value": owner }
             ]}
         }));
-        // A running Cua-owned peer instance in the same VSwitch/SG/VPC.
         f.instances.insert(
             "i-peer-running".into(),
             json!({

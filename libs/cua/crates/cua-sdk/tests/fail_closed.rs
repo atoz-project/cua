@@ -950,7 +950,6 @@ async fn current_mock_daemon() -> (Arc<Old>, Arc<Cua>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_daemon_accepts_and_delivers_m6a_cloud_image_and_sizing_fields() {
-    // 1. Real `cua-daemon` advertises capability & passes client-side preflight.
     let w = current_daemon().await;
     let err = w
         .cua
@@ -982,7 +981,6 @@ async fn current_daemon_accepts_and_delivers_m6a_cloud_image_and_sizing_fields()
         "expected ProviderNotConfigured (capability check passed), got {sb_err:?}"
     );
 
-    // 2. Loopback current mock daemon receives all M6a fields over wire.
     let (rec, cua) = current_mock_daemon().await;
     let sp = cua
         .spaces()
@@ -1066,7 +1064,6 @@ async fn sandboxes_create_ttl_fails_closed_against_old_m5_and_m6_daemons_and_suc
         );
     }
 
-    // Real current daemon advertises `sandboxes.ttl` and passes client preflight.
     let w = current_daemon().await;
     let mut real_opts = SandboxCreateOptions::new("aliyun-ecs", "linux");
     real_opts.name = Some("sb-real-ttl".into());
@@ -1079,7 +1076,6 @@ async fn sandboxes_create_ttl_fails_closed_against_old_m5_and_m6_daemons_and_suc
         "expected ProviderNotConfigured (ttl preflight passed), got {real_err:?}"
     );
 
-    // Loopback current mock daemon receives ttl=Some(0s) and ttl=Some(1800s) over both create & create_reporting.
     let (rec, cua) = current_mock_daemon().await;
     for (idx, ttl) in [0u32, 1800u32].into_iter().enumerate() {
         let mut o = SandboxCreateOptions::new("aliyun-ecs", "linux");

@@ -266,7 +266,6 @@ async fn live_ecs_smoke() {
     let run_id = std::env::var("CUA_E2E_RUN").unwrap_or_else(|_| "manual".to_string());
 
     let dir = tempfile::tempdir().expect("tempdir");
-    // Copy host ~/.aliyun/config.json into isolated HOME so the selected profile works hermetically.
     if let Some(real_home) = std::env::var_os("HOME") {
         let src_cfg = Path::new(&real_home).join(".aliyun/config.json");
         if src_cfg.exists() {
@@ -292,7 +291,6 @@ async fn live_ecs_smoke() {
     };
 
     let smoke_result = std::panic::AssertUnwindSafe(async {
-        // 1. Test & connect
         eprintln!("[live_ecs_smoke] step 1: cloud test aliyun-ecs (profile={profile}, region={region})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
@@ -349,7 +347,6 @@ async fn live_ecs_smoke() {
         assert_eq!(rc, 0, "cloud connect failed: out={out}\nerr={err}");
         eprintln!("[live_ecs_smoke] step 1b: cloud connect passed");
 
-        // 2. Linux Docker-on-VM + guest probe
         eprintln!("[live_ecs_smoke] step 2: sb create linux --runtime docker ({linux_docker_name})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
@@ -386,7 +383,6 @@ async fn live_ecs_smoke() {
             "unexpected linux docker exec output: {out}"
         );
 
-        // 3. Linux Direct VM + guest systemd probe
         eprintln!("[live_ecs_smoke] step 3: sb create linux --runtime native ({linux_native_name})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
@@ -429,7 +425,6 @@ async fn live_ecs_smoke() {
             "expected Linux + active cua-spacesd service, got: {out}"
         );
 
-        // 4. Windows Direct VM (Session >= 1, AutoLogon, AtLogOn task, Event ID 24 tscon)
         eprintln!("[live_ecs_smoke] step 4: sb create windows --runtime native ({windows_native_name})");
         let (rc, out, err) = run_live_cua(
             dir.path(),
@@ -510,7 +505,6 @@ async fn live_ecs_smoke() {
     .catch_unwind()
     .await;
 
-    // 5. Unconditional async teardown before propagating any assertion failure.
     let (sw_rc, sw_out, sw_err, dc_rc, dc_out, dc_err) = run_teardown(dir.path(), &all_names).await;
     guard.disarm();
 

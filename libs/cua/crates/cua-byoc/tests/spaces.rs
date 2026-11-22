@@ -375,7 +375,6 @@ async fn static_relay_cloud_space_works_without_cua_auth_login() {
         .await
         .unwrap();
 
-    // Spaces built WITHOUT `.relay(...)` (zero cua auth login).
     let spaces = Spaces::builder()
         .home(dir.path())
         .sandboxes(sandboxes.clone())
@@ -395,7 +394,6 @@ async fn static_relay_cloud_space_works_without_cua_auth_login() {
     assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
     assert_eq!(created.name, "static-box");
 
-    // Listed with cloud placement & delete owner, findable, and reachable via spacesd.
     let listed = spaces.list().unwrap();
     let row = listed.iter().find(|i| i.id == created.id).unwrap();
     assert_eq!(
@@ -416,7 +414,6 @@ async fn static_relay_cloud_space_works_without_cua_auth_login() {
         .unwrap();
     assert!(out.render().contains("static-spaces"), "{}", out.render());
 
-    // Stop, start, delete through Spaces.
     let off = spaces.stop(&created.id).await.unwrap();
     assert_eq!(off.state, "stopped");
     let on = spaces.start(&created.id).await.unwrap();

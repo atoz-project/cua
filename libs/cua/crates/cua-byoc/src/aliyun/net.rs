@@ -253,16 +253,37 @@ pub(crate) fn net_resource(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct VpcResourceSpec {
+    action: &'static str,
+    id_param: &'static str,
+    outer_key: &'static str,
+    inner_key: &'static str,
+    label: &'static str,
+}
+
+const VPC_SPEC: VpcResourceSpec = VpcResourceSpec {
+    action: "DescribeVpcs",
+    id_param: "VpcId",
+    outer_key: "Vpcs",
+    inner_key: "Vpc",
+    label: "VPC",
+};
+
+const VSWITCH_SPEC: VpcResourceSpec = VpcResourceSpec {
+    action: "DescribeVSwitches",
+    id_param: "VSwitchId",
+    outer_key: "VSwitches",
+    inner_key: "VSwitch",
+    label: "VSwitch",
+};
+
 async fn wait_vpc_resource_available(
     api: &AliyunEcs,
     conn: &Connection,
     region: &str,
-    action: &str,
-    id_param: &str,
+    spec: VpcResourceSpec,
     id: &str,
-    (outer_key, inner_key): (&str, &str),
-    label: &str,
 ) -> Result<()> {
     let profile_hint = api.profile_hint(conn);
     let vpc_ep = api.vpc_endpoint(region);
@@ -271,16 +292,19 @@ async fn wait_vpc_resource_available(
             .call_ok(
                 &vpc_ep,
                 "GET",
-                action,
+                spec.action,
                 VPC_API_VERSION,
                 &[
                     ("RegionId".into(), region.to_string()),
-                    (id_param.into(), id.to_string()),
+                    (spec.id_param.into(), id.to_string()),
                 ],
                 profile_hint,
             )
             .await?;
-        if let Some(obj) = v[outer_key][inner_key].as_array().and_then(|a| a.first()) {
+        if let Some(obj) = v[spec.outer_key][spec.inner_key]
+            .as_array()
+            .and_then(|a| a.first())
+        {
             let status = obj["Status"].as_str().unwrap_or("Available");
             if status.eq_ignore_ascii_case("Available") {
                 return Ok(());
@@ -289,7 +313,8 @@ async fn wait_vpc_resource_available(
         tokio::time::sleep(api.poll_interval()).await;
     }
     Err(Error::Timeout(format!(
-        "aliyun-ecs: {label} {id} did not become Available in {region}"
+        "aliyun-ecs: {} {id} did not become Available in {region}",
+        spec.label
     )))
 }
 
@@ -335,17 +360,7 @@ async fn ensure_vpc(
     owner: &str,
 ) -> Result<(String, Option<Resource>)> {
     if let Some(id) = find_vpc(api, conn, region, owner).await? {
-        wait_vpc_resource_available(
-            api,
-            conn,
-            region,
-            "DescribeVpcs",
-            "VpcId",
-            &id,
-            ("Vpcs", "Vpc"),
-            "VPC",
-        )
-        .await?;
+        wait_vpc_resource_available(api, conn, region, VPC_SPEC, &id).await?;
         return Ok((id, None));
     }
 
@@ -379,18 +394,7 @@ async fn ensure_vpc(
         .ok_or_else(|| Error::Cloud("aliyun-ecs: CreateVpc returned no VpcId".into()))?
         .to_string();
 
-    if let Err(e) = wait_vpc_resource_available(
-        api,
-        conn,
-        region,
-        "DescribeVpcs",
-        "VpcId",
-        &id,
-        ("Vpcs", "Vpc"),
-        "VPC",
-    )
-    .await
-    {
+    if let Err(e) = wait_vpc_resource_available(api, conn, region, VPC_SPEC, &id).await {
         let _ = delete_part(
             api,
             conn,
@@ -400,8 +404,7 @@ async fn ensure_vpc(
         return Err(e);
     }
 
-    // Race-loser cleanup: if two processes created a VPC concurrently, keep
-    // the lowest VpcId and delete our empty redundant one.
+    // Alibaba Cloud CreateVpc does not enforce a unique VpcName across concurrent callers.
     if let Some(winner) = find_vpc(api, conn, region, owner).await?
         && winner != id
     {
@@ -411,17 +414,7 @@ async fn ensure_vpc(
             &net_resource(region, "", "vpc", &id, &name, &tags, &[]),
         )
         .await;
-        wait_vpc_resource_available(
-            api,
-            conn,
-            region,
-            "DescribeVpcs",
-            "VpcId",
-            &winner,
-            ("Vpcs", "Vpc"),
-            "VPC",
-        )
-        .await?;
+        wait_vpc_resource_available(api, conn, region, VPC_SPEC, &winner).await?;
         return Ok((winner, None));
     }
 
@@ -571,17 +564,7 @@ pub async fn ensure_vswitch_for_zone(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        wait_vpc_resource_available(
-            api,
-            conn,
-            region,
-            "DescribeVSwitches",
-            "VSwitchId",
-            id,
-            ("VSwitches", "VSwitch"),
-            "VSwitch",
-        )
-        .await?;
+        wait_vpc_resource_available(api, conn, region, VSWITCH_SPEC, id).await?;
         return Ok((id.to_string(), None));
     }
 
@@ -625,18 +608,7 @@ pub async fn ensure_vswitch_for_zone(
         .ok_or_else(|| Error::Cloud("aliyun-ecs: CreateVSwitch returned no VSwitchId".into()))?
         .to_string();
 
-    if let Err(e) = wait_vpc_resource_available(
-        api,
-        conn,
-        region,
-        "DescribeVSwitches",
-        "VSwitchId",
-        &id,
-        ("VSwitches", "VSwitch"),
-        "VSwitch",
-    )
-    .await
-    {
+    if let Err(e) = wait_vpc_resource_available(api, conn, region, VSWITCH_SPEC, &id).await {
         let _ = delete_part(
             api,
             conn,

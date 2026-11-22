@@ -1009,11 +1009,8 @@ mod sealed {
         let d = device(&url, &issuer, Some(pool.join("laptop")));
         *d.store.0.lock().unwrap() = Some("saved-hcloud-token".into());
 
-        // Sanity check: omitted token (`None`) still finds ambient credentials.
         assert!(d.api.local_secret(&target(None)).is_some());
 
-        // Explicit empty/whitespace token (`--token-stdin`) must return None and
-        // fail sealed connect with InvalidArgument without touching Hetzner or sealing.
         for empty in ["", "   \n"] {
             assert!(
                 d.api.local_secret(&target(Some(empty))).is_none(),

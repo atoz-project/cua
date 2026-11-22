@@ -642,7 +642,6 @@ async fn windows_direct_vm_bypasses_oci_and_rejects_docker_or_container_kind() {
         .state_dir(dir.path().join("sandboxes"))
         .build();
 
-    // 1. Windows with --runtime native succeeds even when no Windows OCI manifest exists in FakeRegistry.
     let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
     o.contrib = Some("aliyun-ecs".into());
     o.name = Some("win-direct-a".into());
@@ -659,7 +658,6 @@ async fn windows_direct_vm_bypasses_oci_and_rejects_docker_or_container_kind() {
     );
     let spec = fake.created.lock().unwrap()[0].clone();
     assert_eq!(spec.image.kind, RunKind::Vm);
-    // env_to_entrypoint = true on Windows Direct VM mints and delivers CUA_ENV_TOKEN.
     let minted = sb
         .env_token()
         .expect("Windows contrib with env_to_entrypoint=true must mint env_token");
@@ -668,14 +666,12 @@ async fn windows_direct_vm_bypasses_oci_and_rejects_docker_or_container_kind() {
         Some(minted.as_str())
     );
 
-    // Persisted state records kind "vm" (not hardcoded "container") and env_token.
     let raw_state =
         std::fs::read_to_string(dir.path().join("sandboxes/win-direct-a.json")).unwrap();
     let state_json: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
     assert_eq!(state_json["image"]["kind"], "vm");
     assert_eq!(state_json["env_token"], minted);
 
-    // 2. Windows + --runtime docker or --kind container is rejected before provider create.
     let mut bad_rt = CreateOptions::new(ProviderKind::Contrib, "windows");
     bad_rt.contrib = Some("aliyun-ecs".into());
     bad_rt.os = "windows".into();
@@ -712,7 +708,6 @@ impl Provider for ConnectOptsTokenFake {
             image_mode: ImageMode::Direct,
             ports: PortExposure::Https,
             command: false,
-            // Provider supplies ConnectOptions token on its own (`held == None`).
             env_to_entrypoint: false,
             private_registry: false,
             suspend: false,
@@ -855,7 +850,6 @@ async fn capable_cloud_forwards_cloud_image_id_disk_gb_instance_type_and_bypasse
         .state_dir(dir.path().join("sandboxes"))
         .build();
 
-    // 1. Windows with custom Cloud Image ID, disk_gb, and instance_type bypasses GHCR lookup.
     let mut win = CreateOptions::new(ProviderKind::Contrib, "windows:11");
     win.contrib = Some("aliyun-ecs".into());
     win.os = "windows".into();
@@ -865,13 +859,11 @@ async fn capable_cloud_forwards_cloud_image_id_disk_gb_instance_type_and_bypasse
     let sb = sbx.create(win).await.unwrap();
     drop(sb);
 
-    // 2. Windows without cloud_image_id (official fallback) also bypasses GHCR lookup.
     let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
     win_official.contrib = Some("aliyun-ecs".into());
     win_official.os = "windows".into();
     sbx.create(win_official).await.unwrap();
 
-    // 3. Linux Docker-on-VM with cloud_image_id keeps OCI reference AND forwards cloud_image_id.
     let mut lin = CreateOptions::new(ProviderKind::Contrib, "ghcr.io/trycua/linux:24.04");
     lin.contrib = Some("aliyun-ecs".into());
     lin.cloud_image_id = Some("m-ubuntu-golden".into());
@@ -913,7 +905,6 @@ async fn linux_with_os_windows_is_rejected_and_direct_vm_bypasses_oci_while_dock
         .state_dir(dir.path().join("sandboxes"))
         .build();
 
-    // 1. Conflicting os="windows" with Linux image ref is rejected before provider/OCI calls.
     for img in ["linux", "linux-slim", "ghcr.io/trycua/linux:24.04"] {
         let mut bad = CreateOptions::new(ProviderKind::Contrib, img);
         bad.contrib = Some("aliyun-ecs".into());
@@ -927,7 +918,6 @@ async fn linux_with_os_windows_is_rejected_and_direct_vm_bypasses_oci_while_dock
     }
     assert!(counting.calls.lock().unwrap().is_empty());
 
-    // 2. Direct VM (runtime = native) for linux and linux-slim bypasses OCI registry completely.
     for (img, cid) in [("linux", "m-ubuntu"), ("linux-slim", "m-slim")] {
         let mut native = CreateOptions::new(ProviderKind::Contrib, img);
         native.contrib = Some("aliyun-ecs".into());
@@ -941,7 +931,6 @@ async fn linux_with_os_windows_is_rejected_and_direct_vm_bypasses_oci_while_dock
         *counting.calls.lock().unwrap()
     );
 
-    // 3. Docker-on-VM (runtime != native) with --cloud-image-id resolves OCI container images once each.
     for (img, cid) in [("linux", "m-ubuntu"), ("linux-slim", "m-slim")] {
         let mut docker = CreateOptions::new(ProviderKind::Contrib, img);
         docker.contrib = Some("aliyun-ecs".into());
@@ -956,7 +945,6 @@ async fn linux_with_os_windows_is_rejected_and_direct_vm_bypasses_oci_while_dock
             "ghcr.io/trycua/linux:24.04-slim".to_string(),
         ]
     );
-    // Restore plain registry source for any tests running after us.
     cua_image::resolve::set_source(Some(Arc::new(registry())));
 }
 
@@ -974,7 +962,6 @@ async fn disk_gb_zero_and_whitespace_cloud_image_or_instance_type_fail_invalid_a
         .state_dir(dir.path().join("sandboxes"))
         .build();
 
-    // disk_gb = Some(0) fails InvalidArgument on both non-capable (e2b) and capable (aliyun-ecs) providers.
     let mut e2b_zero = opts("ghcr.io/trycua/linux:24.04");
     e2b_zero.disk_gb = Some(0);
     let err = e.sbx.create(e2b_zero).await.unwrap_err();
@@ -987,7 +974,6 @@ async fn disk_gb_zero_and_whitespace_cloud_image_or_instance_type_fail_invalid_a
     let err = sbx.create(ali_zero).await.unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // Empty/whitespace-only and internal-whitespace cloud_image_id / instance_type fail InvalidArgument.
     for bad in ["", "   ", "m-foo bar", "m-foo\tbar"] {
         let mut o1 = CreateOptions::new(ProviderKind::Contrib, "windows");
         o1.contrib = Some("aliyun-ecs".into());

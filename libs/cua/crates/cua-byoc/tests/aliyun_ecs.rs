@@ -216,7 +216,6 @@ async fn actionable_errors_retries_and_secret_redaction() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
-    // 1. Missing credentials
     let (api, s, _) = start(None).await;
     let t = api.test(&conn(&api)).await;
     assert!(!t.ok());
@@ -232,14 +231,12 @@ async fn actionable_errors_retries_and_secret_redaction() {
         t.checks
     );
 
-    // 2. Malformed --token-stdin
     api.stage_secret(&target(Some("not-a-pair")));
     let t = api.test(&conn(&api)).await;
     assert!(!t.ok());
     assert!(t.checks[0].detail.contains("missing ':'"), "{:?}", t.checks);
     assert!(api.persist_secret().is_err());
 
-    // 3. Invalid AccessKey ID / secret never leaked
     api.stage_secret(&target(Some("LTAI_UNKNOWN:topsecret-do-not-leak")));
     let t = api.test(&conn(&api)).await;
     assert!(!t.ok());
@@ -255,12 +252,10 @@ async fn actionable_errors_retries_and_secret_redaction() {
         t.checks
     );
 
-    // 4. Target Debug redacts token
     let dbg = format!("{:?}", target(Some("LTAI_TEST_AK:topsecret-do-not-leak")));
     assert!(!dbg.contains("topsecret-do-not-leak"), "{dbg}");
     assert!(dbg.contains("redacted"), "{dbg}");
 
-    // 5. Missing RAM permission on ecs:RunInstances DryRun=true
     api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
     s.lock()
         .unwrap()
@@ -274,7 +269,6 @@ async fn actionable_errors_retries_and_secret_redaction() {
     assert!(perm.detail.contains("ecs:RunInstances"), "{perm:?}");
     s.lock().unwrap().forbidden_actions.clear();
 
-    // 6. Missing RAM permission on vpc:DescribeVpcs
     s.lock()
         .unwrap()
         .forbidden_actions
@@ -288,13 +282,11 @@ async fn actionable_errors_retries_and_secret_redaction() {
     );
     s.lock().unwrap().forbidden_actions.clear();
 
-    // 7. VPC-only region returning InvalidVSwitchId.NotFound after RAM auth still passes permissions
     s.lock().unwrap().run_instances_missing_vswitch = true;
     let t = api.test(&conn(&api)).await;
     assert!(t.ok(), "{:?}", t.checks);
     s.lock().unwrap().run_instances_missing_vswitch = false;
 
-    // 8. Unknown region rejected; bad region syntax rejected at resolve()
     let bad_reg_target = Target {
         provider: "aliyun-ecs".into(),
         region: Some("cn-mars-1".into()),
@@ -322,7 +314,6 @@ async fn actionable_errors_retries_and_secret_redaction() {
         "{syntax_err}"
     );
 
-    // 9. 429 Throttling is retried and succeeds
     api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
     s.lock().unwrap().throttle = 2;
     let t = api.test(&conn(&api)).await;
@@ -356,7 +347,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
             .clone()
     };
 
-    // 5. Fallback to active `current` profile ("oauth"), inheriting its region_id ("cn-shanghai").
     {
         let _env = EnvGuard::set(None, None);
         let t_none = target(None);
@@ -368,14 +358,12 @@ async fn credential_precedence_and_aliyun_config_profiles() {
         assert!(res.ok(), "{:?}", res.checks);
         assert_eq!(last_ak(), "LTAI_CUR_AK");
 
-        // Explicit --region wins over profile region_id.
         let t_reg = Target {
             region: Some("cn-beijing".into()),
             ..target(None)
         };
         assert_eq!(api.resolve(&t_reg).unwrap().region, "cn-beijing");
 
-        // 4. Saved credentials in TokenStore beat active `current` profile.
         store.save("LTAI_SAVED_AK:saved_secret_789").unwrap();
         let c_saved = api.resolve(&t_none).unwrap();
         assert_eq!(c_saved.region, "cn-hangzhou");
@@ -384,7 +372,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
         assert!(res.ok(), "{:?}", res.checks);
         assert_eq!(last_ak(), "LTAI_SAVED_AK");
 
-        // 3. Explicit --profile beats saved TokenStore and `current` profile.
         let t_prof = Target {
             profile: Some("webhook_manager".into()),
             ..target(None)
@@ -396,7 +383,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
         assert!(res.ok(), "{:?}", res.checks);
         assert_eq!(last_ak(), "LTAI_WH_AK");
 
-        // Missing --profile returns crisp error.
         let t_missing = Target {
             profile: Some("no_such_profile".into()),
             ..target(None)
@@ -409,7 +395,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
             res.checks
         );
 
-        // Non-AK mode profile returns crisp error.
         let t_sts = Target {
             profile: Some("sts_prof".into()),
             ..target(None)
@@ -423,7 +408,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
         );
     }
 
-    // 2. Env vars beat explicit --profile and saved TokenStore.
     {
         let _env = EnvGuard::set(Some("LTAI_ENV_AK"), Some("env_secret_abc"));
         let t_prof = Target {
@@ -436,7 +420,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
         assert!(res.ok(), "{:?}", res.checks);
         assert_eq!(last_ak(), "LTAI_ENV_AK");
 
-        // 1. --token-stdin beats env vars, --profile, and TokenStore.
         let t_stdin = Target {
             profile: Some("webhook_manager".into()),
             token: Some("LTAI_STDIN_AK:stdin_secret_xyz".into()),
@@ -449,7 +432,6 @@ async fn credential_precedence_and_aliyun_config_profiles() {
         assert_eq!(last_ak(), "LTAI_STDIN_AK");
     }
 
-    // Partial env var fails loudly rather than falling back to TokenStore/profile.
     {
         let _env = EnvGuard::set(Some("LTAI_ONLY_ID"), None);
         api.stage_secret(&target(None));
@@ -482,7 +464,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // 1. Failed connect must NOT persist credentials or connection state.
     s.lock()
         .unwrap()
         .forbidden_actions
@@ -502,8 +483,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
     );
     s.lock().unwrap().forbidden_actions.clear();
 
-    // 2. Passing connect persists AK/SK into TokenStore (never plaintext in state/audit/status),
-    //    records region, budget, max_size, and ttl_hours (default 8 when None).
     let connected = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -530,7 +509,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
     assert_eq!(connected.provider.max_size, "4x16");
     assert_eq!(store.load().as_deref(), Some("LTAI_TEST_AK:secret123"));
 
-    // Verify zero plaintext secret leakage across disk state, audit, and status JSON.
     let disk_contents = read_all(home.path());
     assert!(!disk_contents.contains("secret123"), "{disk_contents}");
     assert!(!disk_contents.contains("LTAI_TEST_AK"), "{disk_contents}");
@@ -559,12 +537,10 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
         assert!(!k.supported, "{k:?}");
     }
 
-    // 3. disconnect refuses when an owned instance still exists, ignoring untagged/foreign ones.
     let owner = cua_byoc::Store::new(home.path()).owner_id().unwrap();
     let owner_tag = model::label_value(&owner);
     {
         let mut f = s.lock().unwrap();
-        // Foreign instance (must be ignored by list_owned and not block disconnect by itself).
         f.instances.insert(
             "i-foreign-1".into(),
             json!({
@@ -578,7 +554,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
                 ]}
             }),
         );
-        // Owned instance (must block disconnect without --delete).
         f.instances.insert(
             "i-owned-1".into(),
             json!({
@@ -604,7 +579,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
         "credentials kept on refused disconnect"
     );
 
-    // describe() returns live state + tags for owned instance, None for missing.
     let owned_res = cua_byoc::model::Resource {
         provider: "aliyun-ecs".into(),
         id: "i-owned-1".into(),
@@ -633,7 +607,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
             .is_none()
     );
 
-    // Remove owned instance; foreign instance remains; disconnect now succeeds cleanly.
     s.lock().unwrap().instances.remove("i-owned-1");
     let disc = clouds.disconnect("aliyun-ecs", false).await.unwrap();
     assert!(disc.disconnected);
@@ -645,7 +618,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
     assert!(!after_status.providers[0].connected);
     assert!(!after_status.providers[0].default);
 
-    // Connecting via ~/.aliyun/config.json profile does NOT duplicate secrets into TokenStore.
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = write_aliyun_config(dir.path(), "oauth");
     let (api_prof, s_prof, store_prof) = start(Some(cfg_path)).await;
@@ -681,7 +653,6 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
         "CLI profile connect must not duplicate ~/.aliyun/config.json secret into TokenStore"
     );
 
-    // Passing --oidc or --sealed to aliyun-ecs fails cleanly without connecting.
     let oidc_res = clouds2
         .connect_with(&ConnectRequest {
             target: Target {
@@ -725,7 +696,6 @@ async fn token_stdin_or_env_with_profile_clears_connection_profile_post_connect(
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // Connect with BOTH --token-stdin AND --profile webhook_manager.
     let connected = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -740,8 +710,6 @@ async fn token_stdin_or_env_with_profile_clears_connection_profile_post_connect(
         .unwrap();
     assert_eq!(connected.provider.profile, "");
 
-    // Subsequent disconnect (calls list_owned) must authenticate with LTAI_STDIN_AK from TokenStore,
-    // NEVER switching to webhook_manager (LTAI_WH_AK).
     s.lock().unwrap().calls.clear();
     let disc = clouds.disconnect("aliyun-ecs", false).await.unwrap();
     assert!(disc.disconnected);
@@ -752,7 +720,6 @@ async fn token_stdin_or_env_with_profile_clears_connection_profile_post_connect(
         "post-connect calls must use saved TokenStore AK, got: {calls:?}"
     );
 
-    // Same check when connecting via env vars + --profile webhook_manager.
     let (api_env, s_env, _store_env) = start(Some(cfg_path)).await;
     {
         let mut f = s_env.lock().unwrap();
@@ -783,7 +750,6 @@ async fn token_stdin_or_env_with_profile_clears_connection_profile_post_connect(
             .unwrap();
         assert_eq!(conn_env.provider.profile, "");
     }
-    // Env vars dropped now; disconnect must still use saved LTAI_ENV_AK from TokenStore.
     s_env.lock().unwrap().calls.clear();
     let disc_env = clouds_env.disconnect("aliyun-ecs", false).await.unwrap();
     assert!(disc_env.disconnected);
@@ -800,8 +766,6 @@ async fn clouds_test_and_failed_connect_unstage_secret() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
-    // 1. In a clean environment (no env/saved/profile), test(--token-stdin) and failed connect(--token-stdin)
-    //    must unstage the secret so subsequent status() reports credentials.found == false.
     let home_clean = tempfile::tempdir().unwrap();
     let (api_clean, s_clean, _store_clean) = start(None).await;
     let sandboxes_clean = cua_byoc::install_with(
@@ -825,7 +789,6 @@ async fn clouds_test_and_failed_connect_unstage_secret() {
         st_after_test.providers[0].credentials
     );
 
-    // Failed connect via invalid region (early `?` in resolve) must also unstage.
     let err_region = clouds_clean
         .connect_with(&ConnectRequest {
             target: Target {
@@ -849,7 +812,6 @@ async fn clouds_test_and_failed_connect_unstage_secret() {
         st_after_bad_region.providers[0].credentials
     );
 
-    // Failed connect via failed API check must also unstage.
     s_clean
         .lock()
         .unwrap()
@@ -873,7 +835,6 @@ async fn clouds_test_and_failed_connect_unstage_secret() {
         st_after_perm.providers[0].credentials
     );
 
-    // 2. connect -> test(wrong --token-stdin) -> disconnect(false) must succeed without SignatureDoesNotMatch.
     let home = tempfile::tempdir().unwrap();
     let (api, _s, _store) = start(None).await;
     let sandboxes = cua_byoc::install_with(
@@ -926,7 +887,6 @@ async fn call_raw_rejects_malformed_truncated_json_and_empty_account_id() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
-    // 1. 200 OK malformed JSON on GetCallerIdentity, list_owned, and describe must return Err (and fail test).
     let malformed_resp =
         b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<html>not json</html>"
             .to_vec();
@@ -956,7 +916,6 @@ async fn call_raw_rejects_malformed_truncated_json_and_empty_account_id() {
         "200 malformed JSON on describe must return Err, never Ok(None)"
     );
 
-    // 2. 200 OK truncated HTTP body (Content-Length mismatch / early EOF) must fail GetCallerIdentity, list_owned, describe.
     let truncated_resp =
         b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"AccountId\":\"123"
             .to_vec();
@@ -986,7 +945,6 @@ async fn call_raw_rejects_malformed_truncated_json_and_empty_account_id() {
         "200 truncated body on describe must return Err"
     );
 
-    // 3. 200 OK JSON with empty AccountId must fail credentials check.
     let empty_acct_body = r#"{"AccountId":""}"#;
     let empty_acct_resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{empty_acct_body}",
@@ -1010,7 +968,6 @@ async fn call_raw_rejects_malformed_truncated_json_and_empty_account_id() {
     );
     assert!(!t_empty.checks[0].ok, "{:?}", t_empty.checks);
 
-    // 4. 502 HTML error body must preserve a snippet (never "null").
     let html_502 = "<html><body>502 Bad Gateway</body></html>";
     let resp_502 = format!(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html_502}",
@@ -1043,7 +1000,6 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
     let (api, s, _) = start(None).await;
     api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
 
-    // 1. DescribeVSwitches returning Forbidden.RAM must fail permissions (never swallowed).
     s.lock()
         .unwrap()
         .forbidden_actions
@@ -1058,7 +1014,6 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
     );
     s.lock().unwrap().forbidden_actions.clear();
 
-    // 2. When VSwitchId (with VpcId) and matching-VPC SecurityGroupId exist, both are attached to RunInstances DryRun=true.
     {
         let mut f = s.lock().unwrap();
         f.vswitches.push(json!({
@@ -1095,7 +1050,6 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
         );
     }
 
-    // 3. When VSwitchId IS supplied, InvalidVSwitchId.NotFound must FAIL permissions.
     s.lock().unwrap().run_instances_dry_run_error = Some((
         400,
         "InvalidVSwitchId.NotFound".into(),
@@ -1109,7 +1063,6 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
         "{perm:?}"
     );
 
-    // 4. MissingParameter must FAIL permissions both WITH VSwitchId and WITHOUT VSwitchId.
     s.lock().unwrap().run_instances_dry_run_error = Some((
         400,
         "MissingParameter".into(),
@@ -1143,7 +1096,6 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
     );
     s.lock().unwrap().run_instances_dry_run_error = None;
 
-    // 5. Fallback cleanly when VSwitchId exists but no SecurityGroup exists in that VPC.
     {
         let mut f = s.lock().unwrap();
         f.vswitches.push(json!({
@@ -1237,8 +1189,6 @@ async fn test_permissions_dry_runs_vpc_and_creates_zero_security_groups() {
         }
     }
 
-    // 1b. Even when the account already has a pre-existing unrelated VPC/VSwitch, `test()`
-    //     creates ZERO security groups and leaves the existing VPC/VSwitch untouched.
     {
         let mut f = s.lock().unwrap();
         f.calls.clear();
@@ -1280,7 +1230,6 @@ async fn test_permissions_dry_runs_vpc_and_creates_zero_security_groups() {
         );
     }
 
-    // 2. Forbidden.RAM on vpc:CreateVpc, ecs:DescribeSecurityGroups, or ecs:RunInstances fails permissions.
     for perm_action in [
         "vpc:CreateVpc",
         "ecs:DescribeSecurityGroups",
@@ -1315,7 +1264,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
     );
 
     let (api, s, _store) = start(None).await;
-    // Seed pre-existing account network resources that Cua MUST NOT touch.
     {
         let mut f = s.lock().unwrap();
         f.vpcs.push(json!({
@@ -1346,7 +1294,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
             "InnerAccessPolicy": "Accept",
             "Tags": { "Tag": [] }
         }));
-        // Simulate real guest boot: decode UserData #cloud-config and bring machine online on FakeRelay.
         let relay_hook = relay.clone();
         f.on_run_instance = Some(Arc::new(move |_inst_id, params| {
             let ud_b64 = params.get("UserData").expect("UserData must be passed");
@@ -1382,10 +1329,8 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
     let owner = cua_byoc::Store::new(home.path()).owner_id().unwrap();
     let owner_tag = model::label_value(&owner);
 
-    // Clear test/connect calls so we inspect provisioning calls cleanly.
     s.lock().unwrap().calls.clear();
 
-    // 1. Create Linux Docker-on-VM sandbox with explicit `--runtime docker`.
     let mut opts = sb_create_opts("sb-one");
     opts.runtime = Runtime::Other("docker".into());
     let sb1 = sandboxes.create(opts).await.unwrap();
@@ -1397,7 +1342,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         Some("docker-on-vm")
     );
 
-    // Inspect created cloud calls & resources.
     {
         let f = s.lock().unwrap();
         let create_vpc = f.calls.iter().find(|c| c.action == "CreateVpc").unwrap();
@@ -1463,7 +1407,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
                 .map(String::as_str),
             Some("accept")
         );
-        // Never add any ingress rules!
         assert!(
             !f.calls
                 .iter()
@@ -1525,7 +1468,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         assert!(!run.params.contains_key("Password"));
         assert!(!run.params.contains_key("RamRoleName"));
 
-        // Verify UserData (#cloud-config) blocks 100.100.100.200, installs docker, joins relay, schedules TTL.
         let ud = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(run.params.get("UserData").unwrap())
@@ -1544,7 +1486,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         assert!(script.contains("shutdown -h +480"), "{script}");
         assert!(ud.contains("cua-expire.timer"));
 
-        // Verify all 6 tags on Instance, VPC, VSwitch, SG.
         let inst = f.instances.values().next().unwrap();
         let inst_tags = aliyun_net::tags_of(inst);
         for key in [
@@ -1592,7 +1533,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         assert_eq!(sg_tags["cua-machine"], "");
     }
 
-    // 2. Second sandbox reuses existing VPC, VSwitch, and SG without creating new ones.
     s.lock().unwrap().calls.clear();
     let _sb2 = sandboxes.create(sb_create_opts("sb-two")).await.unwrap();
     {
@@ -1611,7 +1551,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         assert_eq!(f.security_groups.len(), 2);
     }
 
-    // 3. Suspend (stop) preserves system disk & transitions to Stopped, resume (start) brings back Running.
     sandboxes.suspend("sb-one").await.unwrap();
     {
         let f = s.lock().unwrap();
@@ -1630,7 +1569,6 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         Status::Running
     );
 
-    // 4. Delete both sandboxes; pre-existing account network remains untouched.
     sandboxes.delete("sb-one").await.unwrap();
     sandboxes.delete("sb-two").await.unwrap();
     assert!(relay.machine(&machine1).is_none());
@@ -1656,7 +1594,6 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
-    // 1. --max-size 1x2 rejects default 2c/4g BEFORE any cloud provisioning call.
     let home1 = tempfile::tempdir().unwrap();
     let relay = Arc::new(FakeRelay::start().await);
     relay.add_account("acct-tok", "user-1", None);
@@ -1696,7 +1633,6 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
         "max-size refusal must happen before ANY cloud API call"
     );
 
-    // 1b. --max-size 4x16 rejects explicit 8 vCPU / 32 GiB override BEFORE any cloud API call.
     let home1b = tempfile::tempdir().unwrap();
     let (api1b, s1b, _) = start(None).await;
     let sb_max_4x16 = cua_byoc::install_with(
@@ -1733,7 +1669,6 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
         "4x16 max-size refusal must happen before ANY cloud API call"
     );
 
-    // 2. --budget 0.01 rejects 0.043/h machine BEFORE any cloud provisioning call.
     let home2 = tempfile::tempdir().unwrap();
     let (api2, s2, _) = start(None).await;
     let sb_budget = cua_byoc::install_with(
@@ -1765,7 +1700,6 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
         "budget refusal must happen before ANY cloud API call"
     );
 
-    // 3. Unsupported runtime is refused cleanly before any cloud API call.
     let mut bad_rt_opts = sb_create_opts("runtime-unsupported");
     bad_rt_opts.runtime = Runtime::Qemu;
     let err_rt = sb_budget.create(bad_rt_opts).await.unwrap_err();
@@ -1785,8 +1719,6 @@ async fn cross_zone_capacity_retry_and_total_failure_network_rollback() {
     store.save("LTAI_TEST_AK:secret123").unwrap();
     let c = conn(&api);
 
-    // Case A: Zone cn-hangzhou-h fails RunInstances with OperationDenied.NoStock;
-    // provision cleans up -h's unused VSwitch and retries in cn-hangzhou-i -> succeeds.
     {
         let mut f = s.lock().unwrap();
         f.zones = vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()];
@@ -1826,7 +1758,6 @@ async fn cross_zone_capacity_retry_and_total_failure_network_rollback() {
         assert_eq!(f.vswitches[0]["ZoneId"], "cn-hangzhou-i");
     }
 
-    // Case B: Fresh provision where ALL zones fail with Zone.NotOnSale -> newly created SG & VPC rolled back.
     let (api2, s2, store2) = start(None).await;
     store2.save("LTAI_TEST_AK:secret123").unwrap();
     {
@@ -1913,7 +1844,6 @@ async fn failed_boot_redacts_console_output_and_rolls_back_instance_and_relay() 
     assert!(!msg.contains("cmt_super_secret_token_999"), "{msg}");
     assert!(!msg.contains("envtok_never_leak_987654"), "{msg}");
 
-    // Saved boot log file is redacted and 0600, instance & relay machine rolled back, shared VPC kept.
     let log_dir = home.path().join("cloud").join("boot-logs");
     let logs: Vec<_> = std::fs::read_dir(&log_dir)
         .unwrap()
@@ -1993,7 +1923,6 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
     let owner = cua_byoc::Store::new(home.path()).owner_id().unwrap();
     let owner_tag = model::label_value(&owner);
 
-    // Pre-seed default VPC (even with forged cua-managed tag!), untagged, and other-owner resources.
     {
         let mut f = s.lock().unwrap();
         f.vpcs.push(json!({
@@ -2068,8 +1997,6 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         );
     }
 
-    // Tag-guard refusal: list_owned excludes and stop/start/delete refuse on untagged,
-    // foreign, and default VPC/VSwitch (even with forged tags) with 0 mutating calls.
     let c = conn(&api);
     assert!(
         api.list_owned(&c, &owner).await.unwrap().is_empty(),
@@ -2124,7 +2051,6 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         }
     }
 
-    // Create a live sandbox and also seed an expired owned instance.
     let _sb = sandboxes.create(sb_create_opts("sb-live")).await.unwrap();
     let expired_at = model::now().saturating_sub(60);
     s.lock().unwrap().instances.insert(
@@ -2143,14 +2069,12 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         }),
     );
 
-    // disconnect without --delete refuses while managed instances exist.
     let refused = clouds.disconnect("aliyun-ecs", false).await.unwrap_err();
     assert!(
         refused.to_string().contains("NOT disconnected"),
         "{refused}"
     );
 
-    // Regular sweep removes ONLY expired owned instance, keeping live sandbox & shared VPC/VSwitch/SG.
     let swept = clouds
         .sweep(Some("aliyun-ecs"), false, false)
         .await
@@ -2163,10 +2087,8 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         "{swept:?}"
     );
     assert!(!s.lock().unwrap().instances.contains_key("i-expired"));
-    assert_eq!(s.lock().unwrap().instances.len(), 3); // i-untagged, i-foreign, sb-live
+    assert_eq!(s.lock().unwrap().instances.len(), 3);
 
-    // disconnect --delete sweeps in dependency order (instance -> security_group -> vswitch -> vpc)
-    // and succeeds even with transient DependencyViolation retries!
     {
         let mut f = s.lock().unwrap();
         f.transient_dependency_errors = 1;
@@ -2205,7 +2127,6 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
         "{del_order:?}"
     );
 
-    // Only untagged, foreign, and default resources remain!
     assert_eq!(f.instances.len(), 2);
     assert!(f.instances.contains_key("i-untagged"));
     assert!(f.instances.contains_key("i-foreign"));
@@ -2287,7 +2208,6 @@ async fn security_group_tie_breaker_and_race_loser_cleanup() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
-    // 1. Lowest-ID tie-breaker: when multiple Cua SGs exist, prepare_network picks the lowest ID.
     let (api1, s1, store1) = start(None).await;
     store1.save("LTAI_TEST_AK:secret123").unwrap();
     let c1 = conn(&api1);
@@ -2351,8 +2271,6 @@ async fn security_group_tie_breaker_and_race_loser_cleanup() {
         "must pick lowest SecurityGroupId on tie"
     );
 
-    // 2. Concurrent race across separate NetLocks: both create SGs behind a barrier,
-    //    both converge on the lowest ID, and the race loser is deleted.
     let s2: S = Arc::new(Mutex::new(FakeAliyun::default()));
     {
         let mut f = s2.lock().unwrap();
@@ -2568,7 +2486,6 @@ async fn vswitch_skips_used_cidrs_and_linux_slim_enforces_40g_cloud_essd() {
     store.save("LTAI_TEST_AK:secret123").unwrap();
     let c = conn(&api);
 
-    // Pre-create an owned VPC that already has a non-Cua VSwitch occupying 10.77.0.0/20 in another zone.
     let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
         .into_iter()
         .map(|(k, v)| json!({ "Key": k, "Value": v }))
@@ -2694,7 +2611,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     let mirror_sha = "cd".repeat(32);
     let mirror_url = format!("https://mirror.example.com/cua-spacesd.exe#sha256={mirror_sha}");
 
-    // 1. Connect with --max-size 2x4 -> Windows (4 vCPU / 8 GiB) must be refused before any cloud call.
     clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -2718,7 +2634,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     assert!(err.to_string().contains("2 vCPU"), "{err}");
     assert!(s.lock().unwrap().instances.is_empty());
 
-    // 2. Reconnect with --max-size 4x16 (and omit spacesd_download_url -> preserved!).
     let connected = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -2736,7 +2651,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
         Some(mirror_url.as_str())
     );
 
-    // 3. Explicit --runtime docker on Windows is refused cleanly.
     let mut o_docker = CreateOptions::new(ProviderKind::Contrib, "windows");
     o_docker.contrib = Some("aliyun-ecs".into());
     o_docker.name = Some("win-docker-nope".into());
@@ -2748,7 +2662,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
         "{err}"
     );
 
-    // 4. Hook FakeAliyun RunInstances to simulate guest joining FakeRelay.
     {
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
@@ -2767,7 +2680,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
         }));
     }
 
-    // 5. Create Windows Direct VM Sandbox.
     let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
     o.contrib = Some("aliyun-ecs".into());
     o.name = Some("win-acct-1".into());
@@ -2775,7 +2687,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     let sb = sandboxes.create(o).await.unwrap();
     assert_eq!(sb.placement(), (Kind::Vm, Runtime::Other("native".into())));
 
-    // Inspect RunInstances call parameters & decoded [powershell] UserData.
     let run_call = {
         let f = s.lock().unwrap();
         f.calls
@@ -2820,7 +2731,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     let ecs_pw = run_call.params.get("Password").unwrap();
     assert!(ecs_pw.len() >= 16);
 
-    // All 6 Cua tags attached at creation time.
     let mut run_tags = BTreeMap::new();
     for i in 1..=10 {
         if let (Some(k), Some(v)) = (
@@ -2861,11 +2771,9 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     assert!(launcher.contains("--relay-jwks"));
     assert!(decode_ps_put(&user_data, "jwks.json").is_some());
 
-    // Connect spacesd over FakeRelay.
     let client = sb.spacesd().await.unwrap();
     client.health().await.unwrap();
 
-    // Stop / Start / Tag-guarded Delete.
     sandboxes.suspend("win-acct-1").await.unwrap();
     {
         let f = s.lock().unwrap();
@@ -2885,7 +2793,6 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
         cua_sandbox_core::Status::Running
     );
 
-    // Wrong owner cannot delete the instance.
     let inst_id = sb.provider_details()["id"].clone();
     let inst_res = model::Resource {
         provider: "aliyun-ecs".into(),
@@ -2948,7 +2855,6 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
         .await
         .unwrap();
 
-    // 1. Successful Static Relay Mode Windows Direct VM create.
     {
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
@@ -2998,7 +2904,6 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
     client.health().await.unwrap();
     sandboxes.delete("win-static-1").await.unwrap();
 
-    // 2. Failed boot: instance stops/dies before joining -> boot log fetched, secrets redacted, rolled back.
     {
         let mut f = s.lock().unwrap();
         f.on_run_instance = Some(Arc::new(|_id, _| {}));
@@ -3229,8 +3134,6 @@ async fn spaces_create_windows_on_aliyun_ecs_static_relay_infers_os_and_vm_kind(
     assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
     assert_eq!(created.kind, "vm");
 
-    // Static Relay Mode must propagate & persist env_token so spaces.space() and
-    // sandbox.service("env").endpoint() authenticate against cua-spacesd.exe.
     let expected_tok = expected_env_tok.lock().unwrap().clone().unwrap();
     let space = spaces.space(&created.id).await.unwrap();
     space.spacesd().unwrap().health().await.unwrap();
@@ -3323,7 +3226,6 @@ async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsuppo
 
     use cua_sandbox_core::byoc::CloudManager as _;
 
-    // 1. Non-supporting provider rejects --windows-image-id, --linux-image-id, --instance-type.
     for bad in [
         Target {
             provider: "hetzner".into(),
@@ -3348,7 +3250,6 @@ async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsuppo
         );
     }
 
-    // 2. Empty/whitespace explicit values rejected cleanly.
     let err = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -3363,7 +3264,6 @@ async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsuppo
         "{err:?}"
     );
 
-    // 3. Wrong-OS, unavailable, and nonexistent image IDs fail `clouds.test` with zero instances.
     let wrong_os = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -3421,7 +3321,6 @@ async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsuppo
         missing_inst.checks
     );
 
-    // 4. Valid custom Windows + Linux Cloud Image IDs and instance type pass `test` & `connect`.
     let valid = Target {
         provider: "aliyun-ecs".into(),
         windows_image_id: Some(" m-win11-golden ".into()),
@@ -3485,7 +3384,6 @@ async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsuppo
     );
     assert!(store.load().is_some());
 
-    // 5. Reconnecting with only `--budget` preserves existing image/type defaults.
     let updated = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -3547,7 +3445,6 @@ async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_o
     let (_, clouds) = cua_byoc::clouds(dir.path(), vec![Arc::new(api)], access);
     use cua_sandbox_core::byoc::CloudManager as _;
 
-    // 1. Oversized instance_type + smaller --max-size fails BEFORE persisting credentials or state.json.
     let err = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -3577,7 +3474,6 @@ async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_o
         "state.json must NOT persist a connection whose instance_type exceeds max_size"
     );
 
-    // 2. Valid connect persists limits and image/type defaults.
     let connected = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -3597,7 +3493,6 @@ async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_o
     assert_eq!(connected.provider.budget_usd_month, Some(200.0));
     assert_eq!(connected.provider.max_size, "8x32x200");
 
-    // 3. Reconnect with only --budget preserves max_size and defaults.
     let updated_budget = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -3624,7 +3519,6 @@ async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_o
         Some("ecs.c7.2xlarge")
     );
 
-    // 4. Reconnect with only --windows-image-id preserves both budget_usd_month and max_size.
     let updated_img = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -3639,7 +3533,6 @@ async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_o
     assert_eq!(updated_img.provider.budget_usd_month, Some(300.0));
     assert_eq!(updated_img.provider.max_size, "8x32x200");
 
-    // 5. Reconnect tightening --max-size below existing saved instance_type fails without overwriting saved limits.
     let err = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -3670,7 +3563,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        // Multiple official system images with different CreationTime to verify newest wins.
         f.images.push(json!({
             "ImageId": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
             "ImageName": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
@@ -3730,7 +3622,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
             "Status": "Available",
             "Size": 20
         }));
-        // Custom instance type only discoverable via DescribeInstanceTypes.
         f.instance_types
             .insert("ecs.custom.8c32g".into(), (8, 32.0));
         f.available_instance_types.push("ecs.custom.8c32g".into());
@@ -3743,7 +3634,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     };
     api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
 
-    // 1. Official fallback (newest Ubuntu 24.04 for Linux, win2022 over win2019 for Windows).
     let lin_spec = model::ProvisionSpec {
         family: "linux".into(),
         disk_gb: 40,
@@ -3768,7 +3658,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     );
     assert_eq!(resolved_win.source, "official-fallback");
 
-    // 2. Connection defaults override official fallback; per-create overrides connection defaults.
     let conn_with_defaults = Connection {
         windows_image_id: Some("m-conn-win".into()),
         linux_image_id: Some("m-conn-lin".into()),
@@ -3811,7 +3700,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
         "m-create-lin"
     );
 
-    // 3. End-to-end Sandboxes + Clouds preflight checks: max-size, disk bounds, budget, and invalid image.
     let dir = tempfile::tempdir().unwrap();
     let relay = Arc::new(cua_host::testing::FakeRelay::start().await);
     relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
@@ -3846,7 +3734,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
 
     s.lock().unwrap().calls.clear();
 
-    // 3a. Custom instance_type exceeding --max-size (catalog type ecs.g7.4xlarge = 16c64g) fails before API calls.
     let mut big_inst =
         cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
     big_inst.contrib = Some("aliyun-ecs".into());
@@ -3859,7 +3746,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     );
     assert!(err.to_string().contains("up to 4 vCPU and 16 GB"), "{err}");
 
-    // 3b. Custom instance_type resolved via DescribeInstanceTypes (8c32g) exceeding --max-size fails before RunInstances.
     let mut custom_big = cua_sandbox_core::CreateOptions::new(
         cua_sandbox_core::ProviderKind::Contrib,
         "ghcr.io/trycua/linux:24.04",
@@ -3873,7 +3759,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     );
     assert!(err.to_string().contains("8 vCPU"), "{err}");
 
-    // 3c. Disk size exceeding --max-size disk cap (120 > 80) fails before provisioning.
     let mut big_disk =
         cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
     big_disk.contrib = Some("aliyun-ecs".into());
@@ -3889,7 +3774,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
         "{err}"
     );
 
-    // 3d. Disk size below image Size (30 < 50 for m-conn-win) fails before provisioning.
     let mut small_disk =
         cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
     small_disk.contrib = Some("aliyun-ecs".into());
@@ -3905,8 +3789,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
         "{err}"
     );
 
-    // 3e. Budget exceeded by instance + disk hourly cost fails with Error::Cloud before provisioning.
-    // Lower budget to $0.05/mo so ecs.c7.xlarge ($0.125/h) fails preflight.
     sbx.clouds()
         .unwrap()
         .connect_with(&ConnectRequest {
@@ -3928,7 +3810,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     assert!(matches!(err, cua_sandbox_core::Error::Cloud(_)), "{err:?}");
     assert!(err.to_string().contains("budget"), "{err}");
 
-    // Raise budget and verify invalid/wrong-OS per-create --cloud-image-id fails before RunInstances/relay.
     sbx.clouds()
         .unwrap()
         .connect_with(&ConnectRequest {
@@ -3954,7 +3835,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     );
     assert!(err.to_string().contains("OSType"), "{err}");
 
-    // Also test missing/non-existent per-create Cloud Image ID fails preflight before provisioning.
     let mut missing_img =
         cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "windows");
     missing_img.contrib = Some("aliyun-ecs".into());
@@ -3963,7 +3843,6 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     let err = sbx.create(missing_img).await.unwrap_err();
     assert!(matches!(err, cua_sandbox_core::Error::Cloud(_)), "{err:?}");
 
-    // Verify zero RunInstances and zero network-creation calls were made by any of these preflight rejections.
     let f = s.lock().unwrap();
     for forbidden in [
         "RunInstances",
@@ -3995,7 +3874,6 @@ async fn validate_image_id_and_official_fallback_require_ostype_and_available_st
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        // Remove default Windows image so we control official fallback candidates cleanly.
         f.images
             .retain(|img| img["OSType"].as_str() != Some("windows"));
         f.images.push(json!({
@@ -4024,7 +3902,6 @@ async fn validate_image_id_and_official_fallback_require_ostype_and_available_st
                 "Size": 40
             }));
         }
-        // Newer Ubuntu image WITHOUT Status must NOT be picked over Available older Ubuntu image.
         f.images.push(json!({
             "ImageId": "ubuntu_24_04_x64_missing_status.vhd",
             "ImageName": "ubuntu_24_04_x64_missing_status.vhd",
@@ -4116,7 +3993,6 @@ async fn os_vs_image_family_and_linux_image_with_windows_substring() {
 
     s.lock().unwrap().calls.clear();
 
-    // 1. Conflicting os="windows" + image="linux" fails InvalidArgument with zero API calls.
     let mut mismatch =
         cua_sandbox_core::CreateOptions::new(cua_sandbox_core::ProviderKind::Contrib, "linux");
     mismatch.contrib = Some("aliyun-ecs".into());
@@ -4129,9 +4005,6 @@ async fn os_vs_image_family_and_linux_image_with_windows_substring() {
     );
     assert!(s.lock().unwrap().calls.is_empty());
 
-    // 2. Linux OCI image whose repo contains "windows" (myorg/windows-tools:1) with os="linux"
-    // must stay Linux (not misclassified as Windows VM) and validate m-lin-tools against OSType="linux"
-    // and pass m-lin-tools to RunInstances.
     let mock_spacesd = cua_spacesd_client::testing::MockServer::start(
         cua_spacesd_client::testing::MockAuth::default(),
     )
@@ -4277,7 +4150,6 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     )
     .build();
 
-    // Helper to extract the most recent non-DryRun RunInstances call.
     let last_run = |s: &S| {
         let f = s.lock().unwrap();
         f.calls
@@ -4287,7 +4159,6 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
             .clone()
     };
 
-    // Phase 1: Official fallback (no connection defaults, no per-create overrides).
     sbx.clouds()
         .unwrap()
         .connect_with(&ConnectRequest {
@@ -4353,7 +4224,6 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     assert!(win_official_ud.starts_with("[powershell]\n"));
     assert!(win_official_ud.contains("Is64BitOperatingSystem"));
 
-    // Phase 2: Connection defaults (--windows-image-id, --linux-image-id, --instance-type).
     sbx.clouds()
         .unwrap()
         .connect_with(&ConnectRequest {
@@ -4415,7 +4285,6 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
 
-    // Phase 3: Per-create overrides (--cloud-image-id, --instance-type, --disk) beat connection defaults.
     let mut lin_over = sb_create_opts("lin-override");
     lin_over.cloud_image_id = Some("m-create-lin".into());
     lin_over.instance_type = Some("ecs.g7.large".into());
@@ -4648,7 +4517,6 @@ async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
         .await
         .unwrap();
 
-    // 1. Default (`Runtime::Auto`) keeps Docker-on-VM (`docker-on-vm`).
     let sb_docker = sandboxes
         .create(sb_create_opts("linux-docker-default"))
         .await
@@ -4667,7 +4535,6 @@ async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
     sandboxes.delete("linux-docker-default").await.unwrap();
     s.lock().unwrap().calls.clear();
 
-    // 2. Explicit `--runtime native` creates a Linux Direct VM Sandbox.
     let mut opts = sb_create_opts("linux-native-acct");
     opts.runtime = Runtime::Other("native".into());
     opts.env.insert("APP_ENV".into(), "production".into());
@@ -4721,7 +4588,6 @@ async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
     let img_id = run_call.params.get("ImageId").unwrap();
     assert!(img_id.starts_with("ubuntu_24_04"), "{img_id}");
 
-    // All 6 Cua tags attached at creation time.
     let mut run_tags = BTreeMap::new();
     for i in 1..=10 {
         if let (Some(k), Some(v)) = (
@@ -4760,7 +4626,6 @@ async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
     assert!(envf.contains("CUA_RELAY_JWKS=/etc/cua/relay/jwks.json"));
     assert!(decode_native_cloud_init_file(&ud, "/etc/cua/relay/jwks.json").is_some());
 
-    // Reachable over FakeRelay, then Stop/Start/Delete cleanly.
     sandboxes.suspend("linux-native-acct").await.unwrap();
     sandboxes.resume("linux-native-acct").await.unwrap();
     sandboxes.delete("linux-native-acct").await.unwrap();
@@ -4816,7 +4681,6 @@ async fn aliyun_ecs_linux_slim_direct_vm_static_relay_mirror_and_failed_boot_rol
         .await
         .unwrap();
 
-    // 1. Successful Static Relay Mode `linux-slim --runtime native` with custom mirror.
     {
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
@@ -4879,7 +4743,6 @@ async fn aliyun_ecs_linux_slim_direct_vm_static_relay_mirror_and_failed_boot_rol
     sandboxes.delete("linux-slim-static-native").await.unwrap();
     assert!(s.lock().unwrap().instances.is_empty());
 
-    // 2. Failed boot: `GetInstanceConsoleOutput` redacted (`spacesd.env` & URL userinfo) + rollback.
     {
         let s_inner = s.clone();
         let mut f = s.lock().unwrap();
@@ -5025,7 +4888,6 @@ async fn linux_native_supports_custom_linux_image_id_cloud_image_id_instance_typ
         .await
         .unwrap();
 
-    // 1. Linux `--runtime native` picks up connection `--linux-image-id`.
     let mut o_conn = sb_create_opts("lin-native-conn-img");
     o_conn.runtime = Runtime::Other("native".into());
     let sb1 = sandboxes.create(o_conn).await.unwrap();
@@ -5045,7 +4907,6 @@ async fn linux_native_supports_custom_linux_image_id_cloud_image_id_instance_typ
     );
     assert!(decode_b64_str(run1.params.get("UserData").unwrap()).starts_with("#cloud-config\n"));
 
-    // 2. Per-create `--cloud-image-id`, `--instance-type`, and `--disk` override defaults on `--runtime native`.
     let mut o_over = sb_create_opts("lin-native-override-img");
     o_over.runtime = Runtime::Other("native".into());
     o_over.cloud_image_id = Some("m-lin-over-native".into());
@@ -5133,7 +4994,6 @@ async fn create_options_ttl_zero_disables_connection_default_auto_release_time()
         .await
         .unwrap();
 
-    // Default CreateOptions.ttl (None) inherits conn.ttl_hours == 8 -> AutoReleaseTime set.
     let _sb_default = sandboxes
         .create(sb_create_opts("ttl-default"))
         .await
@@ -5153,7 +5013,6 @@ async fn create_options_ttl_zero_disables_connection_default_auto_release_time()
         run_default.params
     );
 
-    // Explicit CreateOptions.ttl = Some(Duration::ZERO) disables AutoReleaseTime.
     let mut o_zero = sb_create_opts("ttl-zero");
     o_zero.ttl = Some(Duration::ZERO);
     let _sb_zero = sandboxes.create(o_zero).await.unwrap();
@@ -5220,7 +5079,6 @@ async fn delete_part_retries_more_than_four_transient_dependency_violations_and_
         }));
     }
 
-    // 1. Each part tolerates 6 (> 4) transient DependencyViolation responses before succeeding.
     for (rtype, rid, action) in [
         ("security_group", "sg-retry-1", "DeleteSecurityGroup"),
         ("vswitch", "vsw-retry-1", "DeleteVSwitch"),
@@ -5255,8 +5113,6 @@ async fn delete_part_retries_more_than_four_transient_dependency_violations_and_
         );
     }
 
-    // 2. Permanent non-Cua instance attached to Cua's SG/VSwitch/VPC short-circuits immediately
-    //    (even with a long poll interval) instead of burning 24 * poll_interval per part.
     let slow_api = api.with_poll(Duration::from_secs(5));
     {
         let mut f = s.lock().unwrap();
@@ -5371,7 +5227,6 @@ async fn clamped_disk_gb_cannot_bypass_max_size_or_budget() {
     )
     .build();
 
-    // 1. --max-size 4x16x30 must reject --disk-gb 25 on Linux because aliyun-ecs clamps it to 40 GiB.
     sandboxes
         .clouds()
         .unwrap()
@@ -5405,8 +5260,6 @@ async fn clamped_disk_gb_cannot_bypass_max_size_or_budget() {
         "RunInstances must not be called when clamped disk exceeds --max-size"
     );
 
-    // 2. --budget between 25 GiB cost ($0.0465/h) and clamped 40 GiB cost ($0.0486/h)
-    //    must reject --disk-gb 25 before RunInstances.
     sandboxes
         .clouds()
         .unwrap()
@@ -5464,7 +5317,6 @@ async fn aliyun_ecs_windows_auto_falls_back_when_c7_xlarge_unavailable() {
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
         let mut f = s.lock().unwrap();
-        // Simulate ap-southeast-1 where ecs.c7.xlarge has 0 stock while ecs.e-c1m2.xlarge is available.
         f.available_instance_types = vec!["ecs.e-c1m2.large".into(), "ecs.e-c1m2.xlarge".into()];
         f.instance_types
             .insert("ecs.e-c1m2.xlarge".into(), (4, 8.0));
@@ -5531,7 +5383,6 @@ async fn aliyun_ecs_windows_auto_falls_back_when_c7_xlarge_unavailable() {
     }
     sb.delete().await.unwrap();
 
-    // Explicit --instance-type must never be silently overridden.
     let mut win_explicit = CreateOptions::new(ProviderKind::Contrib, "windows");
     win_explicit.contrib = Some("aliyun-ecs".into());
     win_explicit.name = Some("win-explicit-c7".into());
@@ -5676,7 +5527,6 @@ async fn windows_run_instances_enforces_netbios_hostname_15_char_limit_and_uniqu
     );
     assert_eq!(win_hostnames[2], "win-box-01");
 
-    // Linux retains full sanitized hostnames up to 63 chars (including dots).
     s.lock().unwrap().calls.clear();
     let lin_spec = ProvisionSpec {
         name: "cua-aliyun-ecs-aaaaaaaaaaaa".into(),
@@ -5737,7 +5587,6 @@ async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock
         let mock_url = mock_spacesd.url();
         let mut f = s.lock().unwrap();
         f.zones = vec!["ap-southeast-1a".into(), "ap-southeast-1b".into()];
-        // Register non-hardcoded families + ARM + GPU + bare-metal + burstable + oversized types.
         f.instance_types.insert("ecs.c8y.xlarge".into(), (4, 8.0));
         f.instance_types.insert("ecs.gn7i.xlarge".into(), (4, 8.0));
         f.instance_types.insert("ecs.ebmg7.xlarge".into(), (4, 8.0));
@@ -5772,8 +5621,6 @@ async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock
             json!({ "CpuArchitecture": "X86" }),
         );
 
-        // Zone -a has ClosedWithStock for c7/c9i, ARM (WithStock), GPU (WithStock), bare-metal (WithStock),
-        // and burstable t6 (WithStock); Zone -b has WithStock for non-hardcoded ecs.c9i.xlarge!
         f.available_zones_override = Some(vec![
             json!({
                 "RegionId": "ap-southeast-1",
@@ -5913,8 +5760,6 @@ async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock
     }
     sb.delete().await.unwrap();
 
-    // Verify WithoutStock is rejected while another non-hardcoded family (ecs.u2a-c1m2.xlarge)
-    // is dynamically selected, and explicit --instance-type overrides dynamic selection.
     {
         let mut f = s.lock().unwrap();
         f.available_zones_override = Some(vec![json!({
@@ -6004,8 +5849,6 @@ async fn lookup_instance_type_sends_repeat_list_and_requires_exact_match() {
         );
     }
 
-    // Even if the server ignores the filter and returns [ecs.t1.xsmall, ...],
-    // lookup_instance_type must NOT fall back to arr.first().
     s.lock().unwrap().ignore_instance_types_filter = true;
     let err = api
         .lookup_instance_type(&c, "ecs.missing-page2.xlarge")
@@ -6041,11 +5884,10 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
         let mock_url = mock_spacesd.url();
         let mut f = s.lock().unwrap();
         f.zones = vec!["ap-southeast-1a".into()];
-        // 14 candidates (<= 20): must be queried as RepeatList chunks of 10 + 4.
         let mut supported = Vec::new();
         for idx in 1..=10 {
             let id = format!("ecs.d10-{idx:02}.xlarge");
-            f.instance_types.insert(id.clone(), (2, 4.0)); // Too small for 4c8g Windows
+            f.instance_types.insert(id.clone(), (2, 4.0));
             f.instance_type_details
                 .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
             supported.push(json!({
@@ -6158,7 +6000,6 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
     }
     sb1.delete().await.unwrap();
 
-    // Part B (> 20 candidates + NextToken pagination): 24 candidates, page_size = 6 -> 4 pages.
     {
         let mut f = s.lock().unwrap();
         f.instance_types_page_size = Some(6);
@@ -6174,7 +6015,6 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
                 "StatusCategory": "WithStock"
             }));
         }
-        // Page-last target ecs.c9a.xlarge (comes after ecs.a-* and ecs.c6r/custom-gpu).
         f.instance_types.insert("ecs.c9a.xlarge".into(), (4, 8.0));
         f.instance_type_details.insert(
             "ecs.c9a.xlarge".into(),

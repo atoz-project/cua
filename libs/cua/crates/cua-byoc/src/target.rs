@@ -35,7 +35,6 @@ pub(crate) struct PreparedTarget {
 }
 
 impl PreparedTarget {
-    /// Runs the full target-preparation sequence once.
     pub(crate) fn prepare(
         home: Option<&Path>,
         p: &dyn CloudApi,
@@ -54,7 +53,6 @@ impl PreparedTarget {
         })
     }
 
-    /// Applies the prepared relay and mirror settings onto `conn`.
     pub(crate) fn apply_to(&self, conn: &mut Connection) {
         conn.relay_url = self.relay.url.clone();
         conn.relay_mode = self.relay.stored_mode;

@@ -4234,7 +4234,6 @@ mod tests {
         assert_eq!(r, "ghcr.io/trycua/windows:11");
         assert_eq!(os.as_deref(), Some("windows"));
         assert!(cua_image::windows::build::local_build_target(&r).is_some());
-        // Non-local cloud creates skip the local-ISO note, while still rejecting --iso.
         assert!(
             check_windows_build_note(&On::Provider("aliyun-ecs".into()), &r, None, None).is_ok()
         );

@@ -95,10 +95,7 @@ pub fn system_disk_for(spec: &ProvisionSpec) -> (u32, &'static str) {
 }
 
 pub(crate) fn is_with_stock_category(cat: Option<&str>) -> bool {
-    match cat.map(str::trim) {
-        None | Some("") => true, // Mock/fake-server compatibility when omitted
-        Some(c) => c == "WithStock",
-    }
+    cat.map(str::trim) == Some("WithStock")
 }
 
 pub(crate) fn target_compute_for(spec: &ProvisionSpec) -> (u32, u32) {
@@ -212,7 +209,6 @@ pub(crate) fn is_excluded_instance_family(
     {
         return true;
     }
-    // Bare-metal / supercomputing clusters (ebm*, scc*, scch*).
     if base.starts_with("ebm") || base.starts_with("scc") {
         return true;
     }
@@ -734,8 +730,8 @@ mod tests {
 
     #[test]
     fn dynamic_instance_selection_filters_exclusions_and_ranks_mainstream_over_burstable() {
-        assert!(is_with_stock_category(None));
-        assert!(is_with_stock_category(Some("")));
+        assert!(!is_with_stock_category(None));
+        assert!(!is_with_stock_category(Some("")));
         assert!(is_with_stock_category(Some("WithStock")));
         assert!(!is_with_stock_category(Some("ClosedWithStock")));
         assert!(!is_with_stock_category(Some("WithoutStock")));

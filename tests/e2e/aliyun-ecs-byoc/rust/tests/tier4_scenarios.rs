@@ -359,7 +359,6 @@ async fn t4_04() {
     );
     assert_eq!(w.aliyun.lock().unwrap().count_calls("RunInstances"), 0);
 
-    // Lifecycle stop/rm/disconnect STILL allowed while over budget.
     w.run(&["sb", "suspend", "fits"]).await.ok();
     w.run(&["sb", "rm", "fits", "--force"]).await.ok();
     w.run(&["cloud", "disconnect", "aliyun-ecs", "--delete", "--json"])
@@ -518,7 +517,6 @@ async fn t4_06() {
         exec_out
     );
 
-    // Verify CLI reading same daemon/CUA_HOME sees identical state and cleans up.
     let cli_ls = w.run_raw(&["sb", "ls", "--json"]).await;
     cli_ls.ok();
     assert!(cli_ls.stdout.contains("sdk-cli-parity"));

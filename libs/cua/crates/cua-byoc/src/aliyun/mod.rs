@@ -42,8 +42,8 @@ pub use auth::{
     parse_token_pair,
 };
 pub use client::{
-    Acs3SignedHeaders, ECS_API_VERSION, STS_API_VERSION, STS_ENDPOINT, VPC_API_VERSION,
-    canonical_query_string, rfc3986_encode, sign_acs3,
+    Acs3SignedHeaders, ECS_API_VERSION, STS_API_VERSION, STS_ENDPOINT, SignRequest,
+    VPC_API_VERSION, canonical_query_string, rfc3986_encode, sign_acs3,
 };
 pub use image::{ResolvedCloudImage, WindowsInitHeader};
 pub use sizing::{
@@ -553,9 +553,6 @@ impl CloudApi for AliyunEcs {
             .filter(|o| !o.is_empty())
             .ok_or_else(|| Error::InvalidArgument("aliyun-ecs: missing cua-owner tag".into()))?;
 
-        // Consume the single-pass plan produced by `prepare_provision` so we never
-        // re-resolve SKU sizing or Cloud Image IDs. Direct callers without a plan
-        // fall back to running `prepare_provision` once.
         let plan_arc = match spec
             .provider_plan
             .as_ref()

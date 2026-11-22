@@ -76,7 +76,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // 1. Static mode + OIDC is rejected.
     let err = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -93,7 +92,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 2. Static mode + sealed is rejected.
     let err = clouds
         .connect_with(&ConnectRequest {
             target: Target {
@@ -110,7 +108,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 3. Account mode (explicit or default) + relay_token is rejected.
     for mode in [None, Some(RelayMode::Account)] {
         let err = clouds
             .connect(
@@ -128,7 +125,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
     }
 
-    // 4. Static mode with empty/whitespace token is rejected.
     let err = clouds
         .connect(
             &Target {
@@ -145,7 +141,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 5. Static mode without relay_url is rejected.
     let err = clouds
         .connect(
             &Target {
@@ -161,7 +156,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 6. Static mode without token (nothing stored) is rejected.
     let err = clouds
         .connect(
             &Target {
@@ -177,7 +171,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 7. Invalid relay_url scheme is rejected.
     let err = clouds
         .test(&Target {
             provider: "aws".into(),
@@ -190,7 +183,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 8. Probe fails when relay reports static_tokens: false on GET /v1/info.
     let err = clouds
         .connect(
             &Target {
@@ -211,7 +203,6 @@ async fn validation_rejects_invalid_relay_combinations_without_persisting_secret
         "expected static token probe failure, got: {err}"
     );
 
-    // None of those failures persisted a relay token or cloud connection.
     assert_eq!(store_secret(dir.path(), "byoc-relay-token-aws"), None);
     let status = clouds.status(Some("aws")).await.unwrap();
     assert!(!status.providers[0].connected);
@@ -389,7 +380,6 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // Target Debug never leaks relay_token.
     let target = Target {
         provider: "aws".into(),
         region: Some("us-west-2".into()),
@@ -402,7 +392,6 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
 
     let tested = clouds.test(&target).await.unwrap();
     assert!(tested.ok, "{tested:?}");
-    // `test` must not persist state or secrets.
     assert_eq!(store_secret(dir.path(), "byoc-relay-token-aws"), None);
 
     let conn = clouds.connect(&target, false, Some(2)).await.unwrap();
@@ -414,7 +403,6 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
         Some(static_secret)
     );
 
-    // 1. Fail-fast on wrong env_token during create + rollback + boot log redaction.
     let seen_env_tokens: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let relay = relay.clone();
@@ -452,7 +440,6 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
             .iter()
             .any(|r| r.resource_type == model::RELAY_MACHINE)
     );
-    // Boot log saved on rollback must redact static_secret and env token lines.
     let boot_logs_dir = dir.path().join("cloud/boot-logs");
     let log_files: Vec<_> = std::fs::read_dir(&boot_logs_dir)
         .unwrap()
@@ -465,7 +452,6 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
     }
     let _ = bad_machine;
 
-    // 2. Successful Static Relay Mode VM create -> gRPC GetCapabilities -> suspend/resume -> delete.
     {
         let relay = relay.clone();
         let seen = seen_env_tokens.clone();
@@ -518,20 +504,17 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
     assert!(policy.get("owner").is_none(), "{policy}");
     assert_eq!(policy["sharing"], true);
 
-    // Sandbox connects via SpacesdClient using endpoint + preserved env_token (no GatewayAuth).
     let client = sb.spacesd().await.unwrap();
     let caps = client.refresh_capabilities().await.unwrap();
     assert!(!caps.features.is_empty() || caps.protocol_version > 0);
     let health = client.health().await.unwrap();
     assert_eq!(health.status, 1);
 
-    // Stop / start / delete.
     sandboxes.suspend("static-vm").await.unwrap();
     sandboxes.resume("static-vm").await.unwrap();
     sandboxes.delete("static-vm").await.unwrap();
     assert_eq!(store_secret(dir.path(), "byoc-env-tokens-aws"), None);
 
-    // 3. Sandbox tier (`modal`): checks `spec.env` & `modal_net::request` rather than cloud-init.
     clouds
         .connect(
             &Target {
@@ -566,7 +549,6 @@ async fn static_relay_full_lifecycle_without_cua_auth_login_and_secret_redaction
     sandboxes.delete("static-box").await.unwrap();
     assert_eq!(store_secret(dir.path(), "byoc-env-tokens-modal"), None);
 
-    // Disk files & CloudProvider JSON never contain static_secret or env_token.
     for path in [
         dir.path().join("cloud/state.json"),
         dir.path().join("cloud/links.json"),
@@ -604,7 +586,6 @@ async fn static_reconnect_reuses_token_switch_and_disconnect_clear_secrets() {
     .build();
     let clouds = sandboxes.clouds().unwrap();
 
-    // Connect in Static mode.
     clouds
         .connect(
             &Target {
@@ -624,7 +605,6 @@ async fn static_reconnect_reuses_token_switch_and_disconnect_clear_secrets() {
         Some("static-secret-abc")
     );
 
-    // Reconnect in Static mode without re-supplying token: stored token is reused.
     let reconnected = clouds
         .connect(
             &Target {
@@ -645,7 +625,6 @@ async fn static_reconnect_reuses_token_switch_and_disconnect_clear_secrets() {
         Some("static-secret-abc")
     );
 
-    // Switch Static -> Account: stored relay token is cleared.
     let switched = clouds
         .connect(
             &Target {
@@ -661,7 +640,6 @@ async fn static_reconnect_reuses_token_switch_and_disconnect_clear_secrets() {
     assert_eq!(switched.provider.relay_mode, Some(RelayMode::Account));
     assert_eq!(store_secret(dir.path(), "byoc-relay-token-aws"), None);
 
-    // Re-connect Static and also seed an env token entry, then disconnect -> both cleared.
     clouds
         .connect(
             &Target {

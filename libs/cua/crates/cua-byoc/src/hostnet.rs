@@ -123,7 +123,6 @@ fn render_script(net: &HostNet<'_>, target: GuardTarget) -> String {
         ));
     }
 
-    // Shared dry-run wrapper, resolver discovery, and chain reset helper.
     s.push_str(&format!(
         r#"run() {{ if [ "${{CUA_NET_DRY:-0}}" = 1 ]; then echo "$*"; else "$@"; fi; }}
 resolvers() {{

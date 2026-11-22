@@ -190,13 +190,48 @@ pub fn aliyun_config_path() -> Option<PathBuf> {
     home.map(|h| PathBuf::from(h).join(".aliyun").join("config.json"))
 }
 
-/// Default `~/.aliyun/config.json` discovery path; disabled in test processes
-/// unless explicitly injected via [`super::AliyunEcs::with_endpoints`].
-pub(crate) fn default_aliyun_config_path() -> Option<PathBuf> {
-    if cua_home::is_test_process() {
+fn normalize_for_prefix(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            return rest.into_iter().rev().fold(c, |acc, part| acc.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+fn is_under_dir(path: &Path, dir: &Path) -> bool {
+    path.starts_with(dir) || normalize_for_prefix(path).starts_with(normalize_for_prefix(dir))
+}
+
+fn resolve_default_aliyun_config_path(
+    candidate: Option<PathBuf>,
+    real_os_home: Option<&Path>,
+    test_process: bool,
+) -> Option<PathBuf> {
+    let path = candidate?;
+    if test_process && real_os_home.is_some_and(|home| is_under_dir(&path, home)) {
         return None;
     }
-    aliyun_config_path()
+    Some(path)
+}
+
+/// Default `~/.aliyun/config.json` discovery path; in test processes skips the
+/// user's real OS home while allowing an isolated temporary `HOME`.
+pub(crate) fn default_aliyun_config_path() -> Option<PathBuf> {
+    let real_os_home = cua_home::real_cua_home().and_then(|p| p.parent().map(Path::to_path_buf));
+    resolve_default_aliyun_config_path(
+        aliyun_config_path(),
+        real_os_home.as_deref(),
+        cua_home::is_test_process(),
+    )
 }
 
 pub(crate) fn read_cli_profile(
@@ -406,8 +441,28 @@ mod tests {
     }
 
     #[test]
-    fn test_process_skips_default_aliyun_config_autodiscovery() {
-        assert!(default_aliyun_config_path().is_none());
+    fn default_aliyun_config_guards_real_home_but_allows_isolated_test_home() {
+        let real = tempfile::tempdir().unwrap();
+        let isolated = tempfile::tempdir().unwrap();
+        let real_cfg = real.path().join(".aliyun").join("config.json");
+        let isolated_cfg = isolated.path().join(".aliyun").join("config.json");
+
+        assert_eq!(
+            resolve_default_aliyun_config_path(Some(real_cfg.clone()), Some(real.path()), true),
+            None
+        );
+        assert_eq!(
+            resolve_default_aliyun_config_path(Some(isolated_cfg.clone()), Some(real.path()), true),
+            Some(isolated_cfg)
+        );
+        assert_eq!(
+            resolve_default_aliyun_config_path(Some(real_cfg.clone()), Some(real.path()), false),
+            Some(real_cfg)
+        );
+        assert_eq!(
+            resolve_default_aliyun_config_path(None, Some(real.path()), true),
+            None
+        );
     }
 
     #[test]

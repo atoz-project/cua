@@ -242,8 +242,6 @@ pub(super) async fn resolve_image(
         .cloud_image_id
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
-    // Direct VM (--runtime native or Windows on a VM-capable provider) boots a
-    // cloud OS image rather than a GHCR OCI containerdisk.
     if caps.kinds.contains(&RunKind::Vm)
         && supports_os(caps, supported_oses, effective_os(o))
         && (is_native_vm || is_windows)

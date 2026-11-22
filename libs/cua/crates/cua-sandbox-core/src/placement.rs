@@ -1685,7 +1685,6 @@ mod tests {
             assert!(!crate::provider::is_cloud_location(reserved), "{reserved}");
             assert!(On::parse(reserved).is_err(), "{reserved}");
         }
-        // The error for an unknown word lists hetzner and aliyun-ecs among the valid ones.
         let e = On::parse("hetznr").unwrap_err();
         assert!(e.valid.iter().any(|v| v == "hetzner"), "{:?}", e.valid);
         assert!(e.valid.iter().any(|v| v == "aliyun-ecs"), "{:?}", e.valid);
@@ -1745,13 +1744,10 @@ mod tests {
         let on = On::parse("test-direct-vm").unwrap();
         assert_eq!(validate(&on, Auto, &rt("native")).unwrap(), Vm);
         let linux_rootfs = img(Some("linux"), &[Rootfs]);
-        // Default (`auto`) selects Docker-on-VM (`container` / `docker`).
         let def = select(&on, Auto, &Runtime::Auto, &linux_rootfs, &MAC).unwrap();
         assert_eq!((def.kind, def.runtime), (Container, rt("docker")));
-        // Explicit `--runtime native` selects Direct VM (`vm` / `native`) even with Rootfs.
         let nat = select(&on, Auto, &rt("native"), &linux_rootfs, &MAC).unwrap();
         assert_eq!((nat.kind, nat.runtime), (Vm, rt("native")));
-        // Unknown runtime lists `auto, docker, native`.
         let err = validate(&on, Auto, &Runtime::Qemu).unwrap_err();
         assert_eq!(err.valid, ["auto", "docker", "native"]);
     }

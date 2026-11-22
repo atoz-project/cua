@@ -914,7 +914,6 @@ mod tests {
         assert_eq!(r.resources[0].resource.resource_type, "instance");
         assert_eq!(r.resources[0].action, "delete");
 
-        // relay_mode, relay_url, relay_token, vpc_id, vswitch_id, no_public_ip wire & redaction round-trip.
         let target = CloudTarget {
             provider: "aliyun-ecs".into(),
             relay_url: Some("https://relay.example.com".into()),

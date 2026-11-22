@@ -123,7 +123,6 @@ pub fn generate_desktop_password() -> String {
     for _ in 0..16 {
         out.push(ALL[rand::random::<u32>() as usize % ALL.len()]);
     }
-    // Fisher-Yates shuffle so character classes are not in predictable positions.
     for i in (1..out.len()).rev() {
         let j = rand::random::<u32>() as usize % (i + 1);
         out.swap(i, j);
@@ -261,7 +260,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         user = ps_single_quote(desktop_user),
     ));
 
-    // ACL-restricted directory (SYSTEM, Administrators, desktop user only) + direct $sd staging.
     s.push_str(&format!(
         "Log \"staging secrets for $provider\"\n\
          & icacls.exe $sd /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \"$u`:(OI)(CI)M\" /T | Out-Null\n\
@@ -300,7 +298,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         tscon = ps_single_quote(&tscon_b64),
     ));
 
-    // Pre-installed cua-spacesd.exe check -> download + SHA-256 verification.
     let expected_sha_ps = match expected_sha {
         Some(hex) => ps_single_quote(&hex.to_ascii_lowercase()),
         None => "$null".into(),
@@ -340,7 +337,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         want_sha = expected_sha_ps,
     ));
 
-    // Outbound metadata firewall block (100.100.100.200 & 169.254.169.254).
     s.push_str(
         "  foreach ($ip in @('100.100.100.200','169.254.169.254')) {\n\
          \x20   $rn = \"Cua-Block-Metadata-$ip\"\n\
@@ -349,7 +345,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20 }\n",
     );
 
-    // AutoLogon + disable lock/screensaver/sleep.
     s.push_str(&format!(
         "  $wl = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'\n\
          \x20 Set-ItemProperty -Path $wl -Name 'AutoAdminLogon' -Value '1' -Type String\n\
@@ -392,7 +387,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20 Register-ScheduledTask -TaskName 'cua-tscon-recover' -Action $tAct -Trigger $et -Principal $tPrn -Settings $tSet -Force | Out-Null\n",
     );
 
-    // TTL shutdown backstop.
     if let Some(exp_b64) = expire_ps {
         let clamped = boot.ttl_secs.clamp(1, MAX_SHUTDOWN_TIMEOUT_SECS);
         s.push_str(&format!(
@@ -605,7 +599,6 @@ mod tests {
         );
         assert!(!ps.contains(&j.machine_token) && !ps.contains(pw) && !ps.contains(&j.jwks_json));
 
-        // ACL hardening with language-independent SIDs + direct $sd staging + $dd after /T + temp cleanup.
         assert!(ps.contains("*S-1-5-18:(OI)(CI)F"), "{ps}");
         assert!(ps.contains("*S-1-5-32-544:(OI)(CI)F"), "{ps}");
         let icacls_pos = ps.find("& icacls.exe $sd /inheritance:r").unwrap();
@@ -708,7 +701,6 @@ mod tests {
         let ver = default_spacesd_version();
         let hex = "cd".repeat(32);
 
-        // {version} and {arch} expansion on a single-file URL with #sha256=.
         let templated = format!(
             "https://mirror.example.com/v{{version}}/cua-spacesd-{{arch}}.exe#sha256={hex}"
         );
@@ -719,7 +711,6 @@ mod tests {
         );
         assert_eq!(sha, Some(hex.as_str()));
 
-        // Trailing-slash directory prefix appends the Windows asset name.
         let (dir_url, dir_sha) =
             split_download_url(Some("https://mirror.example.com/cua-spacesd/"));
         assert_eq!(
@@ -728,7 +719,6 @@ mod tests {
         );
         assert_eq!(dir_sha, None);
 
-        // Trailing-slash directory with {version}/{arch} and query string preserves the query.
         let (q_url, q_sha) = split_download_url(Some(
             "https://mirror.example.com/v{version}/{arch}/?sig=SecretToken99",
         ));
@@ -740,7 +730,6 @@ mod tests {
         );
         assert_eq!(q_sha, None);
 
-        // Generated PowerShell fetches the resolved $dlUrl and "$dlUrl.sha256" and redacts the query in logs.
         let j = static_join();
         let env = BTreeMap::new();
         let ps = windows_user_data(&boot_cfg(
@@ -765,7 +754,6 @@ mod tests {
         let env = BTreeMap::from([("GREETING".to_string(), "你好世界".to_string())]);
         let ps = windows_user_data(&boot_cfg(&j, &env, 0, None, "WinPass!1234Abcd"));
 
-        // bin-path is written as BOM-less UTF-8 bytes, never Set-Content -Encoding ASCII.
         assert!(
             ps.contains(
                 "[IO.File]::WriteAllBytes((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8.GetBytes($exe))"

@@ -454,7 +454,6 @@ async fn connect_sealed(
     }
     let mut tested = p.test(&candidate).await;
     drop(unstage);
-    // Probe custom relay BEFORE mutating the issuer (create_connection / set_limits / tokens.put).
     if let Some(url) = prep.relay.probe_url.as_deref() {
         let check = crate::relay::probe_relay_check(url, prep.relay.mode).await;
         if !check.ok {

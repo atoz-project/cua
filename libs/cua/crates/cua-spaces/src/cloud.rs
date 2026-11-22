@@ -673,7 +673,6 @@ mod tests {
         assert_eq!(info.id, "relay:m-custom");
         assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // Persisted in registry with custom relay URL and token: None (Account mode, not Static).
         let cred = spaces
             .inner
             .registry
@@ -686,7 +685,6 @@ mod tests {
         );
         assert_eq!(cred.token, None);
 
-        // Listed and findable without hitting NotFound.
         assert!(
             spaces
                 .list()
@@ -699,7 +697,6 @@ mod tests {
             "relay:m-custom"
         );
 
-        // Dialing `space()` routes through Account auth (RelayBearer) to the custom relay.
         let _ = spaces.space("relay:m-custom").await;
         let custom_reqs = custom_seen.lock().unwrap().clone();
         assert!(
@@ -724,7 +721,6 @@ mod tests {
             "default relay must not receive custom-relay machine traffic"
         );
 
-        // Delete cleans up both the cloud sandbox and the registry record.
         spaces.delete("relay:m-custom").await.unwrap();
         assert_eq!(deleted.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
@@ -740,7 +736,6 @@ mod tests {
     #[tokio::test]
     async fn create_in_cloud_deletes_sandbox_when_registry_upsert_fails() {
         let dir = tempfile::tempdir().unwrap();
-        // Force `registry.upsert` to fail by making `spaces.json` an unreadable directory.
         std::fs::create_dir_all(dir.path().join(crate::registry::SPACES_FILE)).unwrap();
 
         let mock_env = cua_spacesd_client::testing::MockServer::start(Default::default()).await;

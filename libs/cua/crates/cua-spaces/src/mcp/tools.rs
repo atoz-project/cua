@@ -1063,6 +1063,7 @@ fn json_of<T: serde::Serialize>(v: &T) -> ToolOutcome {
 /// A `cloud_*` target, trimmed.
 fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget> {
     let some = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    let trim_keep_empty = |s: Option<String>| s.map(|v| v.trim().to_string());
     let relay_mode = t
         .relay_mode
         .as_deref()
@@ -1077,20 +1078,17 @@ fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget
         zone: some(t.zone),
         project: some(t.project),
         environment: some(t.environment),
-        // Keep `Some("")` distinct from `None` so empty `--token-stdin` does not fall through.
-        token: t.token.map(|v| v.trim().to_string()),
-        relay_url: t.relay_url.map(|v| v.trim().to_string()),
+        token: trim_keep_empty(t.token),
+        relay_url: trim_keep_empty(t.relay_url),
         relay_mode,
-        // Keep `Some("")` distinct from `None` so empty `--relay-token-stdin` does not fall through.
-        relay_token: t.relay_token.map(|v| v.trim().to_string()),
-        spacesd_download_url: t.spacesd_download_url.map(|v| v.trim().to_string()),
-        // Keep `Some("")` distinct from `None` so empty IDs fail validation rather than falling back to isolated VPC.
-        vpc_id: t.vpc_id.map(|v| v.trim().to_string()),
-        vswitch_id: t.vswitch_id.map(|v| v.trim().to_string()),
+        relay_token: trim_keep_empty(t.relay_token),
+        spacesd_download_url: trim_keep_empty(t.spacesd_download_url),
+        vpc_id: trim_keep_empty(t.vpc_id),
+        vswitch_id: trim_keep_empty(t.vswitch_id),
         no_public_ip: t.no_public_ip.unwrap_or(false),
-        windows_image_id: t.windows_image_id.map(|v| v.trim().to_string()),
-        linux_image_id: t.linux_image_id.map(|v| v.trim().to_string()),
-        instance_type: t.instance_type.map(|v| v.trim().to_string()),
+        windows_image_id: trim_keep_empty(t.windows_image_id),
+        linux_image_id: trim_keep_empty(t.linux_image_id),
+        instance_type: trim_keep_empty(t.instance_type),
     })
 }
 

@@ -83,35 +83,37 @@ pub struct Acs3SignedHeaders {
     pub host: String,
 }
 
+/// Inputs to [`sign_acs3`].
+pub struct SignRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a url::Url,
+    pub canonical_query: &'a str,
+    pub action: &'a str,
+    pub version: &'a str,
+    pub body: &'a [u8],
+    pub content_type: Option<&'a str>,
+    pub timestamp_utc: &'a str,
+    pub nonce: &'a str,
+    pub creds: &'a AliyunCredentials,
+}
+
 /// Signs an Alibaba Cloud OpenAPI V3 request with `ACS3-HMAC-SHA256`.
-#[allow(clippy::too_many_arguments)]
-pub fn sign_acs3(
-    method: &str,
-    url: &url::Url,
-    canonical_query: &str,
-    action: &str,
-    version: &str,
-    body: &[u8],
-    content_type: Option<&str>,
-    timestamp_utc: &str,
-    nonce: &str,
-    creds: &AliyunCredentials,
-) -> Acs3SignedHeaders {
-    let host_str = url.host_str().unwrap_or("");
-    let host = match url.port() {
+pub fn sign_acs3(req: &SignRequest<'_>) -> Acs3SignedHeaders {
+    let host_str = req.url.host_str().unwrap_or("");
+    let host = match req.url.port() {
         Some(p) => format!("{host_str}:{p}"),
         None => host_str.to_string(),
     };
-    let content_sha256 = hex::encode(Sha256::digest(body));
+    let content_sha256 = hex::encode(Sha256::digest(req.body));
 
     let mut hdrs: BTreeMap<&str, String> = BTreeMap::new();
     hdrs.insert("host", host.clone());
-    hdrs.insert("x-acs-action", action.to_string());
+    hdrs.insert("x-acs-action", req.action.to_string());
     hdrs.insert("x-acs-content-sha256", content_sha256.clone());
-    hdrs.insert("x-acs-date", timestamp_utc.to_string());
-    hdrs.insert("x-acs-signature-nonce", nonce.to_string());
-    hdrs.insert("x-acs-version", version.to_string());
-    if let Some(ct) = content_type {
+    hdrs.insert("x-acs-date", req.timestamp_utc.to_string());
+    hdrs.insert("x-acs-signature-nonce", req.nonce.to_string());
+    hdrs.insert("x-acs-version", req.version.to_string());
+    if let Some(ct) = req.content_type {
         hdrs.insert("content-type", ct.to_string());
     }
 
@@ -122,17 +124,17 @@ pub fn sign_acs3(
         signed_headers.push(*k);
     }
     let signed_headers_str = signed_headers.join(";");
-    let canonical_uri = if url.path().is_empty() {
+    let canonical_uri = if req.url.path().is_empty() {
         "/"
     } else {
-        url.path()
+        req.url.path()
     };
 
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
-        method.to_ascii_uppercase(),
+        req.method.to_ascii_uppercase(),
         canonical_uri,
-        canonical_query,
+        req.canonical_query,
         canonical_headers,
         signed_headers_str,
         content_sha256
@@ -140,21 +142,21 @@ pub fn sign_acs3(
     let hashed_canonical = hex::encode(Sha256::digest(canonical_request.as_bytes()));
     let string_to_sign = format!("ACS3-HMAC-SHA256\n{hashed_canonical}");
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(creds.access_key_secret.expose().as_bytes())
+    let mut mac = Hmac::<Sha256>::new_from_slice(req.creds.access_key_secret.expose().as_bytes())
         .expect("HMAC accepts keys of any size");
     mac.update(string_to_sign.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
 
     let authorization = format!(
         "ACS3-HMAC-SHA256 Credential={},SignedHeaders={},Signature={}",
-        creds.access_key_id, signed_headers_str, signature
+        req.creds.access_key_id, signed_headers_str, signature
     );
 
     Acs3SignedHeaders {
         authorization,
         content_sha256,
-        date: timestamp_utc.to_string(),
-        nonce: nonce.to_string(),
+        date: req.timestamp_utc.to_string(),
+        nonce: req.nonce.to_string(),
         host,
     }
 }
@@ -389,18 +391,18 @@ impl AliyunEcs {
         loop {
             let now_ts = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
             let nonce = format!("{:032x}", rand::random::<u128>());
-            let signed = sign_acs3(
+            let signed = sign_acs3(&SignRequest {
                 method,
-                &parsed,
-                &canonical_query,
+                url: &parsed,
+                canonical_query: &canonical_query,
                 action,
                 version,
-                &body_bytes,
+                body: &body_bytes,
                 content_type,
-                &now_ts,
-                &nonce,
-                &creds,
-            );
+                timestamp_utc: &now_ts,
+                nonce: &nonce,
+                creds: &creds,
+            });
             let req_method = match method {
                 "POST" => reqwest::Method::POST,
                 _ => reqwest::Method::GET,
@@ -620,18 +622,18 @@ mod tests {
             access_key_secret: Secret::new("SK_SECRET"),
         };
         let url = url::Url::parse("http://127.0.0.1:8080/?RegionId=cn-hangzhou").unwrap();
-        let signed = sign_acs3(
-            "GET",
-            &url,
-            "RegionId=cn-hangzhou",
-            "DescribeRegions",
-            "2014-05-26",
-            b"",
-            None,
-            "2026-11-20T00:00:00Z",
-            "0123456789abcdef0123456789abcdef",
-            &creds,
-        );
+        let signed = sign_acs3(&SignRequest {
+            method: "GET",
+            url: &url,
+            canonical_query: "RegionId=cn-hangzhou",
+            action: "DescribeRegions",
+            version: "2014-05-26",
+            body: b"",
+            content_type: None,
+            timestamp_utc: "2026-11-20T00:00:00Z",
+            nonce: "0123456789abcdef0123456789abcdef",
+            creds: &creds,
+        });
         assert_eq!(signed.host, "127.0.0.1:8080");
         assert_eq!(
             signed.content_sha256,

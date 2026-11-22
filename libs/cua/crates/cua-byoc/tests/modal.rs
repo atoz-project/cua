@@ -524,7 +524,6 @@ async fn empty_token_stdin_does_not_fall_back_to_ambient_credentials_when_sealin
     .with_issuer(issuer.clone() as Arc<dyn IssuerClient>)
     .with_sealer(pool.join("laptop") as Arc<dyn PoolSealer>);
 
-    // Sanity check: omitted token (`None`) still finds ambient credentials.
     let omitted = Target {
         provider: "modal".into(),
         token: None,
@@ -532,8 +531,6 @@ async fn empty_token_stdin_does_not_fall_back_to_ambient_credentials_when_sealin
     };
     assert!(api.local_secret(&omitted).is_some());
 
-    // Explicit empty/whitespace token (`--token-stdin`) must return None and
-    // fail sealed connect with InvalidArgument without touching helper or sealing.
     for empty in ["", "   \n"] {
         let tgt = Target {
             provider: "modal".into(),

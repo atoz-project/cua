@@ -34,7 +34,6 @@ fn non_dry_run_instances_count(f: &aliyun_ecs_byoc_e2e::fake_aliyun::FakeAliyun)
 async fn t2_f1_01() {
     let w = AliyunWorld::start().await;
 
-    // 1. Missing credentials
     let out = w.run(&["cloud", "test", "aliyun-ecs", "--json"]).await;
     assert_ne!(out.code, 0);
     let v = out.json();
@@ -46,7 +45,6 @@ async fn t2_f1_01() {
     );
     w.assert_no_secrets_anywhere(&["secret123"]);
 
-    // 2. Malformed --token-stdin variants
     for (bad, expected_sub) in [
         ("not-a-pair\n", "missing ':'"),
         (":secret\n", "malformed AccessKey pair"),
@@ -196,7 +194,6 @@ async fn t2_f1_04() {
 async fn t2_f1_05() {
     let w = AliyunWorld::start().await;
 
-    // --oidc refused on aliyun-ecs
     let oidc_out = w
         .run(&["cloud", "connect", "aliyun-ecs", "--oidc", "--json"])
         .await;
@@ -210,7 +207,6 @@ async fn t2_f1_05() {
             .contains("without a stored key")
     );
 
-    // --sealed refused on aliyun-ecs
     let sealed_out = w
         .run_with_stdin(
             &[
@@ -235,7 +231,6 @@ async fn t2_f1_05() {
     );
     assert!(!sealed_out.combined().contains("top_secret_never_leak"));
 
-    // Bad region syntax rejected at resolve()
     let bad_syntax = w
         .run_with_stdin(
             &[
@@ -258,7 +253,6 @@ async fn t2_f1_05() {
     );
     assert!(!bad_syntax.combined().contains("top_secret_never_leak"));
 
-    // Disabled region rejected by DescribeRegions
     let disabled = w
         .run_with_stdin(
             &[
@@ -285,8 +279,6 @@ async fn t2_f1_05() {
     );
     assert!(!disabled.combined().contains("secret123"));
 }
-
-// ---- Feature 2 Negative/Boundary ----
 
 #[tokio::test]
 async fn t2_f2_01() {
@@ -430,7 +422,6 @@ async fn t2_f2_03() {
     .await
     .ok();
     let machine = w.relay.static_machines().into_iter().next().unwrap();
-    // Overwrite machine's expected env_token on FakeRelay to simulate revoked/mismatched token.
     w.relay
         .register_static_machine(&machine.id, &machine.name, "env_rotated_other");
     w.relay.set_online(&machine.id, true, "0.1.0");
@@ -557,8 +548,6 @@ async fn t2_f2_05() {
     );
     assert!(w.aliyun.lock().unwrap().calls.is_empty());
 }
-
-// ---- Feature 3 Negative/Boundary ----
 
 #[tokio::test]
 async fn t2_f3_01() {
@@ -751,8 +740,6 @@ async fn t2_f3_03() {
     .await
     .ok();
 
-    // Create a Cua-owned instance for sweep to delete, plus a second instance whose live tags
-    // will be stripped/altered to verify suspend/resume/rm refuse on untagged/foreign instances.
     w.run(&[
         "sb",
         "create",
@@ -797,7 +784,6 @@ async fn t2_f3_03() {
         (owned, tamper)
     };
 
-    // Strip/alter live tags on tag-tamper -> suspend, resume, and rm must all refuse!
     {
         let mut f = w.aliyun.lock().unwrap();
         f.instances.get_mut(&tamper_id).unwrap().tags.clear();
@@ -836,7 +822,6 @@ async fn t2_f3_03() {
         assert!(f.instances.contains_key(&tamper_id));
     }
 
-    // Also verify foreign cua-owner refuses rm.
     {
         let mut f = w.aliyun.lock().unwrap();
         f.instances.get_mut(&tamper_id).unwrap().tags =
@@ -861,8 +846,6 @@ async fn t2_f3_03() {
         );
     }
 
-    // Sweep must delete ONLY the Cua-owned instance (`owned-sweep`), never `i-untagged`,
-    // `i-foreign`, or `tag-tamper` (whose live tags belong to `other-owner`).
     w.aliyun.lock().unwrap().calls.clear();
     w.run(&[
         "cloud",
@@ -961,8 +944,6 @@ async fn t2_f3_05() {
     assert!(w.aliyun.lock().unwrap().instances.is_empty());
 }
 
-// ---- Feature 4 Negative/Boundary ----
-
 #[tokio::test]
 async fn t2_f4_01() {
     let mut w = AliyunWorld::start().await;
@@ -975,7 +956,6 @@ async fn t2_f4_01() {
     .ok();
     w.aliyun.lock().unwrap().calls.clear();
 
-    // 1. windows + --runtime docker must be refused specifically for docker/native runtime.
     let win_docker = w
         .run(&[
             "sb",
@@ -995,7 +975,6 @@ async fn t2_f4_01() {
         "expected docker/native refusal for windows --runtime docker, got: {wd_msg}"
     );
 
-    // 2. Unsupported OSes (macos, omarchy) must name the refused OS.
     for os_img in ["macos", "omarchy"] {
         let out = w.run(&["sb", "create", os_img, "--on", "aliyun-ecs"]).await;
         assert_ne!(out.code, 0, "expected refusal for {os_img}");
@@ -1038,8 +1017,6 @@ async fn t2_f4_01() {
 async fn t2_f4_02() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
-    // FakeAliyun does not execute guest PowerShell; verify generated #ps1_sysnative UserData
-    // enforces SHA-256 verification against the mirror URL and aborts on hash mismatch.
     w.mirror.set_corrupt_bytes(true);
     let mirror_url = w.mirror.windows_url();
     w.run_with_stdin(
@@ -1121,8 +1098,6 @@ async fn t2_f4_03() {
 async fn t2_f4_04() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
-    // FakeAliyun does not execute guest PowerShell, so BootFailMode::StopImmediately simulates
-    // a failed guest mirror download/boot while we also inspect UserData for mirror error handling.
     w.mirror.set_status_override(Some(404));
     w.aliyun.lock().unwrap().boot_fail = Some(BootFailMode::StopImmediately);
     let mirror_url = w.mirror.windows_url();
@@ -1204,8 +1179,6 @@ async fn t2_f4_05() {
         w.assert_no_secrets_anywhere(&["secret123"]);
     }
 }
-
-// ---- Feature 5 Negative/Boundary ----
 
 #[tokio::test]
 async fn t2_f5_01() {
@@ -1515,8 +1488,6 @@ async fn t2_f5_05() {
     );
 }
 
-// ---- Feature 6 Negative/Boundary ----
-
 #[tokio::test]
 async fn t2_f6_01() {
     let w = AliyunWorld::start().await;
@@ -1641,8 +1612,6 @@ async fn t2_f6_04() {
     )
     .await
     .ok();
-    // Seed closed monthly spend ($5.00 >= $2.00 budget) in cloud/state.json, which
-    // Store::spent_month reads for --budget preflight.
     seed_monthly_spend(&w.cua_home(), "aliyun-ecs", 5.0);
     w.aliyun.lock().unwrap().calls.clear();
 
@@ -1699,8 +1668,6 @@ async fn t2_f6_05() {
     assert!(w.aliyun.lock().unwrap().instances.is_empty());
 }
 
-// ---- Feature 7 Negative/Boundary ----
-
 #[tokio::test]
 async fn t2_f7_01() {
     let mut w = AliyunWorld::start().await;
@@ -1752,7 +1719,6 @@ async fn t2_f7_01() {
         0
     );
 
-    // Without --sidecar, --runtime native succeeds cleanly.
     w.run(&[
         "sb",
         "create",
@@ -1773,8 +1739,6 @@ async fn t2_f7_01() {
 async fn t2_f7_02() {
     let mut w = AliyunWorld::start().await;
     w.auth_login().await;
-    // FakeAliyun does not execute guest cloud-init, so BootFailMode::StopImmediately simulates
-    // boot failure while we decode write_files: b64 in UserData to assert sha256sum + abort.
     w.mirror.set_corrupt_bytes(true);
     w.aliyun.lock().unwrap().boot_fail = Some(BootFailMode::StopImmediately);
     let mirror_url = w.mirror.linux_url();
@@ -1991,8 +1955,6 @@ async fn t2_f7_05() {
     );
 }
 
-// ---- Feature 8 Negative/Boundary ----
-
 #[tokio::test]
 async fn t2_f8_01() {
     let policy_path = repo_root().join("libs/cua/crates/cua-byoc/policy/aliyun-ecs-policy.json");
@@ -2122,7 +2084,6 @@ async fn t2_f8_04() {
 
 #[tokio::test]
 async fn t2_f8_05() {
-    // Verify live smoke test enforces opt-in guard AND hermetic runs block real internet egress.
     let live_src = std::fs::read_to_string(
         repo_root().join("tests/e2e/aliyun-ecs-byoc/rust/tests/live_ecs_smoke.rs"),
     )
@@ -2134,7 +2095,6 @@ async fn t2_f8_05() {
     );
 
     let mut w = AliyunWorld::start().await;
-    // 1. Scrubbed `cloud test` without credentials fails without making any external CONNECT.
     w.remove_env("ALIBABA_CLOUD_ACCESS_KEY_ID");
     w.remove_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET");
     let out = w.run(&["cloud", "test", "aliyun-ecs", "--json"]).await;
@@ -2146,7 +2106,6 @@ async fn t2_f8_05() {
     );
     w.assert_no_unexpected_egress();
 
-    // 2. Non-aliyuncs.com CONNECT through w.proxy fails fast with 502 Bad Gateway and is recorded.
     let proxy_addr = w
         .proxy
         .url

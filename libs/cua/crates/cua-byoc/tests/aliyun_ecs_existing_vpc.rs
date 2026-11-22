@@ -162,7 +162,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
     let (api, s, store) = start_aliyun(None).await;
     let (_, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
 
-    // 1. --vswitch-id without --vpc-id rejected naming vpc-id.
     let err = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -177,7 +176,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
         "{err:?}"
     );
 
-    // 2. --vpc-id without --vswitch-id rejected naming vswitch-id.
     let err = clouds
         .connect(
             &Target {
@@ -196,7 +194,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
         "{err:?}"
     );
 
-    // 3. Empty/whitespace IDs rejected.
     let err = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -209,7 +206,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 
-    // 4. VSwitch belongs to different VPC -> test fails naming vpc-a / vsw-b, connect saves nothing.
     {
         let mut f = s.lock().unwrap();
         f.vpcs.push(json!({
@@ -272,7 +268,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
         "failed connect must not store creds"
     );
 
-    // 5. VPC in wrong region (cn-shanghai vs cn-hangzhou) -> fails naming vpc-sh.
     seed_user_vpc(&s, "cn-shanghai", "vpc-sh", "vsw-sh", None);
     let report = clouds
         .test(&Target {
@@ -294,7 +289,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
         .join("; ");
     assert!(joined.contains("vpc-sh"), "{joined}");
 
-    // 6. VSwitch with 0 available IPs fails.
     {
         let mut f = s.lock().unwrap();
         f.vpcs.push(json!({
@@ -323,7 +317,6 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
         .unwrap();
     assert!(!report.ok, "{report:?}");
 
-    // Zero resources created during all failed tests/connects.
     let f = s.lock().unwrap();
     assert!(f.instances.is_empty());
     assert!(
@@ -350,7 +343,6 @@ async fn test_existing_vpc_and_standalone_no_public_ip_pass_dry_run_with_zero_re
     );
     let (_, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
 
-    // Existing VPC + VSwitch + --no-public-ip
     let report = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -406,7 +398,6 @@ async fn test_existing_vpc_and_standalone_no_public_ip_pass_dry_run_with_zero_re
         assert!(f.instances.is_empty());
     }
 
-    // Standalone --no-public-ip without --vpc-id / --vswitch-id (per t3_08) must also succeed!
     let standalone = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -497,7 +488,6 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
         "vsw-user-1",
         Some("sg-lookalike"),
     );
-    // Also add another user SG that is NOT a lookalike name.
     s.lock().unwrap().security_groups.push(json!({
         "SecurityGroupId": "sg-user-1",
         "SecurityGroupName": "user-default-sg",
@@ -533,7 +523,6 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
     assert_eq!(connected.provider.vswitch_id.as_deref(), Some("vsw-user-1"));
     assert!(connected.provider.no_public_ip);
 
-    // 1. Create first sandbox in existing VPC without public IP over Static Relay Mode.
     let sb1 = sandboxes.create(create_opts("priv-box-1")).await.unwrap();
     let client = sb1.spacesd().await.unwrap();
     let health = client.health().await.unwrap();
@@ -620,7 +609,6 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
             Some("required")
         );
 
-        // Verify all 6 Cua tags on instance.
         let tags = cua_byoc::aliyun_net::tags_of(inst);
         for key in [
             model::tag::MANAGED,
@@ -635,7 +623,6 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
         sg_id
     };
 
-    // 2. Create second sandbox -> reuses the same Cua SG (CreateSecurityGroup still 1).
     let _sb2 = sandboxes.create(create_opts("priv-box-2")).await.unwrap();
     {
         let f = s.lock().unwrap();
@@ -656,7 +643,6 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
         }
     }
 
-    // 3. Stop, start, delete lifecycle works cleanly.
     sandboxes.suspend("priv-box-1").await.unwrap();
     sandboxes.resume("priv-box-1").await.unwrap();
     sandboxes.delete("priv-box-1").await.unwrap();
@@ -776,10 +762,8 @@ async fn sweep_and_disconnect_delete_only_cua_instances_and_sg_preserving_user_n
 
     let _sb = sandboxes.create(create_opts("sweep-me")).await.unwrap();
 
-    // disconnect without --delete refuses while running.
     assert!(clouds.disconnect("aliyun-ecs", false).await.is_err());
 
-    // Simulate DependencyViolation retry when deleting Cua SG during sweep --all --delete.
     s.lock().unwrap().transient_dependency_errors = 2;
     let sweep = clouds.sweep(Some("aliyun-ecs"), false, true).await.unwrap();
     assert!(!sweep.dry_run);
@@ -807,7 +791,6 @@ async fn sweep_and_disconnect_delete_only_cua_instances_and_sg_preserving_user_n
         assert_eq!(sg_ids, vec!["sg-lookalike", "sg-user-1"]);
     }
 
-    // Create again, then disconnect --delete cleans up Cua resources and disconnects.
     let _sb2 = sandboxes.create(create_opts("disc-me")).await.unwrap();
     clouds.disconnect("aliyun-ecs", true).await.unwrap();
     {
@@ -917,7 +900,6 @@ async fn delete_refuses_user_vpc_vswitch_and_unowned_sg_even_if_tagged() {
         .is_ok(),
         "delete_part must treat already-deleted security_group as Ok(())"
     );
-    // Even if user VPC/VSwitch carry Cua tags, list_owned and list_parts must exclude them.
     {
         let vpc_tags: Vec<_> = cua_byoc::aliyun_net::part_tags(owner)
             .into_iter()
@@ -982,7 +964,6 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
 
     let (sandboxes, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
 
-    // 1. Connect in isolated mode, create & delete a sandbox (leaves Cua isolated VPC/VSwitch/SG).
     clouds
         .connect(
             &Target {
@@ -1019,7 +1000,6 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
         )
     };
 
-    // 2. Seed existing user VPC/VSwitch/SG + spoofed default/other-user VPCs.
     let owner = cua_byoc::Store::new(dir.path()).owner_id().unwrap();
     let spoofed_tags: Vec<_> = cua_byoc::aliyun_net::part_tags(&owner)
         .into_iter()
@@ -1052,7 +1032,6 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
         }));
     }
 
-    // 3. Reconnect in existing-VPC mode and disconnect --delete.
     clouds
         .connect(
             &Target {
@@ -1115,7 +1094,6 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
             .collect();
         assert_eq!(sg_ids, vec!["sg-user-lookalike"]);
 
-        // Ensure DeleteVpc / DeleteVSwitch targeted only Cua's prior isolated resources.
         for c in &f.calls {
             if c.action == "DeleteVpc" {
                 assert_eq!(c.params.get("VpcId"), Some(&iso_vpc_id));
@@ -1149,8 +1127,6 @@ async fn stale_store_user_network_records_do_not_wedge_sweep_or_disconnect() {
         .map(|(k, v)| json!({ "Key": k, "Value": v }))
         .collect();
 
-    // Seed user VPC/VSwitch WITH spoofed Cua tags (and even Cua-like VpcName on conn.vpc_id),
-    // plus a spoofed IsDefault=true VPC and untagged user SG.
     {
         let mut f = s.lock().unwrap();
         f.vpcs.push(json!({
@@ -1212,7 +1188,6 @@ async fn stale_store_user_network_records_do_not_wedge_sweep_or_disconnect() {
         .await
         .unwrap();
 
-    // Direct delete_part must also refuse default/spoofed VPCs even if != conn.vpc_id.
     let conn = store.connection("aliyun-ecs").unwrap().unwrap();
     assert!(
         cua_byoc::aliyun_net::delete_part(
@@ -1252,7 +1227,6 @@ async fn stale_store_user_network_records_do_not_wedge_sweep_or_disconnect() {
         }
     };
 
-    // 1. sweep --all --delete forgets stale protected/unowned records with 0 Delete* calls.
     seed_stale_records();
     let sweep = clouds.sweep(Some("aliyun-ecs"), false, true).await.unwrap();
     assert!(
@@ -1261,7 +1235,6 @@ async fn stale_store_user_network_records_do_not_wedge_sweep_or_disconnect() {
     );
     assert!(store.resources().unwrap().is_empty());
 
-    // 2. disconnect --delete also succeeds cleanly when stale Store records are present.
     seed_stale_records();
     let disc = clouds.disconnect("aliyun-ecs", true).await.unwrap();
     assert!(disc.disconnected, "{disc:?}");
@@ -1306,7 +1279,6 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
 
     let (sandboxes, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
 
-    // 1. Connect in isolated mode, create & delete sandbox (creates isolated VPC, VSwitch, SG #1).
     clouds
         .connect(
             &Target {
@@ -1343,7 +1315,6 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
         )
     };
 
-    // 2. Seed user VPC/VSwitch/SG + spoofed default/other VPCs & VSwitches.
     let store = cua_byoc::Store::new(dir.path());
     let owner = store.owner_id().unwrap();
     let spoofed_tags: Vec<_> = cua_byoc::aliyun_net::part_tags(&owner)
@@ -1394,7 +1365,6 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
         }));
     }
 
-    // 3. Reconnect in existing-VPC mode, create & delete sandbox (creates SG #2 in vpc-user-1).
     clouds
         .connect(
             &Target {
@@ -1435,7 +1405,6 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
     };
     assert_ne!(iso_sg_id, existing_sg_id);
 
-    // Store must retain BOTH Cua SG records despite identical SecurityGroupName.
     let sg_records: Vec<String> = store
         .resources()
         .unwrap()
@@ -1448,7 +1417,6 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
         "expected both Cua SG records in Store, got: {sg_records:?}"
     );
 
-    // 4. disconnect --delete must remove BOTH Cua SGs + prior isolated VPC/VSwitch in one pass.
     let disc = clouds.disconnect("aliyun-ecs", true).await.unwrap();
     assert!(disc.disconnected, "{disc:?}");
     assert!(disc.left.is_empty(), "{disc:?}");
@@ -1549,7 +1517,6 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
         ..Default::default()
     };
 
-    // 1. Create & delete sandbox in each of two existing VPCs -> creates 2 Cua SGs with identical name.
     clouds
         .connect(&target_for("vpc-user-a", "vsw-user-a"), false, Some(2))
         .await
@@ -1593,7 +1560,6 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
         "expected both Cua SG records in Store, got: {sg_records:?}"
     );
 
-    // 2. sweep --all --delete must delete BOTH Cua SGs and leave user VPCs/VSwitches/SGs untouched.
     let sweep = clouds.sweep(Some("aliyun-ecs"), false, true).await.unwrap();
     let swept_deleted: Vec<&str> = sweep
         .resources
@@ -1629,7 +1595,6 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
         );
     }
 
-    // 3. Repeat across both existing VPCs and verify disconnect --delete also cleans both SGs in one pass.
     clouds
         .connect(&target_for("vpc-user-a", "vsw-user-a"), false, Some(2))
         .await
@@ -1713,7 +1678,6 @@ async fn existing_vpc_test_passes_when_dry_run_reports_missing_sg_before_cua_sg_
         .unwrap();
     assert!(report.ok, "{report:?}");
 
-    // 2. Without existing VPC, InvalidSecurityGroupId must still fail permissions.
     let no_vpc_report = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),
@@ -1725,8 +1689,6 @@ async fn existing_vpc_test_passes_when_dry_run_reports_missing_sg_before_cua_sg_
         .unwrap();
     assert!(!no_vpc_report.ok, "{no_vpc_report:?}");
 
-    // 3. When a Cua SG already exists in the existing VPC, InvalidSecurityGroupId
-    // means a real broken SecurityGroupId and must fail permissions.
     let owner = cua_byoc::state::Store::new(&dir.path().join("cloud"))
         .owner_id()
         .unwrap();

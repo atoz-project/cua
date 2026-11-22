@@ -407,9 +407,6 @@ mod tests {
             .collect()
     }
 
-    /// Scans `aliyun_ecs.rs` (and `aliyun_net.rs` once merged in Phase B) outside
-    /// `#[cfg(test)]` for `"<PascalAction>"` paired with `STS_API_VERSION`,
-    /// `ECS_API_VERSION`, or `VPC_API_VERSION`, plus `tag_params(` implicit tagging.
     fn used_aliyun_actions(sources: &[&str]) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for src in sources {
@@ -496,7 +493,6 @@ mod tests {
                 assert!(!a.starts_with("ram:"), "{sid}: forbidden ram action {a}");
             }
         }
-        // Alibaba Cloud RAM custom policies are limited to 6,144 characters.
         assert!(
             aliyun_ecs_policy_json()
                 .chars()
@@ -619,7 +615,6 @@ mod tests {
                 "{sid}: {acts:?} mutates or reads sensitive console without a cua-managed tag condition"
             );
         }
-        // Tagging actions must require acs:RequestTag/cua-managed.
         for tag_act in ["ecs:TagResources", "vpc:TagResources"] {
             let stmt = aliyun_statements()
                 .into_iter()
@@ -632,7 +627,6 @@ mod tests {
                 "{tag_act} must require acs:RequestTag/cua-managed"
             );
         }
-        // No RAM identity changes, ever.
         for a in allowed_aliyun_actions() {
             assert!(!a.starts_with("ram:"), "{a}");
         }
