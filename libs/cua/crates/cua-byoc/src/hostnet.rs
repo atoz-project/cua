@@ -160,8 +160,7 @@ resolvers() {{
     out=""
     for ns in $(awk '$1=="nameserver"{{print $2}}' "$f"); do
       case "$ns" in
-        127.*|::1|*:*) ;;
-        "$WIRESERVER") ;;
+        127.*|::1|*:*|"$WIRESERVER"|100.100.100.200) ;;
         *) out="$out $ns" ;;
       esac
     done
@@ -212,6 +211,7 @@ CIDRS=$(own_cidrs)
 # IPv4, forwarded traffic of containers (DOCKER-USER runs before Docker's rules).
 fresh iptables $GUARD
 for r in $RES; do
+  if [ "$r" = 100.100.100.200 ]; then continue; fi
   run iptables -A $GUARD -d "$r" -p udp --dport 53 -j RETURN
   run iptables -A $GUARD -d "$r" -p tcp --dport 53 -j RETURN
 done
@@ -976,5 +976,97 @@ mod tests {
                 assert!(stdout.contains("100.100.100.200/32"), "{stdout}");
             }
         }
+    }
+
+    #[test]
+    fn docker_script_blocks_alibaba_metadata_and_dns_leak() {
+        let net = HostNet {
+            provider: "aliyun-ecs",
+            extra_cidrs: &[],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker-guard.sh");
+        std::fs::write(&path, script(&net)).unwrap();
+
+        let out = Command::new("sh")
+            .arg(&path)
+            .env("CUA_NET_DRY", "1")
+            .env("CUA_NET_CIDRS", "10.77.0.0/16")
+            .env("CUA_NET_RESOLVERS", "100.100.2.136 100.100.100.200")
+            .output()
+            .expect("sh");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.contains(
+                &"iptables -A CUA-SPACE-GUARD -d 100.100.2.136 -p udp --dport 53 -j RETURN"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"iptables -A CUA-SPACE-GUARD -d 100.100.2.136 -p tcp --dport 53 -j RETURN"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("100.100.100.200") && l.contains("RETURN")),
+            "100.100.100.200 must never get a DNS RETURN exemption: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"iptables -A CUA-SPACE-GUARD -d 100.100.100.200/32 -j DROP"),
+            "{lines:?}"
+        );
+
+        // Also test resolvers() directly against a resolv.conf fixture containing 100.100.100.200.
+        let missing_resolv = dir.path().join("missing-resolv.conf");
+        let fake_resolv = dir.path().join("resolv.conf");
+        std::fs::write(
+            &fake_resolv,
+            "nameserver 127.0.0.53\nnameserver 168.63.129.16\nnameserver 100.100.100.200\nnameserver 100.100.2.136\n",
+        )
+        .unwrap();
+        let patched = script(&net).replace(
+            "/run/systemd/resolve/resolv.conf /etc/resolv.conf",
+            &format!("{} {}", missing_resolv.display(), fake_resolv.display()),
+        );
+        let patched_path = dir.path().join("docker-guard-resolv.sh");
+        std::fs::write(&patched_path, &patched).unwrap();
+        let out2 = Command::new("sh")
+            .arg(&patched_path)
+            .env("CUA_NET_DRY", "1")
+            .env("CUA_NET_CIDRS", "10.77.0.0/16")
+            .env_remove("CUA_NET_RESOLVERS")
+            .output()
+            .expect("sh");
+        assert!(
+            out2.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+        let lines2: Vec<&str> = std::str::from_utf8(&out2.stdout).unwrap().lines().collect();
+        assert!(
+            lines2.contains(
+                &"iptables -A CUA-SPACE-GUARD -d 100.100.2.136 -p udp --dport 53 -j RETURN"
+            ),
+            "{lines2:?}"
+        );
+        assert!(
+            !lines2
+                .iter()
+                .any(|l| l.contains("100.100.100.200") && l.contains("RETURN")),
+            "resolvers() must exclude 100.100.100.200: {lines2:?}"
+        );
+        assert!(
+            lines2.contains(&"iptables -A CUA-SPACE-GUARD -d 100.100.100.200/32 -j DROP"),
+            "{lines2:?}"
+        );
     }
 }

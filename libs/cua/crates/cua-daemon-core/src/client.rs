@@ -362,16 +362,17 @@ impl DaemonClient {
     /// the daemon does not advertise [`crate::FEATURE_CLOUD_IMAGE_AND_SIZING`]
     /// (or predates `GetInfo`).
     pub async fn require_cloud_image_and_sizing(&self, fields: &[&str]) -> Result<()> {
+        self.require_feature_for_fields(crate::FEATURE_CLOUD_IMAGE_AND_SIZING, fields)
+            .await
+    }
+
+    async fn require_feature_for_fields(&self, feature: &str, fields: &[&str]) -> Result<()> {
         if fields.is_empty() {
             return Ok(());
         }
         match self.info().await {
             Ok(info) => {
-                if info
-                    .features
-                    .iter()
-                    .any(|f| f == crate::FEATURE_CLOUD_IMAGE_AND_SIZING)
-                {
+                if info.features.iter().any(|f| f == feature) {
                     return Ok(());
                 }
                 let version = if info.version.trim().is_empty() {
@@ -395,17 +396,66 @@ impl DaemonClient {
     }
 
     async fn preflight_create(&self, r: &CreateRequest) -> Result<()> {
-        let mut asked = Vec::new();
+        let mut sizing_fields = Vec::new();
         if r.cloud_image_id.is_some() {
-            asked.push("cloud_image_id");
+            sizing_fields.push("cloud_image_id");
         }
         if r.instance_type.is_some() {
-            asked.push("instance_type");
+            sizing_fields.push("instance_type");
         }
         if r.disk_gb.is_some() {
-            asked.push("disk_gb");
+            sizing_fields.push("disk_gb");
         }
-        self.require_cloud_image_and_sizing(&asked).await
+        let needs_ttl = r.ttl.is_some();
+        if sizing_fields.is_empty() && !needs_ttl {
+            return Ok(());
+        }
+        match self.info().await {
+            Ok(info) => {
+                let mut missing = Vec::new();
+                if !sizing_fields.is_empty()
+                    && !info
+                        .features
+                        .iter()
+                        .any(|f| f == crate::FEATURE_CLOUD_IMAGE_AND_SIZING)
+                {
+                    missing.extend(sizing_fields);
+                }
+                if needs_ttl
+                    && !info
+                        .features
+                        .iter()
+                        .any(|f| f == crate::FEATURE_SANDBOX_TTL)
+                {
+                    missing.push("ttl");
+                }
+                if missing.is_empty() {
+                    return Ok(());
+                }
+                let version = if info.version.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", info.version)
+                };
+                Err(Error::CapabilityMissing(format!(
+                    "{}: the cua daemon{version} is too old to enforce it (these sandbox \
+                     options would be ignored); update cua and restart its daemon",
+                    missing.join(", ")
+                )))
+            }
+            Err(Error::Unsupported(_)) => {
+                let mut missing = sizing_fields;
+                if needs_ttl {
+                    missing.push("ttl");
+                }
+                Err(Error::CapabilityMissing(format!(
+                    "{}: the cua daemon is too old to enforce it (these sandbox options would be \
+                     ignored); update cua and restart its daemon",
+                    missing.join(", ")
+                )))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `CreateSandbox`.

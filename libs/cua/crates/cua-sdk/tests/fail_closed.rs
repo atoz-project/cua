@@ -757,6 +757,87 @@ async fn sandboxes_create_m6a_fields_fail_closed_against_old_and_m5_daemons() {
     }
 }
 
+/// An M6a/M6b-era daemon: advertises `FEATURE_CLOUD_IMAGE_AND_SIZING` without
+/// `FEATURE_SANDBOX_TTL`, and silently ignores `CreateSandboxRequest.ttl = 46`.
+#[derive(Clone)]
+struct M6Daemon<const SVC: u8>(Arc<Old>);
+
+impl<const SVC: u8> tonic::server::NamedService for M6Daemon<SVC> {
+    const NAME: &'static str = match SVC {
+        0 => "cua.daemon.v1.SpaceService",
+        1 => "cua.daemon.v1.SandboxService",
+        _ => "cua.daemon.v1.DaemonService",
+    };
+}
+
+impl<B, const SVC: u8> tower::Service<http::Request<B>> for M6Daemon<SVC>
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = BoxFut<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let old = self.0.clone();
+        match req.uri().path() {
+            "/cua.daemon.v1.DaemonService/GetInfo" => {
+                serve(req, move |_: dpb::GetInfoRequest| dpb::GetInfoResponse {
+                    version: "0.28.0-m6".into(),
+                    features: vec![
+                        "env".into(),
+                        "sandboxes".into(),
+                        "spaces".into(),
+                        "mcp".into(),
+                        cua_daemon_core::FEATURE_CLOUD_IMAGE_AND_SIZING.into(),
+                    ],
+                    ..Default::default()
+                })
+            }
+            "/cua.daemon.v1.SandboxService/CreateSandbox" => {
+                serve(req, move |r: dpb::CreateSandboxRequest| {
+                    let name = r.name.clone();
+                    let loc = if r.location.is_empty() {
+                        "local".to_string()
+                    } else {
+                        r.location.clone()
+                    };
+                    old.sandbox_creates.lock().unwrap().push(r);
+                    dpb::CreateSandboxResponse {
+                        sandbox: Some(dpb::Sandbox {
+                            name,
+                            location: loc,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                })
+            }
+            _ => Box::pin(async { Ok(unimplemented()) }),
+        }
+    }
+}
+
+async fn m6_daemon() -> (Arc<Old>, Arc<Cua>) {
+    let old = Arc::new(Old::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(M6Daemon::<0>(old.clone()))
+            .add_service(M6Daemon::<1>(old.clone()))
+            .add_service(M6Daemon::<2>(old.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let cua = Cua::connect(Some(format!("http://{addr}")), Some("token".into())).unwrap();
+    (old, cua)
+}
+
 struct NothingToolBackend;
 
 #[async_trait]
@@ -804,6 +885,7 @@ where
                         "spaces".into(),
                         "mcp".into(),
                         cua_daemon_core::FEATURE_CLOUD_IMAGE_AND_SIZING.into(),
+                        cua_daemon_core::FEATURE_SANDBOX_TTL.into(),
                     ],
                     ..Default::default()
                 })
@@ -944,4 +1026,77 @@ async fn current_daemon_accepts_and_delivers_m6a_cloud_image_and_sizing_fields()
         assert_eq!(req.instance_type, "ecs.c7.2xlarge");
         assert_eq!(req.disk_gb, 120);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sandboxes_create_ttl_fails_closed_against_old_m5_and_m6_daemons_and_succeeds_on_current() {
+    for (label, old, cua) in [
+        ("pre_getinfo", old_daemon().await),
+        ("m5", m5_daemon().await),
+        ("m6", m6_daemon().await),
+    ]
+    .into_iter()
+    .map(|(l, (o, c))| (l, o, c))
+    {
+        for ttl in [0u32, 1800u32] {
+            let mut opts = SandboxCreateOptions::new("aliyun-ecs", "linux");
+            opts.name = Some(format!("sb-ttl-{ttl}"));
+            opts.ttl_seconds = Some(ttl);
+
+            let Err(e) = cua.sandboxes().create(opts.clone()).await else {
+                panic!("{label}/ttl={ttl}: Sandboxes::create must fail closed");
+            };
+            assert!(
+                matches!(&e, CuaError::CapabilityMissing(m) if m.contains("too old") && m.contains("ttl")),
+                "{label}/ttl={ttl}: expected CapabilityMissing naming ttl, got {e:?}"
+            );
+
+            let sink: cua_sandbox_core::progress::Sink = Arc::new(|_| {});
+            let Err(e_rep) = cua.sandboxes().create_reporting(opts, sink).await else {
+                panic!("{label}/ttl={ttl}: Sandboxes::create_reporting must fail closed");
+            };
+            assert!(
+                matches!(&e_rep, CuaError::CapabilityMissing(m) if m.contains("too old") && m.contains("ttl")),
+                "{label}/ttl={ttl}: expected CapabilityMissing naming ttl, got {e_rep:?}"
+            );
+        }
+        assert!(
+            old.sandbox_creates.lock().unwrap().is_empty(),
+            "{label}: CreateSandbox RPC must not be sent when ttl capability is missing"
+        );
+    }
+
+    // Real current daemon advertises `sandboxes.ttl` and passes client preflight.
+    let w = current_daemon().await;
+    let mut real_opts = SandboxCreateOptions::new("aliyun-ecs", "linux");
+    real_opts.name = Some("sb-real-ttl".into());
+    real_opts.ttl_seconds = Some(1800);
+    let Err(real_err) = w.cua.sandboxes().create(real_opts).await else {
+        panic!("expected ProviderNotConfigured without connected aliyun-ecs");
+    };
+    assert!(
+        matches!(real_err, CuaError::ProviderNotConfigured(_)),
+        "expected ProviderNotConfigured (ttl preflight passed), got {real_err:?}"
+    );
+
+    // Loopback current mock daemon receives ttl=Some(0s) and ttl=Some(1800s) over both create & create_reporting.
+    let (rec, cua) = current_mock_daemon().await;
+    for (idx, ttl) in [0u32, 1800u32].into_iter().enumerate() {
+        let mut o = SandboxCreateOptions::new("aliyun-ecs", "linux");
+        o.name = Some(format!("sb-ttl-ok-{idx}"));
+        o.ttl_seconds = Some(ttl);
+        let sb = cua.sandboxes().create(o.clone()).await.unwrap();
+        assert_eq!(sb.info().name, format!("sb-ttl-ok-{idx}"));
+
+        let sink: cua_sandbox_core::progress::Sink = Arc::new(|_| {});
+        o.name = Some(format!("sb-ttl-rep-{idx}"));
+        let sb_rep = cua.sandboxes().create_reporting(o, sink).await.unwrap();
+        assert_eq!(sb_rep.info().name, format!("sb-ttl-rep-{idx}"));
+    }
+    let sb_creates = rec.sandbox_creates.lock().unwrap();
+    assert_eq!(sb_creates.len(), 4);
+    assert_eq!(sb_creates[0].ttl.as_ref().map(|d| d.seconds), Some(0));
+    assert_eq!(sb_creates[1].ttl.as_ref().map(|d| d.seconds), Some(0));
+    assert_eq!(sb_creates[2].ttl.as_ref().map(|d| d.seconds), Some(1800));
+    assert_eq!(sb_creates[3].ttl.as_ref().map(|d| d.seconds), Some(1800));
 }

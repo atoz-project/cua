@@ -473,7 +473,7 @@ impl Sandboxes {
             env,
             command: o.command.clone().filter(|c| !c.is_empty()),
             ports,
-            ttl: None,
+            ttl: o.ttl,
             labels,
             registry_credentials: o.scoped_credentials(),
             timeout: o.ready_timeout,

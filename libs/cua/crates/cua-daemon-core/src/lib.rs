@@ -83,6 +83,10 @@ pub const ERROR_INFO_TYPE_URL: &str = "type.googleapis.com/cua.daemon.v1.DaemonE
 /// (and BYOC `Spaces::create` sizing overrides).
 pub const FEATURE_CLOUD_IMAGE_AND_SIZING: &str = "sandboxes.cloud_image_and_sizing";
 
+/// Feature word in `GetInfoResponse.features` advertised by daemons that read
+/// `ttl` on `CreateSandboxRequest`.
+pub const FEATURE_SANDBOX_TTL: &str = "sandboxes.ttl";
+
 /// Every failure of the SDK runtime, in both topologies.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {

@@ -240,16 +240,17 @@ fn is_not_found_code(code: &str) -> bool {
 }
 
 fn is_retryable_delete_code(code: &str) -> bool {
-    matches!(
-        code,
-        "DependencyViolation"
-            | "InUse"
-            | "VpcInUse"
-            | "IncorrectVpcStatus"
-            | "IncorrectVSwitchStatus"
-            | "ResourceInUse"
-            | "InvalidOperation.Conflict"
-    )
+    code == "DependencyViolation"
+        || code.starts_with("DependencyViolation.")
+        || matches!(
+            code,
+            "InUse"
+                | "VpcInUse"
+                | "IncorrectVpcStatus"
+                | "IncorrectVSwitchStatus"
+                | "ResourceInUse"
+                | "InvalidOperation.Conflict"
+        )
 }
 
 fn net_resource(
@@ -558,6 +559,7 @@ pub async fn discover_zones(
                 .any(|sr| {
                     sr["Value"].as_str() == Some(instance_type)
                         && sr["Status"].as_str() == Some("Available")
+                        && crate::aliyun_ecs::is_with_stock_category(sr["StatusCategory"].as_str())
                 });
             if has_type && !stock_zones.iter().any(|z| z == zone_id) {
                 stock_zones.push(zone_id.to_string());
@@ -1279,6 +1281,94 @@ pub async fn list_parts(api: &AliyunEcs, conn: &Connection, owner: &str) -> Resu
     Ok(out)
 }
 
+async fn has_permanent_non_cua_blocker(
+    api: &AliyunEcs,
+    region: &str,
+    r: &Resource,
+    cua_owner: &str,
+    profile_hint: Option<&str>,
+) -> bool {
+    let mut params = vec![("RegionId".into(), region.to_string())];
+    match r.resource_type.as_str() {
+        "security_group" => params.push(("SecurityGroupId".into(), r.id.clone())),
+        "vswitch" | "subnet" => params.push(("VSwitchId".into(), r.id.clone())),
+        "vpc" => params.push(("VpcId".into(), r.id.clone())),
+        _ => return false,
+    }
+    if let Ok(instances) = paginated_query(
+        api,
+        &api.ecs_endpoint(region),
+        "DescribeInstances",
+        ECS_API_VERSION,
+        &params,
+        ("Instances", "Instance"),
+        profile_hint,
+    )
+    .await
+    {
+        for inst in instances {
+            let st = inst["Status"].as_str().unwrap_or("");
+            if st.eq_ignore_ascii_case("terminated") || st.eq_ignore_ascii_case("deleted") {
+                continue;
+            }
+            let refs_part = match r.resource_type.as_str() {
+                "security_group" => inst["SecurityGroupIds"]["SecurityGroupId"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(r.id.as_str()))),
+                "vswitch" | "subnet" => {
+                    inst["VpcAttributes"]["VSwitchId"].as_str() == Some(r.id.as_str())
+                }
+                "vpc" => inst["VpcAttributes"]["VpcId"].as_str() == Some(r.id.as_str()),
+                _ => false,
+            };
+            if refs_part && !model::is_ours(&tags_of(&inst), cua_owner) {
+                return true;
+            }
+        }
+    }
+    if r.resource_type == "vpc" {
+        let vpc_params = vec![
+            ("RegionId".into(), region.to_string()),
+            ("VpcId".into(), r.id.clone()),
+        ];
+        if let Ok(vswitches) = paginated_query(
+            api,
+            &api.vpc_endpoint(region),
+            "DescribeVSwitches",
+            VPC_API_VERSION,
+            &vpc_params,
+            ("VSwitches", "VSwitch"),
+            profile_hint,
+        )
+        .await
+            && vswitches.iter().any(|vsw| {
+                vsw["VpcId"].as_str() == Some(r.id.as_str())
+                    && !model::is_ours(&tags_of(vsw), cua_owner)
+            })
+        {
+            return true;
+        }
+        if let Ok(sgs) = paginated_query(
+            api,
+            &api.ecs_endpoint(region),
+            "DescribeSecurityGroups",
+            ECS_API_VERSION,
+            &vpc_params,
+            ("SecurityGroups", "SecurityGroup"),
+            profile_hint,
+        )
+        .await
+            && sgs.iter().any(|sg| {
+                sg["VpcId"].as_str() == Some(r.id.as_str())
+                    && !model::is_ours(&tags_of(sg), cua_owner)
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Deletes one network part (`security_group`, `vswitch`/`subnet`, `vpc`),
 /// retrying dependency violations and treating `NotFound` as `Ok(())`.
 pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Result<()> {
@@ -1286,6 +1376,7 @@ pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Re
     if r.id.is_empty() {
         return Ok(());
     }
+    let mut cua_owner = r.tags.get(tag::OWNER).cloned().unwrap_or_default();
     if matches!(
         r.resource_type.as_str(),
         "vpc" | "vswitch" | "subnet" | "security_group"
@@ -1300,6 +1391,11 @@ pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Re
                 "aliyun-ecs: refusing to delete non-Cua-owned {} {}",
                 r.resource_type, r.id
             )));
+        }
+        if cua_owner.is_empty()
+            && let Some(owner) = tags.get(tag::OWNER)
+        {
+            cua_owner = owner.clone();
         }
     }
     let region = if r.region.is_empty() {
@@ -1353,9 +1449,24 @@ pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Re
         if is_not_found_code(code) {
             return Ok(());
         }
-        if is_retryable_delete_code(code) && tries < 24 {
+        // Alibaba Cloud keeps primary ENIs in `Status: Deleting` for up to ~4 minutes
+        // after `DeleteInstance(Force=true)` before `DeleteVSwitch` succeeds (~376s budget
+        // at the default 2s poll interval; unit tests override `poll_interval()` to 10ms).
+        if is_retryable_delete_code(code) && tries < 100 {
+            if tries == 0
+                && !cua_owner.is_empty()
+                && has_permanent_non_cua_blocker(api, region, r, &cua_owner, profile_hint).await
+            {
+                return Err(map_api_error(action, version, status, &body));
+            }
+            let poll = api.poll_interval();
+            let wait = if tries < 12 {
+                poll
+            } else {
+                poll.saturating_mul(2)
+            };
             tries += 1;
-            tokio::time::sleep(api.poll_interval()).await;
+            tokio::time::sleep(wait).await;
             continue;
         }
         return Err(map_api_error(action, version, status, &body));

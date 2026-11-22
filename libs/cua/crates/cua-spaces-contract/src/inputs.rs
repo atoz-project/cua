@@ -2172,43 +2172,146 @@ pub struct CloudTarget {
     pub instance_type: Option<String>,
 }
 
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
+fn is_valid_ipv4_or_dns_host(host: &str) -> bool {
+    if host.is_empty() || !host.is_ascii() {
+        return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let h = host.strip_suffix('.').unwrap_or(host);
+    if h.is_empty() || h.len() > 253 {
+        return false;
+    }
+    for label in h.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return false;
+        }
+    }
+    let last_label = h.rsplit('.').next().unwrap_or(h);
+    !last_label.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_valid_host_or_hostport(auth: &str) -> bool {
+    if auth.is_empty() || !auth.is_ascii() {
+        return false;
+    }
+    if let Some(rest) = auth.strip_prefix('[') {
+        let Some((ip, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return tail.is_empty() || tail.strip_prefix(':').is_some_and(is_valid_port);
+    }
+    if auth.contains(['[', ']']) {
+        return false;
+    }
+    match auth.split_once(':') {
+        Some((host, port)) => is_valid_ipv4_or_dns_host(host) && is_valid_port(port),
+        None => is_valid_ipv4_or_dns_host(auth),
+    }
+}
+
+fn is_qualified_host(host_port: &str) -> bool {
+    if !is_valid_host_or_hostport(host_port) {
+        return false;
+    }
+    if host_port.starts_with('[') {
+        return true;
+    }
+    let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let h = host.trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost") || h.contains('.')
+}
+
 fn redact_url(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    let Some(scheme_pos) = trimmed.find("://") else {
-        return "<redacted>".into();
-    };
-    let scheme = &trimmed[..scheme_pos];
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
-        return "<redacted>".into();
-    }
-    let after_scheme = &trimmed[scheme_pos + 3..];
-    let (before_frag, frag) = match after_scheme.split_once('#') {
-        Some((b, f)) => (b, Some(f)),
-        None => (after_scheme, None),
-    };
-    let before_query = before_frag.split('?').next().unwrap_or(before_frag);
-    let (authority, path) = match before_query.find('/') {
-        Some(i) => (&before_query[..i], &before_query[i..]),
-        None => (before_query, ""),
-    };
-    let host_port = match authority.rsplit_once('@') {
-        Some((_, hp)) => hp,
-        None => authority,
-    };
-    if host_port.is_empty() {
+    if !trimmed.is_ascii()
+        || trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\'' | '"'))
+    {
         return "<redacted>".into();
     }
-    let mut out = format!("{scheme}://{host_port}{path}");
-    if let Some(f) = frag
-        && let Some(hex) = f.strip_prefix("sha256=")
+    let Some((scheme_raw, after_scheme)) = trimmed.split_once("://") else {
+        return "<redacted>".into();
+    };
+    let scheme_lower = scheme_raw.to_ascii_lowercase();
+    if !matches!(scheme_lower.as_str(), "http" | "https") {
+        return "<redacted>".into();
+    }
+    let delim_pos = after_scheme
+        .find(['/', '\\', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let raw_authority = &after_scheme[..delim_pos];
+    let raw_tail = &after_scheme[delim_pos..];
+    if raw_tail.starts_with('\\') {
+        return "<redacted>".into();
+    }
+    let at_count = raw_authority.bytes().filter(|&b| b == b'@').count();
+    if at_count > 1 {
+        return "<redacted>".into();
+    }
+    let has_userinfo = at_count > 0;
+    let raw_host_port = raw_authority
+        .rsplit_once('@')
+        .map_or(raw_authority, |(_, hp)| hp);
+    if !is_valid_host_or_hostport(raw_host_port) {
+        return "<redacted>".into();
+    }
+    let has_port_colon = if let Some(rest) = raw_host_port.strip_prefix('[') {
+        rest.split_once(']')
+            .is_some_and(|(_, t)| t.starts_with(':'))
+    } else {
+        raw_host_port.contains(':')
+    };
+    let ambiguous_at = raw_tail.contains("?@")
+        || raw_tail.contains("#@")
+        || (raw_tail.starts_with("/@") && has_port_colon && !is_qualified_host(raw_host_port))
+        || (!raw_tail.starts_with('/')
+            && raw_tail.contains('@')
+            && (has_userinfo || has_port_colon || !is_qualified_host(raw_host_port)))
+        || (raw_tail.contains('@') && has_port_colon && !is_qualified_host(raw_host_port));
+    if ambiguous_at {
+        return "<redacted>".into();
+    }
+    let raw_path = if raw_tail.starts_with('/') {
+        let end = raw_tail.find(['?', '#']).unwrap_or(raw_tail.len());
+        &raw_tail[..end]
+    } else {
+        ""
+    };
+    let host_port_lower = raw_host_port.to_ascii_lowercase();
+    let mut out = format!("{scheme_lower}://{host_port_lower}{raw_path}");
+    if let Some((_, frag)) = raw_tail.split_once('#')
+        && let Some(hex) = frag.strip_prefix("sha256=")
         && !hex.is_empty()
         && hex.bytes().all(|b| b.is_ascii_hexdigit())
     {
         out.push('#');
-        out.push_str(f);
+        out.push_str(frag);
     }
     out
 }
@@ -2462,6 +2565,95 @@ mod tests {
         assert!(
             dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
             "{dbg}"
+        );
+    }
+
+    #[test]
+    fn redact_url_blocks_confusion_and_bypass_vectors_in_debug() {
+        for bad in [
+            "https://user:secret_pass?@evil.com/bin",
+            "https://user:secret_pass#@evil.com/bin",
+            "https://user:secret_pass\\?@evil.com/bin",
+            "https://user:secret_pass:8080/@evil.com/bin",
+            "https://user:secret_pass/foo@evil.com",
+            "https://user:123456#@evil.com/bin",
+            "https://user:123456?x=@evil.com/bin",
+            "https://user:8080#@evil.com/bin",
+            "https://user:8080?x=@evil.com/bin",
+            "https://user:s3cr3t secret/@evil.com/bin?sig=DeadBeef",
+            "https://user:8080 foo/@evil.com/bin",
+            "https://user:s3cr3t @mirror.example.com/bin",
+            "https://user:8080/@evil.com/bin",
+            "https://ada@org:p4ssw0rd/@evil.com/bin",
+            "https://ada@org:8080/@evil.com/bin",
+            "https://ada@org:secret@mirror.example.com/bin",
+            "https://user:s3cr3t\\@mirror.example.com/bin",
+            "https://user:8443\\@mirror.example.com/bin",
+            "https://mirror.example.com\\@s3cr3t@evil.com/bin",
+            "https://example.com:0/bin",
+            "https://example.com:/bin",
+            "https://example.com:08080/bin",
+        ] {
+            let redacted = redact_url(bad);
+            assert_eq!(
+                redacted, "<redacted>",
+                "redact_url must fail closed for {bad:?}, got {redacted:?}"
+            );
+            let target = CloudTarget {
+                provider: "aliyun-ecs".into(),
+                spacesd_download_url: Some(bad.into()),
+                ..Default::default()
+            };
+            let dbg = format!("{target:?}");
+            for leak in [
+                "secret_pass",
+                "s3cr3t",
+                "p4ssw0rd",
+                "123456",
+                "8080",
+                "8443",
+                "08080",
+                "DeadBeef",
+                "ada@org",
+                "evil.com",
+            ] {
+                assert!(
+                    !dbg.contains(leak),
+                    "CloudTarget Debug leaked {leak:?} for {bad:?}: {dbg}"
+                );
+            }
+        }
+
+        let bad_sha = "https://mirror.example.com/bin#sha256=user:s3cr3t@evil.com";
+        let target_sha = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some(bad_sha.into()),
+            ..Default::default()
+        };
+        let dbg_sha = format!("{target_sha:?}");
+        assert!(
+            !dbg_sha.contains("s3cr3t") && !dbg_sha.contains("user:"),
+            "{dbg_sha}"
+        );
+
+        assert_eq!(
+            redact_url("https://mirror.example.com/cua-{version}-{arch}.tar.gz"),
+            "https://mirror.example.com/cua-{version}-{arch}.tar.gz"
+        );
+        assert_eq!(
+            redact_url("http://localhost:8080/@cua/cua-spacesd"),
+            "http://localhost:8080/@cua/cua-spacesd"
+        );
+        assert_eq!(
+            redact_url("http://[::1]:8080/cua-spacesd"),
+            "http://[::1]:8080/cua-spacesd"
+        );
+        let sha64 = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            redact_url(&format!(
+                "https://mirror.example.com/bin?user=ada@example.com&sig=AbCd#sha256={sha64}"
+            )),
+            format!("https://mirror.example.com/bin#sha256={sha64}")
         );
     }
 }

@@ -172,8 +172,10 @@ pub struct TargetArgs {
     #[arg(long, value_parser = ["account", "static"])]
     pub relay_mode: Option<String>,
     /// Static Relay Mode: read the shared static relay registration token
-    /// from stdin (never pass tokens in argv).
-    #[arg(long, conflicts_with = "token_stdin")]
+    /// from stdin (never pass tokens in argv). When combined with
+    /// `--token-stdin`, line 1 is the cloud token and line 2 is the relay
+    /// token.
+    #[arg(long)]
     pub relay_token_stdin: bool,
     /// Custom `cua-spacesd` binary or `.tar.gz` download URL override for
     /// Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment).
@@ -210,12 +212,17 @@ impl TargetArgs {
     }
 
     fn target_with_stdin(&self, read_stdin: impl FnOnce() -> String) -> CloudTarget {
-        let (token, relay_token) = if self.token_stdin {
-            (Some(read_stdin().trim().to_string()), None)
-        } else if self.relay_token_stdin {
-            (None, Some(read_stdin().trim().to_string()))
-        } else {
-            (None, None)
+        let (token, relay_token) = match (self.token_stdin, self.relay_token_stdin) {
+            (true, true) => {
+                let raw = read_stdin();
+                let mut lines = raw.lines();
+                let tok = lines.next().unwrap_or("").trim().to_string();
+                let relay = lines.next().unwrap_or("").trim().to_string();
+                (Some(tok), Some(relay))
+            }
+            (true, false) => (Some(read_stdin().trim().to_string()), None),
+            (false, true) => (None, Some(read_stdin().trim().to_string())),
+            (false, false) => (None, None),
         };
         CloudTarget {
             token,
@@ -2423,8 +2430,41 @@ mod tests {
             Some("")
         );
 
-        // --relay-token-stdin conflicts with --token-stdin.
-        parse_err(&["connect", "hetzner", "--token-stdin", "--relay-token-stdin"]);
+        // --token-stdin + --relay-token-stdin together read line 1 (cloud token) and line 2 (relay token).
+        match parse(&[
+            "connect",
+            "aliyun-ecs",
+            "--token-stdin",
+            "--relay-url",
+            "https://relay.example.com",
+            "--relay-mode",
+            "static",
+            "--relay-token-stdin",
+        ]) {
+            CloudCmd::Connect { target, .. } => {
+                assert!(target.token_stdin);
+                assert!(target.relay_token_stdin);
+                let wire =
+                    target.target_with_stdin(|| "  LTAI_AK:secret123 \n  static-tok \n".into());
+                assert_eq!(wire.token.as_deref(), Some("LTAI_AK:secret123"));
+                assert_eq!(wire.relay_token.as_deref(), Some("static-tok"));
+                assert!(!format!("{wire:?}").contains("secret123"));
+                assert!(!format!("{wire:?}").contains("static-tok"));
+
+                let empty_line2 = target.target_with_stdin(|| "LTAI_AK:secret123\n   \n".into());
+                assert_eq!(empty_line2.token.as_deref(), Some("LTAI_AK:secret123"));
+                assert_eq!(empty_line2.relay_token.as_deref(), Some(""));
+
+                let missing_line2 = target.target_with_stdin(|| "LTAI_AK:secret123\n".into());
+                assert_eq!(missing_line2.token.as_deref(), Some("LTAI_AK:secret123"));
+                assert_eq!(missing_line2.relay_token.as_deref(), Some(""));
+
+                let empty_line1 = target.target_with_stdin(|| "  \nstatic-tok\n".into());
+                assert_eq!(empty_line1.token.as_deref(), Some(""));
+                assert_eq!(empty_line1.relay_token.as_deref(), Some("static-tok"));
+            }
+            other => panic!("{other:?}"),
+        }
 
         // connect_lines / limits_line / provider_json show relay mode & URL without tokens.
         let p = cua_sdk::CloudProvider {

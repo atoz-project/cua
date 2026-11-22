@@ -62,13 +62,15 @@ pub fn target_of(c: &Connection) -> Target {
     }
 }
 
-/// Resolved effective machine sizing (vCPUs, RAM, total hourly price including
-/// disk) returned by [`CloudApi::resolve_machine_sizing`] before `--max-size`
-/// and `--budget` preflight checks.
+/// Resolved effective machine sizing (vCPUs, RAM, effective disk GiB, total
+/// hourly price including disk) returned by [`CloudApi::resolve_machine_sizing`]
+/// before `--max-size` and `--budget` preflight checks.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ResolvedSizing {
+    pub machine_type: Option<String>,
     pub vcpus: u32,
     pub memory_mb: u64,
+    pub disk_gb: Option<u32>,
     pub usd_per_hour: f64,
 }
 
@@ -164,6 +166,11 @@ pub trait CloudApi: Send + Sync + 'static {
     /// Default boot disk size in GiB for `family`.
     fn default_disk_gb(&self, family: &str) -> u32 {
         crate::provider::disk_for(family)
+    }
+
+    /// Estimated hourly USD cost per GiB of boot disk storage.
+    fn disk_usd_per_gb_hour(&self) -> f64 {
+        0.0
     }
 
     /// Effective `(vcpus, memory_mb)` checked against `--max-size` when

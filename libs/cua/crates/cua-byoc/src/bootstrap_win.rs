@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! First-boot `#ps1_sysnative` `UserData` generator for Windows Direct VM
+//! First-boot PowerShell `UserData` generator for Windows Direct VM
 //! Sandboxes (`--runtime native` on `aliyun-ecs`).
 //!
-//! Runs under 64-bit PowerShell via `cloudbase-init` (`#ps1_sysnative`) and:
+//! Runs under 64-bit PowerShell via `vminit` (`[powershell]`, official
+//! Alibaba Cloud Windows images) or `cloudbase-init` (`#ps1_sysnative`,
+//! custom Windows 10/11 images), with a WOW64 -> `Sysnative` 64-bit
+//! self-relaunch guard, and:
 //! 1. Stages relay/environment credentials into an SID-ACL-restricted
 //!    directory (`SYSTEM`, `Administrators`, desktop user only) and removes
 //!    temporary staging artifacts.
@@ -37,6 +40,15 @@ pub const DEFAULT_WINDOWS_SPACESD_URL: &str = "https://github.com/trycua/cua/rel
 
 /// Maximum raw `UserData` length accepted by Alibaba Cloud ECS (16 KiB).
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
+
+/// Line-1 header required by `cloudbase-init` (custom Windows 10/11 images).
+pub const CLOUDBASE_HEADER: &str = "#ps1_sysnative";
+
+/// Line-1 header required by Alibaba Cloud `vminit` (`Plugin_Main_CloudinitUserData`).
+pub const ALIYUN_VMINIT_HEADER: &str = "[powershell]";
+
+/// Compact 64-bit WOW64 -> `Sysnative` self-relaunch guard for `vminit`.
+const WOW64_SYSNATIVE_GUARD: &str = r#"if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and $PSCommandPath) { & "$env:SystemRoot\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $PSCommandPath; exit $LASTEXITCODE }"#;
 
 /// Maximum `/t` seconds accepted by `shutdown.exe` (10 years).
 const MAX_SHUTDOWN_TIMEOUT_SECS: u64 = 315_360_000;
@@ -142,6 +154,14 @@ fn ps_single_quote(s: &str) -> String {
 /// SID-ACL-protected files (`SYSTEM`, `Administrators`, `desktop_user`),
 /// never echoed to stdout/logs.
 pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
+    windows_user_data_with_header(boot, CLOUDBASE_HEADER)
+}
+
+/// Builds the compact PowerShell `UserData` script with an explicit line-1 header
+/// (`ALIYUN_VMINIT_HEADER` = `[powershell]` for Alibaba Cloud `vminit`, or
+/// `CLOUDBASE_HEADER` = `#ps1_sysnative` for `cloudbase-init`) and a 64-bit
+/// WOW64 -> `Sysnative` self-relaunch guard.
+pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> String {
     let (dl_url, expected_sha) = split_download_url(boot.spacesd_download_url);
     let desktop_user = if boot.desktop_user.trim().is_empty() {
         "Administrator"
@@ -192,8 +212,10 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
         None
     };
 
-    let mut s = String::from(
-        "#ps1_sysnative\n\
+    let hdr = header.trim();
+    let mut s = format!(
+        "{hdr}\n\
+         {WOW64_SYSNATIVE_GUARD}\n\
          $ErrorActionPreference = 'Stop'\n\
          $ProgressPreference = 'SilentlyContinue'\n",
     );
@@ -215,7 +237,8 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20 Write-Output $ln\n\
          }}\n\
          function Dec([string]$b) {{ [Convert]::FromBase64String($b) }}\n\
-         function Put([string]$p,[string]$b) {{ [IO.File]::WriteAllBytes($p,(Dec $b)) }}\n",
+         function Put([string]$p,[string]$b) {{ [IO.File]::WriteAllBytes($p,(Dec $b)) }}\n\
+         function Fetch([string]$u,[string]$o) {{ for ($i=1; $i -le 5; $i++) {{ try {{ Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $o; return }} catch {{ if ($i -eq 5) {{ throw }}; Start-Sleep -Seconds ($i*5) }} }} }}\n",
         prov = ps_single_quote(boot.provider),
         user = ps_single_quote(desktop_user),
     ));
@@ -281,10 +304,10 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20   Log ('downloading cua-spacesd.exe from ' + {dl_url_redacted})\n\
          \x20   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12\n\
          \x20   $dlTmp = Join-Path $stg 'cua-spacesd.exe'\n\
-         \x20   Invoke-WebRequest -UseBasicParsing -Uri $dlUrl -OutFile $dlTmp\n\
+         \x20   Fetch $dlUrl $dlTmp\n\
          \x20   if (-not $wantSha) {{\n\
          \x20     $sumTmp = Join-Path $stg 'cua-spacesd.exe.sha256'\n\
-         \x20     Invoke-WebRequest -UseBasicParsing -Uri \"$dlUrl.sha256\" -OutFile $sumTmp\n\
+         \x20     Fetch \"$dlUrl.sha256\" $sumTmp\n\
          \x20     $wantSha = (((Get-Content -Raw -LiteralPath $sumTmp).Trim() -split '\\s+')[0]).ToLowerInvariant()\n\
          \x20   }}\n\
          \x20   if ($wantSha -notmatch '^[0-9a-f]{{64}}$') {{ throw 'invalid sha256 checksum format' }}\n\
@@ -317,10 +340,10 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
          \x20 Set-ItemProperty -Path $wl -Name 'DefaultPassword' -Value ([Text.Encoding]::UTF8.GetString((Dec {pw}))) -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'ForceAutoLogon' -Value '1' -Type String\n\
          \x20 $sp = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'\n\
-         \x20 New-Item -Path $sp -Force | Out-Null\n\
+         \x20 if (-not (Test-Path -LiteralPath $sp)) {{ New-Item -Path $sp -Force | Out-Null }}\n\
          \x20 Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord\n\
          \x20 $pp = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization'\n\
-         \x20 New-Item -Path $pp -Force | Out-Null\n\
+         \x20 if (-not (Test-Path -LiteralPath $pp)) {{ New-Item -Path $pp -Force | Out-Null }}\n\
          \x20 Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord\n\
          \x20 Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name 'ScreenSaveActive' -Value '0' -Type String -ErrorAction SilentlyContinue\n\
          \x20 & reg.exe add 'HKU\\.DEFAULT\\Control Panel\\Desktop' /v ScreenSaveActive /t REG_SZ /d 0 /f | Out-Null\n\
@@ -387,9 +410,9 @@ pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
 
     s.push_str(
         "} finally {\n\
-         \x20 Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue\n\
-         \x20 Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue\n\
-         \x20 Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue\n\
+         \x20 if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }\n\
+         \x20 if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }\n\
+         \x20 if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }\n\
          }\n",
     );
 
@@ -762,5 +785,166 @@ mod tests {
         let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
         assert!(!launcher.contains('\u{2019}'), "{launcher}");
         assert!(!launcher.contains("Invoke-Expression"), "{launcher}");
+        assert!(ps.contains("function Fetch("), "{ps}");
+        assert!(ps.contains("Fetch $dlUrl $dlTmp"), "{ps}");
+    }
+
+    #[test]
+    fn aliyun_vminit_header_and_wow64_guard_contract() {
+        let j = static_join();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_vminit".to_string(),
+        )]);
+        let pw = "WinPass!1234Abcd";
+        let ps = windows_user_data_with_header(
+            &WindowsVmBoot {
+                join: &j,
+                env: &env,
+                expires: 1_900_000_000,
+                ttl_secs: 8 * 3600,
+                provider: "aliyun-ecs",
+                spacesd_download_url: None,
+                desktop_user: "Administrator",
+                desktop_password: pw,
+            },
+            ALIYUN_VMINIT_HEADER,
+        );
+        let mut lines = ps.lines();
+        assert_eq!(
+            lines.next(),
+            Some("[powershell]"),
+            "line 1 must be exact [powershell] with no spaces"
+        );
+        let guard_line = lines.next().unwrap();
+        assert!(guard_line.contains("Is64BitOperatingSystem"));
+        assert!(guard_line.contains("Is64BitProcess"));
+        assert!(guard_line.contains(r"Sysnative\WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(guard_line.contains("$PSCommandPath"));
+        assert!(
+            ps.len() < MAX_USER_DATA_BYTES,
+            "raw UserData {} >= 16 KiB",
+            ps.len()
+        );
+    }
+
+    #[test]
+    fn registry_policy_keys_guard_new_item_with_test_path() {
+        let j = static_join();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_reg".to_string(),
+        )]);
+        let pw = "WinPass!1234Abcd";
+        let boot = WindowsVmBoot {
+            join: &j,
+            env: &env,
+            expires: 1_900_000_000,
+            ttl_secs: 8 * 3600,
+            provider: "aliyun-ecs",
+            spacesd_download_url: None,
+            desktop_user: "Administrator",
+            desktop_password: pw,
+        };
+        for ps in [
+            windows_user_data(&boot),
+            windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
+        ] {
+            assert!(
+                ps.len() < MAX_USER_DATA_BYTES,
+                "raw UserData {} >= 16 KiB",
+                ps.len()
+            );
+            assert!(
+                ps.contains("if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }"),
+                "missing Test-Path guard on $sp: {ps}"
+            );
+            assert!(
+                ps.contains("if (-not (Test-Path -LiteralPath $pp)) { New-Item -Path $pp -Force | Out-Null }"),
+                "missing Test-Path guard on $pp: {ps}"
+            );
+            for line in ps.lines() {
+                let trimmed = line.trim_start();
+                assert!(
+                    !trimmed.starts_with("New-Item -Path $sp")
+                        && !trimmed.starts_with("New-Item -Path $pp"),
+                    "unguarded New-Item on registry key: {line}"
+                );
+            }
+            assert!(ps.contains(
+                "Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord"
+            ));
+            assert!(
+                ps.contains("Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord")
+            );
+        }
+    }
+
+    #[test]
+    fn finally_cleanup_guards_nullable_temp_paths_against_null_binding() {
+        let j = static_join();
+        let env = BTreeMap::from([(
+            "CUA_ENV_TOKEN".to_string(),
+            "env_secret_static_finally".to_string(),
+        )]);
+        let pw = "WinPass!1234Abcd";
+        let pinned_mirror = format!(
+            "https://mirror.example.com/cua-spacesd.exe#sha256={}",
+            "ab".repeat(32)
+        );
+        for spacesd_download_url in [None, Some(pinned_mirror.as_str())] {
+            let boot = WindowsVmBoot {
+                join: &j,
+                env: &env,
+                expires: 1_900_000_000,
+                ttl_secs: 8 * 3600,
+                provider: "aliyun-ecs",
+                spacesd_download_url,
+                desktop_user: "Administrator",
+                desktop_password: pw,
+            };
+            for ps in [
+                windows_user_data(&boot),
+                windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
+            ] {
+                assert!(
+                    ps.len() < MAX_USER_DATA_BYTES,
+                    "raw UserData {} >= 16 KiB",
+                    ps.len()
+                );
+                let finally_idx = ps.find("} finally {").expect("missing finally block");
+                let finally_block = &ps[finally_idx..];
+                for (var, expected) in [
+                    (
+                        "$dlTmp",
+                        "if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }",
+                    ),
+                    (
+                        "$sumTmp",
+                        "if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }",
+                    ),
+                    (
+                        "$stg",
+                        "if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }",
+                    ),
+                ] {
+                    assert!(
+                        finally_block.contains(expected),
+                        "missing null-guard for {var} in finally block (url={spacesd_download_url:?}):\n{finally_block}"
+                    );
+                }
+                for line in ps.lines() {
+                    for stmt in line.split(';') {
+                        let trimmed = stmt.trim_start();
+                        assert!(
+                            !trimmed.starts_with("Remove-Item -LiteralPath $dlTmp")
+                                && !trimmed.starts_with("Remove-Item -LiteralPath $sumTmp")
+                                && !trimmed.starts_with("Remove-Item -LiteralPath $stg"),
+                            "unguarded Remove-Item -LiteralPath at statement start: {line}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

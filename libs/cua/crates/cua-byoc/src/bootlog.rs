@@ -19,13 +19,15 @@ pub const KEEP_LINES: usize = 200;
 /// Lines quoted in the error.
 pub const SHOW_LINES: usize = 10;
 
-/// Words that make a line secret: the relay token (`cmt_...`), any token,
-/// secret, password, key or credential, and the guest environment file. The
-/// guest's own log filter (`bootstrap`) hides `token` and `cmt_`; this adds
-/// the rest, because a console log also carries the kernel and cloud-init.
+/// Words that make a line secret: the relay token (`cmt_...`), env tokens
+/// (`env_...`), any token, secret, password, key or credential, and the guest
+/// environment file. The guest's own log filter (`bootstrap`) hides `token`
+/// and `cmt_`; this adds the rest, because a console log also carries the
+/// kernel and cloud-init.
 const SECRET_WORDS: &[&str] = &[
     "token",
     "cmt_",
+    "env_",
     "secret",
     "password",
     "passwd",
@@ -331,6 +333,7 @@ mod tests {
             raw.push_str(&format!("\u{1b}[0;32mline {i}\u{1b}[0m\r\n"));
         }
         raw.push_str("relay token cmt_abcdef0123 joined\n");
+        raw.push_str("env_abcdef0123\n");
         raw.push_str("Authorization: Bearer abc\n");
         raw.push_str("value hunter2hunter2 leaked\n");
         raw.push_str("downloading https://u:p@mirror.example.com/cua.exe\n");
@@ -340,6 +343,7 @@ mod tests {
         assert_eq!(out.len(), KEEP_LINES);
         assert_eq!(out.last().unwrap(), "last ok line");
         assert!(out.iter().all(|l| !l.contains("cmt_")
+            && !l.contains("env_")
             && !l.contains("Bearer")
             && !l.contains("hunter2")
             && !l.contains("u:p@")

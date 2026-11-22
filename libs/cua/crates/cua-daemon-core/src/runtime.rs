@@ -157,6 +157,8 @@ pub struct CreateRequest {
     pub cloud_image_id: Option<String>,
     /// Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
     pub instance_type: Option<String>,
+    /// Lifetime backstop (`cua sb create --ttl`). `None` uses the provider default.
+    pub ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for CreateRequest {
@@ -199,6 +201,7 @@ impl std::fmt::Debug for CreateRequest {
             .field("disk_gb", &self.disk_gb)
             .field("cloud_image_id", &self.cloud_image_id)
             .field("instance_type", &self.instance_type)
+            .field("ttl", &self.ttl)
             .finish()
     }
 }
@@ -2044,6 +2047,7 @@ pub(crate) fn options_from(
         "instance_type",
         req.instance_type.as_deref(),
     )?;
+    o.ttl = req.ttl;
     o.kind = kind;
     o.runtime = runtime;
     o.apply_profile(profile, cpus_given, memory_given);

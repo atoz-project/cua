@@ -522,6 +522,7 @@ pub async fn start(runtime: Runtime, config: ServerConfig) -> Result<DaemonHandl
             "env".into(),
             "sandboxes".into(),
             cua_daemon_core::FEATURE_CLOUD_IMAGE_AND_SIZING.into(),
+            cua_daemon_core::FEATURE_SANDBOX_TTL.into(),
         ];
         if cfg!(feature = "spaces") {
             f.extend(["spaces".into(), "mcp".into()]);

@@ -5,7 +5,7 @@ description: Create, keep, reconnect to, list, suspend and delete sandboxes, run
 
 Sandboxes run on this machine by default, so the examples pass no location.
 To use [your own cloud](/cua-sdk/guides/your-cloud), pass
-`on="aws"` (or `"gcp"`, `"modal"`) to `Sandbox.create`.
+`on="aws"` (or `"gcp"`, `"azure"`, `"hetzner"`, `"modal"`, `"aliyun-ecs"`) to `Sandbox.create`.
 
 ## Ephemeral or kept
 
@@ -42,7 +42,7 @@ info.provider_details          # backend internals (for example the local runtim
 | `ready` | Running and every probe passed |
 | `stopped` | Exited, suspended or released |
 
-Refs are `local:<name>`, `aws:<name>` (also `gcp:` and `modal:`) or `direct:<host:port>`. A bare name
+Refs are `local:<name>`, `aws:<name>` (also `gcp:`, `azure:`, `hetzner:`, `modal:` and `aliyun-ecs:`) or `direct:<host:port>`. A bare name
 works when it is unique; otherwise the call raises `AmbiguousSandbox`.
 
 ## Reconnect, list, delete

@@ -54,6 +54,14 @@ pub struct FakeAliyun {
     pub security_group_rules: BTreeMap<String, Vec<Value>>,
     /// Instance type specs (`DescribeInstanceTypes`: `type_id -> (vcpu, mem_gib)`).
     pub instance_types: BTreeMap<String, (u32, f64)>,
+    /// Optional per-instance-type extra fields (`CpuArchitecture`, `GPUAmount`, etc.) for `DescribeInstanceTypes`.
+    pub instance_type_details: BTreeMap<String, Value>,
+    /// Optional page size for `DescribeInstanceTypes` `NextToken` pagination in tests.
+    pub instance_types_page_size: Option<usize>,
+    /// When true, `DescribeInstanceTypes` ignores `InstanceTypes.*` filters (simulating server filter mismatch).
+    pub ignore_instance_types_filter: bool,
+    /// Optional custom `AvailableZone` payload for `DescribeAvailableResource`.
+    pub available_zones_override: Option<Vec<Value>>,
     /// Catalog of ECS images (`DescribeImages`).
     pub images: Vec<Value>,
     /// Existing instances keyed by `InstanceId`.
@@ -66,12 +74,12 @@ pub struct FakeAliyun {
     pub throttle: u32,
     /// Number of upcoming `DeleteSecurityGroup`/`DeleteVSwitch`/`DeleteVpc` calls to reject with `DependencyViolation`.
     pub transient_dependency_errors: u32,
+    /// Optional error code for `transient_dependency_errors` (defaults to `"DependencyViolation"`).
+    pub transient_dependency_code: Option<String>,
     /// Actions (e.g. `"ecs:RunInstances"`, `"vpc:DescribeVpcs"`) that fail with HTTP 403 `Forbidden.RAM`.
     pub forbidden_actions: BTreeSet<String>,
     /// Simulate VPC-only region returning `InvalidVSwitchId.NotFound` on `DryRun=true` when `VSwitchId` is omitted.
     pub run_instances_missing_vswitch: bool,
-    /// Simulate `CreateSecurityGroup DryRun=true` returning `InvalidVpcId.NotFound` when `VpcId` is omitted.
-    pub create_sg_missing_vpc: bool,
     /// Optional forced error `(http_status, code, message)` for `RunInstances DryRun=true`.
     pub run_instances_dry_run_error: Option<(u16, String, String)>,
     /// Optional forced error `(http_status, code, message)` for non-DryRun `RunInstances`.
@@ -111,6 +119,10 @@ impl Default for FakeAliyun {
                 ("ecs.g7.large".into(), (2, 8.0)),
                 ("ecs.g7.4xlarge".into(), (16, 64.0)),
             ]),
+            instance_type_details: BTreeMap::new(),
+            instance_types_page_size: None,
+            ignore_instance_types_filter: false,
+            available_zones_override: None,
             images: vec![
                 json!({
                     "ImageId": "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
@@ -166,9 +178,9 @@ impl Default for FakeAliyun {
             calls: Vec::new(),
             throttle: 0,
             transient_dependency_errors: 0,
+            transient_dependency_code: None,
             forbidden_actions: BTreeSet::new(),
             run_instances_missing_vswitch: false,
-            create_sg_missing_vpc: false,
             run_instances_dry_run_error: None,
             run_instances_error: None,
             force_auth_error: None,
@@ -659,45 +671,54 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeAvailableResource") => {
-                let region = params
-                    .get("RegionId")
-                    .cloned()
-                    .unwrap_or_else(|| "cn-hangzhou".into());
-                let zone_ids = if f.zones.is_empty() {
-                    vec![format!("{region}-h")]
+                let azs: Vec<Value> = if let Some(ref custom) = f.available_zones_override {
+                    let zone_filter = params.get("ZoneId").map(String::as_str);
+                    custom
+                        .iter()
+                        .filter(|z| zone_filter.is_none_or(|zf| z["ZoneId"].as_str() == Some(zf)))
+                        .cloned()
+                        .collect()
                 } else {
-                    f.zones.clone()
+                    let region = params
+                        .get("RegionId")
+                        .cloned()
+                        .unwrap_or_else(|| "cn-hangzhou".into());
+                    let zone_ids = if f.zones.is_empty() {
+                        vec![format!("{region}-h")]
+                    } else {
+                        f.zones.clone()
+                    };
+                    let supported: Vec<Value> = f
+                        .available_instance_types
+                        .iter()
+                        .map(|t| {
+                            json!({
+                                "Value": t,
+                                "Status": "Available",
+                                "StatusCategory": "WithStock"
+                            })
+                        })
+                        .collect();
+                    zone_ids
+                        .into_iter()
+                        .filter(|zid| !f.sold_out_zones.contains_key(zid))
+                        .map(|zid| {
+                            json!({
+                                "RegionId": region,
+                                "ZoneId": zid,
+                                "Status": "Available",
+                                "AvailableResources": {
+                                    "AvailableResource": [{
+                                        "Type": "InstanceType",
+                                        "SupportedResources": {
+                                            "SupportedResource": supported
+                                        }
+                                    }]
+                                }
+                            })
+                        })
+                        .collect()
                 };
-                let supported: Vec<Value> = f
-                    .available_instance_types
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "Value": t,
-                            "Status": "Available",
-                            "StatusCategory": "WithStock"
-                        })
-                    })
-                    .collect();
-                let azs: Vec<Value> = zone_ids
-                    .into_iter()
-                    .filter(|zid| !f.sold_out_zones.contains_key(zid))
-                    .map(|zid| {
-                        json!({
-                            "RegionId": region,
-                            "ZoneId": zid,
-                            "Status": "Available",
-                            "AvailableResources": {
-                                "AvailableResource": [{
-                                    "Type": "InstanceType",
-                                    "SupportedResources": {
-                                        "SupportedResource": supported
-                                    }
-                                }]
-                            }
-                        })
-                    })
-                    .collect();
                 (
                     StatusCode::OK,
                     axum::Json(json!({
@@ -771,9 +792,18 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "DescribeInstanceTypes") => {
-                let requested: Option<Vec<String>> = params
-                    .get("InstanceTypes")
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+                let repeat_list: Vec<String> = (1..=10)
+                    .filter_map(|i| params.get(&format!("InstanceTypes.{i}")).cloned())
+                    .collect();
+                let requested: Option<Vec<String>> = if f.ignore_instance_types_filter {
+                    None
+                } else if !repeat_list.is_empty() {
+                    Some(repeat_list)
+                } else {
+                    params
+                        .get("InstanceTypes")
+                        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                };
                 let items: Vec<Value> = f
                     .instance_types
                     .iter()
@@ -783,17 +813,49 @@ pub async fn handle(
                             .is_none_or(|reqs| reqs.iter().any(|r| r == *id))
                     })
                     .map(|(id, (vcpu, mem_gib))| {
-                        json!({
+                        let mut item = json!({
                             "InstanceTypeId": id,
                             "CpuCoreCount": vcpu,
                             "MemorySize": mem_gib
-                        })
+                        });
+                        if let Some(extra) =
+                            f.instance_type_details.get(id).and_then(|v| v.as_object())
+                            && let Some(obj) = item.as_object_mut()
+                        {
+                            for (k, val) in extra {
+                                obj.insert(k.clone(), val.clone());
+                            }
+                        }
+                        item
                     })
                     .collect();
+                let offset = params
+                    .get("NextToken")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let (page_items, next_token) = if let Some(ps) = f.instance_types_page_size
+                    && ps > 0
+                {
+                    let end = offset.saturating_add(ps).min(items.len());
+                    let slice = if offset < items.len() {
+                        items[offset..end].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let next = if end < items.len() {
+                        end.to_string()
+                    } else {
+                        String::new()
+                    };
+                    (slice, next)
+                } else {
+                    (items, String::new())
+                };
                 (
                     StatusCode::OK,
                     axum::Json(json!({
-                        "InstanceTypes": { "InstanceType": items },
+                        "InstanceTypes": { "InstanceType": page_items },
+                        "NextToken": next_token,
                         "RequestId": "req-inst-types-1"
                     })),
                 )
@@ -839,52 +901,38 @@ pub async fn handle(
                     .into_response()
             }
             ("2014-05-26", "CreateSecurityGroup") => {
-                if params.get("DryRun").map(String::as_str) == Some("true") {
-                    if f.create_sg_missing_vpc && !params.contains_key("VpcId") {
-                        err(
-                            StatusCode::BAD_REQUEST,
-                            "InvalidVpcId.NotFound",
-                            "The specified VpcId does not exist.",
-                        )
-                    } else {
-                        err(
-                            StatusCode::PRECONDITION_FAILED,
-                            "DryRunOperation",
-                            "Request validation has been passed with DryRun flag set.",
-                        )
-                    }
+                // Real Alibaba Cloud ECS `CreateSecurityGroup` does NOT support `DryRun=true`:
+                // it ignores `DryRun` and creates the security group returning HTTP 200 OK.
+                let sg_id = format!("sg-fake-{}", f.next_id);
+                f.next_id += 1;
+                let sg_type = params
+                    .get("SecurityGroupType")
+                    .cloned()
+                    .unwrap_or_else(|| "normal".into());
+                let inner = if sg_type == "enterprise" {
+                    "Drop"
                 } else {
-                    let sg_id = format!("sg-fake-{}", f.next_id);
-                    f.next_id += 1;
-                    let sg_type = params
-                        .get("SecurityGroupType")
-                        .cloned()
-                        .unwrap_or_else(|| "normal".into());
-                    let inner = if sg_type == "enterprise" {
-                        "Drop"
-                    } else {
-                        "Accept"
-                    };
-                    let tags = parse_tag_params(&params, true);
-                    f.security_groups.push(json!({
+                    "Accept"
+                };
+                let tags = parse_tag_params(&params, true);
+                f.security_groups.push(json!({
+                    "SecurityGroupId": sg_id,
+                    "SecurityGroupName": params.get("SecurityGroupName").cloned().unwrap_or_default(),
+                    "VpcId": params.get("VpcId").cloned().unwrap_or_default(),
+                    "RegionId": params.get("RegionId").cloned().unwrap_or_else(|| "cn-hangzhou".into()),
+                    "SecurityGroupType": sg_type,
+                    "InnerAccessPolicy": inner,
+                    "Tags": { "Tag": tags }
+                }));
+                f.security_group_rules.insert(sg_id.clone(), Vec::new());
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
                         "SecurityGroupId": sg_id,
-                        "SecurityGroupName": params.get("SecurityGroupName").cloned().unwrap_or_default(),
-                        "VpcId": params.get("VpcId").cloned().unwrap_or_default(),
-                        "RegionId": params.get("RegionId").cloned().unwrap_or_else(|| "cn-hangzhou".into()),
-                        "SecurityGroupType": sg_type,
-                        "InnerAccessPolicy": inner,
-                        "Tags": { "Tag": tags }
-                    }));
-                    f.security_group_rules.insert(sg_id.clone(), Vec::new());
-                    (
-                        StatusCode::OK,
-                        axum::Json(json!({
-                            "SecurityGroupId": sg_id,
-                            "RequestId": "req-csg-1"
-                        })),
-                    )
-                        .into_response()
-                }
+                        "RequestId": "req-csg-1"
+                    })),
+                )
+                    .into_response()
             }
             ("2014-05-26", "DescribeSecurityGroups") => {
                 let vpc_filter = params.get("VpcId").cloned();
@@ -1126,45 +1174,54 @@ pub async fn handle(
                     .into_response()
             }
             ("2016-04-28", "DeleteVpc") => {
-                let vpc_id = params.get("VpcId").cloned().unwrap_or_default();
-                let has_children = f
-                    .vswitches
-                    .iter()
-                    .any(|v| v["VpcId"].as_str() == Some(&vpc_id))
-                    || f.security_groups
-                        .iter()
-                        .any(|sg| sg["VpcId"].as_str() == Some(&vpc_id));
-                if has_children {
+                if f.transient_dependency_errors > 0 {
+                    f.transient_dependency_errors -= 1;
                     err(
                         StatusCode::BAD_REQUEST,
                         "DependencyViolation",
-                        "VPC has dependent VSwitches or SecurityGroups.",
+                        "VPC has dependent resources.",
                     )
-                } else if let Some(pos) = f
-                    .vpcs
-                    .iter()
-                    .position(|v| v["VpcId"].as_str() == Some(&vpc_id))
-                {
-                    if f.vpcs[pos]["IsDefault"].as_bool().unwrap_or(false) {
+                } else {
+                    let vpc_id = params.get("VpcId").cloned().unwrap_or_default();
+                    let has_children = f
+                        .vswitches
+                        .iter()
+                        .any(|v| v["VpcId"].as_str() == Some(&vpc_id))
+                        || f.security_groups
+                            .iter()
+                            .any(|sg| sg["VpcId"].as_str() == Some(&vpc_id));
+                    if has_children {
                         err(
                             StatusCode::BAD_REQUEST,
-                            "Forbidden.DefaultVpc",
-                            "Cannot delete default VPC.",
+                            "DependencyViolation",
+                            "VPC has dependent VSwitches or SecurityGroups.",
                         )
+                    } else if let Some(pos) = f
+                        .vpcs
+                        .iter()
+                        .position(|v| v["VpcId"].as_str() == Some(&vpc_id))
+                    {
+                        if f.vpcs[pos]["IsDefault"].as_bool().unwrap_or(false) {
+                            err(
+                                StatusCode::BAD_REQUEST,
+                                "Forbidden.DefaultVpc",
+                                "Cannot delete default VPC.",
+                            )
+                        } else {
+                            f.vpcs.remove(pos);
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({ "RequestId": "req-dvpc-1" })),
+                            )
+                                .into_response()
+                        }
                     } else {
-                        f.vpcs.remove(pos);
-                        (
-                            StatusCode::OK,
-                            axum::Json(json!({ "RequestId": "req-dvpc-1" })),
+                        err(
+                            StatusCode::NOT_FOUND,
+                            "InvalidVpcId.NotFound",
+                            "VPC not found.",
                         )
-                            .into_response()
                     }
-                } else {
-                    err(
-                        StatusCode::NOT_FOUND,
-                        "InvalidVpcId.NotFound",
-                        "VPC not found.",
-                    )
                 }
             }
             ("2016-04-28", "CreateVSwitch") => {
@@ -1266,10 +1323,14 @@ pub async fn handle(
             ("2016-04-28", "DeleteVSwitch") => {
                 if f.transient_dependency_errors > 0 {
                     f.transient_dependency_errors -= 1;
+                    let code = f
+                        .transient_dependency_code
+                        .as_deref()
+                        .unwrap_or("DependencyViolation");
                     err(
                         StatusCode::BAD_REQUEST,
-                        "DependencyViolation",
-                        "VSwitch has active instances.",
+                        code,
+                        "VSwitch has active instances or deleting network interfaces.",
                     )
                 } else {
                     let vsw_id = params.get("VSwitchId").cloned().unwrap_or_default();
@@ -1336,6 +1397,28 @@ pub async fn handle(
                         "No capacity available in requested zone.",
                     )
                 } else {
+                    let img_id = params.get("ImageId").map(String::as_str).unwrap_or("");
+                    let is_windows_img = f.images.iter().any(|img| {
+                        img["ImageId"].as_str() == Some(img_id)
+                            && img["OSType"]
+                                .as_str()
+                                .is_some_and(|os| os.eq_ignore_ascii_case("windows"))
+                    });
+                    if is_windows_img && let Some(hn) = params.get("HostName") {
+                        let valid_win_hostname = (2..=15).contains(&hn.len())
+                            && !hn.contains('.')
+                            && !hn.starts_with('-')
+                            && !hn.ends_with('-')
+                            && hn.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                            && !hn.chars().all(|c| c.is_ascii_digit());
+                        if !valid_win_hostname {
+                            return err(
+                                StatusCode::BAD_REQUEST,
+                                "InvalidHostName.Malformed",
+                                "The specified parameter \"HostName\" is not valid.",
+                            );
+                        }
+                    }
                     let id = format!("i-fake-{}", f.next_id);
                     f.next_id += 1;
                     let region = params

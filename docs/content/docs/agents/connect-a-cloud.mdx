@@ -1,37 +1,44 @@
 ---
 title: Connect a cloud
-description: 'For an AI agent: connect your user''s own AWS, Google Cloud, Hetzner or Modal account to Cua Spaces with a region and a budget.'
+description: 'For an AI agent: connect your user''s own AWS, Google Cloud, Hetzner, Modal or Alibaba Cloud ECS account to Cua Spaces with a region and a budget.'
 ---
 
 Your user wants Cua Spaces to create machines in their own cloud account. Cua
 does not rent machines: the Spaces run in that account and cost what that cloud
 charges. Ask your user three things before you run anything: which cloud (AWS,
-Google Cloud, Hetzner or Modal), which region, and a monthly budget in dollars.
-If they already said them in the prompt, repeat them back and wait for a yes.
+Google Cloud, Hetzner, Modal or Alibaba Cloud ECS), which region, and a monthly
+budget in dollars. If they already said them in the prompt, repeat them back and
+wait for a yes.
 
 ## You run on your user's computer
 
 1. Check what you can reach without creating anything. Use the cloud's name for
-   `<cloud>`: `aws`, `gcp`, `hetzner` or `modal`.
+   `<cloud>`: `aws`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`.
 
    ```bash test="cli-shape" id="agent-cloud-test"
    cua cloud test aws --region us-west-2
    ```
 
 2. Connect it with the region, then set the budget. Cua stores only the profile,
-   region, project or environment names. Use `--profile` for a named AWS profile,
-   `--project` for Google Cloud and `--environment` for Modal.
+   region, project or environment names. Use `--profile` for a named AWS or
+   Alibaba Cloud profile, `--project` for Google Cloud and `--environment` for
+   Modal.
 
    ```bash test="cli-shape" id="agent-cloud-connect"
    cua cloud connect aws --region us-west-2
    cua cloud budget --monthly 200
    ```
 
-3. Hetzner has no sign-in. Ask your user to put the project's Read & Write API
-   token in `HCLOUD_TOKEN` in their own terminal and run the connect command there.
+3. Hetzner has no sign-in; ask your user to put its Read & Write token in
+   `HCLOUD_TOKEN` and run `cua cloud connect hetzner --region fsn1`. For
+   Alibaba Cloud ECS (`aliyun-ecs`), use an `AK`-mode profile in
+   `~/.aliyun/config.json` or `ALIBABA_CLOUD_ACCESS_KEY_ID` /
+   `ALIBABA_CLOUD_ACCESS_KEY_SECRET`, and pass `--relay-url` with
+   `--relay-mode static --relay-token-stdin` for a self-hosted relay.
 
    ```bash test="cli-shape" id="agent-cloud-hetzner"
    cua cloud connect hetzner --region fsn1
+   cua cloud connect aliyun-ecs --region cn-hangzhou
    ```
 
 ## You run in the cloud (hosted assistants)

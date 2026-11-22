@@ -600,8 +600,12 @@ pub struct ProvisionSpec {
     pub image: String,
     /// `container` or `vm` (what the Space is).
     pub kind: String,
-    /// The machine type Cua picked ([`crate::Provider::kinds`]).
+    /// The machine type Cua picked ([`crate::Provider::kinds`]), or empty
+    /// to let [`crate::CloudApi::resolve_machine_sizing`] pick an available default.
     pub machine_type: String,
+    /// Whether `machine_type` was explicitly requested by the user/connection
+    /// (`--instance-type`), disabling automatic availability fallback.
+    pub machine_type_explicit: bool,
     /// Boot disk in GiB.
     pub disk_gb: u32,
     /// VM tier: the cloud-init user data (runs the image with Docker and

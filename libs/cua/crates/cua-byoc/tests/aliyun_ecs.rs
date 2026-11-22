@@ -1195,20 +1195,31 @@ fn sb_create_opts(name: &str) -> CreateOptions {
 }
 
 #[tokio::test]
-async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
+async fn test_permissions_dry_runs_vpc_and_creates_zero_security_groups() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);
 
     let (api, s, _) = start(None).await;
     api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
 
-    // 1. Passing test sends Tag.1.Key=cua-managed on RunInstances, CreateVpc, CreateSecurityGroup DryRun=true.
+    // 1. Passing test sends Tag.1.Key=cua-managed on RunInstances and CreateVpc DryRun=true,
+    //    and NEVER calls CreateSecurityGroup (which ignores DryRun=true on real Alibaba Cloud).
     let t = api.test(&conn(&api)).await;
     assert!(t.ok(), "{:?}", t.checks);
     {
         let f = s.lock().unwrap();
-        assert!(f.vpcs.is_empty() && f.security_groups.is_empty() && f.instances.is_empty());
-        for action in ["RunInstances", "CreateVpc", "CreateSecurityGroup"] {
+        assert!(
+            f.vpcs.is_empty() && f.security_groups.is_empty() && f.instances.is_empty(),
+            "test must create zero resources: vpcs={:?} sgs={:?} inst={:?}",
+            f.vpcs,
+            f.security_groups,
+            f.instances
+        );
+        assert!(
+            !f.calls.iter().any(|c| c.action == "CreateSecurityGroup"),
+            "AliyunEcs::test() must never call CreateSecurityGroup (DryRun=true is ignored live)"
+        );
+        for action in ["RunInstances", "CreateVpc"] {
             let call = f
                 .calls
                 .iter()
@@ -1226,8 +1237,55 @@ async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
         }
     }
 
-    // 2. Forbidden.RAM on vpc:CreateVpc or ecs:CreateSecurityGroup fails permissions (never swallowed).
-    for perm_action in ["vpc:CreateVpc", "ecs:CreateSecurityGroup"] {
+    // 1b. Even when the account already has a pre-existing unrelated VPC/VSwitch, `test()`
+    //     creates ZERO security groups and leaves the existing VPC/VSwitch untouched.
+    {
+        let mut f = s.lock().unwrap();
+        f.calls.clear();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-unrelated",
+            "VpcName": "cua-relay-sg-vpc",
+            "CidrBlock": "10.0.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": [
+                { "TagKey": "role", "TagValue": "cua-relay" },
+                { "TagKey": "managed-by", "TagValue": "manual" }
+            ]}
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-unrelated",
+            "VSwitchName": "cua-relay-sg-vsw",
+            "VpcId": "vpc-unrelated",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.0.1.0/24",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": [] }
+        }));
+    }
+    let t_pre = api.test(&conn(&api)).await;
+    assert!(t_pre.ok(), "{:?}", t_pre.checks);
+    {
+        let f = s.lock().unwrap();
+        assert!(
+            f.security_groups.is_empty(),
+            "test() must create zero security groups even with pre-existing VPC: {:?}",
+            f.security_groups
+        );
+        assert!(
+            !f.calls.iter().any(|c| c.action == "CreateSecurityGroup"),
+            "CreateSecurityGroup must not be called when pre-existing VPC exists"
+        );
+    }
+
+    // 2. Forbidden.RAM on vpc:CreateVpc, ecs:DescribeSecurityGroups, or ecs:RunInstances fails permissions.
+    for perm_action in [
+        "vpc:CreateVpc",
+        "ecs:DescribeSecurityGroups",
+        "ecs:RunInstances",
+    ] {
         s.lock()
             .unwrap()
             .forbidden_actions
@@ -1241,11 +1299,6 @@ async fn test_permissions_dry_runs_vpc_and_sg_with_cua_managed_tag() {
         );
         s.lock().unwrap().forbidden_actions.clear();
     }
-
-    // 3. Account with zero VPCs returning InvalidVpcId.NotFound on CreateSecurityGroup DryRun=true passes.
-    s.lock().unwrap().create_sg_missing_vpc = true;
-    let t = api.test(&conn(&api)).await;
-    assert!(t.ok(), "{:?}", t.checks);
 }
 
 #[tokio::test]
@@ -1641,6 +1694,43 @@ async fn preflight_budget_max_size_and_unsupported_modes_refuse_before_cloud_cal
     assert!(
         s1.lock().unwrap().calls.is_empty(),
         "max-size refusal must happen before ANY cloud API call"
+    );
+
+    // 1b. --max-size 4x16 rejects explicit 8 vCPU / 32 GiB override BEFORE any cloud API call.
+    let home1b = tempfile::tempdir().unwrap();
+    let (api1b, s1b, _) = start(None).await;
+    let sb_max_4x16 = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home1b.path().join("sandboxes")),
+        home1b.path(),
+        vec![Arc::new(api1b)],
+        access.clone(),
+    )
+    .build();
+    sb_max_4x16
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("4x16".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s1b.lock().unwrap().calls.clear();
+
+    let mut opts_8x32 = sb_create_opts("too-big-4x16");
+    opts_8x32.cpus = 8;
+    opts_8x32.memory_mb = 32768;
+    let err_size_4x16 = sb_max_4x16.create(opts_8x32).await.unwrap_err();
+    assert!(
+        err_size_4x16
+            .to_string()
+            .contains("allows machines up to 4 vCPU"),
+        "{err_size_4x16}"
+    );
+    assert!(
+        s1b.lock().unwrap().calls.is_empty(),
+        "4x16 max-size refusal must happen before ANY cloud API call"
     );
 
     // 2. --budget 0.01 rejects 0.043/h machine BEFORE any cloud provisioning call.
@@ -2685,7 +2775,7 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     let sb = sandboxes.create(o).await.unwrap();
     assert_eq!(sb.placement(), (Kind::Vm, Runtime::Other("native".into())));
 
-    // Inspect RunInstances call parameters & decoded #ps1_sysnative UserData.
+    // Inspect RunInstances call parameters & decoded [powershell] UserData.
     let run_call = {
         let f = s.lock().unwrap();
         f.calls
@@ -2722,7 +2812,7 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     );
     assert_eq!(
         run_call.params.get("HttpTokens").map(String::as_str),
-        Some("required")
+        Some("optional")
     );
     assert!(run_call.params.contains_key("AutoReleaseTime"));
     let img_id = run_call.params.get("ImageId").unwrap();
@@ -2752,7 +2842,9 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     }
 
     let user_data = decode_b64_str(run_call.params.get("UserData").unwrap());
-    assert!(user_data.starts_with("#ps1_sysnative\n"));
+    assert!(user_data.starts_with("[powershell]\n"));
+    assert!(user_data.contains("Is64BitOperatingSystem"));
+    assert!(user_data.contains(r"Sysnative\WindowsPowerShell\v1.0\powershell.exe"));
     assert!(user_data.len() < 16 * 1024);
     assert!(!user_data.contains(ecs_pw));
     assert!(user_data.contains("*S-1-5-18:(OI)(CI)F"));
@@ -4226,6 +4318,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("40")
     );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("required")
+    );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
 
     let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
@@ -4249,7 +4345,13 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("60")
     );
-    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("optional")
+    );
+    let win_official_ud = decode_b64_str(r.params.get("UserData").unwrap());
+    assert!(win_official_ud.starts_with("[powershell]\n"));
+    assert!(win_official_ud.contains("Is64BitOperatingSystem"));
 
     // Phase 2: Connection defaults (--windows-image-id, --linux-image-id, --instance-type).
     sbx.clouds()
@@ -4307,6 +4409,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("60")
     );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("optional")
+    );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
 
     // Phase 3: Per-create overrides (--cloud-image-id, --instance-type, --disk) beat connection defaults.
@@ -4329,6 +4435,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     assert_eq!(
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("80")
+    );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("required")
     );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#cloud-config"));
 
@@ -4355,6 +4465,10 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     assert_eq!(
         r.params.get("SystemDisk.Size").map(String::as_str),
         Some("120")
+    );
+    assert_eq!(
+        r.params.get("HttpTokens").map(String::as_str),
+        Some("optional")
     );
     assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
 }
@@ -4638,7 +4752,8 @@ async fn aliyun_ecs_linux_direct_vm_account_relay_and_docker_default() {
     assert!(boot.contains("100.100.100.200/32"));
     assert!(ud.contains("cua-expire.timer"));
     assert!(decode_native_cloud_init_file(&ud, "/etc/systemd/system/cua-expire.timer").is_some());
-    assert!(boot.contains("CUA_ENV_NO_DESKTOP=1"));
+    assert!(boot.contains("CUA_ENV_NO_DESKTOP=true"));
+    assert!(boot.contains("libxkbcommon0"));
     assert!(boot.contains("cua-spacesd.service"));
     let envf = decode_native_cloud_init_file(&ud, "/etc/cua/spacesd.env").unwrap();
     assert!(envf.contains("APP_ENV=production\n"));
@@ -4963,4 +5078,1166 @@ async fn linux_native_supports_custom_linux_image_id_cloud_image_id_instance_typ
     assert!(ud2.starts_with("#cloud-config\n"));
     let boot2 = decode_native_cloud_init_file(&ud2, "/usr/local/sbin/cua-first-boot").unwrap();
     assert!(!boot2.contains("docker.io") && !boot2.contains("docker run"));
+}
+
+#[tokio::test]
+async fn create_options_ttl_zero_disables_connection_default_auto_release_time() {
+    use std::time::Duration;
+
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        RelayAccess::new(
+            relay.url.clone(),
+            Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+        ),
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            ttl_hours: Some(8),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Default CreateOptions.ttl (None) inherits conn.ttl_hours == 8 -> AutoReleaseTime set.
+    let _sb_default = sandboxes
+        .create(sb_create_opts("ttl-default"))
+        .await
+        .unwrap();
+    sandboxes.delete("ttl-default").await.unwrap();
+    let run_default = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        run_default.params.contains_key("AutoReleaseTime"),
+        "expected AutoReleaseTime when CreateOptions.ttl is None: {:?}",
+        run_default.params
+    );
+
+    // Explicit CreateOptions.ttl = Some(Duration::ZERO) disables AutoReleaseTime.
+    let mut o_zero = sb_create_opts("ttl-zero");
+    o_zero.ttl = Some(Duration::ZERO);
+    let _sb_zero = sandboxes.create(o_zero).await.unwrap();
+    sandboxes.delete("ttl-zero").await.unwrap();
+    let run_zero = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        !run_zero.params.contains_key("AutoReleaseTime"),
+        "expected no AutoReleaseTime when CreateOptions.ttl is Some(ZERO): {:?}",
+        run_zero.params
+    );
+}
+
+#[tokio::test]
+async fn delete_part_retries_more_than_four_transient_dependency_violations_and_short_circuits_non_cua_blocker()
+ {
+    use std::time::{Duration, Instant};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let api = api.with_poll(Duration::from_millis(10));
+    api.stage_secret(&target(Some("LTAI_TEST_AK:secret123")));
+    let c = conn(&api);
+    let owner = "owner1";
+    let tags = aliyun_net::part_tags(owner);
+
+    {
+        let mut f = s.lock().unwrap();
+        f.vpcs.push(json!({
+            "VpcId": "vpc-retry-1",
+            "VpcName": aliyun_net::vpc_name(owner),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-retry-1",
+            "VSwitchName": aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
+            "VpcId": "vpc-retry-1",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-retry-1",
+            "SecurityGroupName": aliyun_net::sg_name(owner),
+            "VpcId": "vpc-retry-1",
+            "RegionId": "cn-hangzhou",
+            "SecurityGroupType": "enterprise",
+            "InnerAccessPolicy": "Drop",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"TagKey": k, "TagValue": v})).collect::<Vec<_>>() }
+        }));
+    }
+
+    // 1. Each part tolerates 6 (> 4) transient DependencyViolation responses before succeeding.
+    for (rtype, rid, action) in [
+        ("security_group", "sg-retry-1", "DeleteSecurityGroup"),
+        ("vswitch", "vsw-retry-1", "DeleteVSwitch"),
+        ("vpc", "vpc-retry-1", "DeleteVpc"),
+    ] {
+        {
+            let mut f = s.lock().unwrap();
+            f.calls.clear();
+            f.transient_dependency_errors = 6;
+        }
+        let res = Resource {
+            provider: "aliyun-ecs".into(),
+            id: rid.into(),
+            resource_type: rtype.into(),
+            region: "cn-hangzhou".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        };
+        aliyun_net::delete_part(&api, &c, &res)
+            .await
+            .unwrap_or_else(|e| panic!("{rtype} must succeed after 6 transient retries: {e}"));
+        let del_count = s
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| call.action == action)
+            .count();
+        assert_eq!(
+            del_count, 7,
+            "{action} should be attempted 7 times (6 DependencyViolation + 1 success)"
+        );
+    }
+
+    // 2. Permanent non-Cua instance attached to Cua's SG/VSwitch/VPC short-circuits immediately
+    //    (even with a long poll interval) instead of burning 24 * poll_interval per part.
+    let slow_api = api.with_poll(Duration::from_secs(5));
+    {
+        let mut f = s.lock().unwrap();
+        f.calls.clear();
+        f.transient_dependency_errors = 0;
+        f.vpcs.push(json!({
+            "VpcId": "vpc-blocked-1",
+            "VpcName": aliyun_net::vpc_name(owner),
+            "CidrBlock": "10.77.0.0/16",
+            "RegionId": "cn-hangzhou",
+            "IsDefault": false,
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-blocked-1",
+            "VSwitchName": aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
+            "VpcId": "vpc-blocked-1",
+            "ZoneId": "cn-hangzhou-h",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.security_groups.push(json!({
+            "SecurityGroupId": "sg-blocked-1",
+            "SecurityGroupName": aliyun_net::sg_name(owner),
+            "VpcId": "vpc-blocked-1",
+            "RegionId": "cn-hangzhou",
+            "SecurityGroupType": "enterprise",
+            "InnerAccessPolicy": "Drop",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"TagKey": k, "TagValue": v})).collect::<Vec<_>>() }
+        }));
+        f.instances.insert(
+            "i-foreign-blocker".into(),
+            json!({
+                "InstanceId": "i-foreign-blocker",
+                "InstanceName": "foreign-box",
+                "RegionId": "cn-hangzhou",
+                "ZoneId": "cn-hangzhou-h",
+                "Status": "Running",
+                "VpcAttributes": {
+                    "VpcId": "vpc-blocked-1",
+                    "VSwitchId": "vsw-blocked-1"
+                },
+                "SecurityGroupIds": {
+                    "SecurityGroupId": ["sg-blocked-1"]
+                },
+                "Tags": { "Tag": [
+                    { "TagKey": "cua-managed", "TagValue": "true" },
+                    { "TagKey": "cua-owner", "TagValue": "other-owner" }
+                ]}
+            }),
+        );
+    }
+
+    let t0 = Instant::now();
+    for (rtype, rid, action) in [
+        ("security_group", "sg-blocked-1", "DeleteSecurityGroup"),
+        ("vswitch", "vsw-blocked-1", "DeleteVSwitch"),
+        ("vpc", "vpc-blocked-1", "DeleteVpc"),
+    ] {
+        let res = Resource {
+            provider: "aliyun-ecs".into(),
+            id: rid.into(),
+            resource_type: rtype.into(),
+            region: "cn-hangzhou".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        };
+        let err = aliyun_net::delete_part(&slow_api, &c, &res)
+            .await
+            .expect_err("permanently blocked part must return DependencyViolation error");
+        assert!(err.to_string().contains("DependencyViolation"), "{err}");
+        let attempts = s
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|call| call.action == action)
+            .count();
+        assert_eq!(
+            attempts, 1,
+            "{action} must short-circuit after 1 attempt when blocked by foreign instance"
+        );
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "permanent blocker checks took {:?}, expected immediate short-circuit",
+        t0.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn clamped_disk_gb_cannot_bypass_max_size_or_budget() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    // 1. --max-size 4x16x30 must reject --disk-gb 25 on Linux because aliyun-ecs clamps it to 40 GiB.
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("4x16x30".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.lock().unwrap().calls.clear();
+
+    let mut small_disk = sb_create_opts("clamp-max-size");
+    small_disk.disk_gb = Some(25);
+    let err = sandboxes.create(small_disk).await.unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("allows disks up to 30 GB")
+            && err.to_string().contains("needs 40 GB"),
+        "{err}"
+    );
+    assert!(
+        !s.lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|c| c.action == "RunInstances"),
+        "RunInstances must not be called when clamped disk exceeds --max-size"
+    );
+
+    // 2. --budget between 25 GiB cost ($0.0465/h) and clamped 40 GiB cost ($0.0486/h)
+    //    must reject --disk-gb 25 before RunInstances.
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: target(Some("LTAI_TEST_AK:secret123")),
+            max_size: Some("4x16x80".into()),
+            budget_usd_month: Some(0.047),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    s.lock().unwrap().calls.clear();
+
+    let mut under_priced = sb_create_opts("clamp-budget");
+    under_priced.disk_gb = Some(25);
+    let budget_err = sandboxes.create(under_priced).await.unwrap_err();
+    assert!(
+        matches!(budget_err, cua_sandbox_core::Error::Cloud(_)),
+        "{budget_err:?}"
+    );
+    assert!(
+        budget_err.to_string().contains("budget of $0.05")
+            || budget_err.to_string().contains("budget"),
+        "{budget_err}"
+    );
+    assert!(
+        !s.lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|c| c.action == "RunInstances"),
+        "RunInstances must not be called when clamped disk exceeds --budget"
+    );
+}
+
+#[tokio::test]
+async fn aliyun_ecs_windows_auto_falls_back_when_c7_xlarge_unavailable() {
+    use cua_sandbox_core::placement::Runtime;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        // Simulate ap-southeast-1 where ecs.c7.xlarge has 0 stock while ecs.e-c1m2.xlarge is available.
+        f.available_instance_types = vec!["ecs.e-c1m2.large".into(), "ecs.e-c1m2.xlarge".into()];
+        f.instance_types
+            .insert("ecs.e-c1m2.xlarge".into(), (4, 8.0));
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("ap-southeast-1".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut win_auto = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_auto.contrib = Some("aliyun-ecs".into());
+    win_auto.name = Some("win-auto-fallback".into());
+    win_auto.os = "windows".into();
+    win_auto.runtime = Runtime::Other("native".into());
+    win_auto.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_auto).await.unwrap();
+    assert_eq!(
+        sb.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.e-c1m2.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let run = f
+            .calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap();
+        assert_eq!(
+            run.params.get("InstanceType").map(String::as_str),
+            Some("ecs.e-c1m2.xlarge")
+        );
+    }
+    sb.delete().await.unwrap();
+
+    // Explicit --instance-type must never be silently overridden.
+    let mut win_explicit = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_explicit.contrib = Some("aliyun-ecs".into());
+    win_explicit.name = Some("win-explicit-c7".into());
+    win_explicit.os = "windows".into();
+    win_explicit.runtime = Runtime::Other("native".into());
+    win_explicit.instance_type = Some("ecs.c7.xlarge".into());
+    win_explicit.ready_timeout = std::time::Duration::from_secs(10);
+    let sb2 = sbx.create(win_explicit).await.unwrap();
+    assert_eq!(
+        sb2.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    sb2.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn aliyun_net_delete_part_retries_dependency_violation_network_interface_past_48s_budget() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    let api = api.with_poll(std::time::Duration::from_millis(5));
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+    let owner = "owner-eni-retry";
+    let tags = aliyun_net::part_tags(owner);
+
+    {
+        let mut f = s.lock().unwrap();
+        f.vswitches.push(json!({
+            "VSwitchId": "vsw-eni-retry",
+            "VSwitchName": aliyun_net::vswitch_name(owner, "ap-southeast-1a"),
+            "VpcId": "vpc-eni-retry",
+            "ZoneId": "ap-southeast-1a",
+            "CidrBlock": "10.77.0.0/20",
+            "RegionId": "cn-hangzhou",
+            "Status": "Available",
+            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
+        }));
+        f.transient_dependency_errors = 30;
+        f.transient_dependency_code = Some("DependencyViolation.NetworkInterface".into());
+    }
+
+    let res = Resource {
+        provider: "aliyun-ecs".into(),
+        id: "vsw-eni-retry".into(),
+        resource_type: "vswitch".into(),
+        region: "cn-hangzhou".into(),
+        tags,
+        ..Default::default()
+    };
+    aliyun_net::delete_part(&api, &c, &res)
+        .await
+        .expect("DeleteVSwitch must retry DependencyViolation.NetworkInterface past 24 attempts");
+    let del_count = s
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|call| call.action == "DeleteVSwitch")
+        .count();
+    assert_eq!(
+        del_count, 31,
+        "DeleteVSwitch should be attempted 31 times (30 DependencyViolation.NetworkInterface + 1 success)"
+    );
+}
+
+#[tokio::test]
+async fn windows_run_instances_enforces_netbios_hostname_15_char_limit_and_uniqueness() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+
+    let win_spec = |name: &str| ProvisionSpec {
+        name: name.into(),
+        family: "windows".into(),
+        image: "windows".into(),
+        kind: "vm".into(),
+        machine_type: "ecs.c7.xlarge".into(),
+        machine_type_explicit: true,
+        disk_gb: 60,
+        user_data: "#ps1_sysnative\nWrite-Output ok\n".into(),
+        tags: model::tags("owner-hn", "win-hn", "cloud-hn", 0),
+        ttl_secs: 3600,
+        arch: "amd64".into(),
+        runtime: "native".into(),
+        ..Default::default()
+    };
+
+    let assert_valid_netbios = |h: &str| {
+        assert!(
+            (2..=15).contains(&h.len()),
+            "Windows RunInstances HostName must be 2..=15 chars, got {h:?} ({})",
+            h.len()
+        );
+        assert!(
+            h.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+            "Windows HostName must be [A-Za-z0-9-], got {h:?}"
+        );
+        assert!(!h.contains('.'), "Windows HostName must omit '.': {h:?}");
+        assert!(
+            !h.starts_with('-') && !h.ends_with('-'),
+            "Windows HostName must not start/end with '-': {h:?}"
+        );
+        assert!(
+            !h.chars().all(|ch| ch.is_ascii_digit()),
+            "Windows HostName must not be all-digits: {h:?}"
+        );
+    };
+
+    api.provision(&c, &win_spec("cua-aliyun-ecs-aaaaaaaaaaaa"))
+        .await
+        .unwrap();
+    api.provision(&c, &win_spec("cua-aliyun-ecs-aaaaaaaaaaab"))
+        .await
+        .unwrap();
+    api.provision(&c, &win_spec("win.box.01")).await.unwrap();
+    api.provision(&c, &win_spec("123456789012345"))
+        .await
+        .unwrap();
+
+    let win_hostnames: Vec<String> = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .filter(|call| call.action == "RunInstances" && !call.params.contains_key("DryRun"))
+            .map(|call| call.params.get("HostName").cloned().unwrap_or_default())
+            .collect()
+    };
+    assert_eq!(win_hostnames.len(), 4);
+    for hn in &win_hostnames {
+        assert_valid_netbios(hn);
+    }
+    assert_ne!(
+        win_hostnames[0], win_hostnames[1],
+        "distinct cua-aliyun-ecs-<12-hex> names must produce distinct NetBIOS HostNames"
+    );
+    assert_eq!(win_hostnames[2], "win-box-01");
+
+    // Linux retains full sanitized hostnames up to 63 chars (including dots).
+    s.lock().unwrap().calls.clear();
+    let lin_spec = ProvisionSpec {
+        name: "cua-aliyun-ecs-aaaaaaaaaaaa".into(),
+        family: "linux".into(),
+        image: HERMETIC_LINUX_IMAGE.into(),
+        kind: "container".into(),
+        machine_type: "ecs.e-c1m2.large".into(),
+        machine_type_explicit: true,
+        disk_gb: 40,
+        user_data: "#cloud-config\n".into(),
+        tags: model::tags("owner-hn", "lin-hn", "cloud-hn-lin", 0),
+        ttl_secs: 3600,
+        arch: "amd64".into(),
+        runtime: "docker".into(),
+        ..Default::default()
+    };
+    api.provision(&c, &lin_spec).await.unwrap();
+    let mut lin_dots = lin_spec.clone();
+    lin_dots.name = "my.linux.host.01".into();
+    api.provision(&c, &lin_dots).await.unwrap();
+    let lin_hostnames: Vec<String> = {
+        let f = s.lock().unwrap();
+        f.calls
+            .iter()
+            .filter(|call| call.action == "RunInstances" && !call.params.contains_key("DryRun"))
+            .map(|call| call.params.get("HostName").cloned().unwrap_or_default())
+            .collect()
+    };
+    assert_eq!(
+        lin_hostnames,
+        vec![
+            "cua-aliyun-ecs-aaaaaaaaaaaa".to_string(),
+            "my.linux.host.01".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock_and_aligns_zone() {
+    use cua_sandbox_core::placement::Runtime;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.zones = vec!["ap-southeast-1a".into(), "ap-southeast-1b".into()];
+        // Register non-hardcoded families + ARM + GPU + bare-metal + burstable + oversized types.
+        f.instance_types.insert("ecs.c8y.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.gn7i.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.ebmg7.xlarge".into(), (4, 8.0));
+        f.instance_types
+            .insert("ecs.t6-c1m2.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.c9i.xlarge".into(), (4, 8.0));
+        f.instance_types
+            .insert("ecs.u2a-c1m2.xlarge".into(), (4, 8.0));
+        f.instance_types.insert("ecs.g8i.2xlarge".into(), (8, 16.0));
+        f.instance_type_details
+            .insert("ecs.c8y.xlarge".into(), json!({ "CpuArchitecture": "ARM" }));
+        f.instance_type_details.insert(
+            "ecs.gn7i.xlarge".into(),
+            json!({ "CpuArchitecture": "X86", "GpuAmount": 1 }),
+        );
+        f.instance_type_details.insert(
+            "ecs.ebmg7.xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+        f.instance_type_details.insert(
+            "ecs.t6-c1m2.xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+        f.instance_type_details
+            .insert("ecs.c9i.xlarge".into(), json!({ "CpuArchitecture": "X86" }));
+        f.instance_type_details.insert(
+            "ecs.u2a-c1m2.xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+        f.instance_type_details.insert(
+            "ecs.g8i.2xlarge".into(),
+            json!({ "CpuArchitecture": "X86" }),
+        );
+
+        // Zone -a has ClosedWithStock for c7/c9i, ARM (WithStock), GPU (WithStock), bare-metal (WithStock),
+        // and burstable t6 (WithStock); Zone -b has WithStock for non-hardcoded ecs.c9i.xlarge!
+        f.available_zones_override = Some(vec![
+            json!({
+                "RegionId": "ap-southeast-1",
+                "ZoneId": "ap-southeast-1a",
+                "Status": "Available",
+                "AvailableResources": {
+                    "AvailableResource": [{
+                        "Type": "InstanceType",
+                        "SupportedResources": {
+                            "SupportedResource": [
+                                { "Value": "ecs.c7.xlarge", "Status": "Available", "StatusCategory": "ClosedWithStock" },
+                                { "Value": "ecs.c9i.xlarge", "Status": "Available", "StatusCategory": "ClosedWithStock" },
+                                { "Value": "ecs.c8y.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.gn7i.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.ebmg7.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.t6-c1m2.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.e-c1m2.large", "Status": "Available", "StatusCategory": "WithStock" }
+                            ]
+                        }
+                    }]
+                }
+            }),
+            json!({
+                "RegionId": "ap-southeast-1",
+                "ZoneId": "ap-southeast-1b",
+                "Status": "Available",
+                "AvailableResources": {
+                    "AvailableResource": [{
+                        "Type": "InstanceType",
+                        "SupportedResources": {
+                            "SupportedResource": [
+                                { "Value": "ecs.c9i.xlarge", "Status": "Available", "StatusCategory": "WithStock" },
+                                { "Value": "ecs.g8i.2xlarge", "Status": "Available", "StatusCategory": "WithStock" }
+                            ]
+                        }
+                    }]
+                }
+            }),
+        ]);
+
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("ap-southeast-1".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            max_size: Some("4x8x80".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    s.lock().unwrap().calls.clear();
+
+    let mut win_opts = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_opts.contrib = Some("aliyun-ecs".into());
+    win_opts.name = Some("win-dynamic-c9i".into());
+    win_opts.os = "windows".into();
+    win_opts.runtime = Runtime::Other("native".into());
+    win_opts.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sbx.create(win_opts).await.unwrap();
+
+    assert_eq!(
+        sb.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c9i.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let avail_calls: Vec<_> = f
+            .calls
+            .iter()
+            .filter(|c| c.action == "DescribeAvailableResource")
+            .collect();
+        assert!(
+            avail_calls.iter().any(|c| {
+                c.params.get("Cores").map(String::as_str) == Some("4")
+                    && c.params.get("Memory").map(String::as_str) == Some("8")
+            }),
+            "DescribeAvailableResource must pass Cores=4 & Memory=8: {avail_calls:?}"
+        );
+        assert!(
+            f.calls.iter().any(|c| c.action == "DescribeInstanceTypes"),
+            "DescribeInstanceTypes must be queried to inspect architecture/GPU/sizing"
+        );
+        let run = f
+            .calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap();
+        assert_eq!(
+            run.params.get("InstanceType").map(String::as_str),
+            Some("ecs.c9i.xlarge")
+        );
+        assert_eq!(
+            run.params.get("ZoneId").map(String::as_str),
+            Some("ap-southeast-1b"),
+            "RunInstances must align with the WithStock zone of ecs.c9i.xlarge"
+        );
+        let run_vsw = run.params.get("VSwitchId").unwrap();
+        let vsw = f
+            .vswitches
+            .iter()
+            .find(|v| v["VSwitchId"].as_str() == Some(run_vsw.as_str()))
+            .unwrap();
+        assert_eq!(
+            vsw["ZoneId"].as_str(),
+            Some("ap-southeast-1b"),
+            "created VSwitch must be in the WithStock zone of the selected instance type"
+        );
+    }
+    sb.delete().await.unwrap();
+
+    // Verify WithoutStock is rejected while another non-hardcoded family (ecs.u2a-c1m2.xlarge)
+    // is dynamically selected, and explicit --instance-type overrides dynamic selection.
+    {
+        let mut f = s.lock().unwrap();
+        f.available_zones_override = Some(vec![json!({
+            "RegionId": "ap-southeast-1",
+            "ZoneId": "ap-southeast-1a",
+            "Status": "Available",
+            "AvailableResources": {
+                "AvailableResource": [{
+                    "Type": "InstanceType",
+                    "SupportedResources": {
+                        "SupportedResource": [
+                            { "Value": "ecs.c9i.xlarge", "Status": "Available", "StatusCategory": "WithoutStock" },
+                            { "Value": "ecs.u2a-c1m2.xlarge", "Status": "Available", "StatusCategory": "WithStock" }
+                        ]
+                    }
+                }]
+            }
+        })]);
+    }
+    let mut win_u2a = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_u2a.contrib = Some("aliyun-ecs".into());
+    win_u2a.name = Some("win-dynamic-u2a".into());
+    win_u2a.os = "windows".into();
+    win_u2a.runtime = Runtime::Other("native".into());
+    win_u2a.ready_timeout = std::time::Duration::from_secs(10);
+    let sb2 = sbx.create(win_u2a).await.unwrap();
+    assert_eq!(
+        sb2.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.u2a-c1m2.xlarge")
+    );
+    sb2.delete().await.unwrap();
+
+    let mut win_explicit = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_explicit.contrib = Some("aliyun-ecs".into());
+    win_explicit.name = Some("win-explicit-override".into());
+    win_explicit.os = "windows".into();
+    win_explicit.runtime = Runtime::Other("native".into());
+    win_explicit.instance_type = Some("ecs.c7.xlarge".into());
+    win_explicit.ready_timeout = std::time::Duration::from_secs(10);
+    let sb3 = sbx.create(win_explicit).await.unwrap();
+    assert_eq!(
+        sb3.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c7.xlarge")
+    );
+    sb3.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn lookup_instance_type_sends_repeat_list_and_requires_exact_match() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, store) = start(None).await;
+    store.save("LTAI_TEST_AK:secret123").unwrap();
+    let c = conn(&api);
+    {
+        let mut f = s.lock().unwrap();
+        f.instance_types.insert("ecs.t1.xsmall".into(), (1, 0.5));
+        f.instance_types
+            .insert("ecs.u2a-c1m2.xlarge".into(), (4, 8.0));
+    }
+
+    let (cpus, mem_mb, _) = api
+        .lookup_instance_type(&c, "ecs.u2a-c1m2.xlarge")
+        .await
+        .unwrap();
+    assert_eq!((cpus, mem_mb), (4, 8192));
+    {
+        let f = s.lock().unwrap();
+        let call = f
+            .calls
+            .iter()
+            .rfind(|call| call.action == "DescribeInstanceTypes")
+            .unwrap();
+        assert_eq!(
+            call.params.get("InstanceTypes.1").map(String::as_str),
+            Some("ecs.u2a-c1m2.xlarge")
+        );
+        assert!(
+            !call.params.contains_key("InstanceTypes"),
+            "must use RepeatList InstanceTypes.1 instead of JSON InstanceTypes: {:?}",
+            call.params
+        );
+    }
+
+    // Even if the server ignores the filter and returns [ecs.t1.xsmall, ...],
+    // lookup_instance_type must NOT fall back to arr.first().
+    s.lock().unwrap().ignore_instance_types_filter = true;
+    let err = api
+        .lookup_instance_type(&c, "ecs.missing-page2.xlarge")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+        "expected InvalidArgument for missing instance type, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_token_and_excludes_gpu_amount()
+ {
+    use cua_sandbox_core::placement::Runtime;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "u1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+
+    let (api, s, _store) = start(None).await;
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let mut f = s.lock().unwrap();
+        f.zones = vec!["ap-southeast-1a".into()];
+        // 14 candidates (<= 20): must be queried as RepeatList chunks of 10 + 4.
+        let mut supported = Vec::new();
+        for idx in 1..=10 {
+            let id = format!("ecs.d10-{idx:02}.xlarge");
+            f.instance_types.insert(id.clone(), (2, 4.0)); // Too small for 4c8g Windows
+            f.instance_type_details
+                .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
+            supported.push(json!({
+                "Value": id,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        // Include GPU (uppercase GPUAmount), unexcluded-prefix GPU, ARM c6r, and target u2a.
+        for (id, details) in [
+            (
+                "ecs.ga1.xlarge",
+                json!({ "CpuArchitecture": "X86", "GPUAmount": 1 }),
+            ),
+            (
+                "ecs.custom-gpu.xlarge",
+                json!({ "CpuArchitecture": "X86", "GPUAmount": 1 }),
+            ),
+            ("ecs.c6r.xlarge", json!({ "CpuArchitecture": "ARM" })),
+            (
+                "ecs.u2a-c1m2.xlarge",
+                json!({ "CpuArchitecture": "X86", "GPUAmount": 0 }),
+            ),
+        ] {
+            f.instance_types.insert(id.into(), (4, 8.0));
+            f.instance_type_details.insert(id.into(), details);
+            supported.push(json!({
+                "Value": id,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        f.available_zones_override = Some(vec![json!({
+            "RegionId": "ap-southeast-1",
+            "ZoneId": "ap-southeast-1a",
+            "Status": "Available",
+            "AvailableResources": {
+                "AvailableResource": [{
+                    "Type": "InstanceType",
+                    "SupportedResources": {
+                        "SupportedResource": supported
+                    }
+                }]
+            }
+        })]);
+        f.on_run_instance = Some(Arc::new(move |_id, params| {
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sbx = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+
+    sbx.clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("ap-southeast-1".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            max_size: Some("4x8x80".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    s.lock().unwrap().calls.clear();
+
+    let mut opts1 = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts1.contrib = Some("aliyun-ecs".into());
+    opts1.name = Some("win-chunk10-gpu".into());
+    opts1.os = "windows".into();
+    opts1.runtime = Runtime::Other("native".into());
+    opts1.ready_timeout = std::time::Duration::from_secs(10);
+    let sb1 = sbx.create(opts1).await.unwrap();
+    assert_eq!(
+        sb1.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.u2a-c1m2.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let dt_calls: Vec<_> = f
+            .calls
+            .iter()
+            .filter(|c| c.action == "DescribeInstanceTypes")
+            .collect();
+        assert_eq!(dt_calls.len(), 2, "14 candidates must split into 10 + 4");
+        assert!(dt_calls[0].params.contains_key("InstanceTypes.10"));
+        assert!(!dt_calls[0].params.contains_key("InstanceTypes.11"));
+        assert!(dt_calls[1].params.contains_key("InstanceTypes.4"));
+        assert!(!dt_calls[1].params.contains_key("InstanceTypes.5"));
+    }
+    sb1.delete().await.unwrap();
+
+    // Part B (> 20 candidates + NextToken pagination): 24 candidates, page_size = 6 -> 4 pages.
+    {
+        let mut f = s.lock().unwrap();
+        f.instance_types_page_size = Some(6);
+        let mut supported = Vec::new();
+        for idx in 1..=21 {
+            let id = format!("ecs.a-small-{idx:02}.large");
+            f.instance_types.insert(id.clone(), (2, 4.0));
+            f.instance_type_details
+                .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
+            supported.push(json!({
+                "Value": id,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        // Page-last target ecs.c9a.xlarge (comes after ecs.a-* and ecs.c6r/custom-gpu).
+        f.instance_types.insert("ecs.c9a.xlarge".into(), (4, 8.0));
+        f.instance_type_details.insert(
+            "ecs.c9a.xlarge".into(),
+            json!({ "CpuArchitecture": "X86", "GPUAmount": 0 }),
+        );
+        for extra in [
+            "ecs.ga1.xlarge",
+            "ecs.custom-gpu.xlarge",
+            "ecs.c6r.xlarge",
+            "ecs.c9a.xlarge",
+        ] {
+            supported.push(json!({
+                "Value": extra,
+                "Status": "Available",
+                "StatusCategory": "WithStock"
+            }));
+        }
+        f.available_zones_override = Some(vec![json!({
+            "RegionId": "ap-southeast-1",
+            "ZoneId": "ap-southeast-1a",
+            "Status": "Available",
+            "AvailableResources": {
+                "AvailableResource": [{
+                    "Type": "InstanceType",
+                    "SupportedResources": {
+                        "SupportedResource": supported
+                    }
+                }]
+            }
+        })]);
+        f.calls.clear();
+    }
+
+    let mut opts2 = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts2.contrib = Some("aliyun-ecs".into());
+    opts2.name = Some("win-next-token".into());
+    opts2.os = "windows".into();
+    opts2.runtime = Runtime::Other("native".into());
+    opts2.ready_timeout = std::time::Duration::from_secs(10);
+    let sb2 = sbx.create(opts2).await.unwrap();
+    assert_eq!(
+        sb2.provider_details()
+            .get("machine_type")
+            .map(String::as_str),
+        Some("ecs.c9a.xlarge")
+    );
+    {
+        let f = s.lock().unwrap();
+        let dt_calls: Vec<_> = f
+            .calls
+            .iter()
+            .filter(|c| c.action == "DescribeInstanceTypes")
+            .collect();
+        assert!(
+            dt_calls.len() >= 2 && dt_calls.iter().any(|c| c.params.contains_key("NextToken")),
+            "expected paginated DescribeInstanceTypes calls with NextToken: {dt_calls:?}"
+        );
+        assert!(
+            dt_calls
+                .iter()
+                .all(|c| !c.params.contains_key("InstanceTypes.1")),
+            "> 20 candidates must query unfiltered paginated DescribeInstanceTypes"
+        );
+    }
+    sb2.delete().await.unwrap();
 }

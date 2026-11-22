@@ -615,6 +615,7 @@ pub fn create_request_from_pb(r: pb::CreateSandboxRequest) -> Result<crate::Crea
         disk_gb: (r.disk_gb > 0).then_some(r.disk_gb),
         cloud_image_id: non_empty(r.cloud_image_id),
         instance_type: non_empty(r.instance_type),
+        ttl: r.ttl.as_ref().map(from_dur),
     };
     Ok(create)
 }
@@ -667,6 +668,7 @@ pub fn create_request_to_pb(r: crate::CreateRequest) -> pb::CreateSandboxRequest
         disk_gb: r.disk_gb.unwrap_or_default(),
         cloud_image_id: r.cloud_image_id.clone().unwrap_or_default(),
         instance_type: r.instance_type.clone().unwrap_or_default(),
+        ttl: r.ttl.map(dur),
     }
 }
 

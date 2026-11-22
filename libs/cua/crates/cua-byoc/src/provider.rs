@@ -30,8 +30,8 @@ use crate::relay::RelayAccess;
 use crate::state::Store;
 
 /// How long a new cloud machine may take to come online on the relay: a
-/// VM's first boot installs Docker and pulls the image.
-pub const ONLINE_WAIT: Duration = Duration::from_secs(15 * 60);
+/// VM's first boot installs Docker or runs Windows `vminit`, binary download, and AutoLogon reboot.
+pub const ONLINE_WAIT: Duration = Duration::from_secs(20 * 60);
 
 /// Instance details (`provider_details`).
 pub mod detail {
@@ -616,15 +616,15 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 ));
             }
         }
-        let machine_type = spec_instance_type
-            .or_else(|| {
-                conn.instance_type
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| offer.machine_type.clone());
+        let explicit_machine_type = spec_instance_type.or_else(|| {
+            conn.instance_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+        let machine_type_explicit = explicit_machine_type.is_some();
+        let mut machine_type = explicit_machine_type.unwrap_or_else(|| offer.machine_type.clone());
         let disk_gb = spec
             .disk_gb
             .unwrap_or_else(|| self.api.default_disk_gb(family));
@@ -675,6 +675,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             image: spec.image.pinned_ref.clone(),
             kind: effective_kind.into(),
             machine_type: machine_type.clone(),
+            machine_type_explicit,
             disk_gb,
             cpus: Some(spec.cpus),
             memory_mb: Some(spec.memory_mb),
@@ -690,12 +691,52 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         };
         // Say a budget share passed before a new machine adds to it.
         crate::alerts::check_all(&self.store, now());
+        let spent = self
+            .store
+            .spent_for_limits(&conn, now())
+            .await
+            .map_err(Self::io)?;
+        if self.api.supports_custom_image_and_sizing() {
+            let (min_cpus, min_mem_mb) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
+            let min_usd_floor = if machine_type_explicit {
+                0.0
+            } else {
+                f64::from(min_cpus.unwrap_or(2)) * 0.01
+                    + f64::from(disk_gb) * self.api.disk_usd_per_gb_hour()
+            };
+            crate::limits::check_new_machine_with_disk(
+                &conn,
+                self.api.title(),
+                min_cpus,
+                min_mem_mb,
+                Some(disk_gb),
+                min_usd_floor,
+                spent,
+            )?;
+        }
         let sizing = self.api.resolve_machine_sizing(&conn, &provision).await?;
-        let (eff_cpus, eff_mem_mb, eff_usd) = match sizing {
-            Some(s) => (Some(s.vcpus), Some(s.memory_mb), s.usd_per_hour),
+        if let Some(resolved_mt) = sizing
+            .as_ref()
+            .and_then(|s| s.machine_type.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            machine_type = resolved_mt.to_string();
+            provision.machine_type = machine_type.clone();
+        } else if machine_type.is_empty() {
+            machine_type = offer.machine_type.clone();
+            provision.machine_type = machine_type.clone();
+        }
+        let (eff_cpus, eff_mem_mb, eff_disk_gb, eff_usd) = match sizing {
+            Some(s) => (
+                Some(s.vcpus.max(spec.cpus)),
+                Some(s.memory_mb.max(spec.memory_mb)),
+                s.disk_gb.unwrap_or(disk_gb),
+                s.usd_per_hour,
+            ),
             None => {
                 let (c, m) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
-                (c, m, offer.usd_per_hour)
+                (c, m, disk_gb, offer.usd_per_hour)
             }
         };
         crate::limits::check_new_machine_with_disk(
@@ -703,12 +744,9 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             self.api.title(),
             eff_cpus,
             eff_mem_mb,
-            Some(disk_gb),
+            Some(eff_disk_gb),
             eff_usd,
-            self.store
-                .spent_for_limits(&conn, now())
-                .await
-                .map_err(Self::io)?,
+            spent,
         )?;
         if let Some(resolved_image) = self.api.resolve_provision_image(&conn, &provision).await? {
             provision.cloud_image_id = Some(resolved_image);

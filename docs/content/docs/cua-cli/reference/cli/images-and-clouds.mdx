@@ -557,7 +557,7 @@ cua cloud connect [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-connect--client-id"></span>`--client-id` | string |  | Azure: the cua-spaces managed identity's client id (the template's clientId). |
 | <span id="cua-cloud-connect--resource-group"></span>`--resource-group` | string |  | Azure: the resource group Cua works in, the only one its roles reach (default cua-spaces). |
 | <span id="cua-cloud-connect--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store. |
-| <span id="cua-cloud-connect--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). |
+| <span id="cua-cloud-connect--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). When combined with `--token-stdin`, line 1 is the cloud token and line 2 is the relay token. |
 | <span id="cua-cloud-connect--no-public-ip"></span>`--no-public-ip` | boolean | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
 | <span id="cua-cloud-connect--default"></span>`--default` | boolean | `false` | Also make it the default location (`default.on`). |
 | <span id="cua-cloud-connect--oidc"></span>`--oidc` | boolean | `false` | Link without a stored key: Cua's issuer signs 15-minute tokens your account trusts (AWS, Google Cloud; Azure always). |
@@ -680,7 +680,7 @@ cua cloud test [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-test--linux-image-id"></span>`--linux-image-id` | string |  | Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux sandboxes. |
 | <span id="cua-cloud-test--instance-type"></span>`--instance-type` | string |  | Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`). |
 | <span id="cua-cloud-test--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store. |
-| <span id="cua-cloud-test--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). |
+| <span id="cua-cloud-test--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). When combined with `--token-stdin`, line 1 is the cloud token and line 2 is the relay token. |
 | <span id="cua-cloud-test--no-public-ip"></span>`--no-public-ip` | boolean | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
 
 **Examples**
