@@ -90,6 +90,87 @@ async fn custom_vpc_flags_rejected_generically_by_supports_custom_vpc() {
     }
 }
 
+#[tokio::test]
+async fn create_rejects_mismatched_os_or_hashed_dir_spacesd_download_url_before_cloud_or_relay() {
+    use cua_sandbox_core::{CreateOptions, ProviderKind};
+
+    let sha = "a".repeat(64);
+    let cases = [
+        (
+            "linux",
+            "linux",
+            "https://mirror.example.com/cua-spacesd.exe".to_string(),
+            "Windows artifact",
+        ),
+        (
+            "windows",
+            "windows",
+            "https://mirror.example.com/cua-spacesd-linux-x86_64.tar.gz".to_string(),
+            "Linux artifact",
+        ),
+        (
+            "linux",
+            "linux",
+            format!("https://mirror.example.com/releases/#sha256={sha}"),
+            "directory mirror",
+        ),
+    ];
+
+    for (idx, (os, image, url, expected)) in cases.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay = Arc::new(FakeRelay::start().await);
+        let fake = FakeProvider::new("fakecloud", Tier::Vm);
+        fake.account.lock().unwrap().supported_oses = Some(&["linux", "windows"]);
+        fake.set_runtimes(vec![cua_sandbox_core::placement::Runtime::Other(
+            "native".into(),
+        )]);
+        let sandboxes = cua_byoc::install_with(
+            Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+            dir.path(),
+            vec![fake.clone()],
+            RelayAccess::new(
+                relay.url.clone(),
+                Arc::new(cua_host::relay::StaticToken("unused".into())),
+            ),
+        )
+        .build();
+        let clouds = sandboxes.clouds().unwrap();
+        clouds
+            .connect_with(&ConnectRequest {
+                target: Target {
+                    provider: "fakecloud".into(),
+                    spacesd_download_url: Some(url),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let calls_before = fake.calls().len();
+        let mut opts = CreateOptions::new(ProviderKind::Contrib, image);
+        opts.contrib = Some("fakecloud".into());
+        opts.name = Some(format!("cross-os-{idx}"));
+        opts.os = os.into();
+        let err = sandboxes.create(opts).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains(expected)),
+            "case {idx} ({os}): expected InvalidArgument containing {expected:?}, got {err:?}"
+        );
+        assert_eq!(
+            fake.calls().len(),
+            calls_before,
+            "case {idx} must fail before calling cloud API: {:?}",
+            fake.calls()
+        );
+        assert_eq!(
+            relay.register_calls(),
+            0,
+            "case {idx} must fail before registering on relay"
+        );
+    }
+}
+
 #[cfg(all(feature = "federation", feature = "hetzner"))]
 #[path = "sealed_support/mod.rs"]
 mod sealed_support;
@@ -130,14 +211,12 @@ mod sealed_relay_probe {
 
     #[tokio::test]
     async fn connect_sealed_probes_custom_relay_before_mutating_issuer() {
-        // Start fake Hetzner server.
         let s: S = Arc::default();
         let app = axum::Router::new().fallback(handle).with_state(s);
         let h_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let h_addr = h_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(h_listener, app).await.unwrap() });
 
-        // Start a broken relay returning HTTP 500 on every probe.
         let broken_app = axum::Router::new()
             .fallback(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "relay down") });
         let r_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -33,7 +33,6 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
         }
     };
 
-    // 1. Credentials: sts:GetCallerIdentity
     let identity = match api
         .call_ok(
             &api.sts_endpoint,
@@ -74,7 +73,6 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
     let ecs = api.ecs_endpoint(&conn.region);
     let vpc = api.vpc_endpoint(&conn.region);
 
-    // 2. Region: ecs:DescribeRegions
     match api
         .call_ok(
             &ecs,
@@ -109,7 +107,6 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
         }
     }
 
-    // 3. Machine offerings: ecs:DescribeAvailableResource
     let discovered_type: String;
     match api
         .call_ok(
@@ -265,7 +262,6 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
         }
     }
 
-    // 4. Image lookup: official Ubuntu 24.04 + configured defaults
     let discovered_image =
         match image::resolve_official_image(api, conn, &conn.region, "linux").await {
             Ok(img) => {
@@ -278,7 +274,6 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
             }
         };
 
-    // 4b. Existing VPC / VSwitch validation when configured
     let existing_vpc_pair = conn.vpc_id.as_deref().zip(conn.vswitch_id.as_deref());
     if let Some((vpc_id, vswitch_id)) = existing_vpc_pair {
         match existing_vpc::validate_existing_vpc(
@@ -312,7 +307,6 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
         }
     }
 
-    // 4c. Custom Cloud Image ID validation when configured
     let mut custom_images_ok = true;
     if let Some(ref win_id) = conn.windows_image_id {
         match image::validate_image_id(api, conn, &conn.region, win_id, "windows").await {
@@ -348,10 +342,8 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
         return t;
     }
 
-    // 5. Permissions: DescribeInstances, DescribeVpcs, DescribeVSwitches, DescribeSecurityGroups,
-    //    CreateVpc DryRun=true (isolated mode), RunInstances DryRun=true.
-    //    Note: Alibaba Cloud ECS `CreateSecurityGroup` does NOT support `DryRun=true`, so
-    //    preflight never invokes `CreateSecurityGroup`.
+    // Alibaba Cloud ECS `CreateSecurityGroup` does not support `DryRun=true`, so
+    // preflight never invokes `CreateSecurityGroup`.
     if let Err(e) = api
         .call_ok(
             &ecs,

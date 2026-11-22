@@ -40,15 +40,7 @@ fn path(home: &Path) -> PathBuf {
 
 /// How people name the cloud `provider`.
 pub fn title_of(provider: &str) -> &str {
-    match provider {
-        "aws" => "AWS",
-        "gcp" => "Google Cloud",
-        "azure" => "Microsoft Azure",
-        "hetzner" => "Hetzner Cloud",
-        "modal" => "Modal",
-        "aliyun-ecs" => "Alibaba Cloud ECS",
-        other => other,
-    }
+    cua_sandbox_core::byoc::provider_title(provider)
 }
 
 /// The alerts `conn` is due now that `spent_usd` is spent this month (at

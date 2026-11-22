@@ -31,7 +31,7 @@ use crate::state::Store;
 
 /// The plain name of a cloud (`AWS`).
 pub fn cloud_title(provider: &str) -> String {
-    crate::alerts::title_of(provider).to_owned()
+    cua_sandbox_core::byoc::provider_title(provider).to_owned()
 }
 
 /// A host-route share as opened: where people connect, and what the daemon

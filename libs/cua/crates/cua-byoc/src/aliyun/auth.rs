@@ -294,18 +294,15 @@ pub(crate) fn resolve_credentials(
     aliyun_config: Option<&Path>,
     profile_hint: Option<&str>,
 ) -> Result<(AliyunCredentials, CredSource)> {
-    // 1. --token-stdin
     if let Some(res) = staged.lock().unwrap().clone() {
         let creds = res.map_err(Error::InvalidArgument)?;
         return Ok((creds, CredSource::TokenStdin));
     }
 
-    // 2. Environment variables
     if let Some(creds) = env_credentials().map_err(Error::ContribNotConfigured)? {
         return Ok((creds, CredSource::Env));
     }
 
-    // 3. Explicit --profile <name>
     let explicit = profile_hint.map(str::trim).filter(|s| !s.is_empty());
     if let Some(name) = explicit {
         let Some(path) = aliyun_config else {
@@ -324,13 +321,11 @@ pub(crate) fn resolve_credentials(
         return Ok((creds, CredSource::ExplicitProfile(name.to_string())));
     }
 
-    // 4. Saved credentials in TokenStore
     if let Some(saved) = store.load() {
         let creds = parse_token_pair(&saved).map_err(Error::ContribNotConfigured)?;
         return Ok((creds, CredSource::Saved));
     }
 
-    // 5. Active `current` profile in ~/.aliyun/config.json
     if let Some(path) = aliyun_config
         && let Some((name, creds, _)) =
             read_cli_profile(path, None).map_err(Error::ContribNotConfigured)?

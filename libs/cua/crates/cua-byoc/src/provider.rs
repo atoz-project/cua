@@ -441,10 +441,17 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
 
     async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
         let conn = self.connection()?;
+        let family = create_family(spec);
         if let Some(url) = conn.spacesd_download_url.as_deref() {
             crate::target::normalize_spacesd_download_url(url)?;
+            let os_family = match family {
+                "windows" => "windows",
+                "macos" => "macos",
+                _ => "linux",
+            };
+            cua_sandbox_core::byoc::validate_spacesd_url_for_os(url, os_family)
+                .map_err(Error::InvalidArgument)?;
         }
-        let family = create_family(spec);
         let kinds = self.api.kinds(&conn);
         let offer = kinds.iter().find(|k| k.image == family).ok_or_else(|| {
             let ran = kinds
@@ -615,7 +622,6 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             provision.cloud_image_id = Some(resolved_image);
         }
         provision.provider_plan = prep.provider_plan;
-        // 1. The relay machine the sandbox joins as (account registration or static token).
         let (join, static_env_token) = conn_relay
             .prepare_join(
                 &self.store,
@@ -666,7 +672,6 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             rec.extra
                 .insert(detail::RUNTIME.into(), effective_runtime.clone());
         }
-        // 2. Recorded before the cloud call.
         self.store.record(rec.clone()).map_err(Self::io)?;
         self.store.audit(audit::of_resource(
             "resource_recorded",
@@ -722,7 +727,6 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 provision.command = spec.command.clone();
             }
         }
-        // 3. The cloud call.
         let made = match self.api.provision(&conn, &provision).await {
             Ok(m) => m,
             Err(e) => {
@@ -757,7 +761,6 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             ));
             all.push(r);
         }
-        // 4. The guest boots and joins the relay.
         let budget = spec.timeout.max(ONLINE_WAIT);
         let joined = conn_relay
             .wait_online(
