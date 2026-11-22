@@ -7,7 +7,7 @@ publish = false
 description = "Opaque-box E2E test suite for Alibaba Cloud ECS (aliyun-ecs) BYOC and per-connection self-hosted relay."
 
 [dependencies]
-cua-byoc = { path = "../../../../libs/cua/crates/cua-byoc", features = ["aliyun-ecs"] }
+cua-byoc = { path = "../../../../libs/cua/crates/cua-byoc", features = ["aliyun-ecs", "testing"] }
 cua-host = { path = "../../../../libs/cua/crates/cua-host", features = ["testing"] }
 cua-sdk = { path = "../../../../libs/cua/crates/cua-sdk" }
 cua-spacesd-client = { path = "../../../../libs/cua/crates/cua-spacesd-client", features = ["testing"] }
