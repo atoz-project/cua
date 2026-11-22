@@ -1700,6 +1700,7 @@ dependencies = [
  "cua-home",
  "cua-image",
  "cua-repo-cache",
+ "cua-spaces-contract",
  "cua-spacesd-client",
  "cua-vmm",
  "futures-util",
