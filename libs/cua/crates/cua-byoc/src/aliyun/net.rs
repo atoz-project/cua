@@ -34,7 +34,6 @@ use crate::api::Result;
 use crate::model::{self, Connection, Resource, tag};
 
 pub use super::security_group::sg_name;
-pub(crate) use super::vpc::cidrs_overlap;
 pub use super::vpc::{
     MAX_ZONES, VPC_CIDR, ensure_vswitch_for_zone, vpc_name, vswitch_cidr, vswitch_name,
 };

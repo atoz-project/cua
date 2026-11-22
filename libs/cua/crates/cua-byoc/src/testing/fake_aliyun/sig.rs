@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub use crate::aliyun::client::rfc3986_encode;
-pub(crate) use crate::aliyun::net::cidrs_overlap;
+pub(crate) use crate::aliyun::vpc::cidrs_overlap;
 
 pub type Acs3VerifyOk = (String, String, String, String);
 pub type Acs3VerifyErr = (StatusCode, &'static str, String);
