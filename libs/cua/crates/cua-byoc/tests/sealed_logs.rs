@@ -75,8 +75,11 @@ async fn the_token_never_reaches_the_logs() {
         .connect(Connection {
             provider: "hetzner".into(),
             region: "fsn1".into(),
-            auth: Auth::Sealed {
-                conn_id: server.id.clone(),
+            extras: cua_byoc::ConnectionExtras {
+                auth: Auth::Sealed {
+                    conn_id: server.id.clone(),
+                },
+                ..Default::default()
             },
             ..Default::default()
         })

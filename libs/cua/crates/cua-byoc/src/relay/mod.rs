@@ -400,13 +400,12 @@ impl RelayAccess {
     }
 }
 
-#[path = "relay_static.rs"]
 mod static_relay;
 
 pub use static_relay::ConnectionRelay;
 pub(crate) use static_relay::{
     clear_env_tokens, clear_static_relay_token, load_static_relay_token, probe_relay_check,
-    save_static_relay_token, secret_store,
+    remove_env_token, save_static_relay_token, secret_store,
 };
 
 /// The relay gateway bearer: the account token plus this device's

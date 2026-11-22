@@ -5,6 +5,7 @@
 //! and private-only (`--no-public-ip`) networking (`#8`).
 #![cfg(feature = "aliyun-ecs")]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
@@ -13,16 +14,12 @@ use cua_byoc::aliyun_ecs::{AliyunEcs, TokenStore};
 use cua_byoc::api::{CloudApi, Target};
 use cua_byoc::model::{self, Tier};
 use cua_byoc::testing::FakeProvider;
+use cua_byoc::testing::fake_aliyun::{FakeSg, FakeVSwitch, FakeVpc, S, handle};
 use cua_host::relay::AccountTokens;
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::{CloudManager, ConnectRequest, RelayMode};
 use cua_sandbox_core::{CreateOptions, Error, ProviderKind, Sandboxes};
 use cua_spacesd_client::testing::{MockAuth, MockServer};
-use serde_json::json;
-
-#[path = "support/fake_aliyun.rs"]
-mod fake_aliyun;
-use fake_aliyun::{S, handle};
 
 struct FailingTokens;
 
@@ -70,30 +67,32 @@ async fn start_aliyun(
 
 fn seed_user_vpc(s: &S, region: &str, vpc_id: &str, vsw_id: &str, user_sg_id: Option<&str>) {
     let mut f = s.lock().unwrap();
-    f.vpcs.push(json!({
-        "VpcId": vpc_id,
-        "RegionId": region,
-        "Status": "Available",
-        "CidrBlock": "10.20.0.0/16",
-        "VpcName": "user-vpc",
-    }));
-    f.vswitches.push(json!({
-        "VSwitchId": vsw_id,
-        "VpcId": vpc_id,
-        "RegionId": region,
-        "ZoneId": format!("{region}-h"),
-        "Status": "Available",
-        "CidrBlock": "10.20.1.0/24",
-        "AvailableIpAddressCount": 200,
-    }));
+    f.seed_vpc(FakeVpc {
+        vpc_id: vpc_id.into(),
+        region_id: region.into(),
+        status: "Available".into(),
+        cidr_block: "10.20.0.0/16".into(),
+        vpc_name: "user-vpc".into(),
+        ..Default::default()
+    });
+    f.seed_vswitch(FakeVSwitch {
+        vswitch_id: vsw_id.into(),
+        vpc_id: vpc_id.into(),
+        region_id: region.into(),
+        zone_id: format!("{region}-h"),
+        status: "Available".into(),
+        cidr_block: "10.20.1.0/24".into(),
+        available_ip_address_count: Some(200),
+        ..Default::default()
+    });
     if let Some(sg_id) = user_sg_id {
-        f.security_groups.push(json!({
-            "SecurityGroupId": sg_id,
-            "SecurityGroupName": "cua-sandboxes-lookalike",
-            "VpcId": vpc_id,
-            "RegionId": region,
-            "Tags": { "Tag": [] }
-        }));
+        f.seed_sg(FakeSg {
+            sg_id: sg_id.into(),
+            sg_name: "cua-sandboxes-lookalike".into(),
+            vpc_id: vpc_id.into(),
+            region_id: region.into(),
+            ..Default::default()
+        });
     }
 }
 
@@ -208,18 +207,20 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
 
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-a",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-b",
-            "VpcId": "vpc-other",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "AvailableIpAddressCount": 100,
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-a".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-b".into(),
+            vpc_id: "vpc-other".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            available_ip_address_count: Some(100),
+            ..Default::default()
+        });
     }
     let report = clouds
         .test(&Target {
@@ -291,18 +292,20 @@ async fn preflight_rejects_incomplete_or_mismatched_vpc_vswitch_without_creating
 
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-full",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-full",
-            "VpcId": "vpc-full",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "AvailableIpAddressCount": 0,
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-full".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-full".into(),
+            vpc_id: "vpc-full".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            available_ip_address_count: Some(0),
+            ..Default::default()
+        });
     }
     let report = clouds
         .test(&Target {
@@ -488,13 +491,13 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
         "vsw-user-1",
         Some("sg-lookalike"),
     );
-    s.lock().unwrap().security_groups.push(json!({
-        "SecurityGroupId": "sg-user-1",
-        "SecurityGroupName": "user-default-sg",
-        "VpcId": "vpc-user-1",
-        "RegionId": "cn-hangzhou",
-        "Tags": { "Tag": [] }
-    }));
+    s.lock().unwrap().seed_sg(FakeSg {
+        sg_id: "sg-user-1".into(),
+        sg_name: "user-default-sg".into(),
+        vpc_id: "vpc-user-1".into(),
+        region_id: "cn-hangzhou".into(),
+        ..Default::default()
+    });
     wire_fake_aliyun_to_relay(&s, &relay, &mock_spacesd.url());
 
     let (sandboxes, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
@@ -572,15 +575,9 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
         );
         assert_eq!(f.instances.len(), 1);
         let inst = f.instances.values().next().unwrap();
-        assert_eq!(inst["VpcAttributes"]["VpcId"].as_str(), Some("vpc-user-1"));
-        assert_eq!(
-            inst["VpcAttributes"]["VSwitchId"].as_str(),
-            Some("vsw-user-1")
-        );
-        let sg_id = inst["SecurityGroupIds"]["SecurityGroupId"][0]
-            .as_str()
-            .unwrap()
-            .to_string();
+        assert_eq!(inst.vpc_id, "vpc-user-1");
+        assert_eq!(inst.vswitch_id, "vsw-user-1");
+        let sg_id = inst.security_group_id.clone();
         assert_ne!(sg_id, "sg-lookalike");
         assert_ne!(sg_id, "sg-user-1");
         let rules = &f.security_group_rules[&sg_id];
@@ -602,14 +599,10 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
             Some("0")
         );
         assert!(!run_call.params.contains_key("InternetChargeType"));
-        assert_eq!(inst["InternetMaxBandwidthOut"].as_u64(), Some(0));
-        assert_eq!(inst["InternetChargeType"].as_str(), Some(""));
-        assert_eq!(
-            inst["MetadataOptions"]["HttpTokens"].as_str(),
-            Some("required")
-        );
+        assert_eq!(inst.internet_max_bandwidth_out.as_deref(), Some("0"));
+        assert_eq!(inst.internet_charge_type, "");
+        assert_eq!(inst.http_tokens.as_deref(), Some("required"));
 
-        let tags = cua_byoc::aliyun_net::tags_of(inst);
         for key in [
             model::tag::MANAGED,
             model::tag::OWNER,
@@ -618,7 +611,11 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
             model::tag::CREATED_BY,
             model::tag::EXPIRES,
         ] {
-            assert!(tags.contains_key(key), "missing tag {key}: {tags:?}");
+            assert!(
+                inst.tags.contains_key(key),
+                "missing tag {key}: {:?}",
+                inst.tags
+            );
         }
         sg_id
     };
@@ -636,10 +633,7 @@ async fn existing_vpc_no_public_ip_with_static_relay_lifecycle_and_sg_reuse() {
         );
         assert_eq!(f.instances.len(), 2);
         for inst in f.instances.values() {
-            assert_eq!(
-                inst["SecurityGroupIds"]["SecurityGroupId"][0].as_str(),
-                Some(sg_created_id.as_str())
-            );
+            assert_eq!(inst.security_group_id, sg_created_id);
         }
     }
 
@@ -691,8 +685,8 @@ async fn standalone_no_public_ip_without_vpc_sets_zero_bandwidth() {
     {
         let f = s.lock().unwrap();
         let inst = f.instances.values().next().unwrap();
-        assert_eq!(inst["InternetMaxBandwidthOut"].as_u64(), Some(0));
-        assert_eq!(inst["InternetChargeType"].as_str(), Some(""));
+        assert_eq!(inst.internet_max_bandwidth_out.as_deref(), Some("0"));
+        assert_eq!(inst.internet_charge_type, "");
         let run_call = f
             .calls
             .iter()
@@ -730,13 +724,13 @@ async fn sweep_and_disconnect_delete_only_cua_instances_and_sg_preserving_user_n
         "vsw-user-1",
         Some("sg-lookalike"),
     );
-    s.lock().unwrap().security_groups.push(json!({
-        "SecurityGroupId": "sg-user-1",
-        "SecurityGroupName": "user-sg",
-        "VpcId": "vpc-user-1",
-        "RegionId": "cn-hangzhou",
-        "Tags": { "Tag": [] }
-    }));
+    s.lock().unwrap().seed_sg(FakeSg {
+        sg_id: "sg-user-1".into(),
+        sg_name: "user-sg".into(),
+        vpc_id: "vpc-user-1".into(),
+        region_id: "cn-hangzhou".into(),
+        ..Default::default()
+    });
     wire_fake_aliyun_to_relay(&s, &relay, &mock_spacesd.url());
 
     let (sandboxes, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
@@ -783,11 +777,7 @@ async fn sweep_and_disconnect_delete_only_cua_instances_and_sg_preserving_user_n
         );
         assert_eq!(f.vpcs.len(), 1);
         assert_eq!(f.vswitches.len(), 1);
-        let sg_ids: Vec<&str> = f
-            .security_groups
-            .iter()
-            .filter_map(|g| g["SecurityGroupId"].as_str())
-            .collect();
+        let sg_ids: Vec<&str> = f.security_groups.keys().map(String::as_str).collect();
         assert_eq!(sg_ids, vec!["sg-lookalike", "sg-user-1"]);
     }
 
@@ -809,11 +799,7 @@ async fn sweep_and_disconnect_delete_only_cua_instances_and_sg_preserving_user_n
         );
         assert_eq!(f.vpcs.len(), 1);
         assert_eq!(f.vswitches.len(), 1);
-        let sg_ids: Vec<&str> = f
-            .security_groups
-            .iter()
-            .filter_map(|g| g["SecurityGroupId"].as_str())
-            .collect();
+        let sg_ids: Vec<&str> = f.security_groups.keys().map(String::as_str).collect();
         assert_eq!(sg_ids, vec!["sg-lookalike", "sg-user-1"]);
     }
     let st = clouds.status(Some("aliyun-ecs")).await.unwrap();
@@ -842,13 +828,13 @@ async fn delete_refuses_user_vpc_vswitch_and_unowned_sg_even_if_tagged() {
 
     let owner = "owner-abc";
     let tags = model::tags(owner, "sb", "m", 0);
-    s.lock().unwrap().security_groups.push(json!({
-        "SecurityGroupId": "sg-lookalike",
-        "SecurityGroupName": "cua-sandboxes-lookalike",
-        "VpcId": "vpc-user-1",
-        "RegionId": "cn-hangzhou",
-        "Tags": { "Tag": [] }
-    }));
+    s.lock().unwrap().seed_sg(FakeSg {
+        sg_id: "sg-lookalike".into(),
+        sg_name: "cua-sandboxes-lookalike".into(),
+        vpc_id: "vpc-user-1".into(),
+        region_id: "cn-hangzhou".into(),
+        ..Default::default()
+    });
 
     for res in [
         model::Resource {
@@ -901,26 +887,23 @@ async fn delete_refuses_user_vpc_vswitch_and_unowned_sg_even_if_tagged() {
         "delete_part must treat already-deleted security_group as Ok(())"
     );
     {
-        let vpc_tags: Vec<_> = cua_byoc::aliyun_net::part_tags(owner)
-            .into_iter()
-            .map(|(k, v)| json!({ "Key": k, "Value": v }))
-            .collect();
+        let vpc_tags = cua_byoc::aliyun_net::part_tags(owner);
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-user-1",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "IsDefault": false,
-            "Tags": { "Tag": vpc_tags.clone() }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-user-1",
-            "VpcId": "vpc-user-1",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "IsDefault": false,
-            "Tags": { "Tag": vpc_tags }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-user-1".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: vpc_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-user-1".into(),
+            vpc_id: "vpc-user-1".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: vpc_tags,
+            ..Default::default()
+        });
     }
     let owned = api.list_owned(&conn, owner).await.unwrap();
     assert!(
@@ -991,20 +974,14 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
         assert_eq!(f.vswitches.len(), 1);
         assert_eq!(f.security_groups.len(), 1);
         (
-            f.vpcs[0]["VpcId"].as_str().unwrap().to_string(),
-            f.vswitches[0]["VSwitchId"].as_str().unwrap().to_string(),
-            f.security_groups[0]["SecurityGroupId"]
-                .as_str()
-                .unwrap()
-                .to_string(),
+            f.vpcs.keys().next().unwrap().clone(),
+            f.vswitches.keys().next().unwrap().clone(),
+            f.security_groups.keys().next().unwrap().clone(),
         )
     };
 
     let owner = cua_byoc::Store::new(dir.path()).owner_id().unwrap();
-    let spoofed_tags: Vec<_> = cua_byoc::aliyun_net::part_tags(&owner)
-        .into_iter()
-        .map(|(k, v)| json!({ "Key": k, "Value": v }))
-        .collect();
+    let spoofed_tags = cua_byoc::aliyun_net::part_tags(&owner);
     seed_user_vpc(
         &s,
         "cn-hangzhou",
@@ -1014,22 +991,23 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
     );
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-default-spoofed",
-            "VpcName": cua_byoc::aliyun_net::vpc_name(&owner),
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": spoofed_tags.clone() }
-        }));
-        f.vpcs.push(json!({
-            "VpcId": "vpc-other-spoofed",
-            "VpcName": "corp-other-vpc",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": spoofed_tags }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-default-spoofed".into(),
+            vpc_name: cua_byoc::aliyun_net::vpc_name(&owner),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: spoofed_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-other-spoofed".into(),
+            vpc_name: "corp-other-vpc".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: spoofed_tags,
+            ..Default::default()
+        });
     }
 
     clouds
@@ -1059,39 +1037,29 @@ async fn mode_switch_isolated_to_existing_vpc_cleans_prior_isolated_network_and_
     {
         let f = s.lock().unwrap();
         assert!(
-            !f.vpcs.iter().any(|v| v["VpcId"] == iso_vpc_id),
+            !f.vpcs.contains_key(&iso_vpc_id),
             "prior isolated VPC {iso_vpc_id} must be deleted: {:?}",
             f.vpcs
         );
         assert!(
-            !f.vswitches.iter().any(|v| v["VSwitchId"] == iso_vsw_id),
+            !f.vswitches.contains_key(&iso_vsw_id),
             "prior isolated VSwitch {iso_vsw_id} must be deleted: {:?}",
             f.vswitches
         );
         assert!(
-            !f.security_groups
-                .iter()
-                .any(|g| g["SecurityGroupId"] == iso_sg_id),
+            !f.security_groups.contains_key(&iso_sg_id),
             "prior isolated SG {iso_sg_id} must be deleted: {:?}",
             f.security_groups
         );
 
-        let vpc_ids: Vec<&str> = f.vpcs.iter().filter_map(|v| v["VpcId"].as_str()).collect();
+        let vpc_ids: BTreeSet<&str> = f.vpcs.keys().map(String::as_str).collect();
         assert_eq!(
             vpc_ids,
-            vec!["vpc-user-1", "vpc-default-spoofed", "vpc-other-spoofed"]
+            BTreeSet::from(["vpc-user-1", "vpc-default-spoofed", "vpc-other-spoofed"])
         );
-        let vsw_ids: Vec<&str> = f
-            .vswitches
-            .iter()
-            .filter_map(|v| v["VSwitchId"].as_str())
-            .collect();
+        let vsw_ids: Vec<&str> = f.vswitches.keys().map(String::as_str).collect();
         assert_eq!(vsw_ids, vec!["vsw-user-1"]);
-        let sg_ids: Vec<&str> = f
-            .security_groups
-            .iter()
-            .filter_map(|g| g["SecurityGroupId"].as_str())
-            .collect();
+        let sg_ids: Vec<&str> = f.security_groups.keys().map(String::as_str).collect();
         assert_eq!(sg_ids, vec!["sg-user-lookalike"]);
 
         for c in &f.calls {
@@ -1122,49 +1090,46 @@ async fn stale_store_user_network_records_do_not_wedge_sweep_or_disconnect() {
     let store = cua_byoc::Store::new(dir.path());
     let owner = store.owner_id().unwrap();
     let spoofed_tags_kv = cua_byoc::aliyun_net::part_tags(&owner);
-    let spoofed_tags: Vec<_> = spoofed_tags_kv
-        .iter()
-        .map(|(k, v)| json!({ "Key": k, "Value": v }))
-        .collect();
 
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-user-1",
-            "VpcName": cua_byoc::aliyun_net::vpc_name(&owner),
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "CidrBlock": "10.20.0.0/16",
-            "Tags": { "Tag": spoofed_tags.clone() }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-user-1",
-            "VSwitchName": cua_byoc::aliyun_net::vswitch_name(&owner, "cn-hangzhou-h"),
-            "VpcId": "vpc-user-1",
-            "RegionId": "cn-hangzhou",
-            "ZoneId": "cn-hangzhou-h",
-            "IsDefault": false,
-            "Status": "Available",
-            "CidrBlock": "10.20.1.0/24",
-            "AvailableIpAddressCount": 200,
-            "Tags": { "Tag": spoofed_tags.clone() }
-        }));
-        f.vpcs.push(json!({
-            "VpcId": "vpc-default-spoofed",
-            "VpcName": cua_byoc::aliyun_net::vpc_name(&owner),
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": spoofed_tags }
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-user-1",
-            "SecurityGroupName": "user-sg",
-            "VpcId": "vpc-user-1",
-            "RegionId": "cn-hangzhou",
-            "Tags": { "Tag": [] }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-user-1".into(),
+            vpc_name: cua_byoc::aliyun_net::vpc_name(&owner),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            cidr_block: "10.20.0.0/16".into(),
+            tags: spoofed_tags_kv.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-user-1".into(),
+            vswitch_name: cua_byoc::aliyun_net::vswitch_name(&owner, "cn-hangzhou-h"),
+            vpc_id: "vpc-user-1".into(),
+            region_id: "cn-hangzhou".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            status: "Available".into(),
+            cidr_block: "10.20.1.0/24".into(),
+            available_ip_address_count: Some(200),
+            tags: spoofed_tags_kv.clone(),
+            ..Default::default()
+        });
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-default-spoofed".into(),
+            vpc_name: cua_byoc::aliyun_net::vpc_name(&owner),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: spoofed_tags_kv.clone(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-user-1".into(),
+            sg_name: "user-sg".into(),
+            vpc_id: "vpc-user-1".into(),
+            region_id: "cn-hangzhou".into(),
+            ..Default::default()
+        });
     }
 
     let (_, clouds) = build_env(dir.path(), vec![api.clone()], &relay.url);
@@ -1306,21 +1271,15 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
         assert_eq!(f.vswitches.len(), 1);
         assert_eq!(f.security_groups.len(), 1);
         (
-            f.vpcs[0]["VpcId"].as_str().unwrap().to_string(),
-            f.vswitches[0]["VSwitchId"].as_str().unwrap().to_string(),
-            f.security_groups[0]["SecurityGroupId"]
-                .as_str()
-                .unwrap()
-                .to_string(),
+            f.vpcs.keys().next().unwrap().clone(),
+            f.vswitches.keys().next().unwrap().clone(),
+            f.security_groups.keys().next().unwrap().clone(),
         )
     };
 
     let store = cua_byoc::Store::new(dir.path());
     let owner = store.owner_id().unwrap();
-    let spoofed_tags: Vec<_> = cua_byoc::aliyun_net::part_tags(&owner)
-        .into_iter()
-        .map(|(k, v)| json!({ "Key": k, "Value": v }))
-        .collect();
+    let spoofed_tags = cua_byoc::aliyun_net::part_tags(&owner);
     seed_user_vpc(
         &s,
         "cn-hangzhou",
@@ -1330,39 +1289,41 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
     );
     {
         let mut f = s.lock().unwrap();
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-user-1",
-            "SecurityGroupName": "user-default-sg",
-            "VpcId": "vpc-user-1",
-            "RegionId": "cn-hangzhou",
-            "Tags": { "Tag": [] }
-        }));
-        f.vpcs.push(json!({
-            "VpcId": "vpc-default-spoofed",
-            "VpcName": cua_byoc::aliyun_net::vpc_name(&owner),
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": spoofed_tags.clone() }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-default-spoofed",
-            "VSwitchName": cua_byoc::aliyun_net::vswitch_name(&owner, "cn-hangzhou-h"),
-            "VpcId": "vpc-default-spoofed",
-            "RegionId": "cn-hangzhou",
-            "ZoneId": "cn-hangzhou-h",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": spoofed_tags.clone() }
-        }));
-        f.vpcs.push(json!({
-            "VpcId": "vpc-other-spoofed",
-            "VpcName": "corp-other-vpc",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": spoofed_tags }
-        }));
+        f.seed_sg(FakeSg {
+            sg_id: "sg-user-1".into(),
+            sg_name: "user-default-sg".into(),
+            vpc_id: "vpc-user-1".into(),
+            region_id: "cn-hangzhou".into(),
+            ..Default::default()
+        });
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-default-spoofed".into(),
+            vpc_name: cua_byoc::aliyun_net::vpc_name(&owner),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: spoofed_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-default-spoofed".into(),
+            vswitch_name: cua_byoc::aliyun_net::vswitch_name(&owner, "cn-hangzhou-h"),
+            vpc_id: "vpc-default-spoofed".into(),
+            region_id: "cn-hangzhou".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: spoofed_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-other-spoofed".into(),
+            vpc_name: "corp-other-vpc".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: spoofed_tags,
+            ..Default::default()
+        });
     }
 
     clouds
@@ -1392,16 +1353,13 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
         let f = s.lock().unwrap();
         assert!(f.instances.is_empty());
         f.security_groups
-            .iter()
+            .values()
             .find(|g| {
-                g["VpcId"] == "vpc-user-1"
-                    && g["SecurityGroupId"] != "sg-lookalike"
-                    && g["SecurityGroupId"] != "sg-user-1"
+                g.vpc_id == "vpc-user-1" && g.sg_id != "sg-lookalike" && g.sg_id != "sg-user-1"
             })
-            .expect("existing-VPC Cua SG created")["SecurityGroupId"]
-            .as_str()
-            .unwrap()
-            .to_string()
+            .expect("existing-VPC Cua SG created")
+            .sg_id
+            .clone()
     };
     assert_ne!(iso_sg_id, existing_sg_id);
 
@@ -1435,22 +1393,17 @@ async fn isolated_and_existing_vpc_sandboxes_both_sgs_cleaned_on_disconnect() {
 
     {
         let f = s.lock().unwrap();
-        let vpc_ids: Vec<&str> = f.vpcs.iter().filter_map(|v| v["VpcId"].as_str()).collect();
+        let vpc_ids: BTreeSet<&str> = f.vpcs.keys().map(String::as_str).collect();
         assert_eq!(
             vpc_ids,
-            vec!["vpc-user-1", "vpc-default-spoofed", "vpc-other-spoofed"]
+            BTreeSet::from(["vpc-user-1", "vpc-default-spoofed", "vpc-other-spoofed"])
         );
-        let vsw_ids: Vec<&str> = f
-            .vswitches
-            .iter()
-            .filter_map(|v| v["VSwitchId"].as_str())
-            .collect();
-        assert_eq!(vsw_ids, vec!["vsw-user-1", "vsw-default-spoofed"]);
-        let sg_ids: Vec<&str> = f
-            .security_groups
-            .iter()
-            .filter_map(|g| g["SecurityGroupId"].as_str())
-            .collect();
+        let vsw_ids: BTreeSet<&str> = f.vswitches.keys().map(String::as_str).collect();
+        assert_eq!(
+            vsw_ids,
+            BTreeSet::from(["vsw-user-1", "vsw-default-spoofed"])
+        );
+        let sg_ids: Vec<&str> = f.security_groups.keys().map(String::as_str).collect();
         assert_eq!(sg_ids, vec!["sg-lookalike", "sg-user-1"]);
 
         for c in &f.calls {
@@ -1535,12 +1488,11 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
         let f = s.lock().unwrap();
         let find_sg = |vpc: &str, user_sg: &str| {
             f.security_groups
-                .iter()
-                .find(|g| g["VpcId"] == vpc && g["SecurityGroupId"] != user_sg)
-                .expect("Cua SG created in VPC")["SecurityGroupId"]
-                .as_str()
-                .unwrap()
-                .to_string()
+                .values()
+                .find(|g| g.vpc_id == vpc && g.sg_id != user_sg)
+                .expect("Cua SG created in VPC")
+                .sg_id
+                .clone()
         };
         (
             find_sg("vpc-user-a", "sg-user-a"),
@@ -1574,11 +1526,7 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
     assert!(store.resources().unwrap().is_empty());
     {
         let f = s.lock().unwrap();
-        let sg_ids: Vec<&str> = f
-            .security_groups
-            .iter()
-            .filter_map(|g| g["SecurityGroupId"].as_str())
-            .collect();
+        let sg_ids: Vec<&str> = f.security_groups.keys().map(String::as_str).collect();
         assert_eq!(sg_ids, vec!["sg-user-a", "sg-user-b"]);
         assert_eq!(f.vpcs.len(), 2);
         assert_eq!(f.vswitches.len(), 2);
@@ -1623,11 +1571,7 @@ async fn two_existing_vpcs_same_sg_name_sweep_and_disconnect() {
     assert!(store.resources().unwrap().is_empty());
 
     let f = s.lock().unwrap();
-    let sg_ids: Vec<&str> = f
-        .security_groups
-        .iter()
-        .filter_map(|g| g["SecurityGroupId"].as_str())
-        .collect();
+    let sg_ids: Vec<&str> = f.security_groups.keys().map(String::as_str).collect();
     assert_eq!(sg_ids, vec!["sg-user-a", "sg-user-b"]);
     assert_eq!(f.vpcs.len(), 2);
     assert_eq!(f.vswitches.len(), 2);
@@ -1692,16 +1636,17 @@ async fn existing_vpc_test_passes_when_dry_run_reports_missing_sg_before_cua_sg_
     let owner = cua_byoc::state::Store::new(&dir.path().join("cloud"))
         .owner_id()
         .unwrap();
-    s.lock().unwrap().security_groups.push(json!({
-        "SecurityGroupId": "sg-cua-existing",
-        "SecurityGroupName": format!("cua-sandboxes-{owner}"),
-        "VpcId": "vpc-user-1",
-        "RegionId": "cn-hangzhou",
-        "Tags": { "Tag": [
-            { "TagKey": "cua-managed", "TagValue": "true" },
-            { "TagKey": "cua-owner", "TagValue": owner }
-        ]}
-    }));
+    s.lock().unwrap().seed_sg(FakeSg {
+        sg_id: "sg-cua-existing".into(),
+        sg_name: format!("cua-sandboxes-{owner}"),
+        vpc_id: "vpc-user-1".into(),
+        region_id: "cn-hangzhou".into(),
+        tags: BTreeMap::from([
+            ("cua-managed".into(), "true".into()),
+            ("cua-owner".into(), owner),
+        ]),
+        ..Default::default()
+    });
     let with_sg_report = clouds
         .test(&Target {
             provider: "aliyun-ecs".into(),

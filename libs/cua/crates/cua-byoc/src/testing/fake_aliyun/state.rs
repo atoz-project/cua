@@ -25,12 +25,34 @@ pub enum BootFailMode {
     NeverJoinRelay,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ZoneFault {
+    /// Reported as `WithoutStock` in `DescribeAvailableResource` and fails `RunInstances` with the given code.
+    SoldOut(String),
+    /// Reported as `WithStock` in `DescribeAvailableResource`, but fails `RunInstances` with the given code.
+    RunFail(String),
+}
+
+impl ZoneFault {
+    pub fn code(&self) -> &str {
+        match self {
+            ZoneFault::SoldOut(c) | ZoneFault::RunFail(c) => c.as_str(),
+        }
+    }
+
+    pub fn is_sold_out(&self) -> bool {
+        matches!(self, ZoneFault::SoldOut(_))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FakeVpc {
     pub vpc_id: String,
     pub region_id: String,
     pub cidr_block: String,
     pub vpc_name: String,
+    pub status: String,
+    pub is_default: bool,
     pub tags: BTreeMap<String, String>,
     pub is_user_owned: bool,
 }
@@ -43,6 +65,9 @@ pub struct FakeVSwitch {
     pub region_id: String,
     pub cidr_block: String,
     pub vswitch_name: String,
+    pub status: String,
+    pub is_default: bool,
+    pub available_ip_address_count: Option<u32>,
     pub tags: BTreeMap<String, String>,
     pub is_user_owned: bool,
 }
@@ -53,6 +78,8 @@ pub struct FakeSg {
     pub vpc_id: String,
     pub region_id: String,
     pub sg_name: String,
+    pub sg_type: String,
+    pub inner_access_policy: String,
     pub tags: BTreeMap<String, String>,
     pub ingress_rules: Vec<Value>,
     pub is_user_owned: bool,
@@ -62,20 +89,24 @@ pub struct FakeSg {
 pub struct FakeInstance {
     pub instance_id: String,
     pub instance_name: String,
+    pub host_name: String,
     pub region_id: String,
     pub zone_id: String,
     pub vpc_id: String,
     pub vswitch_id: String,
     pub security_group_id: String,
+    pub extra_security_group_ids: Vec<String>,
     pub instance_type: String,
     pub image_id: String,
     pub status: String,
     pub instance_charge_type: String,
     pub stopped_mode: String,
     pub auto_release_time: Option<String>,
+    pub http_endpoint: String,
     pub http_tokens: Option<String>,
     pub key_pair_name: Option<String>,
     pub ram_role_name: Option<String>,
+    pub internet_charge_type: String,
     pub internet_max_bandwidth_out: Option<String>,
     pub system_disk_category: Option<String>,
     pub system_disk_size: Option<String>,
@@ -104,48 +135,83 @@ pub(crate) fn merge_extra(base: &mut Value, extra: Option<&Value>) {
 }
 
 impl FakeVpc {
-    pub fn to_api_json(&self, extra: Option<&Value>) -> Value {
-        let mut out = json!({
-            "VpcId": self.vpc_id, "VpcName": self.vpc_name, "CidrBlock": self.cidr_block,
-            "RegionId": self.region_id, "IsDefault": false, "Status": "Available",
+    pub fn to_api_json(&self) -> Value {
+        let status = if self.status.is_empty() {
+            "Available"
+        } else {
+            self.status.as_str()
+        };
+        json!({
+            "VpcId": self.vpc_id,
+            "VpcName": self.vpc_name,
+            "CidrBlock": self.cidr_block,
+            "RegionId": self.region_id,
+            "IsDefault": self.is_default,
+            "Status": status,
             "Tags": { "Tag": tags_json(&self.tags, false) },
-        });
-        merge_extra(&mut out, extra);
-        out
+        })
     }
 }
 
 impl FakeVSwitch {
-    pub fn to_api_json(&self, extra: Option<&Value>) -> Value {
+    pub fn to_api_json(&self) -> Value {
+        let status = if self.status.is_empty() {
+            "Available"
+        } else {
+            self.status.as_str()
+        };
         let mut out = json!({
-            "VSwitchId": self.vswitch_id, "VSwitchName": self.vswitch_name,
-            "VpcId": self.vpc_id, "ZoneId": self.zone_id, "RegionId": self.region_id,
-            "CidrBlock": self.cidr_block, "IsDefault": false, "Status": "Available",
+            "VSwitchId": self.vswitch_id,
+            "VSwitchName": self.vswitch_name,
+            "VpcId": self.vpc_id,
+            "ZoneId": self.zone_id,
+            "RegionId": self.region_id,
+            "CidrBlock": self.cidr_block,
+            "IsDefault": self.is_default,
+            "Status": status,
             "Tags": { "Tag": tags_json(&self.tags, false) },
         });
-        merge_extra(&mut out, extra);
+        if let Some(avail) = self.available_ip_address_count {
+            out["AvailableIpAddressCount"] = json!(avail);
+        }
         out
     }
 }
 
 impl FakeSg {
-    pub fn to_api_json(&self, extra: Option<&Value>) -> Value {
+    pub fn to_api_json(&self) -> Value {
         let mut out = json!({
-            "SecurityGroupId": self.sg_id, "SecurityGroupName": self.sg_name,
-            "VpcId": self.vpc_id, "RegionId": self.region_id,
+            "SecurityGroupId": self.sg_id,
+            "SecurityGroupName": self.sg_name,
+            "VpcId": self.vpc_id,
+            "RegionId": self.region_id,
             "Tags": { "Tag": tags_json(&self.tags, true) },
         });
-        merge_extra(&mut out, extra);
+        if !self.sg_type.is_empty() {
+            out["SecurityGroupType"] = json!(self.sg_type);
+        }
+        if !self.inner_access_policy.is_empty() {
+            out["InnerAccessPolicy"] = json!(self.inner_access_policy);
+        }
         out
     }
 }
 
 impl FakeInstance {
-    pub fn to_api_json(&self) -> Value {
-        self.to_api_json_with_extra(None)
+    pub fn all_security_group_ids(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.security_group_id.is_empty() {
+            out.push(self.security_group_id.clone());
+        }
+        for sg in &self.extra_security_group_ids {
+            if !sg.is_empty() && !out.iter().any(|x| x == sg) {
+                out.push(sg.clone());
+            }
+        }
+        out
     }
 
-    pub fn to_api_json_with_extra(&self, extra: Option<&Value>) -> Value {
+    pub fn to_api_json(&self) -> Value {
         let bw_out: u32 = self
             .internet_max_bandwidth_out
             .as_deref()
@@ -156,52 +222,76 @@ impl FakeInstance {
         } else {
             Vec::new()
         };
-        let sgs = if self.security_group_id.is_empty() {
-            vec![]
-        } else {
-            vec![self.security_group_id.clone()]
-        };
-        let mut out = json!({
-            "InstanceId": self.instance_id, "InstanceName": self.instance_name,
-            "RegionId": self.region_id, "ZoneId": self.zone_id,
-            "InstanceType": self.instance_type, "ImageId": self.image_id,
-            "Status": self.status, "InstanceChargeType": self.instance_charge_type,
+        let sgs = self.all_security_group_ids();
+        json!({
+            "InstanceId": self.instance_id,
+            "InstanceName": self.instance_name,
+            "HostName": self.host_name,
+            "RegionId": self.region_id,
+            "ZoneId": self.zone_id,
+            "InstanceType": self.instance_type,
+            "ImageId": self.image_id,
+            "Status": self.status,
+            "InstanceChargeType": self.instance_charge_type,
             "StoppedMode": self.stopped_mode,
             "AutoReleaseTime": self.auto_release_time.clone().unwrap_or_default(),
+            "InternetChargeType": self.internet_charge_type,
             "InternetMaxBandwidthOut": bw_out,
             "MetadataOptions": {
-                "HttpEndpoint": "", "HttpTokens": self.http_tokens.clone().unwrap_or_default(),
+                "HttpEndpoint": self.http_endpoint,
+                "HttpTokens": self.http_tokens.clone().unwrap_or_default(),
             },
             "SystemDisk": {
                 "Category": self.system_disk_category.clone().unwrap_or_default(),
                 "Size": self.system_disk_size.clone().unwrap_or_default(),
             },
             "VpcAttributes": {
-                "VpcId": self.vpc_id, "VSwitchId": self.vswitch_id,
+                "VpcId": self.vpc_id,
+                "VSwitchId": self.vswitch_id,
                 "PrivateIpAddress": { "IpAddress": ["172.16.0.10"] }
             },
             "SecurityGroupIds": { "SecurityGroupId": sgs },
             "PublicIpAddress": { "IpAddress": pub_ips },
             "Tags": { "Tag": tags_json(&self.tags, true) }
-        });
-        merge_extra(&mut out, extra);
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert("Status".into(), json!(self.status));
-            obj.insert("StoppedMode".into(), json!(self.stopped_mode));
-        }
-        out
+        })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FakeImage {
     pub image_id: String,
     pub image_name: String,
     pub os_type: String,
+    pub os_name_en: Option<String>,
     pub arch: String,
     pub status: String,
     pub owner_alias: String,
     pub region_id: String,
+    pub creation_time: String,
+    pub size_gb: u32,
+}
+
+impl FakeImage {
+    pub fn to_api_json(&self) -> Value {
+        let mut item = json!({
+            "ImageId": self.image_id,
+            "ImageName": self.image_name,
+            "OSType": self.os_type,
+            "Architecture": self.arch,
+            "Status": self.status,
+            "ImageOwnerAlias": self.owner_alias,
+        });
+        if let Some(ref en) = self.os_name_en {
+            item["OSNameEn"] = json!(en);
+        }
+        if !self.creation_time.is_empty() {
+            item["CreationTime"] = json!(self.creation_time);
+        }
+        if self.size_gb > 0 {
+            item["Size"] = json!(self.size_gb);
+        }
+        item
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -220,7 +310,6 @@ pub struct FakeAliyun {
     pub keys: BTreeMap<String, String>,
     pub regions: Vec<String>,
     pub zones: BTreeMap<String, Vec<String>>,
-    pub flat_zones: Option<Vec<String>>,
     pub instance_types: Vec<FakeInstanceType>,
     pub available_instance_types: Option<Vec<String>>,
     pub instance_type_details: BTreeMap<String, Value>,
@@ -233,11 +322,6 @@ pub struct FakeAliyun {
     pub security_groups: BTreeMap<String, FakeSg>,
     pub security_group_rules: BTreeMap<String, Vec<Value>>,
     pub instances: BTreeMap<String, FakeInstance>,
-    pub extra_vpc_fields: BTreeMap<String, Value>,
-    pub extra_vswitch_fields: BTreeMap<String, Value>,
-    pub extra_sg_fields: BTreeMap<String, Value>,
-    pub extra_image_fields: BTreeMap<String, Value>,
-    pub extra_instance_fields: BTreeMap<String, Value>,
     pub calls: Vec<RecordedCall>,
     pub authorize_sg_calls: usize,
     pub throttle: u32,
@@ -249,12 +333,7 @@ pub struct FakeAliyun {
     pub run_instances_dry_run_error: Option<(u16, String, String)>,
     pub run_instances_error: Option<(u16, String, String)>,
     pub force_auth_error: Option<(String, String)>,
-    pub sold_out_zones: BTreeSet<String>,
-    pub sold_out_zone_errors: BTreeMap<String, String>,
-    pub run_fail_zones: BTreeSet<String>,
-    pub run_fail_zone_errors: BTreeMap<String, String>,
-    pub unsupported_zones: BTreeSet<String>,
-    pub omit_sold_out_zones_in_available: bool,
+    pub zone_faults: BTreeMap<String, ZoneFault>,
     pub boot_fail: Option<BootFailMode>,
     pub console_output: Option<String>,
     pub console_outputs: BTreeMap<String, String>,
@@ -284,26 +363,50 @@ impl Default for FakeAliyun {
                 )
             })
             .collect();
-        let mut images = Vec::new();
-        for r in &regions {
-            for (id, os) in [
-                ("ubuntu_24_04_x64_20G_alibase_20250101.vhd", "linux"),
-                (
-                    "win2022_21H2_x64_dtc_en-us_40G_alibase_20250101.vhd",
-                    "windows",
-                ),
-            ] {
-                images.push(FakeImage {
-                    image_id: id.into(),
-                    image_name: id.into(),
-                    os_type: os.into(),
-                    arch: "x86_64".into(),
-                    status: "Available".into(),
-                    owner_alias: "system".into(),
-                    region_id: r.clone(),
-                });
-            }
-        }
+        let images = [
+            (
+                "ubuntu_24_04_x64_20G_alibase_20240601.vhd",
+                "linux",
+                None,
+                "2024-06-01T00:00:00Z",
+                20,
+            ),
+            (
+                "ubuntu_24_04_x64_20G_alibase_20250101.vhd",
+                "linux",
+                None,
+                "2025-01-01T00:00:00Z",
+                20,
+            ),
+            (
+                "win2019_1809_x64_dtc_zh-cn_40G_alibase_20240601.vhd",
+                "windows",
+                Some("Windows Server 2019 Datacenter Edition 64bit Chinese"),
+                "2024-06-01T00:00:00Z",
+                40,
+            ),
+            (
+                "win2022_21H2_x64_dtc_en-us_40G_alibase_20250201.vhd",
+                "windows",
+                Some("Windows Server 2022 Datacenter Edition 64bit"),
+                "2025-02-01T00:00:00Z",
+                40,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, os, os_en, created, size)| FakeImage {
+            image_id: id.into(),
+            image_name: id.into(),
+            os_type: os.into(),
+            os_name_en: os_en.map(str::to_string),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            owner_alias: "system".into(),
+            region_id: String::new(),
+            creation_time: created.into(),
+            size_gb: size,
+        })
+        .collect();
         let instance_types = [
             ("ecs.e-c1m2.large", 2, 4.0),
             ("ecs.e-c1m1.large", 2, 2.0),
@@ -311,6 +414,7 @@ impl Default for FakeAliyun {
             ("ecs.g7.large", 2, 8.0),
             ("ecs.g7.xlarge", 4, 16.0),
             ("ecs.g7.2xlarge", 8, 32.0),
+            ("ecs.g7.4xlarge", 16, 64.0),
         ]
         .into_iter()
         .map(|(id, cpu, mem)| FakeInstanceType {
@@ -324,7 +428,6 @@ impl Default for FakeAliyun {
             keys: BTreeMap::from([("LTAI_TEST_AK".into(), "secret123".into())]),
             regions,
             zones,
-            flat_zones: None,
             instance_types,
             available_instance_types: None,
             instance_type_details: BTreeMap::new(),
@@ -337,11 +440,6 @@ impl Default for FakeAliyun {
             security_groups: BTreeMap::new(),
             security_group_rules: BTreeMap::new(),
             instances: BTreeMap::new(),
-            extra_vpc_fields: BTreeMap::new(),
-            extra_vswitch_fields: BTreeMap::new(),
-            extra_sg_fields: BTreeMap::new(),
-            extra_image_fields: BTreeMap::new(),
-            extra_instance_fields: BTreeMap::new(),
             calls: Vec::new(),
             authorize_sg_calls: 0,
             throttle: 0,
@@ -353,12 +451,7 @@ impl Default for FakeAliyun {
             run_instances_dry_run_error: None,
             run_instances_error: None,
             force_auth_error: None,
-            sold_out_zones: BTreeSet::new(),
-            sold_out_zone_errors: BTreeMap::new(),
-            run_fail_zones: BTreeSet::new(),
-            run_fail_zone_errors: BTreeMap::new(),
-            unsupported_zones: BTreeSet::new(),
-            omit_sold_out_zones_in_available: false,
+            zone_faults: BTreeMap::new(),
             boot_fail: None,
             console_output: None,
             console_outputs: BTreeMap::new(),
@@ -383,8 +476,9 @@ impl FakeAliyun {
     }
 
     pub(crate) fn effective_zones(&self, region: &str) -> Vec<String> {
-        let list = self.flat_zones.as_ref().or_else(|| self.zones.get(region));
-        list.filter(|z| !z.is_empty())
+        self.zones
+            .get(region)
+            .filter(|z| !z.is_empty())
             .cloned()
             .unwrap_or_else(|| vec![format!("{region}-h")])
     }
@@ -395,6 +489,61 @@ impl FakeAliyun {
 
     pub fn add_image(&mut self, img: FakeImage) {
         self.images.push(img);
+    }
+
+    pub fn seed_vpc(&mut self, vpc: FakeVpc) {
+        self.vpcs.insert(vpc.vpc_id.clone(), vpc);
+    }
+
+    pub fn seed_vswitch(&mut self, vsw: FakeVSwitch) {
+        self.vswitches.insert(vsw.vswitch_id.clone(), vsw);
+    }
+
+    pub fn seed_sg(&mut self, sg: FakeSg) {
+        self.security_groups.insert(sg.sg_id.clone(), sg);
+    }
+
+    pub fn seed_instance(&mut self, inst: FakeInstance) {
+        self.instances.insert(inst.instance_id.clone(), inst);
+    }
+
+    pub fn seed_zone(&mut self, region: &str, zone: impl Into<String>) {
+        self.zones
+            .entry(region.to_string())
+            .or_default()
+            .push(zone.into());
+    }
+
+    pub fn set_zones(&mut self, region: &str, zones: Vec<String>) {
+        self.zones.insert(region.to_string(), zones);
+    }
+
+    pub fn add_instance_type(&mut self, id: &str, cpu_core_count: u32, memory_size_gb: f64) {
+        if let Some(existing) = self.instance_types.iter_mut().find(|t| t.id == id) {
+            existing.cpu_core_count = cpu_core_count;
+            existing.memory_size_gb = memory_size_gb;
+        } else {
+            self.instance_types.push(FakeInstanceType {
+                id: id.to_string(),
+                cpu_core_count,
+                memory_size_gb,
+            });
+        }
+        if let Some(avail) = &mut self.available_instance_types
+            && !avail.iter().any(|x| x == id)
+        {
+            avail.push(id.to_string());
+        }
+    }
+
+    pub fn mark_zone_sold_out(&mut self, zone: impl Into<String>, code: impl Into<String>) {
+        self.zone_faults
+            .insert(zone.into(), ZoneFault::SoldOut(code.into()));
+    }
+
+    pub fn mark_zone_run_fail(&mut self, zone: impl Into<String>, code: impl Into<String>) {
+        self.zone_faults
+            .insert(zone.into(), ZoneFault::RunFail(code.into()));
     }
 
     pub fn count_calls(&self, action: &str) -> usize {

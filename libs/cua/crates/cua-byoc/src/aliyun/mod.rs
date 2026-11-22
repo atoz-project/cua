@@ -18,10 +18,11 @@ pub mod existing_vpc;
 pub mod image;
 mod lifecycle;
 pub mod net;
-mod net_lifecycle;
-mod net_zones;
 mod preflight;
+pub mod security_group;
 pub mod sizing;
+pub mod vpc;
+pub mod zones;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -61,18 +62,6 @@ use net::{NetLocks, NetworkConfig};
 
 /// Default Alibaba Cloud region when neither `--region` nor a CLI profile specifies one.
 pub const DEFAULT_REGION: &str = "cn-hangzhou";
-
-/// Single-pass resolved launch plan produced by [`AliyunEcs::prepare_provision`]
-/// and consumed by [`AliyunEcs::provision`] without re-querying sizing or images.
-#[derive(Clone, Debug)]
-pub(crate) struct AliyunProvisionPlan {
-    pub region: String,
-    pub instance_type: String,
-    pub disk_gb: u32,
-    pub disk_category: &'static str,
-    pub stock_zones: Option<Vec<String>>,
-    pub resolved_image: ResolvedCloudImage,
-}
 
 /// Alibaba Cloud ECS provider (`--on aliyun-ecs`).
 pub struct AliyunEcs {
@@ -421,12 +410,15 @@ impl CloudApi for AliyunEcs {
             profile,
             region,
             ttl_hours: model::DEFAULT_TTL_HOURS,
-            vpc_id,
-            vswitch_id,
-            no_public_ip: t.no_public_ip,
-            windows_image_id,
-            linux_image_id,
-            instance_type,
+            extras: model::ConnectionExtras {
+                vpc_id,
+                vswitch_id,
+                no_public_ip: t.no_public_ip,
+                windows_image_id,
+                linux_image_id,
+                instance_type,
+                ..Default::default()
+            },
             ..Default::default()
         })
     }
@@ -481,7 +473,7 @@ impl CloudApi for AliyunEcs {
         if spec.disk_gb > 0 {
             validate_disk_gb(spec.disk_gb)?;
         }
-        let (effective_disk_gb, disk_category) = system_disk_for(spec);
+        let (effective_disk_gb, _disk_category) = system_disk_for(spec);
         validate_disk_gb(effective_disk_gb)?;
         let disk_usd = f64::from(effective_disk_gb) * ESSD_USD_PER_GB_HOUR;
 
@@ -519,16 +511,6 @@ impl CloudApi for AliyunEcs {
         let resolved_image = image::resolve_image_id(self, &effective_conn, spec).await?;
         let windows_header =
             (spec.family == "windows").then(|| resolved_image.windows_init_header());
-        let cloud_image_id = resolved_image.image_id.clone();
-
-        let plan = AliyunProvisionPlan {
-            region,
-            instance_type: instance_type.clone(),
-            disk_gb: effective_disk_gb,
-            disk_category,
-            stock_zones,
-            resolved_image,
-        };
 
         Ok(PreparedProvision {
             sizing: Some(ResolvedSizing {
@@ -538,9 +520,9 @@ impl CloudApi for AliyunEcs {
                 disk_gb: Some(effective_disk_gb),
                 usd_per_hour: inst_usd + disk_usd,
             }),
-            cloud_image_id: Some(cloud_image_id),
+            cloud_image_id: Some(resolved_image.image_id),
             windows_header,
-            provider_plan: Some(Arc::new(plan)),
+            candidate_zones: stock_zones,
         })
     }
 
@@ -553,29 +535,33 @@ impl CloudApi for AliyunEcs {
             .filter(|o| !o.is_empty())
             .ok_or_else(|| Error::InvalidArgument("aliyun-ecs: missing cua-owner tag".into()))?;
 
-        let plan_arc = match spec
-            .provider_plan
-            .as_ref()
-            .and_then(|p| p.downcast_ref::<AliyunProvisionPlan>())
+        let mut resolved_spec;
+        let spec = if !spec.machine_type.trim().is_empty()
+            && spec
+                .cloud_image_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            && spec.disk_gb > 0
         {
-            Some(existing) => existing.clone(),
-            None => {
-                let prep = self.prepare_provision(conn, spec).await?;
-                prep.provider_plan
-                    .as_ref()
-                    .and_then(|p| p.downcast_ref::<AliyunProvisionPlan>())
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::Cloud("aliyun-ecs: prepare_provision returned no plan".into())
-                    })?
-            }
+            validate_disk_gb(spec.disk_gb)?;
+            spec
+        } else {
+            let prep = self.prepare_provision(conn, spec).await?;
+            resolved_spec = spec.clone();
+            prep.apply_to(&mut resolved_spec);
+            &resolved_spec
         };
 
-        let region = plan_arc.region;
-        let instance_type = plan_arc.instance_type;
-        let disk_gb = plan_arc.disk_gb;
-        let disk_category = plan_arc.disk_category;
-        let image_id = plan_arc.resolved_image.image_id;
+        let region = spec.region_or(conn).to_string();
+        let instance_type = spec.machine_type.trim().to_string();
+        let (disk_gb, disk_category) = system_disk_for(spec);
+        let image_id = spec
+            .cloud_image_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::Cloud("aliyun-ecs: missing resolved Cloud Image ID".into()))?
+            .to_string();
 
         let profile_hint = self.profile_hint(conn);
         let ecs_ep = self.ecs_endpoint(&region);
@@ -593,7 +579,7 @@ impl CloudApi for AliyunEcs {
             &instance_type,
             &net_cfg,
             &self.net_locks,
-            plan_arc.stock_zones.as_deref(),
+            spec.candidate_zones.as_deref(),
         )
         .await?;
 
@@ -703,7 +689,9 @@ impl CloudApi for AliyunEcs {
                 Ok((status, body)) if status.is_success() => {
                     let ApiBody::Json(v) = body else {
                         if let Some(ref vsw) = made_vsw {
-                            let _ = net::delete_part(self, &effective_conn, vsw).await;
+                            let _ =
+                                net::delete_part_owned(self, &effective_conn, vsw, Some(&owner))
+                                    .await;
                         }
                         net::rollback_made(self, &effective_conn, &net.made).await;
                         return Err(cloud_err(
@@ -720,7 +708,9 @@ impl CloudApi for AliyunEcs {
                         .filter(|s| !s.is_empty())
                     else {
                         if let Some(ref vsw) = made_vsw {
-                            let _ = net::delete_part(self, &effective_conn, vsw).await;
+                            let _ =
+                                net::delete_part_owned(self, &effective_conn, vsw, Some(&owner))
+                                    .await;
                         }
                         net::rollback_made(self, &effective_conn, &net.made).await;
                         return Err(cloud_err(
@@ -764,7 +754,8 @@ impl CloudApi for AliyunEcs {
                     };
                     let err = map_api_error("RunInstances", ECS_API_VERSION, status, &body);
                     if let Some(ref vsw) = made_vsw {
-                        let _ = net::delete_part(self, &effective_conn, vsw).await;
+                        let _ =
+                            net::delete_part_owned(self, &effective_conn, vsw, Some(&owner)).await;
                     }
                     if is_zone_capacity_error(&code) {
                         tried.push(format!("{} ({vswitch_id}): {err}", cand.zone_id));
@@ -775,7 +766,8 @@ impl CloudApi for AliyunEcs {
                 }
                 Err(e) => {
                     if let Some(ref vsw) = made_vsw {
-                        let _ = net::delete_part(self, &effective_conn, vsw).await;
+                        let _ =
+                            net::delete_part_owned(self, &effective_conn, vsw, Some(&owner)).await;
                     }
                     net::rollback_made(self, &effective_conn, &net.made).await;
                     return Err(e);

@@ -674,64 +674,31 @@ async fn t2_f3_03() {
     w.auth_login().await;
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.instances.insert(
-            "i-untagged".into(),
-            FakeInstance {
-                instance_id: "i-untagged".into(),
-                instance_name: "cua-sb-lookalike".into(),
-                region_id: "cn-hangzhou".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                vpc_id: String::new(),
-                vswitch_id: String::new(),
-                security_group_id: String::new(),
-                instance_type: "ecs.e-c1m2.large".into(),
-                image_id: "ubuntu".into(),
-                status: "Running".into(),
-                instance_charge_type: "PostPaid".into(),
-                stopped_mode: "StopCharging".into(),
-                auto_release_time: None,
-                http_tokens: None,
-                key_pair_name: None,
-                ram_role_name: None,
-                internet_max_bandwidth_out: None,
-                system_disk_category: None,
-                system_disk_size: None,
-                user_data_raw: String::new(),
-                user_data_decoded: String::new(),
-                tags: Default::default(),
-                client_token: None,
-                machine_id: None,
-            },
-        );
-        f.instances.insert(
-            "i-foreign".into(),
-            FakeInstance {
-                instance_id: "i-foreign".into(),
-                instance_name: "foreign-box".into(),
-                region_id: "cn-hangzhou".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                vpc_id: String::new(),
-                vswitch_id: String::new(),
-                security_group_id: String::new(),
-                instance_type: "ecs.e-c1m2.large".into(),
-                image_id: "ubuntu".into(),
-                status: "Running".into(),
-                instance_charge_type: "PostPaid".into(),
-                stopped_mode: "StopCharging".into(),
-                auto_release_time: None,
-                http_tokens: None,
-                key_pair_name: None,
-                ram_role_name: None,
-                internet_max_bandwidth_out: None,
-                system_disk_category: None,
-                system_disk_size: None,
-                user_data_raw: String::new(),
-                user_data_decoded: String::new(),
-                tags: make_tags(&[("cua-managed", "true"), ("cua-owner", "other-owner")]),
-                client_token: None,
-                machine_id: None,
-            },
-        );
+        f.seed_instance(FakeInstance {
+            instance_id: "i-untagged".into(),
+            instance_name: "cua-sb-lookalike".into(),
+            region_id: "cn-hangzhou".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            instance_type: "ecs.e-c1m2.large".into(),
+            image_id: "ubuntu".into(),
+            status: "Running".into(),
+            instance_charge_type: "PostPaid".into(),
+            stopped_mode: "StopCharging".into(),
+            ..Default::default()
+        });
+        f.seed_instance(FakeInstance {
+            instance_id: "i-foreign".into(),
+            instance_name: "foreign-box".into(),
+            region_id: "cn-hangzhou".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            instance_type: "ecs.e-c1m2.large".into(),
+            image_id: "ubuntu".into(),
+            status: "Running".into(),
+            instance_charge_type: "PostPaid".into(),
+            stopped_mode: "StopCharging".into(),
+            tags: make_tags(&[("cua-managed", "true"), ("cua-owner", "other-owner")]),
+            ..Default::default()
+        });
     }
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
@@ -914,7 +881,7 @@ async fn t2_f3_05() {
     {
         let mut f = w.aliyun.lock().unwrap();
         for z in ["cn-hangzhou-h", "cn-hangzhou-i", "cn-hangzhou-j"] {
-            f.run_fail_zones.insert(z.into());
+            f.mark_zone_run_fail(z, "OperationDenied.NoStock");
         }
     }
     w.run_with_stdin(
@@ -1224,30 +1191,24 @@ async fn t2_f5_02() {
     let w = AliyunWorld::start().await;
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.vpcs.insert(
-            "vpc-a".into(),
-            FakeVpc {
-                vpc_id: "vpc-a".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.0.0.0/16".into(),
-                vpc_name: "a".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-b".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-b".into(),
-                vpc_id: "vpc-other".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.1.1.0/24".into(),
-                vswitch_name: "b".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-a".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.0.0.0/16".into(),
+            vpc_name: "a".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-b".into(),
+            vpc_id: "vpc-other".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.1.1.0/24".into(),
+            vswitch_name: "b".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
     }
     let out = w
         .run_with_stdin(
@@ -1274,30 +1235,24 @@ async fn t2_f5_03() {
     let w = AliyunWorld::start().await;
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.vpcs.insert(
-            "vpc-sh".into(),
-            FakeVpc {
-                vpc_id: "vpc-sh".into(),
-                region_id: "cn-shanghai".into(),
-                cidr_block: "10.2.0.0/16".into(),
-                vpc_name: "sh".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-sh".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-sh".into(),
-                vpc_id: "vpc-sh".into(),
-                zone_id: "cn-shanghai-h".into(),
-                region_id: "cn-shanghai".into(),
-                cidr_block: "10.2.1.0/24".into(),
-                vswitch_name: "sh".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-sh".into(),
+            region_id: "cn-shanghai".into(),
+            cidr_block: "10.2.0.0/16".into(),
+            vpc_name: "sh".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-sh".into(),
+            vpc_id: "vpc-sh".into(),
+            zone_id: "cn-shanghai-h".into(),
+            region_id: "cn-shanghai".into(),
+            cidr_block: "10.2.1.0/24".into(),
+            vswitch_name: "sh".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
     }
     let out = w
         .run_with_stdin(
@@ -1327,30 +1282,24 @@ async fn t2_f5_04() {
     w.auth_login().await;
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.vpcs.insert(
-            "vpc-priv".into(),
-            FakeVpc {
-                vpc_id: "vpc-priv".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.3.0.0/16".into(),
-                vpc_name: "priv".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-priv".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-priv".into(),
-                vpc_id: "vpc-priv".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.3.1.0/24".into(),
-                vswitch_name: "priv".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-priv".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.3.0.0/16".into(),
+            vpc_name: "priv".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-priv".into(),
+            vpc_id: "vpc-priv".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.3.1.0/24".into(),
+            vswitch_name: "priv".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
     }
     w.run_with_stdin(
         &[
@@ -1392,42 +1341,32 @@ async fn t2_f5_05() {
     w.auth_login().await;
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.vpcs.insert(
-            "vpc-user".into(),
-            FakeVpc {
-                vpc_id: "vpc-user".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.4.0.0/16".into(),
-                vpc_name: "user".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-user".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-user".into(),
-                vpc_id: "vpc-user".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.4.1.0/24".into(),
-                vswitch_name: "user".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.security_groups.insert(
-            "sg-lookalike".into(),
-            FakeSg {
-                sg_id: "sg-lookalike".into(),
-                vpc_id: "vpc-user".into(),
-                region_id: "cn-hangzhou".into(),
-                sg_name: "cua-sandboxes-lookalike".into(),
-                tags: Default::default(),
-                ingress_rules: vec![],
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-user".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.4.0.0/16".into(),
+            vpc_name: "user".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-user".into(),
+            vpc_id: "vpc-user".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.4.1.0/24".into(),
+            vswitch_name: "user".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-lookalike".into(),
+            vpc_id: "vpc-user".into(),
+            region_id: "cn-hangzhou".into(),
+            sg_name: "cua-sandboxes-lookalike".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
     }
     w.run_with_stdin(
         &[
@@ -1499,6 +1438,7 @@ async fn t2_f6_01() {
         status: "Unavailable".into(),
         owner_alias: "self".into(),
         region_id: "cn-hangzhou".into(),
+        ..Default::default()
     });
 
     let bad = w

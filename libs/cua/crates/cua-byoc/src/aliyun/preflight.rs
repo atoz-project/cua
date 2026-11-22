@@ -15,7 +15,7 @@ use super::image;
 use super::net;
 use super::sizing::{
     LINUX_INSTANCE_TYPE, describe_instance_types_batch, ecs_instance_spec,
-    is_excluded_instance_family, is_with_stock_category, lookup_instance_type,
+    is_excluded_instance_family, lookup_instance_type, query_available_instance_types,
     select_best_dynamic_candidate,
 };
 use crate::api::Tested;
@@ -108,55 +108,9 @@ pub(crate) async fn run_preflight_test(api: &AliyunEcs, conn: &Connection) -> Te
     }
 
     let discovered_type: String;
-    match api
-        .call_ok(
-            &ecs,
-            "GET",
-            "DescribeAvailableResource",
-            ECS_API_VERSION,
-            &[
-                ("RegionId".into(), conn.region.clone()),
-                ("DestinationResource".into(), "InstanceType".into()),
-                ("InstanceChargeType".into(), "PostPaid".into()),
-                ("IoOptimized".into(), "optimized".into()),
-            ],
-            profile_hint,
-        )
-        .await
-    {
-        Ok(v) => {
-            let mut available_types = Vec::new();
-            for zone in v["AvailableZones"]["AvailableZone"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                if let Some(st) = zone["Status"].as_str()
-                    && !st.eq_ignore_ascii_case("Available")
-                {
-                    continue;
-                }
-                for ar in zone["AvailableResources"]["AvailableResource"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    for sr in ar["SupportedResources"]["SupportedResource"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                    {
-                        let status = sr["Status"].as_str().unwrap_or("");
-                        if status == "Available"
-                            && is_with_stock_category(sr["StatusCategory"].as_str())
-                            && let Some(val) = sr["Value"].as_str()
-                            && !available_types.iter().any(|x| x == val)
-                        {
-                            available_types.push(val.to_string());
-                        }
-                    }
-                }
-            }
+    match query_available_instance_types(api, conn, &conn.region, None, None, None).await {
+        Ok(available) => {
+            let available_types: Vec<String> = available.into_iter().map(|(id, _)| id).collect();
             if available_types.is_empty() {
                 t.check(
                     "machine",

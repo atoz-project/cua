@@ -1,167 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! Zone candidate ordering and zero-ingress Security Group provisioning for
-//! `aliyun-ecs`.
+//! Zero-ingress enterprise Security Group provisioning, verification, listing,
+//! and inspection for `aliyun-ecs`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use cua_sandbox_core::Error;
 
 use super::AliyunEcs;
 use super::client::ECS_API_VERSION;
-use super::net::{net_resource, owner_tag_filters, part_tags, sg_name, tag_params, tags_of};
-use super::net_lifecycle::delete_part;
-use super::sizing::is_with_stock_category;
+use super::net::{
+    delete_part_owned, net_resource, owner_tag_filters, part_tags, tag_params, tags_of,
+};
 use crate::api::Result;
 use crate::model::{self, Connection, Resource};
 
-/// Discovers availability zones in deterministic order: stock-available zones
-/// for `instance_type` first, supplemented by remaining available zones from
-/// `DescribeZones`.
-pub async fn discover_zones(
-    api: &AliyunEcs,
-    conn: &Connection,
-    region: &str,
-    instance_type: &str,
-) -> Result<Vec<String>> {
-    discover_zones_with_stock(api, conn, region, instance_type, None).await
-}
-
-/// Orders candidate zones putting `precomputed_stock_zones` first (avoiding a
-/// duplicate `DescribeAvailableResource` call when sizing already fetched them),
-/// supplemented by remaining zones from `DescribeZones`.
-pub(crate) async fn discover_zones_with_stock(
-    api: &AliyunEcs,
-    conn: &Connection,
-    region: &str,
-    instance_type: &str,
-    precomputed_stock_zones: Option<&[String]>,
-) -> Result<Vec<String>> {
-    let profile_hint = api.profile_hint(conn);
-    let ecs_ep = api.ecs_endpoint(region);
-
-    let mut avail_err: Option<Error> = None;
-    let mut stock_zones: Vec<String> = match precomputed_stock_zones {
-        Some(zones) if !zones.is_empty() => {
-            let mut z = zones.to_vec();
-            z.sort();
-            z
-        }
-        _ => {
-            let mut found = Vec::new();
-            match api
-                .call_ok(
-                    &ecs_ep,
-                    "GET",
-                    "DescribeAvailableResource",
-                    ECS_API_VERSION,
-                    &[
-                        ("RegionId".into(), region.to_string()),
-                        ("DestinationResource".into(), "InstanceType".into()),
-                        ("InstanceChargeType".into(), "PostPaid".into()),
-                        ("IoOptimized".into(), "optimized".into()),
-                        ("InstanceType".into(), instance_type.to_string()),
-                    ],
-                    profile_hint,
-                )
-                .await
-            {
-                Ok(v) => {
-                    for az in v["AvailableZones"]["AvailableZone"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                    {
-                        if let Some(st) = az["Status"].as_str()
-                            && !st.eq_ignore_ascii_case("Available")
-                        {
-                            continue;
-                        }
-                        let Some(zone_id) = az["ZoneId"]
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        else {
-                            continue;
-                        };
-                        let has_type = az["AvailableResources"]["AvailableResource"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .flat_map(|ar| {
-                                ar["SupportedResources"]["SupportedResource"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                            })
-                            .any(|sr| {
-                                sr["Value"].as_str() == Some(instance_type)
-                                    && sr["Status"].as_str() == Some("Available")
-                                    && is_with_stock_category(sr["StatusCategory"].as_str())
-                            });
-                        if has_type && !found.iter().any(|z| z == zone_id) {
-                            found.push(zone_id.to_string());
-                        }
-                    }
-                    found.sort();
-                }
-                Err(e) => avail_err = Some(e),
-            }
-            found
-        }
-    };
-
-    let mut all_zones = Vec::new();
-    match api
-        .call_ok(
-            &ecs_ep,
-            "GET",
-            "DescribeZones",
-            ECS_API_VERSION,
-            &[
-                ("RegionId".into(), region.to_string()),
-                ("InstanceChargeType".into(), "PostPaid".into()),
-            ],
-            profile_hint,
-        )
-        .await
-    {
-        Ok(v) => {
-            for z in v["Zones"]["Zone"].as_array().into_iter().flatten() {
-                if let Some(st) = z["Status"].as_str()
-                    && !st.eq_ignore_ascii_case("Available")
-                {
-                    continue;
-                }
-                if let Some(zid) = z["ZoneId"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    && !all_zones.iter().any(|x| x == zid)
-                {
-                    all_zones.push(zid.to_string());
-                }
-            }
-            all_zones.sort();
-        }
-        Err(e) if stock_zones.is_empty() => {
-            if let Some(ae) = avail_err {
-                return Err(ae);
-            }
-            return Err(e);
-        }
-        Err(_) => {}
-    }
-
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut ordered = Vec::new();
-    for z in stock_zones.drain(..).chain(all_zones) {
-        if seen.insert(z.clone()) {
-            ordered.push(z);
-        }
-    }
-    Ok(ordered)
+/// Name of `owner`'s zero-ingress Security Group (`cua-sandboxes-<owner>`).
+pub fn sg_name(owner: &str) -> String {
+    format!("cua-sandboxes-{}", model::label_value(owner))
 }
 
 async fn authorize_sg_egress(
@@ -344,10 +201,11 @@ pub(crate) async fn ensure_security_group(
         .to_string();
 
     if let Err(e) = authorize_sg_egress(api, conn, region, &id).await {
-        let _ = delete_part(
+        let _ = delete_part_owned(
             api,
             conn,
             &net_resource(region, "", "security_group", &id, &name, &tags, &[]),
+            Some(owner),
         )
         .await;
         return Err(e);
@@ -356,10 +214,11 @@ pub(crate) async fn ensure_security_group(
     if let Some(winner) = find_security_group(api, conn, region, owner, vpc_id).await?
         && winner != id
     {
-        let _ = delete_part(
+        let _ = delete_part_owned(
             api,
             conn,
             &net_resource(region, "", "security_group", &id, &name, &tags, &[]),
+            Some(owner),
         )
         .await;
         verify_and_repair_sg(api, conn, region, &winner).await?;
@@ -378,4 +237,73 @@ pub(crate) async fn ensure_security_group(
             &[("vpc", vpc_id)],
         )),
     ))
+}
+
+pub(crate) async fn describe_security_group(
+    api: &AliyunEcs,
+    conn: &Connection,
+    region: &str,
+    id: &str,
+) -> Result<Option<(String, BTreeMap<String, String>)>> {
+    let v = api
+        .call_ok(
+            &api.ecs_endpoint(region),
+            "GET",
+            "DescribeSecurityGroups",
+            ECS_API_VERSION,
+            &[
+                ("RegionId".into(), region.to_string()),
+                ("SecurityGroupId".into(), id.to_string()),
+            ],
+            api.profile_hint(conn),
+        )
+        .await?;
+    let Some(sg) = v["SecurityGroups"]["SecurityGroup"]
+        .as_array()
+        .and_then(|a| a.first())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(("available".into(), tags_of(sg))))
+}
+
+pub(crate) async fn list_security_groups(
+    api: &AliyunEcs,
+    conn: &Connection,
+    owner: &str,
+) -> Result<Vec<Resource>> {
+    let mut base = vec![("RegionId".into(), conn.region.clone())];
+    base.extend(owner_tag_filters(owner));
+    let mut out = Vec::new();
+    for sg in api
+        .paginated_page_number(
+            &api.ecs_endpoint(&conn.region),
+            "DescribeSecurityGroups",
+            ECS_API_VERSION,
+            &base,
+            ("SecurityGroups", "SecurityGroup"),
+            api.profile_hint(conn),
+        )
+        .await?
+    {
+        let tags = tags_of(&sg);
+        if !model::is_ours(&tags, owner) {
+            continue;
+        }
+        let Some(id) = sg["SecurityGroupId"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let name = sg["SecurityGroupName"].as_str().unwrap_or_default();
+        let vpc = sg["VpcId"].as_str().unwrap_or_default();
+        let mut r = net_resource(&conn.region, "", "security_group", id, name, &tags, &[]);
+        if !vpc.is_empty() {
+            r.extra.insert("vpc".into(), vpc.into());
+        }
+        out.push(r);
+    }
+    Ok(out)
 }

@@ -749,3 +749,156 @@ async fn account_and_static_clouds_coexist_in_the_same_home() {
     sandboxes.delete("static-vm").await.unwrap();
     sandboxes.delete("acct-vm").await.unwrap();
 }
+
+#[tokio::test]
+async fn static_connection_missing_url_or_token_never_reaches_account_relay_on_delete_or_rollback()
+{
+    use cua_sandbox_core::Provider as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let acct_hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = acct_hits.clone();
+    let acct_app = axum::Router::new().fallback(move || {
+        let hits = hits_clone.clone();
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({})),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let acct_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, acct_app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let static_relay = Arc::new(FakeRelay::start().await);
+    static_relay.add_static_token("static-tok");
+    let mock_spacesd = MockServer::start(MockAuth::default()).await;
+    let fake = FakeProvider::new("hetzner", Tier::Vm);
+    {
+        let static_relay = static_relay.clone();
+        let mock_url = mock_spacesd.url();
+        fake.on_boot(Arc::new(move |spec, _| {
+            let machine = spec.tags[model::tag::MACHINE].clone();
+            let sb_env = decode_cloud_init_file(&spec.user_data, "/etc/cua/sandbox.env").unwrap();
+            let env_tok = env_value(&sb_env, "CUA_ENV_TOKEN").unwrap();
+            static_relay.tunnel(&machine, &mock_url);
+            static_relay.set_static_online(&machine, true, Some(&env_tok));
+        }));
+    }
+
+    let relay_access = RelayAccess::new(
+        acct_url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![fake.clone()],
+        relay_access.clone(),
+    )
+    .build();
+    let clouds = sandboxes.clouds().unwrap();
+    clouds
+        .connect(
+            &Target {
+                provider: "hetzner".into(),
+                relay_url: Some(static_relay.url.clone()),
+                relay_mode: Some(RelayMode::Static),
+                relay_token: Some("static-tok".into()),
+                ..Default::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 1. Create a sandbox, then corrupt the stored static connection (drop relay_url
+    //    and clear its static token) before calling endpoint() and delete().
+    let sb = sandboxes
+        .create(create_opts("hetzner", "corrupt-static-del"))
+        .await
+        .unwrap();
+    let machine_id = sb.provider_details()[DETAIL_RELAY_MACHINE].clone();
+    let store = cua_byoc::Store::new(dir.path());
+    let mut conn = store.connection("hetzner").unwrap().unwrap();
+    conn.relay_url = None;
+    store.connect(conn).unwrap();
+    let cred_store = cua_auth::Store::File(dir.path().join("credentials.json"));
+    let _ = cred_store.clear_secret("byoc-relay-token-hetzner");
+
+    let provider = cua_byoc::CloudSandboxes::new(
+        fake.clone(),
+        Arc::new(cua_byoc::Store::new(dir.path())),
+        relay_access.clone(),
+    );
+    let inst = provider
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name == "corrupt-static-del")
+        .unwrap();
+    let ep_err = provider.endpoint(&inst, 8000).unwrap_err();
+    assert!(
+        ep_err.to_string().contains("no relay URL is recorded"),
+        "expected static relay error from endpoint(), got: {ep_err}"
+    );
+    sandboxes.delete("corrupt-static-del").await.unwrap();
+    assert_eq!(
+        acct_hits.load(Ordering::SeqCst),
+        0,
+        "delete must never fall back to the account relay for a misconfigured static connection"
+    );
+    let env_map: Option<Vec<u8>> = cred_store.load_secret("byoc-env-tokens-hetzner").unwrap();
+    assert!(
+        env_map.is_none_or(|b| !String::from_utf8_lossy(&b).contains(&machine_id)),
+        "local env token should still be cleaned up on delete"
+    );
+
+    // 2. Rollback path: restore valid relay_url + token for prepare_join, then inject a
+    //    boot hook that corrupts the connection's relay_url, clears its static token,
+    //    and stops the VM so boot fails and rollback runs with missing static config.
+    let mut valid_conn = store.connection("hetzner").unwrap().unwrap();
+    valid_conn.relay_url = Some(static_relay.url.clone());
+    store.connect(valid_conn).unwrap();
+    cred_store
+        .save_secret("byoc-relay-token-hetzner", b"static-tok")
+        .unwrap();
+    let home_for_hook = dir.path().to_path_buf();
+    let fake_for_hook = fake.clone();
+    fake.on_boot(Arc::new(move |_spec, res| {
+        let store = cua_byoc::Store::new(&home_for_hook);
+        if let Ok(Some(mut c)) = store.connection("hetzner") {
+            c.relay_url = None;
+            let _ = store.connect(c);
+        }
+        let creds = cua_auth::Store::File(home_for_hook.join("credentials.json"));
+        let _ = creds.clear_secret("byoc-relay-token-hetzner");
+        if let Some(r) = fake_for_hook
+            .account
+            .lock()
+            .unwrap()
+            .resources
+            .get_mut(&res.id)
+        {
+            r.state = "stopped".into();
+        }
+    }));
+    let err = sandboxes
+        .create(create_opts("hetzner", "static-rollback-vm"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("stopped") || err.to_string().contains("relay"),
+        "{err}"
+    );
+    assert_eq!(
+        acct_hits.load(Ordering::SeqCst),
+        0,
+        "rollback must never reach the account relay for a static connection"
+    );
+}

@@ -1449,6 +1449,28 @@ async fn connect_oidc(
         }
     }
 
+    let relay_check = match prep.relay.probe_url.as_deref() {
+        Some(url) => {
+            let check = crate::relay::probe_relay_check(url, prep.relay.mode).await;
+            if !check.ok {
+                return Ok(outcome(
+                    clouds,
+                    p,
+                    None,
+                    status::FAILED,
+                    Some(CloudNext {
+                        run: Some(cmd.line(req.check, false)),
+                        why: check.detail.clone(),
+                        ..Default::default()
+                    }),
+                    vec![check],
+                ));
+            }
+            Some(check)
+        }
+        None => None,
+    };
+
     // 3. The account's connection on the issuer: created, or its limits
     // brought in line (an agent's raise waits for approval).
     let wanted = IssuerLimits {
@@ -1571,10 +1593,8 @@ async fn connect_oidc(
         );
         t
     };
-    if let Some(url) = prep.relay.probe_url.as_deref() {
-        tested
-            .checks
-            .push(crate::relay::probe_relay_check(url, prep.relay.mode).await);
+    if let Some(check) = relay_check {
+        tested.checks.push(check);
     }
     if !tested.ok() {
         let untrusted = tested

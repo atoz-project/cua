@@ -358,7 +358,10 @@ fn gcp_conn(sa: &str) -> Connection {
         zone: "us-central1-a".into(),
         project: PROJECT.into(),
         account: NUMBER.into(),
-        auth: Auth::gcp("conn_g", gcp_provider(), sa),
+        extras: cua_byoc::ConnectionExtras {
+            auth: Auth::gcp("conn_g", gcp_provider(), sa),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -767,7 +770,10 @@ fn azure_conn() -> Connection {
         region: "westus2".into(),
         account: SUB.into(),
         project: "cua-spaces".into(),
-        auth: Auth::azure("conn_z", TENANT, CLIENT),
+        extras: cua_byoc::ConnectionExtras {
+            auth: Auth::azure("conn_z", TENANT, CLIENT),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -878,10 +884,8 @@ async fn azure_tokens_are_cached_and_refusals_say_why() {
     assert!(f.z.lock().unwrap().entra.is_empty());
 
     // A CLI link is not a way to reach Azure.
-    let cli = Connection {
-        auth: Auth::Cli,
-        ..azure_conn()
-    };
+    let mut cli = azure_conn();
+    cli.auth = Auth::Cli;
     let e = f
         .azure(Arc::new(FakeIssuer::default()), None)
         .list_owned(&cli, "o")

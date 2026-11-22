@@ -4,7 +4,6 @@
 //! ACS3-HMAC-SHA256 signature verification and OpenAPI parameter/CIDR/pagination helpers.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
 
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use base64::Engine as _;
@@ -12,20 +11,11 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub use crate::aliyun::client::rfc3986_encode;
+pub(crate) use crate::aliyun::net::cidrs_overlap;
+
 pub type Acs3VerifyOk = (String, String, String, String);
 pub type Acs3VerifyErr = (StatusCode, &'static str, String);
-
-pub fn rfc3986_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for &b in input.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
 
 pub fn parse_query_params(raw: &str) -> BTreeMap<String, String> {
     url::form_urlencoded::parse(raw.as_bytes())
@@ -57,27 +47,6 @@ pub fn matches_glob(pattern: &str, text: &str) -> bool {
         text.ends_with(suffix)
     } else {
         text == pattern
-    }
-}
-
-pub fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
-    let (ip_str, prefix_str) = cidr.trim().split_once('/')?;
-    let (ip, prefix): (Ipv4Addr, u32) = (ip_str.parse().ok()?, prefix_str.parse().ok()?);
-    let mask = if prefix > 32 {
-        return None;
-    } else if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    let start = u32::from(ip) & mask;
-    Some((start, start | !mask))
-}
-
-pub fn cidrs_overlap(a: &str, b: &str) -> bool {
-    match (parse_cidr(a), parse_cidr(b)) {
-        (Some((a0, a1)), Some((b0, b1))) => a0 <= b1 && b0 <= a1,
-        _ => a.trim() == b.trim(),
     }
 }
 
@@ -298,7 +267,7 @@ fn b64_utf8(raw: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
-fn decode_cloud_init_write_files(user_data: &str) -> BTreeMap<String, String> {
+pub fn decode_cloud_init_write_files(user_data: &str) -> BTreeMap<String, String> {
     let (mut files, mut in_wf) = (BTreeMap::new(), false);
     let mut cur: (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let flush = |out: &mut BTreeMap<String, String>,
@@ -357,7 +326,7 @@ fn decode_cloud_init_write_files(user_data: &str) -> BTreeMap<String, String> {
     files
 }
 
-fn decode_ps_puts(user_data: &str) -> BTreeMap<String, String> {
+pub fn decode_ps_puts(user_data: &str) -> BTreeMap<String, String> {
     let marker = "Put (Join-Path $sd '";
     user_data
         .lines()

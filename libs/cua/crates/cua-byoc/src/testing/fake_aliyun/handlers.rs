@@ -282,7 +282,7 @@ fn handle_describe_instances(f: &FakeAliyun, params: &Params) -> Response {
                     .is_none_or(|ids| ids.iter().any(|id| id == &inst.instance_id))
                 && tag_filters.iter().all(|(k, v)| inst.tags.get(k) == Some(v))
         })
-        .map(|inst| inst.to_api_json_with_extra(f.extra_instance_fields.get(&inst.instance_id)))
+        .map(FakeInstance::to_api_json)
         .collect();
     paged_ok("Instances", "Instance", items, params, "req-instances-1")
 }
@@ -339,28 +339,11 @@ fn handle_run_instances(f: &mut FakeAliyun, params: &Params, hooks: &mut PostHoo
         .or_else(|| f.vswitches.get(&vsw_id).map(|v| v.zone_id.clone()))
         .unwrap_or_else(|| format!("{region}-h"));
 
-    if let Some(code) = f
-        .sold_out_zone_errors
-        .get(&zone_id)
-        .or_else(|| f.run_fail_zone_errors.get(&zone_id))
-        .cloned()
-    {
+    if let Some(fault) = f.zone_faults.get(&zone_id) {
         return err(
             StatusCode::FORBIDDEN,
-            &code,
+            fault.code(),
             "No capacity available in requested zone.",
-        );
-    }
-    if f.sold_out_zones.contains(&zone_id) || f.run_fail_zones.contains(&zone_id) {
-        return bad_req(
-            "OperationDenied.NoStock",
-            &format!("Zone {zone_id} is out of stock"),
-        );
-    }
-    if f.unsupported_zones.contains(&zone_id) {
-        return bad_req(
-            "Zone.NotOnSale",
-            &format!("Zone {zone_id} does not support instance type"),
         );
     }
 
@@ -401,20 +384,24 @@ fn handle_run_instances(f: &mut FakeAliyun, params: &Params, hooks: &mut PostHoo
     let inst = FakeInstance {
         instance_id: id.clone(),
         instance_name: p_str(params, "InstanceName"),
+        host_name: p_str(params, "HostName"),
         region_id: region,
         zone_id,
         vpc_id,
         vswitch_id: vsw_id,
         security_group_id: p_str(params, "SecurityGroupId"),
+        extra_security_group_ids: Vec::new(),
         instance_type: p_str(params, "InstanceType"),
         image_id: img_id,
         status: status.into(),
         instance_charge_type: p_str(params, "InstanceChargeType"),
         stopped_mode: p_str(params, "StoppedMode"),
         auto_release_time: params.get("AutoReleaseTime").cloned(),
+        http_endpoint: p_str(params, "HttpEndpoint"),
         http_tokens: params.get("HttpTokens").cloned(),
         key_pair_name: params.get("KeyPairName").cloned(),
         ram_role_name: params.get("RamRoleName").cloned(),
+        internet_charge_type: p_str(params, "InternetChargeType"),
         internet_max_bandwidth_out: params.get("InternetMaxBandwidthOut").cloned(),
         system_disk_category: params.get("SystemDisk.Category").cloned(),
         system_disk_size: params.get("SystemDisk.Size").cloned(),
@@ -424,14 +411,6 @@ fn handle_run_instances(f: &mut FakeAliyun, params: &Params, hooks: &mut PostHoo
         client_token: params.get("ClientToken").cloned(),
         machine_id,
     };
-    f.extra_instance_fields.insert(
-        id.clone(),
-        json!({
-            "HostName": p_str(params, "HostName"),
-            "InternetChargeType": p_str(params, "InternetChargeType"),
-            "MetadataOptions": { "HttpEndpoint": p_str(params, "HttpEndpoint"), "HttpTokens": p_str(params, "HttpTokens") }
-        }),
-    );
     if let Some(ref ct) = inst.client_token {
         f.client_tokens.insert(ct.clone(), id.clone());
     }
@@ -531,7 +510,6 @@ fn handle_instance_ops(
             }
             let power_cb = f.on_power.clone();
             for id in &ids {
-                f.extra_instance_fields.remove(id);
                 if let Some(inst) = f.instances.remove(id)
                     && let Some(ref cb) = power_cb
                 {

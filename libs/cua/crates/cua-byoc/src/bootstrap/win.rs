@@ -136,24 +136,15 @@ pub fn generate_desktop_password() -> String {
 /// When the URL path (before `?`/`#`) ends with `/`, appends
 /// `cua-spacesd-x86_64-pc-windows-msvc.exe` while preserving any query string.
 pub fn split_download_url(raw: Option<&str>) -> (String, Option<&str>) {
-    let Some(trimmed) = raw.map(str::trim).filter(|u| !u.is_empty()) else {
-        return (default_windows_spacesd_url(), None);
-    };
-    let (base, sha) = match trimmed.split_once('#') {
-        Some((u, frag)) => (u, frag.strip_prefix("sha256=")),
-        None => (trimmed, None),
-    };
-    let expanded = base
-        .replace("{version}", default_spacesd_version())
-        .replace("{arch}", "x86_64");
-    let resolved = match expanded.split_once('?') {
-        Some((path, query)) if path.ends_with('/') => {
-            format!("{path}{WINDOWS_SPACESD_ASSET}?{query}")
-        }
-        None if expanded.ends_with('/') => format!("{expanded}{WINDOWS_SPACESD_ASSET}"),
-        _ => expanded,
-    };
-    (resolved, sha)
+    match super::resolve_spacesd_download(
+        raw,
+        default_spacesd_version(),
+        Some("x86_64"),
+        WINDOWS_SPACESD_ASSET,
+    ) {
+        Some(res) => res,
+        None => (default_windows_spacesd_url(), None),
+    }
 }
 
 fn b64(s: &str) -> String {
@@ -366,7 +357,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         pw = ps_single_quote(&pass_b64),
     ));
 
-    // AtLogOn interactive scheduled task (Session >= 1, never Session 0).
     s.push_str(
         "  $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `\"$sd\\launch-spacesd.ps1`\"\"\n\
          \x20 $trg = New-ScheduledTaskTrigger -AtLogOn -User $u\n\
@@ -375,7 +365,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20 Register-ScheduledTask -TaskName 'cua-spacesd' -Action $act -Trigger $trg -Principal $prn -Settings $set -Force | Out-Null\n",
     );
 
-    // SYSTEM scheduled task triggered by Event ID 24 -> tscon.exe <SessionId> /dest:console.
     s.push_str(
         "  $tc = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'\n\
          \x20 $et = New-CimInstance -CimClass $tc -ClientOnly\n\

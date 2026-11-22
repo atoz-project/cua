@@ -43,20 +43,6 @@ pub struct Verdict {
     pub reason: String,
 }
 
-/// The order a sweep deletes in: machines first, then what they used (a
-/// security group), then the parts of a cloud network from the inside out
-/// (subnets, route table, internet gateway), the network last.
-fn delete_rank(resource_type: &str) -> u8 {
-    match resource_type {
-        "instance" | "sandbox" => 0,
-        "subnet" | "vswitch" => 2,
-        "route_table" => 3,
-        "internet_gateway" => 4,
-        "vpc" => 5,
-        _ => 1,
-    }
-}
-
 /// The sweeper's decision for `r`, as the cloud shows it with `tags`,
 /// given this home's `records`. Pure, so the rules are tested directly.
 pub fn verdict(
@@ -79,7 +65,7 @@ pub fn verdict(
     if !model::is_ours(tags, owner) {
         return keep("not Cua's (tags): never touched");
     }
-    let recorded = records.iter().find(|x| same(x, r));
+    let recorded = records.iter().find(|x| x.same_identity(r));
     let expires = recorded
         .map(|x| x.expires)
         .filter(|e| *e > 0)
@@ -200,7 +186,7 @@ pub async fn sweep_provider(
                     if r.region.is_empty() {
                         r.region = c.region.clone();
                     }
-                    if !listed.iter().any(|x| same(x, &r)) {
+                    if !listed.iter().any(|x| x.same_identity(&r)) {
                         listed.push(r);
                     }
                 }
@@ -227,7 +213,7 @@ pub async fn sweep_provider(
     let mut out = Vec::new();
     // Instances and sandboxes first, shared resources after them.
     let mut ordered: Vec<&Resource> = listed.iter().collect();
-    ordered.sort_by_key(|r| delete_rank(&r.resource_type));
+    ordered.sort_by_key(|r| r.delete_rank());
     for r in ordered {
         if r.state == "terminated" {
             continue;
@@ -263,12 +249,12 @@ pub async fn sweep_provider(
                     // with the other relay machines left behind).
                     let machine = records
                         .iter()
-                        .find(|x| same(x, r))
+                        .find(|x| x.same_identity(r))
                         .map(|x| x.machine.clone())
                         .filter(|m| !m.is_empty())
                         .or_else(|| r.tags.get(model::tag::MACHINE).cloned())
                         .filter(|m| !m.is_empty());
-                    for rec in records.iter().filter(|x| same(x, r)) {
+                    for rec in records.iter().filter(|x| x.same_identity(r)) {
                         let _ = store.forget(rec);
                     }
                     if let Some(m) = machine {
@@ -304,7 +290,7 @@ pub async fn sweep_provider(
         if rec.id.is_empty() && t.saturating_sub(rec.created) < GRACE_SECS {
             continue;
         }
-        if listed.iter().any(|r| same(rec, r)) {
+        if listed.iter().any(|r| rec.same_identity(r)) {
             continue;
         }
         // Not in the listing. Gone or no longer Cua-owned only if the cloud,
@@ -365,16 +351,6 @@ pub async fn sweep_provider(
         }
     }
     Ok(out)
-}
-
-pub(crate) fn same(a: &Resource, b: &Resource) -> bool {
-    a.provider == b.provider
-        && a.resource_type == b.resource_type
-        && if !a.id.is_empty() && !b.id.is_empty() {
-            a.id == b.id
-        } else {
-            !a.name.is_empty() && a.name == b.name
-        }
 }
 
 /// A report from the rows of every provider.
@@ -449,7 +425,7 @@ pub(crate) async fn live_resources(
         .into_iter()
         .filter(|r| r.provider == p.name())
     {
-        if listed.iter().any(|r| same(&rec, r)) {
+        if listed.iter().any(|r| rec.same_identity(r)) {
             continue;
         }
         if rec.resource_type == model::RELAY_MACHINE {
@@ -659,10 +635,15 @@ mod tests {
 
     #[test]
     fn delete_rank_orders_inside_out_with_vswitch_after_security_group() {
-        assert!(delete_rank("instance") < delete_rank("security_group"));
-        assert!(delete_rank("security_group") < delete_rank("vswitch"));
-        assert_eq!(delete_rank("vswitch"), delete_rank("subnet"));
-        assert!(delete_rank("vswitch") < delete_rank("vpc"));
+        assert!(
+            Resource::delete_rank_for("instance") < Resource::delete_rank_for("security_group")
+        );
+        assert!(Resource::delete_rank_for("security_group") < Resource::delete_rank_for("vswitch"));
+        assert_eq!(
+            Resource::delete_rank_for("vswitch"),
+            Resource::delete_rank_for("subnet")
+        );
+        assert!(Resource::delete_rank_for("vswitch") < Resource::delete_rank_for("vpc"));
     }
 
     #[test]
@@ -686,9 +667,9 @@ mod tests {
             id: String::new(),
             ..sg1.clone()
         };
-        assert!(!same(&sg1, &sg2));
-        assert!(same(&sg1, &sg1_unnamed));
-        assert!(same(&pending, &sg1));
-        assert!(same(&sg2, &pending));
+        assert!(!sg1.same_identity(&sg2));
+        assert!(sg1.same_identity(&sg1_unnamed));
+        assert!(pending.same_identity(&sg1));
+        assert!(sg2.same_identity(&pending));
     }
 }

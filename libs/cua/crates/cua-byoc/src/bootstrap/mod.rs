@@ -14,11 +14,40 @@ use base64::Engine as _;
 
 use crate::relay::Join;
 
-#[path = "bootstrap_linux_native.rs"]
 mod linux_native;
+pub mod win;
 
-pub use crate::bootstrap_win::{WindowsVmBoot, windows_user_data};
 pub use linux_native::*;
+pub use win::{WindowsVmBoot, windows_user_data};
+
+/// Resolves an optional custom `cua-spacesd` mirror URL into
+/// `(resolved_url_without_fragment, optional_sha256_hex)`.
+///
+/// Expands `{version}` (and `{arch}` when `arch_replacement` is `Some`),
+/// splits off `#sha256=<hex>`, and appends `dir_asset_name` when the path
+/// before `?` ends with `/`.
+pub(crate) fn resolve_spacesd_download<'a>(
+    raw: Option<&'a str>,
+    version: &str,
+    arch_replacement: Option<&str>,
+    dir_asset_name: &str,
+) -> Option<(String, Option<&'a str>)> {
+    let trimmed = raw.map(str::trim).filter(|u| !u.is_empty())?;
+    let (base, sha) = match trimmed.split_once('#') {
+        Some((u, frag)) => (u, frag.strip_prefix("sha256=").map(str::trim)),
+        None => (trimmed, None),
+    };
+    let mut expanded = base.replace("{version}", version);
+    if let Some(arch) = arch_replacement {
+        expanded = expanded.replace("{arch}", arch);
+    }
+    let resolved = match expanded.split_once('?') {
+        Some((path, query)) if path.ends_with('/') => format!("{path}{dir_asset_name}?{query}"),
+        None if expanded.ends_with('/') => format!("{expanded}{dir_asset_name}"),
+        _ => expanded,
+    };
+    Some((resolved, sha))
+}
 
 /// The container the VM runs the sandbox in.
 pub const CONTAINER: &str = "cua-sandbox";

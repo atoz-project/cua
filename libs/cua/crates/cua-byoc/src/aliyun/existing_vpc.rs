@@ -240,8 +240,11 @@ mod tests {
         let conn = Connection {
             provider: "aliyun-ecs".into(),
             region: "cn-hangzhou".into(),
-            vpc_id: Some("vpc-user-1".into()),
-            vswitch_id: Some("vsw-user-1".into()),
+            extras: crate::model::ConnectionExtras {
+                vpc_id: Some("vpc-user-1".into()),
+                vswitch_id: Some("vsw-user-1".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vpc_res = Resource {

@@ -337,37 +337,10 @@ impl std::fmt::Display for MaxSize {
     }
 }
 
-/// Where Spaces go in one cloud account: names only, never a secret.
+/// Extended per-connection options stored inline on [`Connection`] and mirrored
+/// in `links.json` via `#[serde(flatten)]` so an older `cua` cannot drop them.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Connection {
-    /// `aws`, `gcp`, `modal`.
-    pub provider: String,
-    /// AWS or Modal profile.
-    #[serde(default)]
-    pub profile: String,
-    /// Region.
-    #[serde(default)]
-    pub region: String,
-    /// GCP zone.
-    #[serde(default)]
-    pub zone: String,
-    /// GCP project (its id; the project number when only that is known),
-    /// or Azure resource group.
-    #[serde(default)]
-    pub project: String,
-    /// Modal environment.
-    #[serde(default)]
-    pub environment: String,
-    /// The account the credentials reached at connect (AWS account id,
-    /// GCP project number, Azure subscription id, Modal workspace).
-    #[serde(default)]
-    pub account: String,
-    /// Hours after which a Space deletes itself (0: never).
-    #[serde(default = "default_ttl")]
-    pub ttl_hours: u32,
-    /// When it was connected (RFC 3339).
-    #[serde(default)]
-    pub connected_at: String,
+pub struct ConnectionExtras {
     /// How it reaches the cloud (absent: the CLI sign-in, as every
     /// connection made before federation).
     #[serde(default, skip_serializing_if = "Auth::is_cli")]
@@ -414,22 +387,19 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-impl std::fmt::Debug for Connection {
+impl std::fmt::Debug for ConnectionExtras {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection")
-            .field("provider", &self.provider)
-            .field("profile", &self.profile)
-            .field("region", &self.region)
-            .field("zone", &self.zone)
-            .field("project", &self.project)
-            .field("environment", &self.environment)
-            .field("account", &self.account)
-            .field("ttl_hours", &self.ttl_hours)
-            .field("connected_at", &self.connected_at)
+        f.debug_struct("ConnectionExtras")
             .field("auth", &self.auth)
             .field("budget_usd_month", &self.budget_usd_month)
             .field("max_size", &self.max_size)
-            .field("relay_url", &self.relay_url)
+            .field(
+                "relay_url",
+                &self
+                    .relay_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
             .field("relay_mode", &self.relay_mode)
             .field(
                 "spacesd_download_url",
@@ -445,6 +415,55 @@ impl std::fmt::Debug for Connection {
             .field("linux_image_id", &self.linux_image_id)
             .field("instance_type", &self.instance_type)
             .finish()
+    }
+}
+
+/// Where Spaces go in one cloud account: names only, never a secret.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Connection {
+    /// `aws`, `gcp`, `modal`.
+    pub provider: String,
+    /// AWS or Modal profile.
+    #[serde(default)]
+    pub profile: String,
+    /// Region.
+    #[serde(default)]
+    pub region: String,
+    /// GCP zone.
+    #[serde(default)]
+    pub zone: String,
+    /// GCP project (its id; the project number when only that is known),
+    /// or Azure resource group.
+    #[serde(default)]
+    pub project: String,
+    /// Modal environment.
+    #[serde(default)]
+    pub environment: String,
+    /// The account the credentials reached at connect (AWS account id,
+    /// GCP project number, Azure subscription id, Modal workspace).
+    #[serde(default)]
+    pub account: String,
+    /// Hours after which a Space deletes itself (0: never).
+    #[serde(default = "default_ttl")]
+    pub ttl_hours: u32,
+    /// When it was connected (RFC 3339).
+    #[serde(default)]
+    pub connected_at: String,
+    /// Extended connection options serialized flat alongside the base fields.
+    #[serde(flatten)]
+    pub extras: ConnectionExtras,
+}
+
+impl std::ops::Deref for Connection {
+    type Target = ConnectionExtras;
+    fn deref(&self) -> &Self::Target {
+        &self.extras
+    }
+}
+
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.extras
     }
 }
 
@@ -478,18 +497,7 @@ impl Connection {
     /// limits, custom relay, mirror URL, existing VPC, or image/sizing defaults)
     /// that an older cua would drop when rewriting `state.json`.
     pub fn has_extended_options(&self) -> bool {
-        !self.auth.is_cli()
-            || self.budget_usd_month.is_some()
-            || self.max_size.is_some()
-            || self.relay_url.is_some()
-            || self.relay_mode.is_some()
-            || self.spacesd_download_url.is_some()
-            || self.vpc_id.is_some()
-            || self.vswitch_id.is_some()
-            || self.no_public_ip
-            || self.windows_image_id.is_some()
-            || self.linux_image_id.is_some()
-            || self.instance_type.is_some()
+        self.extras != ConnectionExtras::default()
     }
 
     /// "AWS · us-west-2", "Google Cloud · my-project", "Modal · main".
@@ -565,6 +573,38 @@ impl Resource {
     /// Whether it is past its expiry.
     pub fn expired(&self, now: u64) -> bool {
         self.expires > 0 && now >= self.expires
+    }
+
+    /// Whether `self` and `other` refer to the same cloud resource: same
+    /// provider and type, and the same cloud id (or, while one is pending,
+    /// the same name).
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.resource_type == other.resource_type
+            && if !self.id.is_empty() && !other.id.is_empty() {
+                self.id == other.id
+            } else {
+                !self.name.is_empty() && self.name == other.name
+            }
+    }
+
+    /// Teardown priority (lower deletes first): machines first, then security
+    /// groups / shared parts, then network parts from the inside out (subnets/
+    /// vswitches, route tables, internet gateways), and the VPC last.
+    pub fn delete_rank(&self) -> u8 {
+        Self::delete_rank_for(&self.resource_type)
+    }
+
+    /// Teardown priority for a `resource_type` string.
+    pub fn delete_rank_for(resource_type: &str) -> u8 {
+        match resource_type {
+            "instance" | "sandbox" => 0,
+            "subnet" | "vswitch" => 2,
+            "route_table" => 3,
+            "internet_gateway" => 4,
+            "vpc" => 5,
+            _ => 1,
+        }
     }
 
     /// The wire row.
@@ -677,9 +717,9 @@ pub struct ProvisionSpec {
     /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
     /// distinct from `image` (the Sandbox Image).
     pub cloud_image_id: Option<String>,
-    /// Opaque provider-specific plan produced by [`crate::CloudApi::prepare_provision`]
-    /// and consumed by [`crate::CloudApi::provision`] without re-querying the cloud.
-    pub provider_plan: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Optional ordered availability zones where the selected shape has stock,
+    /// populated by [`crate::CloudApi::prepare_provision`].
+    pub candidate_zones: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for ProvisionSpec {
@@ -699,6 +739,7 @@ impl std::fmt::Debug for ProvisionSpec {
             .field("role", &self.role)
             .field("region", &self.region)
             .field("cloud_image_id", &self.cloud_image_id)
+            .field("candidate_zones", &self.candidate_zones)
             .field(
                 "spacesd_download_url",
                 &self
@@ -849,18 +890,26 @@ mod tests {
     #[test]
     fn connection_and_provision_spec_debug_redact_url_secrets() {
         let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab";
+        let secret_relay = "https://ruser:RelayPass1122@relay.example.com?tok=RelayQuery33";
         let conn = Connection {
             provider: "aliyun-ecs".into(),
-            spacesd_download_url: Some(secret_url.into()),
+            extras: ConnectionExtras {
+                relay_url: Some(secret_relay.into()),
+                spacesd_download_url: Some(secret_url.into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let c_dbg = format!("{conn:?}");
         assert!(!c_dbg.contains("MyPass998877"), "{c_dbg}");
         assert!(!c_dbg.contains("DeadBeefCafe9988"), "{c_dbg}");
+        assert!(!c_dbg.contains("RelayPass1122"), "{c_dbg}");
+        assert!(!c_dbg.contains("RelayQuery33"), "{c_dbg}");
         assert!(
             c_dbg.contains("https://mirror.example.com/cua-spacesd.exe#sha256=abab"),
             "{c_dbg}"
         );
+        assert!(c_dbg.contains("https://relay.example.com"), "{c_dbg}");
 
         let spec = ProvisionSpec {
             name: "test".into(),
@@ -876,5 +925,41 @@ mod tests {
             s_dbg.contains("https://mirror.example.com/cua-spacesd.exe#sha256=abab"),
             "{s_dbg}"
         );
+    }
+
+    #[test]
+    fn connection_json_is_flat_and_byte_compatible() {
+        let sample = r#"{
+  "provider": "aliyun-ecs",
+  "profile": "",
+  "region": "cn-hangzhou",
+  "zone": "",
+  "project": "",
+  "environment": "",
+  "account": "123456789012",
+  "ttl_hours": 8,
+  "connected_at": "2026-11-22T00:00:00Z",
+  "budget_usd_month": 50.0,
+  "max_size": {
+    "vcpu": 4,
+    "mem_gib": 16,
+    "disk_gib": 100
+  },
+  "relay_url": "https://relay.example.com",
+  "relay_mode": "static",
+  "spacesd_download_url": "https://mirror.example.com/cua-spacesd.exe",
+  "vpc_id": "vpc-123",
+  "vswitch_id": "vsw-456",
+  "no_public_ip": true,
+  "windows_image_id": "m-win",
+  "linux_image_id": "m-lin",
+  "instance_type": "ecs.c7.xlarge"
+}"#;
+        let conn: Connection = serde_json::from_str(sample).unwrap();
+        assert!(conn.has_extended_options());
+        assert_eq!(conn.vpc_id.as_deref(), Some("vpc-123"));
+        assert!(conn.no_public_ip);
+        let serialized = serde_json::to_string_pretty(&conn).unwrap();
+        assert_eq!(serialized, sample);
     }
 }

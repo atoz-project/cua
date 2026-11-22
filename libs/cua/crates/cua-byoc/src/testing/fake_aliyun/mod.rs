@@ -10,9 +10,10 @@ pub mod sig;
 pub mod state;
 
 pub use handlers::{PostHooks, dispatch_locked, handle};
+pub use sig::{decode_cloud_init_write_files, decode_ps_puts};
 pub use state::{
     BootCallback, BootFailMode, FakeAliyun, FakeImage, FakeInstance, FakeInstanceType, FakeSg,
-    FakeVSwitch, FakeVpc, RecordedCall, RunHook, S, StateCallback,
+    FakeVSwitch, FakeVpc, RecordedCall, RunHook, S, StateCallback, ZoneFault,
 };
 
 #[cfg(test)]
