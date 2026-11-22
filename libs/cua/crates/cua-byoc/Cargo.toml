@@ -30,9 +30,10 @@ modal = ["dep:cua-contrib"]
 # Every provider.
 all = ["aws", "azure", "gcp", "hetzner", "modal", "aliyun-ecs"]
 # Test doubles (a scripted cloud) for this crate's and the daemon's tests.
-testing = []
+testing = ["dep:axum"]
 
 [dependencies]
+axum = { workspace = true, features = ["json"], optional = true }
 cua-sandbox-core.workspace = true
 cua-share.workspace = true
 cua-spacesd-client.workspace = true
@@ -66,7 +67,7 @@ cua-contrib = { workspace = true, optional = true }
 
 
 [dev-dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["json"] }
 hmac = "0.12"
 sha2.workspace = true
 hex.workspace = true

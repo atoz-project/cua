@@ -18,6 +18,10 @@ use crate::model::{
     self, Billing, Capabilities, Connection, HostType, ProvisionSpec, Resource, Supplies, Tier,
 };
 
+#[cfg(feature = "aliyun-ecs")]
+#[path = "testing_aliyun/mod.rs"]
+pub mod fake_aliyun;
+
 /// Called with each provision (the spec, the created resource).
 pub type BootHook = Arc<dyn Fn(&ProvisionSpec, &Resource) + Send + Sync>;
 

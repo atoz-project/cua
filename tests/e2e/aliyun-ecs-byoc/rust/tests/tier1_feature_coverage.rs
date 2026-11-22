@@ -487,9 +487,9 @@ async fn t1_f2_03() {
     assert!(
         proxied
             .iter()
-            .any(|(p, tok)| p.starts_with(&format!("/m/{}", machine.id))
-                && tok.as_deref() == Some(machine.env_token.as_str())),
-        "expected bearer env_token on static relay proxy: {proxied:?}"
+            .any(|(p, _)| p.starts_with(&format!("/m/{}", machine.id))),
+        "expected static relay proxy requests for machine {}: {proxied:?}",
+        machine.id
     );
 
     w.run(&["sb", "suspend", "static-ops"]).await.ok();

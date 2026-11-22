@@ -1419,6 +1419,7 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-sts",
  "aws-types",
+ "axum",
  "base64 0.22.1",
  "cua-auth",
  "cua-contrib",
