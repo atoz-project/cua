@@ -284,7 +284,10 @@ fn oidc_conn() -> Connection {
         provider: "aws".into(),
         region: "us-west-2".into(),
         account: "123456789012".into(),
-        auth: Auth::aws("conn_1", "arn:aws:iam::123456789012:role/cua-spaces"),
+        extras: cua_byoc::ConnectionExtras {
+            auth: Auth::aws("conn_1", "arn:aws:iam::123456789012:role/cua-spaces"),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -415,10 +418,8 @@ async fn a_cli_connection_never_asks_the_issuer() {
     let (url, sts) = serve(3600).await;
     let issuer = Arc::new(FakeIssuer::default());
     let aws = Aws::with_endpoint(&url, "AKIASTATIC", "s").with_issuer(issuer.clone());
-    let conn = Connection {
-        auth: Auth::Cli,
-        ..oidc_conn()
-    };
+    let mut conn = oidc_conn();
+    conn.auth = Auth::Cli;
     aws.list_owned(&conn, "o").await.unwrap();
     assert!(issuer.requests.lock().unwrap().is_empty());
     let calls = sts.lock().unwrap().calls.clone();
@@ -877,12 +878,15 @@ fn cli_aws(account: &str) -> Connection {
         account: account.into(),
         ttl_hours: 4,
         connected_at: "2026-10-01T10:00:00Z".into(),
-        budget_usd_month: Some(30.0),
-        max_size: Some(cua_byoc::MaxSize {
-            vcpu: 2,
-            mem_gib: 8,
-            disk_gib: None,
-        }),
+        extras: cua_byoc::ConnectionExtras {
+            budget_usd_month: Some(30.0),
+            max_size: Some(cua_byoc::MaxSize {
+                vcpu: 2,
+                mem_gib: 8,
+                disk_gib: None,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -1198,4 +1202,43 @@ async fn a_denied_agent_link_is_forgotten_here() {
     assert!(!row.connected);
     assert_eq!(w.issuer.conns.lock().unwrap()[0].status, "revoked");
     assert!(w.store.connection("aws").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn connect_oidc_probes_custom_relay_before_mutating_issuer() {
+    let broken_app = axum::Router::new()
+        .fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "relay down") });
+    let r_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let r_addr = r_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(r_listener, broken_app).await.unwrap() });
+    let broken_url = format!("http://{r_addr}");
+
+    for check in [false, true] {
+        let w = linked().await;
+        let out = w
+            .clouds
+            .connect_with(&ask(|r| {
+                r.budget_usd_month = Some(50.0);
+                r.account_id = Some("123456789012".into());
+                r.target.relay_url = Some(broken_url.clone());
+                r.check = check;
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out.provider.status, "failed", "check={check}: {out:?}");
+        assert!(
+            out.checks.iter().any(|c| c.name == "relay" && !c.ok),
+            "check={check}: expected failed relay check: {:?}",
+            out.checks
+        );
+        assert!(
+            w.issuer.changes.lock().unwrap().is_empty(),
+            "check={check}: issuer must not be mutated before relay probe passes: {:?}",
+            w.issuer.changes.lock().unwrap()
+        );
+        assert!(
+            w.issuer.conns.lock().unwrap().is_empty(),
+            "check={check}: no server connection should be created when relay probe fails"
+        );
+    }
 }

@@ -160,13 +160,11 @@ pub(crate) fn remove_env_token(
     Ok(())
 }
 
-pub(crate) fn clear_env_tokens(home: Option<&std::path::Path>, provider: &str) -> bool {
-    let Ok(key) = secret_key("byoc-env-tokens-", provider) else {
-        return false;
-    };
+pub(crate) fn clear_env_tokens(home: Option<&std::path::Path>, provider: &str) -> Result<bool> {
+    let key = secret_key("byoc-env-tokens-", provider)?;
     let _g = ENV_TOKENS_LOCK.lock().expect("env tokens lock");
-    let _fl = lock_env_tokens_file(home).ok();
-    secret_store(home).clear_secret(&key).unwrap_or(false)
+    let _fl = lock_env_tokens_file(home)?;
+    secret_store(home).clear_secret(&key).map_err(store_err)
 }
 
 /// How one cloud connection talks to its relay: Account Relay Mode (account
@@ -222,19 +220,58 @@ impl ConnectionRelay {
     }
 
     /// Resolves the relay for operating on an existing sandbox (`connect_options`,
-    /// `start`, `forget_machine`, `sweep`).
+    /// `start`, `endpoint`, `forget_machine`, `sweep`).
     pub fn for_connection(
         conn: &crate::model::Connection,
         default_relay: &RelayAccess,
     ) -> Result<Self> {
-        let url = conn.effective_relay_url(&default_relay.url);
         if conn.is_static_relay() {
+            let relay_url = conn
+                .relay_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
+                    Error::Cloud(format!(
+                        "{} is connected in Static Relay Mode, but no relay URL is recorded; \
+                         reconnect with `cua cloud connect {} --relay-mode static \
+                         --relay-url <URL> --relay-token-stdin`",
+                        conn.provider, conn.provider
+                    ))
+                })?
+                .to_string();
             return Ok(ConnectionRelay::Static {
-                relay_url: url.to_string(),
+                relay_url,
                 relay_token: None,
             });
         }
+        let url = conn.effective_relay_url(&default_relay.url);
         Ok(ConnectionRelay::Account(default_relay.rebind(url)?))
+    }
+
+    /// Resolves the relay for sweeping orphaned relay machines when a
+    /// connection or account relay may be absent.
+    pub fn for_optional(
+        conn: Option<&crate::model::Connection>,
+        default_relay: Option<&RelayAccess>,
+    ) -> Option<Self> {
+        match (conn, default_relay) {
+            (Some(c), _) if c.is_static_relay() => Some(ConnectionRelay::Static {
+                relay_url: c
+                    .relay_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_default()
+                    .to_string(),
+                relay_token: None,
+            }),
+            (Some(c), Some(r)) => Some(
+                Self::for_connection(c, r).unwrap_or_else(|_| ConnectionRelay::Account(r.clone())),
+            ),
+            (None, Some(r)) => Some(ConnectionRelay::Account(r.clone())),
+            (_, None) => None,
+        }
     }
 
     /// Base relay URL.
@@ -582,10 +619,35 @@ mod tests {
             load_env_token(Some(&home), "aliyun-ecs", "cloud-t0-0").unwrap(),
             None
         );
-        assert!(clear_env_tokens(Some(&home), "aliyun-ecs"));
+        assert!(clear_env_tokens(Some(&home), "aliyun-ecs").unwrap());
         assert_eq!(
             load_env_token(Some(&home), "aliyun-ecs", "cloud-t1-1").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn for_connection_rejects_static_connection_without_relay_url() {
+        let default_relay = RelayAccess::new(
+            "https://relay.cua.ai",
+            std::sync::Arc::new(cua_host::relay::StaticToken("unused".into())),
+        );
+        let mut conn = crate::model::Connection {
+            provider: "aliyun-ecs".into(),
+            ..Default::default()
+        };
+        conn.relay_mode = Some(cua_sandbox_core::byoc::RelayMode::Static);
+        let err = match ConnectionRelay::for_connection(&conn, &default_relay) {
+            Ok(_) => panic!("expected static connection without relay_url to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::Cloud(ref m) if m.contains("no relay URL is recorded")),
+            "unexpected error: {err:?}"
+        );
+        assert!(matches!(
+            ConnectionRelay::for_optional(Some(&conn), Some(&default_relay)),
+            Some(ConnectionRelay::Static { .. })
+        ));
     }
 }

@@ -163,7 +163,10 @@ mod tests {
     fn conn(budget: Option<f64>) -> Connection {
         Connection {
             provider: "aws".into(),
-            budget_usd_month: budget,
+            extras: crate::model::ConnectionExtras {
+                budget_usd_month: budget,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

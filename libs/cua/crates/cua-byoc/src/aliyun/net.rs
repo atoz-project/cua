@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! Isolated VPC, VSwitch, and zero-ingress Security Group management for
-//! Alibaba Cloud ECS (`--on aliyun-ecs`).
+//! Networking facade for Alibaba Cloud ECS (`--on aliyun-ecs`), coordinating
+//! [`super::vpc`], [`super::security_group`], [`super::zones`], and
+//! [`super::existing_vpc`].
 //!
 //! One VPC per cua home and region (`cua-sb-<owner>`, `10.77.0.0/16`):
 //! - one `/20` VSwitch per availability zone (`cua-sb-<owner>-<zone>`,
@@ -15,26 +16,29 @@
 //!   without Cua's tags are never modified or deleted.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
 
 use cua_sandbox_core::Error;
 use serde_json::Value;
 
 use super::AliyunEcs;
-use super::client::VPC_API_VERSION;
+use super::client::{
+    ApiBody, ECS_API_VERSION, VPC_API_VERSION, api_error_code_message, map_api_error,
+};
 use super::existing_vpc;
-use super::net_zones::{discover_zones_with_stock, ensure_security_group};
+use super::security_group::{describe_security_group, ensure_security_group, list_security_groups};
+use super::vpc::{
+    describe_vpc, describe_vswitch, ensure_vpc, has_vpc_children, list_vpcs, list_vswitches,
+};
+use super::zones::discover_zones_with_stock;
 use crate::api::Result;
 use crate::model::{self, Connection, Resource, tag};
 
-pub use super::net_lifecycle::{delete_part, describe_part, list_parts, rollback_made};
-pub use super::net_zones::discover_zones;
-
-/// The VPC's IPv4 CIDR block.
-pub const VPC_CIDR: &str = "10.77.0.0/16";
-
-/// Maximum `/20` VSwitches that fit inside a `/16` (`10.77.0.0/16`).
-pub const MAX_ZONES: usize = 16;
+pub use super::security_group::sg_name;
+pub(crate) use super::vpc::cidrs_overlap;
+pub use super::vpc::{
+    MAX_ZONES, VPC_CIDR, ensure_vswitch_for_zone, vpc_name, vswitch_cidr, vswitch_name,
+};
+pub use super::zones::discover_zones;
 
 /// Default PayByTraffic public IPv4 egress bandwidth cap (Mbps).
 pub const DEFAULT_PUBLIC_BANDWIDTH_MBPS: u32 = 100;
@@ -124,26 +128,6 @@ pub struct PreparedNetwork {
     pub made: Vec<Resource>,
 }
 
-/// Name of `owner`'s isolated VPC (`cua-sb-<owner>`).
-pub fn vpc_name(owner: &str) -> String {
-    format!("cua-sb-{}", model::label_value(owner))
-}
-
-/// Name of `owner`'s zero-ingress Security Group (`cua-sandboxes-<owner>`).
-pub fn sg_name(owner: &str) -> String {
-    format!("cua-sandboxes-{}", model::label_value(owner))
-}
-
-/// Name of `owner`'s per-zone VSwitch (`cua-sb-<owner>-<zone>`).
-pub fn vswitch_name(owner: &str, zone_id: &str) -> String {
-    format!("cua-sb-{}-{zone_id}", model::label_value(owner))
-}
-
-/// The `/20` VSwitch CIDR at `index` inside `10.77.0.0/16` (`0..16`).
-pub fn vswitch_cidr(index: usize) -> Option<String> {
-    (index < MAX_ZONES).then(|| format!("10.77.{}.0/20", index * 16))
-}
-
 /// Whether `resource_type` is a network resource managed by `aliyun::net`.
 pub fn is_network_type(resource_type: &str) -> bool {
     matches!(
@@ -195,36 +179,6 @@ pub(crate) fn owner_tag_filters(owner: &str) -> [(String, String); 4] {
     ]
 }
 
-fn parse_cidr(cidr: &str) -> Option<(u32, u32)> {
-    let (ip_str, prefix_str) = cidr.trim().split_once('/')?;
-    let ip: Ipv4Addr = ip_str.parse().ok()?;
-    let prefix: u32 = prefix_str.parse().ok()?;
-    if prefix > 32 {
-        return None;
-    }
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    let start = u32::from(ip) & mask;
-    let end = start | !mask;
-    Some((start, end))
-}
-
-fn cidrs_overlap(a: &str, b: &str) -> bool {
-    match (parse_cidr(a), parse_cidr(b)) {
-        (Some((a0, a1)), Some((b0, b1))) => a0 <= b1 && b0 <= a1,
-        _ => a.trim() == b.trim(),
-    }
-}
-
-fn next_free_vswitch_cidr(used_cidrs: &[String]) -> Option<String> {
-    (0..MAX_ZONES)
-        .filter_map(vswitch_cidr)
-        .find(|cand| !used_cidrs.iter().any(|u| cidrs_overlap(cand, u)))
-}
-
 pub(crate) fn net_resource(
     region: &str,
     zone: &str,
@@ -251,185 +205,6 @@ pub(crate) fn net_resource(
             .collect(),
         ..Default::default()
     }
-}
-
-#[derive(Clone, Copy)]
-struct VpcResourceSpec {
-    action: &'static str,
-    id_param: &'static str,
-    outer_key: &'static str,
-    inner_key: &'static str,
-    label: &'static str,
-}
-
-const VPC_SPEC: VpcResourceSpec = VpcResourceSpec {
-    action: "DescribeVpcs",
-    id_param: "VpcId",
-    outer_key: "Vpcs",
-    inner_key: "Vpc",
-    label: "VPC",
-};
-
-const VSWITCH_SPEC: VpcResourceSpec = VpcResourceSpec {
-    action: "DescribeVSwitches",
-    id_param: "VSwitchId",
-    outer_key: "VSwitches",
-    inner_key: "VSwitch",
-    label: "VSwitch",
-};
-
-async fn wait_vpc_resource_available(
-    api: &AliyunEcs,
-    conn: &Connection,
-    region: &str,
-    spec: VpcResourceSpec,
-    id: &str,
-) -> Result<()> {
-    let profile_hint = api.profile_hint(conn);
-    let vpc_ep = api.vpc_endpoint(region);
-    for _ in 0..60 {
-        let v = api
-            .call_ok(
-                &vpc_ep,
-                "GET",
-                spec.action,
-                VPC_API_VERSION,
-                &[
-                    ("RegionId".into(), region.to_string()),
-                    (spec.id_param.into(), id.to_string()),
-                ],
-                profile_hint,
-            )
-            .await?;
-        if let Some(obj) = v[spec.outer_key][spec.inner_key]
-            .as_array()
-            .and_then(|a| a.first())
-        {
-            let status = obj["Status"].as_str().unwrap_or("Available");
-            if status.eq_ignore_ascii_case("Available") {
-                return Ok(());
-            }
-        }
-        tokio::time::sleep(api.poll_interval()).await;
-    }
-    Err(Error::Timeout(format!(
-        "aliyun-ecs: {} {id} did not become Available in {region}",
-        spec.label
-    )))
-}
-
-async fn find_vpc(
-    api: &AliyunEcs,
-    conn: &Connection,
-    region: &str,
-    owner: &str,
-) -> Result<Option<String>> {
-    let profile_hint = api.profile_hint(conn);
-    let vpc_ep = api.vpc_endpoint(region);
-    let mut base = vec![("RegionId".into(), region.to_string())];
-    base.extend(owner_tag_filters(owner));
-    let items = api
-        .paginated_page_number(
-            &vpc_ep,
-            "DescribeVpcs",
-            VPC_API_VERSION,
-            &base,
-            ("Vpcs", "Vpc"),
-            profile_hint,
-        )
-        .await?;
-    let expected_name = vpc_name(owner);
-    Ok(items
-        .into_iter()
-        .filter(|v| {
-            !v["IsDefault"].as_bool().unwrap_or(false)
-                && model::is_ours(&tags_of(v), owner)
-                && v["VpcName"]
-                    .as_str()
-                    .is_none_or(|n| n.is_empty() || n == expected_name)
-        })
-        .filter_map(|v| v["VpcId"].as_str().map(str::to_string))
-        .filter(|id| !id.is_empty())
-        .min())
-}
-
-async fn ensure_vpc(
-    api: &AliyunEcs,
-    conn: &Connection,
-    region: &str,
-    owner: &str,
-) -> Result<(String, Option<Resource>)> {
-    if let Some(id) = find_vpc(api, conn, region, owner).await? {
-        wait_vpc_resource_available(api, conn, region, VPC_SPEC, &id).await?;
-        return Ok((id, None));
-    }
-
-    let name = vpc_name(owner);
-    let tags = part_tags(owner);
-    let token = format!("cua-vpc-{:016x}", rand::random::<u64>());
-    let mut params = vec![
-        ("RegionId".into(), region.to_string()),
-        ("CidrBlock".into(), VPC_CIDR.to_string()),
-        ("VpcName".into(), name.clone()),
-        ("ClientToken".into(), token),
-    ];
-    params.extend(tag_params(&tags));
-
-    let profile_hint = api.profile_hint(conn);
-    let vpc_ep = api.vpc_endpoint(region);
-    let created = api
-        .call_ok(
-            &vpc_ep,
-            "POST",
-            "CreateVpc",
-            VPC_API_VERSION,
-            &params,
-            profile_hint,
-        )
-        .await?;
-    let id = created["VpcId"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Cloud("aliyun-ecs: CreateVpc returned no VpcId".into()))?
-        .to_string();
-
-    if let Err(e) = wait_vpc_resource_available(api, conn, region, VPC_SPEC, &id).await {
-        let _ = delete_part(
-            api,
-            conn,
-            &net_resource(region, "", "vpc", &id, &name, &tags, &[]),
-        )
-        .await;
-        return Err(e);
-    }
-
-    // Alibaba Cloud CreateVpc does not enforce a unique VpcName across concurrent callers.
-    if let Some(winner) = find_vpc(api, conn, region, owner).await?
-        && winner != id
-    {
-        let _ = delete_part(
-            api,
-            conn,
-            &net_resource(region, "", "vpc", &id, &name, &tags, &[]),
-        )
-        .await;
-        wait_vpc_resource_available(api, conn, region, VPC_SPEC, &winner).await?;
-        return Ok((winner, None));
-    }
-
-    Ok((
-        id.clone(),
-        Some(net_resource(
-            region,
-            "",
-            "vpc",
-            &id,
-            &name,
-            &tags,
-            &[("cidr", VPC_CIDR)],
-        )),
-    ))
 }
 
 /// Ensures Cua's VPC, Security Group, and ordered zone candidates are ready.
@@ -526,134 +301,242 @@ pub(crate) async fn prepare_network_with_stock(
     })
 }
 
-/// Finds or creates Cua's `/20` VSwitch in `zone_id` inside `vpc_id`, skipping
-/// any CIDR blocks already occupied in `vpc_id`.
-pub async fn ensure_vswitch_for_zone(
+/// Describes one network part (`vpc`, `vswitch`/`subnet`, `security_group`).
+pub async fn describe_part(
     api: &AliyunEcs,
     conn: &Connection,
+    r: &Resource,
+) -> Result<Option<(String, BTreeMap<String, String>)>> {
+    if r.id.is_empty() {
+        return Ok(None);
+    }
+    let region = if r.region.is_empty() {
+        conn.region.as_str()
+    } else {
+        r.region.as_str()
+    };
+    match r.resource_type.as_str() {
+        "vpc" => describe_vpc(api, conn, region, &r.id).await,
+        "vswitch" | "subnet" => describe_vswitch(api, conn, region, &r.id).await,
+        "security_group" => describe_security_group(api, conn, region, &r.id).await,
+        _ => Ok(None),
+    }
+}
+
+/// Lists all Cua-owned network parts (`security_group`, `vswitch`, `vpc`) in
+/// `conn.region`, verifying [`model::is_ours`] on every returned row.
+pub async fn list_parts(api: &AliyunEcs, conn: &Connection, owner: &str) -> Result<Vec<Resource>> {
+    let mut out = list_security_groups(api, conn, owner).await?;
+    out.extend(list_vswitches(api, conn, owner).await?);
+    out.extend(list_vpcs(api, conn, owner).await?);
+    Ok(out)
+}
+
+fn is_not_found_code(code: &str) -> bool {
+    matches!(
+        code,
+        "InvalidVpcId.NotFound"
+            | "InvalidVSwitchId.NotFound"
+            | "InvalidSecurityGroupId.NotFound"
+            | "InvalidSecurityGroup.NotFound"
+    )
+}
+
+fn is_retryable_delete_code(code: &str) -> bool {
+    code == "DependencyViolation"
+        || code.starts_with("DependencyViolation.")
+        || matches!(
+            code,
+            "InUse"
+                | "VpcInUse"
+                | "IncorrectVpcStatus"
+                | "IncorrectVSwitchStatus"
+                | "ResourceInUse"
+                | "InvalidOperation.Conflict"
+        )
+}
+
+async fn has_active_blocker(
+    api: &AliyunEcs,
     region: &str,
-    owner: &str,
-    vpc_id: &str,
-    zone_id: &str,
-    locks: &NetLocks,
-) -> Result<(String, Option<Resource>)> {
-    let _guard = locks.net_lock.lock().await;
-    let profile_hint = api.profile_hint(conn);
-    let vpc_ep = api.vpc_endpoint(region);
-
-    let existing = api
+    r: &Resource,
+    profile_hint: Option<&str>,
+) -> bool {
+    let mut params = vec![("RegionId".into(), region.to_string())];
+    match r.resource_type.as_str() {
+        "security_group" => params.push(("SecurityGroupId".into(), r.id.clone())),
+        "vswitch" | "subnet" => params.push(("VSwitchId".into(), r.id.clone())),
+        "vpc" => params.push(("VpcId".into(), r.id.clone())),
+        _ => return false,
+    }
+    if let Ok(instances) = api
         .paginated_page_number(
-            &vpc_ep,
-            "DescribeVSwitches",
-            VPC_API_VERSION,
-            &[
-                ("RegionId".into(), region.to_string()),
-                ("VpcId".into(), vpc_id.to_string()),
-            ],
-            ("VSwitches", "VSwitch"),
-            profile_hint,
-        )
-        .await?;
-
-    if let Some(vsw) = existing.iter().find(|v| {
-        !v["IsDefault"].as_bool().unwrap_or(false)
-            && v["ZoneId"].as_str() == Some(zone_id)
-            && model::is_ours(&tags_of(v), owner)
-    }) && let Some(id) = vsw["VSwitchId"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        wait_vpc_resource_available(api, conn, region, VSWITCH_SPEC, id).await?;
-        return Ok((id.to_string(), None));
-    }
-
-    let used_cidrs: Vec<String> = existing
-        .iter()
-        .filter_map(|v| v["CidrBlock"].as_str().map(str::to_string))
-        .collect();
-    let cidr = next_free_vswitch_cidr(&used_cidrs).ok_or_else(|| {
-        Error::Cloud(format!(
-            "aliyun-ecs: no free /20 VSwitch CIDR left in VPC {vpc_id} for zone {zone_id}"
-        ))
-    })?;
-
-    let name = vswitch_name(owner, zone_id);
-    let tags = part_tags(owner);
-    let token = format!("cua-vsw-{:016x}", rand::random::<u64>());
-    let mut params = vec![
-        ("RegionId".into(), region.to_string()),
-        ("VpcId".into(), vpc_id.to_string()),
-        ("ZoneId".into(), zone_id.to_string()),
-        ("CidrBlock".into(), cidr.clone()),
-        ("VSwitchName".into(), name.clone()),
-        ("ClientToken".into(), token),
-    ];
-    params.extend(tag_params(&tags));
-
-    let created = api
-        .call_ok(
-            &vpc_ep,
-            "POST",
-            "CreateVSwitch",
-            VPC_API_VERSION,
+            &api.ecs_endpoint(region),
+            "DescribeInstances",
+            ECS_API_VERSION,
             &params,
+            ("Instances", "Instance"),
             profile_hint,
         )
-        .await?;
-    let id = created["VSwitchId"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Cloud("aliyun-ecs: CreateVSwitch returned no VSwitchId".into()))?
-        .to_string();
-
-    if let Err(e) = wait_vpc_resource_available(api, conn, region, VSWITCH_SPEC, &id).await {
-        let _ = delete_part(
-            api,
-            conn,
-            &net_resource(region, zone_id, "vswitch", &id, &name, &tags, &[]),
-        )
-        .await;
-        return Err(e);
+        .await
+    {
+        for inst in instances {
+            let st = inst["Status"].as_str().unwrap_or("");
+            if st.eq_ignore_ascii_case("terminated") || st.eq_ignore_ascii_case("deleted") {
+                continue;
+            }
+            let refs_part = match r.resource_type.as_str() {
+                "security_group" => inst["SecurityGroupIds"]["SecurityGroupId"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(r.id.as_str()))),
+                "vswitch" | "subnet" => {
+                    inst["VpcAttributes"]["VSwitchId"].as_str() == Some(r.id.as_str())
+                }
+                "vpc" => inst["VpcAttributes"]["VpcId"].as_str() == Some(r.id.as_str()),
+                _ => false,
+            };
+            if refs_part {
+                return true;
+            }
+        }
     }
+    r.resource_type == "vpc" && has_vpc_children(api, region, &r.id, profile_hint).await
+}
 
-    Ok((
-        id.clone(),
-        Some(net_resource(
-            region,
-            zone_id,
-            "vswitch",
-            &id,
-            &name,
-            &tags,
-            &[("vpc", vpc_id), ("cidr", &cidr)],
-        )),
-    ))
+/// Deletes one network part (`security_group`, `vswitch`/`subnet`, `vpc`),
+/// verifying Cua ownership once before issuing the delete, retrying transient
+/// dependency violations while failing fast on active blockers, and treating
+/// `NotFound` as `Ok(())`.
+pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Result<()> {
+    delete_part_owned(api, conn, r, None).await
+}
+
+pub(crate) async fn delete_part_owned(
+    api: &AliyunEcs,
+    conn: &Connection,
+    r: &Resource,
+    expected_owner: Option<&str>,
+) -> Result<()> {
+    existing_vpc::guard_user_network_untouched(conn, r)?;
+    if r.id.is_empty() {
+        return Ok(());
+    }
+    if is_network_type(&r.resource_type) {
+        let Some((_, tags)) = describe_part(api, conn, r).await? else {
+            return Ok(());
+        };
+        match expected_owner {
+            Some(owner) => {
+                if !model::is_ours(&tags, owner) {
+                    return Err(Error::Cloud(format!(
+                        "aliyun-ecs: refusing to delete {} {} (it does not carry {}=true and {}={})",
+                        r.resource_type,
+                        r.id,
+                        tag::MANAGED,
+                        tag::OWNER,
+                        model::label_value(owner)
+                    )));
+                }
+            }
+            None => {
+                let is_cua_tagged = tags.get(tag::MANAGED).map(String::as_str) == Some("true")
+                    && tags.get(tag::OWNER).is_some_and(|o| !o.is_empty());
+                if !is_cua_tagged {
+                    return Err(Error::Cloud(format!(
+                        "aliyun-ecs: refusing to delete non-Cua-owned {} {}",
+                        r.resource_type, r.id
+                    )));
+                }
+            }
+        }
+    }
+    let region = if r.region.is_empty() {
+        conn.region.as_str()
+    } else {
+        r.region.as_str()
+    };
+    let profile_hint = api.profile_hint(conn);
+    let (endpoint, action, version, id_param) = match r.resource_type.as_str() {
+        "security_group" => (
+            api.ecs_endpoint(region),
+            "DeleteSecurityGroup",
+            ECS_API_VERSION,
+            "SecurityGroupId",
+        ),
+        "vswitch" | "subnet" => (
+            api.vpc_endpoint(region),
+            "DeleteVSwitch",
+            VPC_API_VERSION,
+            "VSwitchId",
+        ),
+        "vpc" => (
+            api.vpc_endpoint(region),
+            "DeleteVpc",
+            VPC_API_VERSION,
+            "VpcId",
+        ),
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: {other} is not a network resource"
+            )));
+        }
+    };
+
+    let params = vec![
+        ("RegionId".into(), region.to_string()),
+        (id_param.into(), r.id.clone()),
+    ];
+    let mut tries = 0u32;
+    loop {
+        let (status, body) = api
+            .call_raw(&endpoint, "POST", action, version, &params, profile_hint)
+            .await?;
+        if status.is_success() {
+            return Ok(());
+        }
+        let code = match &body {
+            ApiBody::Json(v) => api_error_code_message(v).0,
+            ApiBody::Text(_) => "",
+        };
+        if is_not_found_code(code) {
+            return Ok(());
+        }
+        // Alibaba Cloud keeps primary ENIs in `Status: Deleting` for up to ~4 minutes
+        // after `DeleteInstance(Force=true)` before `DeleteVSwitch` succeeds (~376s budget
+        // at the default 2s poll interval; unit tests override `poll_interval()` to 10ms).
+        if is_retryable_delete_code(code) && tries < 100 {
+            if tries == 0 && has_active_blocker(api, region, r, profile_hint).await {
+                return Err(map_api_error(action, version, status, &body));
+            }
+            let poll = api.poll_interval();
+            let wait = if tries < 12 {
+                poll
+            } else {
+                poll.saturating_mul(2)
+            };
+            tries += 1;
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        return Err(map_api_error(action, version, status, &body));
+    }
+}
+
+/// Best-effort rollback of only the network parts newly created during a
+/// failed `provision()`, ordered by [`Resource::delete_rank`].
+pub async fn rollback_made(api: &AliyunEcs, conn: &Connection, made: &[Resource]) {
+    let mut ordered: Vec<&Resource> = made.iter().collect();
+    ordered.sort_by_key(|r| r.delete_rank());
+    for r in ordered {
+        let owner = r.tags.get(tag::OWNER).map(String::as_str);
+        let _ = delete_part_owned(api, conn, r, owner).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn vswitch_cidrs_are_disjoint_slash_20s_inside_vpc_slash_16() {
-        assert_eq!(VPC_CIDR, "10.77.0.0/16");
-        assert_eq!(vswitch_cidr(0).unwrap(), "10.77.0.0/20");
-        assert_eq!(vswitch_cidr(1).unwrap(), "10.77.16.0/20");
-        assert_eq!(vswitch_cidr(15).unwrap(), "10.77.240.0/20");
-        assert!(vswitch_cidr(16).is_none());
-
-        assert_eq!(
-            next_free_vswitch_cidr(&["10.77.0.0/20".into(), "10.77.16.0/20".into()]).as_deref(),
-            Some("10.77.32.0/20")
-        );
-        assert_eq!(
-            next_free_vswitch_cidr(&["10.77.0.0/19".into()]).as_deref(),
-            Some("10.77.32.0/20"),
-            "must skip overlapping /19 covering first two /20 slots"
-        );
-    }
+    use crate::model::ConnectionExtras;
 
     #[test]
     fn part_tags_carry_all_six_keys_with_empty_machine_and_space() {
@@ -700,9 +583,12 @@ mod tests {
         assert_eq!(cfg.public_ip_mbps, DEFAULT_PUBLIC_BANDWIDTH_MBPS);
 
         let existing_cfg = NetworkConfig::from_connection(&Connection {
-            vpc_id: Some("vpc-user-1".into()),
-            vswitch_id: Some("vsw-user-1".into()),
-            no_public_ip: true,
+            extras: ConnectionExtras {
+                vpc_id: Some("vpc-user-1".into()),
+                vswitch_id: Some("vsw-user-1".into()),
+                no_public_ip: true,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .unwrap();
@@ -716,7 +602,10 @@ mod tests {
         assert_eq!(existing_cfg.public_ip_mbps, 0);
 
         let standalone_no_pub = NetworkConfig::from_connection(&Connection {
-            no_public_ip: true,
+            extras: ConnectionExtras {
+                no_public_ip: true,
+                ..Default::default()
+            },
             ..Default::default()
         })
         .unwrap();
@@ -725,7 +614,10 @@ mod tests {
 
         assert!(
             NetworkConfig::from_connection(&Connection {
-                vpc_id: Some("vpc-only".into()),
+                extras: ConnectionExtras {
+                    vpc_id: Some("vpc-only".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .is_err()

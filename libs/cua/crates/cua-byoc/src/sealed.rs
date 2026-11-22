@@ -212,7 +212,7 @@ impl SealedTokens {
     }
 
     fn sealed_conn(&self, provider: &str) -> Option<String> {
-        match self.store.connection(provider).ok()??.auth {
+        match self.store.connection(provider).ok()??.extras.auth {
             Auth::Sealed { conn_id } => Some(conn_id),
             _ => None,
         }

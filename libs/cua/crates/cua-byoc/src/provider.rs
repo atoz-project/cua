@@ -101,9 +101,28 @@ impl CloudSandboxes {
             })
     }
 
-    fn connection_relay(&self, conn: &Connection) -> ConnectionRelay {
+    fn connection_relay(&self, conn: &Connection) -> Result<ConnectionRelay> {
         ConnectionRelay::for_connection(conn, &self.relay)
-            .unwrap_or_else(|_| ConnectionRelay::Account(self.relay.clone()))
+    }
+
+    async fn forget_connection_machine(&self, conn: &Connection, machine: &str) {
+        match self.connection_relay(conn) {
+            Ok(relay) => {
+                relay
+                    .forget_machine(&self.store, self.api.name(), machine)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(machine, "skipping relay cleanup: {e}");
+                if conn.is_static_relay() {
+                    let _ = crate::relay::remove_env_token(
+                        self.store.home().as_deref(),
+                        self.api.name(),
+                        machine,
+                    );
+                }
+            }
+        }
     }
 
     /// What the sandbox's relay machine says about it (no secrets): every
@@ -235,9 +254,7 @@ impl CloudSandboxes {
             }
         }
         if !machine.is_empty() {
-            self.connection_relay(conn)
-                .forget_machine(&self.store, self.api.name(), machine)
-                .await;
+            self.forget_connection_machine(conn, machine).await;
         }
     }
 
@@ -584,16 +601,10 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             )?;
         }
         let prep = self.api.prepare_provision(&conn, &provision).await?;
-        if let Some(resolved_mt) = prep
-            .sizing
-            .as_ref()
-            .and_then(|s| s.machine_type.as_deref())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            machine_type = resolved_mt.to_string();
-            provision.machine_type = machine_type.clone();
-        } else if machine_type.is_empty() {
+        prep.apply_to(&mut provision);
+        if !provision.machine_type.is_empty() {
+            machine_type = provision.machine_type.clone();
+        } else {
             machine_type = offer.machine_type.clone();
             provision.machine_type = machine_type.clone();
         }
@@ -618,10 +629,6 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             eff_usd,
             spent,
         )?;
-        if let Some(resolved_image) = prep.cloud_image_id {
-            provision.cloud_image_id = Some(resolved_image);
-        }
-        provision.provider_plan = prep.provider_plan;
         let (join, static_env_token) = conn_relay
             .prepare_join(
                 &self.store,
@@ -872,9 +879,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             "deleted with its sandbox",
         ));
         if !rec.machine.is_empty() {
-            self.connection_relay(&conn)
-                .forget_machine(&self.store, self.api.name(), &rec.machine)
-                .await;
+            self.forget_connection_machine(&conn, &rec.machine).await;
         }
         Ok(())
     }
@@ -885,7 +890,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .get(DETAIL_RELAY_MACHINE)
             .ok_or_else(|| Error::NotFound(format!("the relay computer of {}", instance.id)))?;
         let url = match self.connection() {
-            Ok(conn) => self.connection_relay(&conn).machine_url(machine),
+            Ok(conn) => self.connection_relay(&conn)?.machine_url(machine),
             Err(_) => self.relay.machine_url(machine),
         };
         Ok(ServiceEndpoint {
@@ -904,7 +909,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             Ok(c) => c,
             Err(_) => return Some(self.relay.connect_options(machine)),
         };
-        let relay = match ConnectionRelay::for_connection(&conn, &self.relay) {
+        let relay = match self.connection_relay(&conn) {
             Ok(r) => r,
             Err(e) => return Some(Err(e)),
         };
@@ -944,7 +949,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .ok_or_else(|| Error::NotFound(format!("{}:{id}", self.api.name())))?;
         self.api.start(&conn, &rec, &owner).await?;
         if !rec.machine.is_empty() {
-            let relay = ConnectionRelay::for_connection(&conn, &self.relay)?;
+            let relay = self.connection_relay(&conn)?;
             relay
                 .wait_online(
                     self.store.home().as_deref(),

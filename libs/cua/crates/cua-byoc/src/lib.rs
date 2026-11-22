@@ -51,7 +51,7 @@ pub mod awsnet;
 pub mod azure;
 pub mod bootlog;
 pub mod bootstrap;
-pub mod bootstrap_win;
+pub use bootstrap::win as bootstrap_win;
 pub mod cloud_shares;
 #[cfg(any(test, feature = "testing"))]
 pub mod conformance;
@@ -95,8 +95,8 @@ pub use api::{
 pub use cua_share::route as share_route;
 pub use manager::Clouds;
 pub use model::{
-    Auth, Billing, Capabilities, Connection, HostType, MaxSize, ProvisionSpec, Resource, Supplies,
-    Tier,
+    Auth, Billing, Capabilities, Connection, ConnectionExtras, HostType, MaxSize, ProvisionSpec,
+    Resource, Supplies, Tier,
 };
 pub use provider::CloudSandboxes;
 pub use relay::{ConnectionRelay, Join, RelayAccess};
@@ -108,7 +108,9 @@ pub fn builtin_apis() -> Vec<Arc<dyn CloudApi>> {
 }
 
 #[allow(clippy::vec_init_then_push)]
-fn builtin_apis_for(home: Option<&Path>) -> Vec<Arc<dyn CloudApi>> {
+fn builtin_apis_for(
+    #[cfg_attr(not(feature = "aliyun-ecs"), allow(unused_variables))] home: Option<&Path>,
+) -> Vec<Arc<dyn CloudApi>> {
     #[allow(unused_mut)]
     let mut v: Vec<Arc<dyn CloudApi>> = Vec::new();
     #[cfg(feature = "aws")]

@@ -19,7 +19,6 @@ use crate::model::{
 };
 
 #[cfg(feature = "aliyun-ecs")]
-#[path = "testing_aliyun/mod.rs"]
 pub mod fake_aliyun;
 
 /// Called with each provision (the spec, the created resource).

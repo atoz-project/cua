@@ -198,12 +198,12 @@ impl AliyunEcs {
         owner: &str,
     ) -> Result<()> {
         existing_vpc::guard_user_network_untouched(conn, r)?;
+        if net::is_network_type(&r.resource_type) {
+            return net::delete_part_owned(self, conn, r, Some(owner)).await;
+        }
         let Some(state) = self.guard_owned(conn, r, owner, "delete").await? else {
             return Ok(());
         };
-        if net::is_network_type(&r.resource_type) {
-            return net::delete_part(self, conn, r).await;
-        }
         if r.resource_type != "instance" {
             return Ok(());
         }

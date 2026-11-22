@@ -45,8 +45,9 @@ mod tests {
     const ALIYUN_SIZING_SOURCE: &str = include_str!("aliyun/sizing.rs");
     const ALIYUN_IMAGE_SOURCE: &str = include_str!("aliyun/image.rs");
     const ALIYUN_NET_SOURCE: &str = include_str!("aliyun/net.rs");
-    const ALIYUN_NET_ZONES_SOURCE: &str = include_str!("aliyun/net_zones.rs");
-    const ALIYUN_NET_LIFECYCLE_SOURCE: &str = include_str!("aliyun/net_lifecycle.rs");
+    const ALIYUN_VPC_SOURCE: &str = include_str!("aliyun/vpc.rs");
+    const ALIYUN_SG_SOURCE: &str = include_str!("aliyun/security_group.rs");
+    const ALIYUN_ZONES_SOURCE: &str = include_str!("aliyun/zones.rs");
     const ALIYUN_PREFLIGHT_SOURCE: &str = include_str!("aliyun/preflight.rs");
     const ALIYUN_EXISTING_VPC_SOURCE: &str = include_str!("aliyun/existing_vpc.rs");
     const DOCS: &str =
@@ -513,8 +514,9 @@ mod tests {
             ALIYUN_SIZING_SOURCE,
             ALIYUN_IMAGE_SOURCE,
             ALIYUN_NET_SOURCE,
-            ALIYUN_NET_ZONES_SOURCE,
-            ALIYUN_NET_LIFECYCLE_SOURCE,
+            ALIYUN_VPC_SOURCE,
+            ALIYUN_SG_SOURCE,
+            ALIYUN_ZONES_SOURCE,
             ALIYUN_PREFLIGHT_SOURCE,
             ALIYUN_EXISTING_VPC_SOURCE,
         ]);

@@ -95,23 +95,38 @@ impl WindowsInitHeader {
 }
 
 /// Single-pass resolved sizing, Cloud Image ID, Windows init header, and
-/// opaque provider-specific launch plan returned by [`CloudApi::prepare_provision`].
-#[derive(Clone, Default)]
+/// candidate availability zones returned by [`CloudApi::prepare_provision`].
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreparedProvision {
     pub sizing: Option<ResolvedSizing>,
     pub cloud_image_id: Option<String>,
     pub windows_header: Option<WindowsInitHeader>,
-    pub provider_plan: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Optional ordered availability zones where the selected shape has stock.
+    pub candidate_zones: Option<Vec<String>>,
 }
 
-impl std::fmt::Debug for PreparedProvision {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedProvision")
-            .field("sizing", &self.sizing)
-            .field("cloud_image_id", &self.cloud_image_id)
-            .field("windows_header", &self.windows_header)
-            .field("has_provider_plan", &self.provider_plan.is_some())
-            .finish()
+impl PreparedProvision {
+    /// Writes resolved sizing, Cloud Image ID, and stock-zone hints onto `spec`.
+    pub fn apply_to(&self, spec: &mut ProvisionSpec) {
+        if let Some(sizing) = &self.sizing {
+            if let Some(mt) = sizing
+                .machine_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                spec.machine_type = mt.to_string();
+            }
+            if let Some(disk_gb) = sizing.disk_gb {
+                spec.disk_gb = disk_gb;
+            }
+        }
+        if let Some(img) = &self.cloud_image_id {
+            spec.cloud_image_id = Some(img.clone());
+        }
+        if self.candidate_zones.is_some() {
+            spec.candidate_zones = self.candidate_zones.clone();
+        }
     }
 }
 

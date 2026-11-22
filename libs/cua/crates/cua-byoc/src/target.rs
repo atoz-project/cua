@@ -390,7 +390,10 @@ mod tests {
         );
 
         let existing = Connection {
-            spacesd_download_url: Some("https://old.example/cua-spacesd.exe".into()),
+            extras: crate::model::ConnectionExtras {
+                spacesd_download_url: Some("https://old.example/cua-spacesd.exe".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let omitted = CloudTarget {

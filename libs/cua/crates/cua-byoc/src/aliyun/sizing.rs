@@ -383,7 +383,7 @@ pub(crate) async fn query_available_instance_types(
     api: &AliyunEcs,
     conn: &Connection,
     region: &str,
-    target_vcpus: u32,
+    target_vcpus: Option<u32>,
     target_mem_gib: Option<u32>,
     target_zone: Option<&str>,
 ) -> Result<Vec<(String, Vec<String>)>> {
@@ -394,8 +394,10 @@ pub(crate) async fn query_available_instance_types(
         ("DestinationResource".into(), "InstanceType".into()),
         ("InstanceChargeType".into(), "PostPaid".into()),
         ("IoOptimized".into(), "optimized".into()),
-        ("Cores".into(), target_vcpus.to_string()),
     ];
+    if let Some(cores) = target_vcpus {
+        params.push(("Cores".into(), cores.to_string()));
+    }
     if let Some(mem) = target_mem_gib {
         params.push(("Memory".into(), mem.to_string()));
     }
@@ -627,7 +629,7 @@ pub(crate) async fn resolve_dynamic_instance_type_for_spec(
             api,
             conn,
             region,
-            target_vcpus,
+            Some(target_vcpus),
             mem_filter,
             target_zone.as_deref(),
         )

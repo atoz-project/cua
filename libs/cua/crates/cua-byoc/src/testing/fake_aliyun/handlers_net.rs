@@ -42,13 +42,8 @@ pub(crate) fn handle_describe_available(f: &FakeAliyun, params: &Params) -> Resp
         };
         f.effective_zones(&region)
             .into_iter()
-            .filter(|z| {
-                !f.omit_sold_out_zones_in_available
-                    || (!f.sold_out_zones.contains(z) && !f.sold_out_zone_errors.contains_key(z))
-            })
             .map(|z| {
-                let sold_out =
-                    f.sold_out_zones.contains(&z) || f.sold_out_zone_errors.contains_key(&z);
+                let sold_out = f.zone_faults.get(&z).is_some_and(|zf| zf.is_sold_out());
                 let (st, cat) = if sold_out {
                     ("WithoutStock", "WithoutStock")
                 } else {
@@ -140,14 +135,7 @@ pub(crate) fn handle_describe_images(f: &FakeAliyun, params: &Params) -> Respons
                     .get("Status")
                     .is_none_or(|st| img.status.eq_ignore_ascii_case(st))
         })
-        .map(|img| {
-            let mut item = json!({
-                "ImageId": img.image_id, "ImageName": img.image_name, "OSType": img.os_type,
-                "Architecture": img.arch, "Status": img.status, "ImageOwnerAlias": img.owner_alias,
-            });
-            merge_extra(&mut item, f.extra_image_fields.get(&img.image_id));
-            item
-        })
+        .map(super::state::FakeImage::to_api_json)
         .collect();
     let total = items.len();
     if let Some(ps) = params.get("PageSize").and_then(|s| s.parse().ok()) {
@@ -156,12 +144,8 @@ pub(crate) fn handle_describe_images(f: &FakeAliyun, params: &Params) -> Respons
     ok(json!({ "Images": { "Image": items }, "TotalCount": total, "RequestId": "req-images-1" }))
 }
 
-fn instance_uses_sg(f: &FakeAliyun, inst: &FakeInstance, sg_id: &str) -> bool {
-    inst.security_group_id == sg_id
-        || f.extra_instance_fields
-            .get(&inst.instance_id)
-            .and_then(|v| v["SecurityGroupIds"]["SecurityGroupId"].as_array())
-            .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(sg_id)))
+fn instance_uses_sg(inst: &FakeInstance, sg_id: &str) -> bool {
+    inst.security_group_id == sg_id || inst.extra_security_group_ids.iter().any(|x| x == sg_id)
 }
 
 pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Response {
@@ -171,6 +155,12 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
             let tags = parse_tags(params);
             if let Some(r) = check_cua_tag(f, &tags, "ecs:CreateSecurityGroup") {
                 return r;
+            }
+            if let Some(id) = params
+                .get("ClientToken")
+                .and_then(|ct| f.client_tokens.get(ct))
+            {
+                return ok(json!({ "SecurityGroupId": id, "RequestId": "req-csg-idempotent" }));
             }
             let id = format!("sg-fake-{}", f.next_seq());
             let sg_type = p_or(params, "SecurityGroupType", "normal");
@@ -186,14 +176,15 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
                     vpc_id: p_str(params, "VpcId"),
                     region_id: p_or(params, "RegionId", "cn-hangzhou"),
                     sg_name: p_str(params, "SecurityGroupName"),
+                    sg_type,
+                    inner_access_policy: inner.into(),
                     tags,
                     ..Default::default()
                 },
             );
-            f.extra_sg_fields.insert(
-                id.clone(),
-                json!({ "SecurityGroupType": sg_type, "InnerAccessPolicy": inner }),
-            );
+            if let Some(ct) = params.get("ClientToken") {
+                f.client_tokens.insert(ct.clone(), id.clone());
+            }
             f.security_group_rules.insert(id.clone(), Vec::new());
             ok(json!({ "SecurityGroupId": id, "RequestId": "req-csg-1" }))
         }
@@ -209,7 +200,7 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
                             .is_none_or(|id| &sg.sg_id == id)
                         && matches_region_and_tags(&sg.region_id, &sg.tags, params, &tf)
                 })
-                .map(|sg| sg.to_api_json(f.extra_sg_fields.get(&sg.sg_id)))
+                .map(FakeSg::to_api_json)
                 .collect();
             paged_ok("SecurityGroups", "SecurityGroup", sgs, params, "req-sg-1")
         }
@@ -234,11 +225,11 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
                 }
                 rules.push(rule);
             }
-            let inner = f
-                .extra_sg_fields
-                .get(&sg_id)
-                .and_then(|v| v["InnerAccessPolicy"].as_str())
-                .unwrap_or("Drop");
+            let inner = if sg.inner_access_policy.is_empty() {
+                "Drop"
+            } else {
+                sg.inner_access_policy.as_str()
+            };
             ok(json!({
                 "SecurityGroupId": sg_id, "VpcId": sg.vpc_id, "RegionId": sg.region_id,
                 "InnerAccessPolicy": inner, "Permissions": { "Permission": rules }, "RequestId": "req-sga-1"
@@ -293,7 +284,7 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
             if let Some(r) = check_cua_tag(f, &sg.tags, "ecs:DeleteSecurityGroup") {
                 return r;
             }
-            if f.instances.values().any(|i| instance_uses_sg(f, i, &id)) {
+            if f.instances.values().any(|i| instance_uses_sg(i, &id)) {
                 return bad_req(
                     "DependencyViolation",
                     "SecurityGroup is in use by an instance.",
@@ -301,7 +292,6 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
             }
             f.security_groups.remove(&id);
             f.security_group_rules.remove(&id);
-            f.extra_sg_fields.remove(&id);
             ok(json!({ "RequestId": "req-dsg-1" }))
         }
         _ => unreachable!(),
@@ -318,6 +308,12 @@ pub(crate) fn handle_vpc(f: &mut FakeAliyun, action: &str, params: &Params) -> R
             if is_dry_run(params) {
                 return dry_run_ok();
             }
+            if let Some(id) = params
+                .get("ClientToken")
+                .and_then(|ct| f.client_tokens.get(ct))
+            {
+                return ok(json!({ "VpcId": id, "RequestId": "req-cvpc-idempotent" }));
+            }
             let id = format!("vpc-fake-{}", f.next_seq());
             f.vpcs.insert(
                 id.clone(),
@@ -330,6 +326,9 @@ pub(crate) fn handle_vpc(f: &mut FakeAliyun, action: &str, params: &Params) -> R
                     ..Default::default()
                 },
             );
+            if let Some(ct) = params.get("ClientToken") {
+                f.client_tokens.insert(ct.clone(), id.clone());
+            }
             ok(json!({ "VpcId": id, "RequestId": "req-cvpc-1" }))
         }
         "DescribeVpcs" => {
@@ -343,7 +342,7 @@ pub(crate) fn handle_vpc(f: &mut FakeAliyun, action: &str, params: &Params) -> R
                         .is_none_or(|id| id.split(',').any(|x| x.trim() == v.vpc_id))
                         && matches_region_and_tags(&v.region_id, &v.tags, params, &tf)
                 })
-                .map(|v| v.to_api_json(f.extra_vpc_fields.get(&v.vpc_id)))
+                .map(FakeVpc::to_api_json)
                 .collect();
             paged_ok("Vpcs", "Vpc", items, params, "req-vpc-1")
         }
@@ -363,15 +362,10 @@ pub(crate) fn handle_vpc(f: &mut FakeAliyun, action: &str, params: &Params) -> R
             {
                 return bad_req("DependencyViolation", "VPC has dependent resources.");
             }
-            if f.extra_vpc_fields
-                .get(&id)
-                .and_then(|v| v["IsDefault"].as_bool())
-                .unwrap_or(false)
-            {
+            if vpc.is_default {
                 return bad_req("Forbidden.DefaultVpc", "Cannot delete default VPC.");
             }
             f.vpcs.remove(&id);
-            f.extra_vpc_fields.remove(&id);
             ok(json!({ "RequestId": "req-dvpc-1" }))
         }
         _ => unreachable!(),
@@ -387,6 +381,12 @@ pub(crate) fn handle_vswitch(f: &mut FakeAliyun, action: &str, params: &Params) 
             }
             if is_dry_run(params) {
                 return dry_run_ok();
+            }
+            if let Some(id) = params
+                .get("ClientToken")
+                .and_then(|ct| f.client_tokens.get(ct))
+            {
+                return ok(json!({ "VSwitchId": id, "RequestId": "req-cvsw-idempotent" }));
             }
             let vpc_id = p_str(params, "VpcId");
             let cidr = p_or(params, "CidrBlock", "172.16.1.0/24");
@@ -417,6 +417,9 @@ pub(crate) fn handle_vswitch(f: &mut FakeAliyun, action: &str, params: &Params) 
                     ..Default::default()
                 },
             );
+            if let Some(ct) = params.get("ClientToken") {
+                f.client_tokens.insert(ct.clone(), id.clone());
+            }
             ok(json!({ "VSwitchId": id, "RequestId": "req-cvsw-1" }))
         }
         "DescribeVSwitches" => {
@@ -430,7 +433,7 @@ pub(crate) fn handle_vswitch(f: &mut FakeAliyun, action: &str, params: &Params) 
                         && params.get("ZoneId").is_none_or(|z| &v.zone_id == z)
                         && matches_region_and_tags(&v.region_id, &v.tags, params, &tf)
                 })
-                .map(|v| v.to_api_json(f.extra_vswitch_fields.get(&v.vswitch_id)))
+                .map(FakeVSwitch::to_api_json)
                 .collect();
             paged_ok("VSwitches", "VSwitch", items, params, "req-vsw-1")
         }
@@ -451,7 +454,6 @@ pub(crate) fn handle_vswitch(f: &mut FakeAliyun, action: &str, params: &Params) 
                 return bad_req("DependencyViolation", "VSwitch is in use by an instance.");
             }
             f.vswitches.remove(&id);
-            f.extra_vswitch_fields.remove(&id);
             ok(json!({ "RequestId": "req-dvsw-1" }))
         }
         _ => unreachable!(),

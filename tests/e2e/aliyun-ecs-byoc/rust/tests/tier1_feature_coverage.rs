@@ -672,8 +672,7 @@ async fn t1_f3_04() {
     w.aliyun
         .lock()
         .unwrap()
-        .run_fail_zones
-        .insert("cn-hangzhou-h".into());
+        .mark_zone_run_fail("cn-hangzhou-h", "OperationDenied.NoStock");
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
         "LTAI_TEST_AK:secret123\n",
@@ -1006,42 +1005,33 @@ async fn t1_f4_05() {
 
 fn seed_user_vpc(w: &AliyunWorld, region: &str) {
     let mut f = w.aliyun.lock().unwrap();
-    f.vpcs.insert(
-        "vpc-user-1".into(),
-        FakeVpc {
-            vpc_id: "vpc-user-1".into(),
-            region_id: region.into(),
-            cidr_block: "10.10.0.0/16".into(),
-            vpc_name: "user-vpc".into(),
-            tags: Default::default(),
-            is_user_owned: true,
-        },
-    );
-    f.vswitches.insert(
-        "vsw-user-1".into(),
-        FakeVSwitch {
-            vswitch_id: "vsw-user-1".into(),
-            vpc_id: "vpc-user-1".into(),
-            zone_id: format!("{region}-h"),
-            region_id: region.into(),
-            cidr_block: "10.10.1.0/24".into(),
-            vswitch_name: "user-vsw".into(),
-            tags: Default::default(),
-            is_user_owned: true,
-        },
-    );
-    f.security_groups.insert(
-        "sg-user-1".into(),
-        FakeSg {
-            sg_id: "sg-user-1".into(),
-            vpc_id: "vpc-user-1".into(),
-            region_id: region.into(),
-            sg_name: "user-sg".into(),
-            tags: Default::default(),
-            ingress_rules: vec![json!({"PortRange": "22/22"})],
-            is_user_owned: true,
-        },
-    );
+    f.seed_vpc(FakeVpc {
+        vpc_id: "vpc-user-1".into(),
+        region_id: region.into(),
+        cidr_block: "10.10.0.0/16".into(),
+        vpc_name: "user-vpc".into(),
+        is_user_owned: true,
+        ..Default::default()
+    });
+    f.seed_vswitch(FakeVSwitch {
+        vswitch_id: "vsw-user-1".into(),
+        vpc_id: "vpc-user-1".into(),
+        zone_id: format!("{region}-h"),
+        region_id: region.into(),
+        cidr_block: "10.10.1.0/24".into(),
+        vswitch_name: "user-vsw".into(),
+        is_user_owned: true,
+        ..Default::default()
+    });
+    f.seed_sg(FakeSg {
+        sg_id: "sg-user-1".into(),
+        vpc_id: "vpc-user-1".into(),
+        region_id: region.into(),
+        sg_name: "user-sg".into(),
+        ingress_rules: vec![json!({"PortRange": "22/22"})],
+        is_user_owned: true,
+        ..Default::default()
+    });
 }
 
 #[tokio::test]
@@ -1293,6 +1283,7 @@ fn seed_custom_images(w: &AliyunWorld) {
             status: "Available".into(),
             owner_alias: "self".into(),
             region_id: "cn-hangzhou".into(),
+            ..Default::default()
         });
     }
 }

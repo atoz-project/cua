@@ -167,21 +167,9 @@ impl Clouds {
                 reason: "a relay computer a failed create left".into(),
             };
             if !dry_run {
-                let conn_relay = match (&conn, &self.relay) {
-                    (Some(c), _) if c.is_static_relay() => Some(ConnectionRelay::Static {
-                        relay_url: c
-                            .effective_relay_url(cua_sandbox_core::byoc::DEFAULT_RELAY_URL)
-                            .to_string(),
-                        relay_token: None,
-                    }),
-                    (Some(c), Some(r)) => Some(
-                        ConnectionRelay::for_connection(c, r)
-                            .unwrap_or_else(|_| ConnectionRelay::Account(r.clone())),
-                    ),
-                    (None, Some(r)) => Some(ConnectionRelay::Account(r.clone())),
-                    (_, None) => None,
-                };
-                let Some(conn_relay) = conn_relay else {
+                let Some(conn_relay) =
+                    ConnectionRelay::for_optional(conn.as_ref(), self.relay.as_ref())
+                else {
                     item.action = "failed".into();
                     item.reason = "no relay account in this process".into();
                     out.push(item);
@@ -295,7 +283,7 @@ impl Clouds {
         let after: Vec<Resource> = self.hosts.records().unwrap_or_default();
         for r in hosts_before
             .iter()
-            .filter(|r| !after.iter().any(|x| sweep::same(x, r)))
+            .filter(|r| !after.iter().any(|x| x.same_identity(r)))
         {
             let name = r
                 .extra
@@ -748,7 +736,7 @@ impl CloudManager for Clouds {
         p.forget_secret();
         let home = self.store.home();
         crate::relay::clear_static_relay_token(home.as_deref(), p.name());
-        crate::relay::clear_env_tokens(home.as_deref(), p.name());
+        crate::relay::clear_env_tokens(home.as_deref(), p.name())?;
         if disconnected {
             let mut a = audit::entry("disconnect", p.name(), "user");
             a.detail = if delete {

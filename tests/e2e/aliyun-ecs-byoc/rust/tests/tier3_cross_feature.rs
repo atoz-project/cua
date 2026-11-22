@@ -21,6 +21,7 @@ async fn t3_01() {
                 status: "Available".into(),
                 owner_alias: "self".into(),
                 region_id: "cn-hangzhou".into(),
+                ..Default::default()
             });
         }
     }
@@ -85,30 +86,24 @@ async fn t3_02() {
     w.relay.add_static_token("static-relay-secret");
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.vpcs.insert(
-            "vpc-user".into(),
-            FakeVpc {
-                vpc_id: "vpc-user".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.0.0.0/16".into(),
-                vpc_name: "user".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-user".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-user".into(),
-                vpc_id: "vpc-user".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.0.1.0/24".into(),
-                vswitch_name: "user".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-user".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.0.0.0/16".into(),
+            vpc_name: "user".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-user".into(),
+            vpc_id: "vpc-user".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.0.1.0/24".into(),
+            vswitch_name: "user".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
     }
     w.run_with_stdin(
         &[
@@ -178,30 +173,24 @@ async fn t3_03() {
     {
         let mut f = w.aliyun.lock().unwrap();
         f.add_key("LTAI_WH_AK", "wh_secret_456");
-        f.vpcs.insert(
-            "vpc-ap".into(),
-            FakeVpc {
-                vpc_id: "vpc-ap".into(),
-                region_id: "ap-southeast-1".into(),
-                cidr_block: "10.8.0.0/16".into(),
-                vpc_name: "ap".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-ap".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-ap".into(),
-                vpc_id: "vpc-ap".into(),
-                zone_id: "ap-southeast-1-h".into(),
-                region_id: "ap-southeast-1".into(),
-                cidr_block: "10.8.1.0/24".into(),
-                vswitch_name: "ap".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-ap".into(),
+            region_id: "ap-southeast-1".into(),
+            cidr_block: "10.8.0.0/16".into(),
+            vpc_name: "ap".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-ap".into(),
+            vpc_id: "vpc-ap".into(),
+            zone_id: "ap-southeast-1-h".into(),
+            region_id: "ap-southeast-1".into(),
+            cidr_block: "10.8.1.0/24".into(),
+            vswitch_name: "ap".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
     }
     w.write_aliyun_config(&json!({
         "current": "webhook_manager",
@@ -281,8 +270,7 @@ async fn t3_04() {
     w.aliyun
         .lock()
         .unwrap()
-        .sold_out_zones
-        .insert("cn-hangzhou-h".into());
+        .mark_zone_sold_out("cn-hangzhou-h", "OperationDenied.NoStock");
     w.run_with_stdin(
         &["cloud", "connect", "aliyun-ecs", "--token-stdin", "--json"],
         "LTAI_TEST_AK:secret123\n",
@@ -430,6 +418,7 @@ async fn t3_07() {
             status: "Available".into(),
             owner_alias: "self".into(),
             region_id: "cn-hangzhou".into(),
+            ..Default::default()
         });
         f.boot_fail = Some(BootFailMode::StopImmediately);
     }
@@ -493,6 +482,7 @@ async fn t3_08() {
         status: "Available".into(),
         owner_alias: "self".into(),
         region_id: "cn-hangzhou".into(),
+        ..Default::default()
     });
     w.run_with_stdin(
         &[
@@ -546,30 +536,24 @@ async fn t3_09() {
     w.auth_login().await;
     {
         let mut f = w.aliyun.lock().unwrap();
-        f.vpcs.insert(
-            "vpc-user".into(),
-            FakeVpc {
-                vpc_id: "vpc-user".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.0.0.0/16".into(),
-                vpc_name: "user".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
-        f.vswitches.insert(
-            "vsw-user".into(),
-            FakeVSwitch {
-                vswitch_id: "vsw-user".into(),
-                vpc_id: "vpc-user".into(),
-                zone_id: "cn-hangzhou-h".into(),
-                region_id: "cn-hangzhou".into(),
-                cidr_block: "10.0.1.0/24".into(),
-                vswitch_name: "user".into(),
-                tags: Default::default(),
-                is_user_owned: true,
-            },
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-user".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.0.0.0/16".into(),
+            vpc_name: "user".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-user".into(),
+            vpc_id: "vpc-user".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            region_id: "cn-hangzhou".into(),
+            cidr_block: "10.0.1.0/24".into(),
+            vswitch_name: "user".into(),
+            is_user_owned: true,
+            ..Default::default()
+        });
         for (id, tags) in [
             (
                 "i-foreign",
@@ -577,35 +561,21 @@ async fn t3_09() {
             ),
             ("i-untagged", Default::default()),
         ] {
-            f.instances.insert(
-                id.into(),
-                FakeInstance {
-                    instance_id: id.into(),
-                    instance_name: id.into(),
-                    region_id: "cn-hangzhou".into(),
-                    zone_id: "cn-hangzhou-h".into(),
-                    vpc_id: "vpc-user".into(),
-                    vswitch_id: "vsw-user".into(),
-                    security_group_id: String::new(),
-                    instance_type: "ecs.e-c1m2.large".into(),
-                    image_id: "ubuntu".into(),
-                    status: "Running".into(),
-                    instance_charge_type: "PostPaid".into(),
-                    stopped_mode: "StopCharging".into(),
-                    auto_release_time: None,
-                    http_tokens: None,
-                    key_pair_name: None,
-                    ram_role_name: None,
-                    internet_max_bandwidth_out: None,
-                    system_disk_category: None,
-                    system_disk_size: None,
-                    user_data_raw: String::new(),
-                    user_data_decoded: String::new(),
-                    tags,
-                    client_token: None,
-                    machine_id: None,
-                },
-            );
+            f.seed_instance(FakeInstance {
+                instance_id: id.into(),
+                instance_name: id.into(),
+                region_id: "cn-hangzhou".into(),
+                zone_id: "cn-hangzhou-h".into(),
+                vpc_id: "vpc-user".into(),
+                vswitch_id: "vsw-user".into(),
+                instance_type: "ecs.e-c1m2.large".into(),
+                image_id: "ubuntu".into(),
+                status: "Running".into(),
+                instance_charge_type: "PostPaid".into(),
+                stopped_mode: "StopCharging".into(),
+                tags,
+                ..Default::default()
+            });
         }
     }
     w.run_with_stdin(

@@ -5,5 +5,5 @@
 
 pub use cua_byoc::testing::fake_aliyun::{
     BootCallback, BootFailMode, FakeAliyun, FakeImage, FakeInstance, FakeInstanceType, FakeSg,
-    FakeVSwitch, FakeVpc, RecordedCall, S, StateCallback, handle,
+    FakeVSwitch, FakeVpc, RecordedCall, S, StateCallback, ZoneFault, handle,
 };

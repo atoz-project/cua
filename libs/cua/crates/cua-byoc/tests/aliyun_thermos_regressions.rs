@@ -14,15 +14,13 @@ use cua_byoc::RelayAccess;
 use cua_byoc::aliyun_ecs::{AliyunEcs, TokenStore};
 use cua_byoc::api::{CloudApi, Target, WindowsInitHeader};
 use cua_byoc::model::{self, ProvisionSpec, Resource};
+use cua_byoc::testing::fake_aliyun::{
+    FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc, S, handle,
+};
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::ConnectRequest;
 use cua_sandbox_core::{CreateOptions, ProviderKind, Sandboxes};
 use cua_spacesd_client::testing::{MockAuth, MockServer};
-use serde_json::json;
-
-#[path = "support/fake_aliyun.rs"]
-mod fake_aliyun;
-use fake_aliyun::{S, handle};
 
 #[derive(Default)]
 struct MemStore(Mutex<Option<String>>);
@@ -69,7 +67,7 @@ async fn build_connected_aliyun(
     budget_usd_month: Option<f64>,
     ttl_hours: Option<u32>,
     windows_image_id: Option<&str>,
-    extra_images: Vec<serde_json::Value>,
+    extra_images: Vec<FakeImage>,
     poll: Duration,
 ) -> (tempfile::TempDir, Sandboxes, S, Arc<FakeRelay>, MockServer) {
     let home = tempfile::tempdir().unwrap();
@@ -182,16 +180,17 @@ async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls()
         None,
         None,
         Some("m-customwin202501"),
-        vec![json!({
-            "ImageId": "m-customwin202501",
-            "ImageName": "custom-windows-golden",
-            "ImageOwnerAlias": "self",
-            "OSType": "windows",
-            "Architecture": "x86_64",
-            "Status": "Available",
-            "CreationTime": "2025-03-01T00:00:00Z",
-            "Size": 60
-        })],
+        vec![FakeImage {
+            image_id: "m-customwin202501".into(),
+            image_name: "custom-windows-golden".into(),
+            owner_alias: "self".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-03-01T00:00:00Z".into(),
+            size_gb: 60,
+            ..Default::default()
+        }],
         Duration::from_millis(5),
     )
     .await;
@@ -229,7 +228,7 @@ async fn budget_checked_against_exact_resolved_sku_and_blocks_pricier_fallback()
     install_online_hook(&s, &relay, mock_spacesd.url());
     {
         let mut f = s.lock().unwrap();
-        f.available_instance_types = vec!["ecs.g7.4xlarge".into()];
+        f.available_instance_types = Some(vec!["ecs.g7.4xlarge".into()]);
     }
 
     let mut o = CreateOptions::new(ProviderKind::Contrib, "registry.invalid/trycua/linux:24.04");
@@ -291,8 +290,7 @@ async fn prepare_provision_uses_spec_region_and_preserves_sku_and_header() {
         .expect("resolved machine_type");
     assert_eq!(resolved_sku, "ecs.c7.xlarge");
 
-    spec.machine_type = resolved_sku.to_string();
-    spec.provider_plan = prep.provider_plan.clone();
+    prep.apply_to(&mut spec);
     api.provision(&conn, &spec).await.unwrap();
 
     let f = s.lock().unwrap();
@@ -334,57 +332,46 @@ async fn fast_rollback_short_circuits_immediately_when_cua_owned_peer_uses_netwo
         .unwrap();
 
     let owner = "owner-peer";
+    let owner_tags = std::collections::BTreeMap::from([
+        (model::tag::MANAGED.into(), "true".into()),
+        (model::tag::OWNER.into(), owner.into()),
+    ]);
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-peer-1",
-            "VpcName": "cua-vpc-peer",
-            "Status": "Available",
-            "CidrBlock": "10.0.0.0/16",
-            "Tags": { "Tag": [
-                { "Key": model::tag::MANAGED, "Value": "true" },
-                { "Key": model::tag::OWNER, "Value": owner }
-            ]}
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-peer-1",
-            "VpcId": "vpc-peer-1",
-            "ZoneId": "cn-hangzhou-h",
-            "Status": "Available",
-            "CidrBlock": "10.0.1.0/24",
-            "Tags": { "Tag": [
-                { "Key": model::tag::MANAGED, "Value": "true" },
-                { "Key": model::tag::OWNER, "Value": owner }
-            ]}
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-peer-1",
-            "VpcId": "vpc-peer-1",
-            "SecurityGroupName": "cua-sg-peer",
-            "Tags": { "Tag": [
-                { "Key": model::tag::MANAGED, "Value": "true" },
-                { "Key": model::tag::OWNER, "Value": owner }
-            ]}
-        }));
-        f.instances.insert(
-            "i-peer-running".into(),
-            json!({
-                "InstanceId": "i-peer-running",
-                "InstanceName": "peer-box",
-                "RegionId": "cn-hangzhou",
-                "ZoneId": "cn-hangzhou-h",
-                "Status": "Running",
-                "VpcAttributes": {
-                    "VpcId": "vpc-peer-1",
-                    "VSwitchId": "vsw-peer-1"
-                },
-                "SecurityGroupIds": { "SecurityGroupId": ["sg-peer-1"] },
-                "Tags": { "Tag": [
-                    { "Key": model::tag::MANAGED, "Value": "true" },
-                    { "Key": model::tag::OWNER, "Value": owner }
-                ]}
-            }),
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-peer-1".into(),
+            vpc_name: "cua-vpc-peer".into(),
+            cidr_block: "10.0.0.0/16".into(),
+            tags: owner_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-peer-1".into(),
+            vpc_id: "vpc-peer-1".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "10.0.1.0/24".into(),
+            tags: owner_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-peer-1".into(),
+            vpc_id: "vpc-peer-1".into(),
+            sg_name: "cua-sg-peer".into(),
+            tags: owner_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_instance(FakeInstance {
+            instance_id: "i-peer-running".into(),
+            instance_name: "peer-box".into(),
+            region_id: "cn-hangzhou".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            status: "Running".into(),
+            vpc_id: "vpc-peer-1".into(),
+            vswitch_id: "vsw-peer-1".into(),
+            security_group_id: "sg-peer-1".into(),
+            tags: owner_tags,
+            ..Default::default()
+        });
         f.transient_dependency_errors = 10;
     }
 
@@ -419,4 +406,59 @@ async fn fast_rollback_short_circuits_immediately_when_cua_owned_peer_uses_netwo
     assert_eq!(count_action(&s, "DeleteVSwitch"), 1);
     assert_eq!(count_action(&s, "DeleteSecurityGroup"), 1);
     assert_eq!(count_action(&s, "DeleteVpc"), 1);
+    assert_eq!(
+        count_action(&s, "DescribeVSwitches"),
+        1,
+        "expected single DescribeVSwitches ownership check on delete_resource"
+    );
+    assert_eq!(
+        count_action(&s, "DescribeSecurityGroups"),
+        1,
+        "expected single DescribeSecurityGroups ownership check on delete_resource"
+    );
+    assert_eq!(
+        count_action(&s, "DescribeVpcs"),
+        1,
+        "expected single DescribeVpcs ownership check on delete_resource"
+    );
+}
+
+#[tokio::test]
+async fn canonical_fake_preserves_client_token_idempotency_across_requests() {
+    let (api, s) = start_fake(Duration::from_millis(5)).await;
+    api.stage_secret(&Target {
+        provider: "aliyun-ecs".into(),
+        token: Some("LTAI_TEST_AK:secret123".into()),
+        ..Default::default()
+    });
+    let conn = api
+        .resolve(&Target {
+            provider: "aliyun-ecs".into(),
+            region: Some("cn-hangzhou".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let spec = ProvisionSpec {
+        name: "cua-idempotent-token-1".into(),
+        family: "linux".into(),
+        image: "linux".into(),
+        kind: "container".into(),
+        arch: "amd64".into(),
+        tags: model::tags("owner-idem", "idem-sb", "cloud-idem", 1_900_000_000),
+        ttl_secs: 3600,
+        ..Default::default()
+    };
+
+    let first = api.provision(&conn, &spec).await.unwrap();
+    let second = api.provision(&conn, &spec).await.unwrap();
+    assert_eq!(
+        first[0].id, second[0].id,
+        "repeated RunInstances with identical ClientToken must return the same instance id"
+    );
+    assert_eq!(
+        s.lock().unwrap().instances.len(),
+        1,
+        "idempotent ClientToken replay must not create a second instance"
+    );
 }

@@ -155,7 +155,10 @@ async fn a_budget_share_is_said_once_through_status_and_the_audit_log() {
         .connect(Connection {
             provider: "aws".into(),
             region: "us-west-2".into(),
-            budget_usd_month: Some(spent / 0.85),
+            extras: cua_byoc::ConnectionExtras {
+                budget_usd_month: Some(spent / 0.85),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .unwrap();

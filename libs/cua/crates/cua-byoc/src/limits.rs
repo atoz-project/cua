@@ -177,12 +177,15 @@ mod tests {
     fn conn() -> Connection {
         Connection {
             provider: "aws".into(),
-            budget_usd_month: Some(10.0),
-            max_size: Some(MaxSize {
-                vcpu: 4,
-                mem_gib: 16,
-                disk_gib: None,
-            }),
+            extras: crate::model::ConnectionExtras {
+                budget_usd_month: Some(10.0),
+                max_size: Some(MaxSize {
+                    vcpu: 4,
+                    mem_gib: 16,
+                    disk_gib: None,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

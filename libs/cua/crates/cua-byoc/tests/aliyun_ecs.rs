@@ -15,15 +15,14 @@ use cua_byoc::aliyun_ecs::{AliyunEcs, TokenStore};
 use cua_byoc::aliyun_net;
 use cua_byoc::api::{CloudApi, Target};
 use cua_byoc::model::{self, Connection, ProvisionSpec, Resource};
+use cua_byoc::testing::fake_aliyun::{
+    FakeAliyun, FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc, S, handle,
+};
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::{ConnectRequest, DETAIL_RELAY_MACHINE};
 use cua_sandbox_core::placement::Runtime;
 use cua_sandbox_core::{CreateOptions, ProviderKind, Sandboxes, Status};
 use serde_json::json;
-
-#[path = "support/fake_aliyun.rs"]
-mod fake_aliyun;
-use fake_aliyun::{FakeAliyun, S, handle};
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -541,32 +540,28 @@ async fn clouds_and_sandboxes_connect_status_disconnect_and_secret_hygiene() {
     let owner_tag = model::label_value(&owner);
     {
         let mut f = s.lock().unwrap();
-        f.instances.insert(
-            "i-foreign-1".into(),
-            json!({
-                "InstanceId": "i-foreign-1",
-                "InstanceName": "foreign",
-                "RegionId": "cn-shanghai",
-                "Status": "Running",
-                "Tags": { "Tag": [
-                    { "TagKey": "cua-managed", "TagValue": "true" },
-                    { "TagKey": "cua-owner", "TagValue": "someone-else" }
-                ]}
-            }),
-        );
-        f.instances.insert(
-            "i-owned-1".into(),
-            json!({
-                "InstanceId": "i-owned-1",
-                "InstanceName": "cua-sb-1",
-                "RegionId": "cn-shanghai",
-                "Status": "Running",
-                "Tags": { "Tag": [
-                    { "TagKey": "cua-managed", "TagValue": "true" },
-                    { "TagKey": "cua-owner", "TagValue": owner_tag }
-                ]}
-            }),
-        );
+        f.seed_instance(FakeInstance {
+            instance_id: "i-foreign-1".into(),
+            instance_name: "foreign".into(),
+            region_id: "cn-shanghai".into(),
+            status: "Running".into(),
+            tags: BTreeMap::from([
+                ("cua-managed".into(), "true".into()),
+                ("cua-owner".into(), "someone-else".into()),
+            ]),
+            ..Default::default()
+        });
+        f.seed_instance(FakeInstance {
+            instance_id: "i-owned-1".into(),
+            instance_name: "cua-sb-1".into(),
+            region_id: "cn-shanghai".into(),
+            status: "Running".into(),
+            tags: BTreeMap::from([
+                ("cua-managed".into(), "true".into()),
+                ("cua-owner".into(), owner_tag.clone()),
+            ]),
+            ..Default::default()
+        });
     }
 
     let refused = clouds.disconnect("aliyun-ecs", false).await.unwrap_err();
@@ -1016,18 +1011,21 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
 
     {
         let mut f = s.lock().unwrap();
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-match-1",
-            "VpcId": "vpc-match-1",
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-other-vpc",
-            "VpcId": "vpc-other",
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-match-1",
-            "VpcId": "vpc-match-1",
-        }));
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-match-1".into(),
+            vpc_id: "vpc-match-1".into(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-other-vpc".into(),
+            vpc_id: "vpc-other".into(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-match-1".into(),
+            vpc_id: "vpc-match-1".into(),
+            ..Default::default()
+        });
         f.calls.clear();
     }
     let t = api.test(&conn(&api)).await;
@@ -1098,14 +1096,16 @@ async fn test_permissions_checks_vswitch_sg_and_rejects_missing_parameter() {
 
     {
         let mut f = s.lock().unwrap();
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-only-1",
-            "VpcId": "vpc-no-sg",
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-wrong-vpc",
-            "VpcId": "vpc-other",
-        }));
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-only-1".into(),
+            vpc_id: "vpc-no-sg".into(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-wrong-vpc".into(),
+            vpc_id: "vpc-other".into(),
+            ..Default::default()
+        });
         f.calls.clear();
     }
     let t = api.test(&conn(&api)).await;
@@ -1192,28 +1192,28 @@ async fn test_permissions_dry_runs_vpc_and_creates_zero_security_groups() {
     {
         let mut f = s.lock().unwrap();
         f.calls.clear();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-unrelated",
-            "VpcName": "cua-relay-sg-vpc",
-            "CidrBlock": "10.0.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": [
-                { "TagKey": "role", "TagValue": "cua-relay" },
-                { "TagKey": "managed-by", "TagValue": "manual" }
-            ]}
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-unrelated",
-            "VSwitchName": "cua-relay-sg-vsw",
-            "VpcId": "vpc-unrelated",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "10.0.1.0/24",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": [] }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-unrelated".into(),
+            vpc_name: "cua-relay-sg-vpc".into(),
+            cidr_block: "10.0.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: BTreeMap::from([
+                ("role".into(), "cua-relay".into()),
+                ("managed-by".into(), "manual".into()),
+            ]),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-unrelated".into(),
+            vswitch_name: "cua-relay-sg-vsw".into(),
+            vpc_id: "vpc-unrelated".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "10.0.1.0/24".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
     }
     let t_pre = api.test(&conn(&api)).await;
     assert!(t_pre.ok(), "{:?}", t_pre.checks);
@@ -1266,34 +1266,34 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
     let (api, s, _store) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-acct-default",
-            "VpcName": "default-vpc",
-            "CidrBlock": "172.16.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": [] }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-acct-existing",
-            "VSwitchName": "prod-vsw",
-            "VpcId": "vpc-acct-default",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "172.16.0.0/24",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": [] }
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-acct-existing",
-            "SecurityGroupName": "prod-sg",
-            "VpcId": "vpc-acct-default",
-            "RegionId": "cn-hangzhou",
-            "SecurityGroupType": "normal",
-            "InnerAccessPolicy": "Accept",
-            "Tags": { "Tag": [] }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-acct-default".into(),
+            vpc_name: "default-vpc".into(),
+            cidr_block: "172.16.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-acct-existing".into(),
+            vswitch_name: "prod-vsw".into(),
+            vpc_id: "vpc-acct-default".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "172.16.0.0/24".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-acct-existing".into(),
+            sg_name: "prod-sg".into(),
+            vpc_id: "vpc-acct-default".into(),
+            region_id: "cn-hangzhou".into(),
+            sg_type: "normal".into(),
+            inner_access_policy: "Accept".into(),
+            ..Default::default()
+        });
         let relay_hook = relay.clone();
         f.on_run_instance = Some(Arc::new(move |_inst_id, params| {
             let ud_b64 = params.get("UserData").expect("UserData must be passed");
@@ -1487,7 +1487,7 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
         assert!(ud.contains("cua-expire.timer"));
 
         let inst = f.instances.values().next().unwrap();
-        let inst_tags = aliyun_net::tags_of(inst);
+        let inst_tags = &inst.tags;
         for key in [
             "cua-managed",
             "cua-owner",
@@ -1505,30 +1505,30 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
 
         let cua_vpc = f
             .vpcs
-            .iter()
-            .find(|v| v["VpcId"] != "vpc-acct-default")
+            .values()
+            .find(|v| v.vpc_id != "vpc-acct-default")
             .unwrap();
-        let vpc_tags = aliyun_net::tags_of(cua_vpc);
+        let vpc_tags = &cua_vpc.tags;
         assert_eq!(vpc_tags.len(), 6, "{vpc_tags:?}");
         assert_eq!(vpc_tags["cua-machine"], "");
         assert_eq!(vpc_tags["cua-space"], "");
 
         let cua_vsw = f
             .vswitches
-            .iter()
-            .find(|v| v["VSwitchId"] != "vsw-acct-existing")
+            .values()
+            .find(|v| v.vswitch_id != "vsw-acct-existing")
             .unwrap();
-        assert_eq!(cua_vsw["CidrBlock"], "10.77.0.0/20");
-        let vsw_tags = aliyun_net::tags_of(cua_vsw);
+        assert_eq!(cua_vsw.cidr_block, "10.77.0.0/20");
+        let vsw_tags = &cua_vsw.tags;
         assert_eq!(vsw_tags.len(), 6, "{vsw_tags:?}");
         assert_eq!(vsw_tags["cua-machine"], "");
 
         let cua_sg = f
             .security_groups
-            .iter()
-            .find(|g| g["SecurityGroupId"] != "sg-acct-existing")
+            .values()
+            .find(|g| g.sg_id != "sg-acct-existing")
             .unwrap();
-        let sg_tags = aliyun_net::tags_of(cua_sg);
+        let sg_tags = &cua_sg.tags;
         assert_eq!(sg_tags.len(), 6, "{sg_tags:?}");
         assert_eq!(sg_tags["cua-machine"], "");
     }
@@ -1575,17 +1575,9 @@ async fn linux_docker_on_vm_sandbox_lifecycle_vpc_reuse_and_security_invariants(
     {
         let f = s.lock().unwrap();
         assert!(f.instances.is_empty());
-        assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-acct-default"));
-        assert!(
-            f.vswitches
-                .iter()
-                .any(|v| v["VSwitchId"] == "vsw-acct-existing")
-        );
-        assert!(
-            f.security_groups
-                .iter()
-                .any(|g| g["SecurityGroupId"] == "sg-acct-existing")
-        );
+        assert!(f.vpcs.contains_key("vpc-acct-default"));
+        assert!(f.vswitches.contains_key("vsw-acct-existing"));
+        assert!(f.security_groups.contains_key("sg-acct-existing"));
     }
 }
 
@@ -1721,9 +1713,11 @@ async fn cross_zone_capacity_retry_and_total_failure_network_rollback() {
 
     {
         let mut f = s.lock().unwrap();
-        f.zones = vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()];
-        f.run_fail_zones
-            .insert("cn-hangzhou-h".into(), "OperationDenied.NoStock".into());
+        f.set_zones(
+            "cn-hangzhou",
+            vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()],
+        );
+        f.mark_zone_run_fail("cn-hangzhou-h", "OperationDenied.NoStock");
     }
     let spec = ProvisionSpec {
         name: "cua-aliyun-ecs-retry1".into(),
@@ -1755,18 +1749,22 @@ async fn cross_zone_capacity_retry_and_total_failure_network_rollback() {
             1,
             "unused VSwitch from sold-out zone must be cleaned up"
         );
-        assert_eq!(f.vswitches[0]["ZoneId"], "cn-hangzhou-i");
+        assert_eq!(
+            f.vswitches.values().next().unwrap().zone_id,
+            "cn-hangzhou-i"
+        );
     }
 
     let (api2, s2, store2) = start(None).await;
     store2.save("LTAI_TEST_AK:secret123").unwrap();
     {
         let mut f = s2.lock().unwrap();
-        f.zones = vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()];
-        f.sold_out_zones
-            .insert("cn-hangzhou-h".into(), "Zone.NotOnSale".into());
-        f.sold_out_zones
-            .insert("cn-hangzhou-i".into(), "OperationDenied.NoStock".into());
+        f.set_zones(
+            "cn-hangzhou",
+            vec!["cn-hangzhou-h".into(), "cn-hangzhou-i".into()],
+        );
+        f.mark_zone_sold_out("cn-hangzhou-h", "Zone.NotOnSale");
+        f.mark_zone_sold_out("cn-hangzhou-i", "OperationDenied.NoStock");
     }
     let err = api2.provision(&conn(&api2), &spec).await.unwrap_err();
     assert!(
@@ -1801,7 +1799,7 @@ async fn failed_boot_redacts_console_output_and_rolls_back_instance_and_relay() 
         f.on_run_instance = Some(Arc::new(move |inst_id, _params| {
             let mut f = s_hook.lock().unwrap();
             if let Some(inst) = f.instances.get_mut(inst_id) {
-                inst["Status"] = json!("Stopped");
+                inst.status = "Stopped".into();
             }
             f.console_outputs.insert(
                 inst_id.to_string(),
@@ -1925,76 +1923,70 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
 
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-default",
-            "VpcName": "default",
-            "CidrBlock": "172.16.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": [
-                { "Key": "cua-managed", "Value": "true" },
-                { "Key": "cua-owner", "Value": owner_tag }
-            ]}
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-default",
-            "VSwitchName": "default-vsw",
-            "VpcId": "vpc-default",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "172.16.0.0/24",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": [
-                { "Key": "cua-managed", "Value": "true" },
-                { "Key": "cua-owner", "Value": owner_tag }
-            ]}
-        }));
-        f.vpcs.push(json!({
-            "VpcId": "vpc-untagged",
-            "CidrBlock": "192.168.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": [] }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-untagged",
-            "VpcId": "vpc-untagged",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "192.168.0.0/24",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": [] }
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-untagged",
-            "VpcId": "vpc-untagged",
-            "RegionId": "cn-hangzhou",
-            "Tags": { "Tag": [] }
-        }));
-        f.instances.insert(
-            "i-untagged".into(),
-            json!({
-                "InstanceId": "i-untagged",
-                "RegionId": "cn-hangzhou",
-                "Status": "Running",
-                "Tags": { "Tag": [] }
-            }),
-        );
-        f.instances.insert(
-            "i-foreign".into(),
-            json!({
-                "InstanceId": "i-foreign",
-                "RegionId": "cn-hangzhou",
-                "Status": "Running",
-                "Tags": { "Tag": [
-                    { "TagKey": "cua-managed", "TagValue": "true" },
-                    { "TagKey": "cua-owner", "TagValue": "someone-else" }
-                ]}
-            }),
-        );
+        let owner_tags = BTreeMap::from([
+            ("cua-managed".into(), "true".into()),
+            ("cua-owner".into(), owner_tag.clone()),
+        ]);
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-default".into(),
+            vpc_name: "default".into(),
+            cidr_block: "172.16.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: owner_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-default".into(),
+            vswitch_name: "default-vsw".into(),
+            vpc_id: "vpc-default".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "172.16.0.0/24".into(),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: owner_tags,
+            ..Default::default()
+        });
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-untagged".into(),
+            cidr_block: "192.168.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-untagged".into(),
+            vpc_id: "vpc-untagged".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "192.168.0.0/24".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-untagged".into(),
+            vpc_id: "vpc-untagged".into(),
+            region_id: "cn-hangzhou".into(),
+            ..Default::default()
+        });
+        f.seed_instance(FakeInstance {
+            instance_id: "i-untagged".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Running".into(),
+            ..Default::default()
+        });
+        f.seed_instance(FakeInstance {
+            instance_id: "i-foreign".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Running".into(),
+            tags: BTreeMap::from([
+                ("cua-managed".into(), "true".into()),
+                ("cua-owner".into(), "someone-else".into()),
+            ]),
+            ..Default::default()
+        });
     }
 
     let c = conn(&api);
@@ -2053,21 +2045,19 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
 
     let _sb = sandboxes.create(sb_create_opts("sb-live")).await.unwrap();
     let expired_at = model::now().saturating_sub(60);
-    s.lock().unwrap().instances.insert(
-        "i-expired".into(),
-        json!({
-            "InstanceId": "i-expired",
-            "InstanceName": "cua-aliyun-ecs-exp",
-            "RegionId": "cn-hangzhou",
-            "Status": "Running",
-            "Tags": { "Tag": [
-                { "TagKey": "cua-managed", "TagValue": "true" },
-                { "TagKey": "cua-owner", "TagValue": owner_tag },
-                { "TagKey": "cua-expires", "TagValue": expired_at.to_string() },
-                { "TagKey": "cua-machine", "TagValue": "cloud-expired-1" }
-            ]}
-        }),
-    );
+    s.lock().unwrap().seed_instance(FakeInstance {
+        instance_id: "i-expired".into(),
+        instance_name: "cua-aliyun-ecs-exp".into(),
+        region_id: "cn-hangzhou".into(),
+        status: "Running".into(),
+        tags: BTreeMap::from([
+            ("cua-managed".into(), "true".into()),
+            ("cua-owner".into(), owner_tag),
+            ("cua-expires".into(), expired_at.to_string()),
+            ("cua-machine".into(), "cloud-expired-1".into()),
+        ]),
+        ..Default::default()
+    });
 
     let refused = clouds.disconnect("aliyun-ecs", false).await.unwrap_err();
     assert!(
@@ -2131,11 +2121,11 @@ async fn tag_guards_sweep_ordering_and_disconnect_refusal_vs_delete() {
     assert!(f.instances.contains_key("i-untagged"));
     assert!(f.instances.contains_key("i-foreign"));
     assert_eq!(f.vpcs.len(), 2);
-    assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-default"));
-    assert!(f.vpcs.iter().any(|v| v["VpcId"] == "vpc-untagged"));
+    assert!(f.vpcs.contains_key("vpc-default"));
+    assert!(f.vpcs.contains_key("vpc-untagged"));
     assert_eq!(f.vswitches.len(), 2);
-    assert!(f.vswitches.iter().any(|v| v["VSwitchId"] == "vsw-default"));
-    assert!(f.vswitches.iter().any(|v| v["VSwitchId"] == "vsw-untagged"));
+    assert!(f.vswitches.contains_key("vsw-default"));
+    assert!(f.vswitches.contains_key("vsw-untagged"));
     assert_eq!(f.security_groups.len(), 1);
 }
 
@@ -2148,32 +2138,30 @@ async fn default_vswitch_with_spoofed_cua_tags_is_never_reused() {
     store.save("LTAI_TEST_AK:secret123").unwrap();
     let c = conn(&api);
 
-    let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
-        .into_iter()
-        .map(|(k, v)| json!({ "Key": k, "Value": v }))
-        .collect();
+    let vpc_tags = aliyun_net::part_tags("owner1");
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-owned-1",
-            "VpcName": aliyun_net::vpc_name("owner1"),
-            "CidrBlock": "10.77.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": vpc_tags }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-default-spoofed",
-            "VSwitchName": "default-vsw",
-            "VpcId": "vpc-owned-1",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "10.77.0.0/20",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": true,
-            "Status": "Available",
-            "Tags": { "Tag": vpc_tags }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-owned-1".into(),
+            vpc_name: aliyun_net::vpc_name("owner1"),
+            cidr_block: "10.77.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: vpc_tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-default-spoofed".into(),
+            vswitch_name: "default-vsw".into(),
+            vpc_id: "vpc-owned-1".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "10.77.0.0/20".into(),
+            region_id: "cn-hangzhou".into(),
+            is_default: true,
+            status: "Available".into(),
+            tags: vpc_tags,
+            ..Default::default()
+        });
     }
 
     let locks = aliyun_net::NetLocks::default();
@@ -2211,35 +2199,29 @@ async fn security_group_tie_breaker_and_race_loser_cleanup() {
     let (api1, s1, store1) = start(None).await;
     store1.save("LTAI_TEST_AK:secret123").unwrap();
     let c1 = conn(&api1);
-    let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
-        .into_iter()
-        .map(|(k, v)| json!({ "Key": k, "Value": v }))
-        .collect();
-    let sg_tags: Vec<_> = aliyun_net::part_tags("owner1")
-        .into_iter()
-        .map(|(k, v)| json!({ "TagKey": k, "TagValue": v }))
-        .collect();
+    let vpc_tags = aliyun_net::part_tags("owner1");
     {
         let mut f = s1.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-owned-1",
-            "VpcName": aliyun_net::vpc_name("owner1"),
-            "CidrBlock": "10.77.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": vpc_tags.clone() }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-owned-1".into(),
+            vpc_name: aliyun_net::vpc_name("owner1"),
+            cidr_block: "10.77.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: vpc_tags.clone(),
+            ..Default::default()
+        });
         for sg_id in ["sg-zeta", "sg-alpha"] {
-            f.security_groups.push(json!({
-                "SecurityGroupId": sg_id,
-                "SecurityGroupName": aliyun_net::sg_name("owner1"),
-                "VpcId": "vpc-owned-1",
-                "RegionId": "cn-hangzhou",
-                "SecurityGroupType": "enterprise",
-                "InnerAccessPolicy": "Drop",
-                "Tags": { "Tag": sg_tags.clone() }
-            }));
+            f.seed_sg(FakeSg {
+                sg_id: sg_id.into(),
+                sg_name: aliyun_net::sg_name("owner1"),
+                vpc_id: "vpc-owned-1".into(),
+                region_id: "cn-hangzhou".into(),
+                sg_type: "enterprise".into(),
+                inner_access_policy: "Drop".into(),
+                tags: vpc_tags.clone(),
+                ..Default::default()
+            });
             f.security_group_rules.insert(
                 sg_id.into(),
                 vec![json!({
@@ -2274,15 +2256,15 @@ async fn security_group_tie_breaker_and_race_loser_cleanup() {
     let s2: S = Arc::new(Mutex::new(FakeAliyun::default()));
     {
         let mut f = s2.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-owned-race",
-            "VpcName": aliyun_net::vpc_name("owner1"),
-            "CidrBlock": "10.77.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": vpc_tags }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-owned-race".into(),
+            vpc_name: aliyun_net::vpc_name("owner1"),
+            cidr_block: "10.77.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: vpc_tags,
+            ..Default::default()
+        });
     }
     let fake_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
@@ -2486,31 +2468,28 @@ async fn vswitch_skips_used_cidrs_and_linux_slim_enforces_40g_cloud_essd() {
     store.save("LTAI_TEST_AK:secret123").unwrap();
     let c = conn(&api);
 
-    let vpc_tags: Vec<_> = aliyun_net::part_tags("owner1")
-        .into_iter()
-        .map(|(k, v)| json!({ "Key": k, "Value": v }))
-        .collect();
+    let vpc_tags = aliyun_net::part_tags("owner1");
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-pre-1",
-            "VpcName": aliyun_net::vpc_name("owner1"),
-            "CidrBlock": "10.77.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": vpc_tags }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-other-zone",
-            "VSwitchName": "other",
-            "VpcId": "vpc-pre-1",
-            "ZoneId": "cn-hangzhou-z",
-            "CidrBlock": "10.77.0.0/20",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": [] }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-pre-1".into(),
+            vpc_name: aliyun_net::vpc_name("owner1"),
+            cidr_block: "10.77.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: vpc_tags,
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-other-zone".into(),
+            vswitch_name: "other".into(),
+            vpc_id: "vpc-pre-1".into(),
+            zone_id: "cn-hangzhou-z".into(),
+            cidr_block: "10.77.0.0/20".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            ..Default::default()
+        });
     }
 
     assert_eq!(api.default_disk_gb("linux"), 40);
@@ -2545,11 +2524,11 @@ async fn vswitch_skips_used_cidrs_and_linux_slim_enforces_40g_cloud_essd() {
     let f = s.lock().unwrap();
     let new_vsw = f
         .vswitches
-        .iter()
-        .find(|v| v["VSwitchId"] != "vsw-other-zone")
+        .values()
+        .find(|v| v.vswitch_id != "vsw-other-zone")
         .unwrap();
     assert_eq!(
-        new_vsw["CidrBlock"], "10.77.16.0/20",
+        new_vsw.cidr_block, "10.77.16.0/20",
         "must skip occupied 10.77.0.0/20"
     );
     let run = f.calls.iter().find(|c| c.action == "RunInstances").unwrap();
@@ -2984,7 +2963,7 @@ async fn windows_direct_vm_static_mode_and_failed_boot_redaction_rollback() {
                     ),
                 );
                 if let Some(inst) = f.instances.get_mut(&id_owned) {
-                    inst["Status"] = json!("Stopped");
+                    inst.status = "Stopped".into();
                 }
                 if let Some(ch) = tx.lock().unwrap().take() {
                     let _ = ch.send(());
@@ -3184,32 +3163,37 @@ async fn connection_defaults_validated_in_test_persisted_and_rejected_on_unsuppo
     let (api, s, store) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images.push(json!({
-            "ImageId": "m-win11-golden",
-            "ImageName": "win11-golden",
-            "ImageOwnerAlias": "self",
-            "OSType": "windows",
-            "Status": "Available",
-            "Size": 50
-        }));
-        f.images.push(json!({
-            "ImageId": "m-ubuntu-golden",
-            "ImageName": "ubuntu-golden",
-            "ImageOwnerAlias": "self",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 25
-        }));
-        f.images.push(json!({
-            "ImageId": "m-creating-win",
-            "ImageName": "win-creating",
-            "ImageOwnerAlias": "self",
-            "OSType": "windows",
-            "Status": "Creating",
-            "Size": 50
-        }));
-        f.available_instance_types.push("ecs.c7.2xlarge".into());
-        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+        f.add_image(FakeImage {
+            image_id: "m-win11-golden".into(),
+            image_name: "win11-golden".into(),
+            owner_alias: "self".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 50,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-ubuntu-golden".into(),
+            image_name: "ubuntu-golden".into(),
+            owner_alias: "self".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 25,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-creating-win".into(),
+            image_name: "win-creating".into(),
+            owner_alias: "self".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Creating".into(),
+            size_gb: 50,
+            ..Default::default()
+        });
+        f.add_instance_type("ecs.c7.2xlarge", 8, 16.0);
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -3419,22 +3403,25 @@ async fn connect_with_enforces_max_size_before_persisting_and_preserves_limits_o
     let (api, s, store) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images.push(json!({
-            "ImageId": "m-win11",
-            "ImageName": "win11",
-            "OSType": "windows",
-            "Status": "Available",
-            "Size": 60
-        }));
-        f.images.push(json!({
-            "ImageId": "m-lin1",
-            "ImageName": "lin1",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 40
-        }));
-        f.available_instance_types.push("ecs.c7.2xlarge".into());
-        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+        f.add_image(FakeImage {
+            image_id: "m-win11".into(),
+            image_name: "win11".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 60,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-lin1".into(),
+            image_name: "lin1".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
+        f.add_instance_type("ecs.c7.2xlarge", 8, 16.0);
     }
     let dir = tempfile::tempdir().unwrap();
     let relay = cua_host::testing::FakeRelay::start().await;
@@ -3563,68 +3550,80 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images.push(json!({
-            "ImageId": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
-            "ImageName": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "linux",
-            "Status": "Available",
-            "CreationTime": "2025-06-01T00:00:00Z",
-            "Size": 20
-        }));
-        f.images.push(json!({
-            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
-            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "windows",
-            "Status": "Available",
-            "CreationTime": "2025-09-01T00:00:00Z",
-            "Size": 40
-        }));
-        f.images.push(json!({
-            "ImageId": "win2019_1809_x64_dtc_en-us_40G_alibase_20251001.vhd",
-            "ImageName": "win2019_1809_x64_dtc_en-us_40G_alibase_20251001.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "windows",
-            "Status": "Available",
-            "CreationTime": "2025-10-01T00:00:00Z",
-            "Size": 40
-        }));
-        f.images.push(json!({
-            "ImageId": "m-conn-win",
-            "ImageName": "conn-win",
-            "ImageOwnerAlias": "self",
-            "OSType": "windows",
-            "Status": "Available",
-            "Size": 50
-        }));
-        f.images.push(json!({
-            "ImageId": "m-create-win",
-            "ImageName": "create-win",
-            "ImageOwnerAlias": "self",
-            "OSType": "windows",
-            "Status": "Available",
-            "Size": 50
-        }));
-        f.images.push(json!({
-            "ImageId": "m-conn-lin",
-            "ImageName": "conn-lin",
-            "ImageOwnerAlias": "self",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 20
-        }));
-        f.images.push(json!({
-            "ImageId": "m-create-lin",
-            "ImageName": "create-lin",
-            "ImageOwnerAlias": "self",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 20
-        }));
-        f.instance_types
-            .insert("ecs.custom.8c32g".into(), (8, 32.0));
-        f.available_instance_types.push("ecs.custom.8c32g".into());
+        f.add_image(FakeImage {
+            image_id: "ubuntu_24_04_x64_20G_alibase_20250601.vhd".into(),
+            image_name: "ubuntu_24_04_x64_20G_alibase_20250601.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-06-01T00:00:00Z".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd".into(),
+            image_name: "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-09-01T00:00:00Z".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "win2019_1809_x64_dtc_en-us_40G_alibase_20251001.vhd".into(),
+            image_name: "win2019_1809_x64_dtc_en-us_40G_alibase_20251001.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-10-01T00:00:00Z".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-conn-win".into(),
+            image_name: "conn-win".into(),
+            owner_alias: "self".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 50,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-create-win".into(),
+            image_name: "create-win".into(),
+            owner_alias: "self".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 50,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-conn-lin".into(),
+            image_name: "conn-lin".into(),
+            owner_alias: "self".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-create-lin".into(),
+            image_name: "create-lin".into(),
+            owner_alias: "self".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_instance_type("ecs.custom.8c32g", 8, 32.0);
     }
 
     let base_conn = Connection {
@@ -3658,11 +3657,9 @@ async fn image_precedence_official_fallback_and_preflight_limits_enforce_before_
     );
     assert_eq!(resolved_win.source, "official-fallback");
 
-    let conn_with_defaults = Connection {
-        windows_image_id: Some("m-conn-win".into()),
-        linux_image_id: Some("m-conn-lin".into()),
-        ..base_conn.clone()
-    };
+    let mut conn_with_defaults = base_conn.clone();
+    conn_with_defaults.windows_image_id = Some("m-conn-win".into());
+    conn_with_defaults.linux_image_id = Some("m-conn-lin".into());
     assert_eq!(
         api.resolve_image_id(&conn_with_defaults, &win_spec)
             .await
@@ -3874,51 +3871,60 @@ async fn validate_image_id_and_official_fallback_require_ostype_and_available_st
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images
-            .retain(|img| img["OSType"].as_str() != Some("windows"));
-        f.images.push(json!({
-            "ImageId": "m-missing-ostype",
-            "ImageName": "missing-ostype",
-            "Status": "Available",
-            "Size": 40
-        }));
-        f.images.push(json!({
-            "ImageId": "m-empty-ostype",
-            "ImageName": "empty-ostype",
-            "OSType": "   ",
-            "Status": "Available",
-            "Size": 40
-        }));
+        f.images.retain(|img| img.os_type != "windows");
+        f.add_image(FakeImage {
+            image_id: "m-missing-ostype".into(),
+            image_name: "missing-ostype".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-empty-ostype".into(),
+            image_name: "empty-ostype".into(),
+            os_type: "   ".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
         // Add >100 non-win2022 system Windows images BEFORE the win2022 image so an unfiltered
         // PageSize=50 or PageSize=100 query truncates win2022 unless ImageName=win2022* is queried.
         for i in 0..105 {
-            f.images.push(json!({
-                "ImageId": format!("win2016_x64_dtc_{i:03}.vhd"),
-                "ImageName": format!("win2016_x64_dtc_{i:03}.vhd"),
-                "ImageOwnerAlias": "system",
-                "OSType": "windows",
-                "Status": "Available",
-                "CreationTime": "2024-01-01T00:00:00Z",
-                "Size": 40
-            }));
+            f.add_image(FakeImage {
+                image_id: format!("win2016_x64_dtc_{i:03}.vhd"),
+                image_name: format!("win2016_x64_dtc_{i:03}.vhd"),
+                owner_alias: "system".into(),
+                os_type: "windows".into(),
+                arch: "x86_64".into(),
+                status: "Available".into(),
+                creation_time: "2024-01-01T00:00:00Z".into(),
+                size_gb: 40,
+                ..Default::default()
+            });
         }
-        f.images.push(json!({
-            "ImageId": "ubuntu_24_04_x64_missing_status.vhd",
-            "ImageName": "ubuntu_24_04_x64_missing_status.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "linux",
-            "CreationTime": "2026-01-01T00:00:00Z",
-            "Size": 20
-        }));
-        f.images.push(json!({
-            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
-            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "windows",
-            "Status": "Available",
-            "CreationTime": "2025-09-01T00:00:00Z",
-            "Size": 40
-        }));
+        f.add_image(FakeImage {
+            image_id: "ubuntu_24_04_x64_missing_status.vhd".into(),
+            image_name: "ubuntu_24_04_x64_missing_status.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            creation_time: "2026-01-01T00:00:00Z".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd".into(),
+            image_name: "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-09-01T00:00:00Z".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
     }
     let conn = Connection {
         provider: "aliyun-ecs".into(),
@@ -3956,13 +3962,15 @@ async fn os_vs_image_family_and_linux_image_with_windows_substring() {
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images.push(json!({
-            "ImageId": "m-lin-tools",
-            "ImageName": "linux-tools",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 40
-        }));
+        f.add_image(FakeImage {
+            image_id: "m-lin-tools".into(),
+            image_name: "linux-tools".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
     }
     let dir = tempfile::tempdir().unwrap();
     let relay = Arc::new(cua_host::testing::FakeRelay::start().await);
@@ -4060,57 +4068,66 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images.push(json!({
-            "ImageId": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
-            "ImageName": "ubuntu_24_04_x64_20G_alibase_20250601.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "linux",
-            "Status": "Available",
-            "CreationTime": "2025-06-01T00:00:00Z",
-            "Size": 20
-        }));
-        f.images.push(json!({
-            "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
-            "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd",
-            "ImageOwnerAlias": "system",
-            "OSType": "windows",
-            "Status": "Available",
-            "CreationTime": "2025-09-01T00:00:00Z",
-            "Size": 40
-        }));
-        f.images.push(json!({
-            "ImageId": "m-conn-win",
-            "ImageName": "conn-win",
-            "OSType": "windows",
-            "Status": "Available",
-            "Size": 50
-        }));
-        f.images.push(json!({
-            "ImageId": "m-create-win",
-            "ImageName": "create-win",
-            "OSType": "windows",
-            "Status": "Available",
-            "Size": 50
-        }));
-        f.images.push(json!({
-            "ImageId": "m-conn-lin",
-            "ImageName": "conn-lin",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 20
-        }));
-        f.images.push(json!({
-            "ImageId": "m-create-lin",
-            "ImageName": "create-lin",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 20
-        }));
-        f.available_instance_types.push("ecs.c7.2xlarge".into());
-        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
-        f.available_instance_types.push("ecs.custom.8c32g".into());
-        f.instance_types
-            .insert("ecs.custom.8c32g".into(), (8, 32.0));
+        f.add_image(FakeImage {
+            image_id: "ubuntu_24_04_x64_20G_alibase_20250601.vhd".into(),
+            image_name: "ubuntu_24_04_x64_20G_alibase_20250601.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-06-01T00:00:00Z".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd".into(),
+            image_name: "win2022_21H2_x64_dtc_en-us_40G_alibase_20250901.vhd".into(),
+            owner_alias: "system".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            creation_time: "2025-09-01T00:00:00Z".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-conn-win".into(),
+            image_name: "conn-win".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 50,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-create-win".into(),
+            image_name: "create-win".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 50,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-conn-lin".into(),
+            image_name: "conn-lin".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-create-lin".into(),
+            image_name: "create-lin".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 20,
+            ..Default::default()
+        });
+        f.add_instance_type("ecs.c7.2xlarge", 8, 16.0);
+        f.add_instance_type("ecs.custom.8c32g", 8, 32.0);
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -4769,7 +4786,7 @@ async fn aliyun_ecs_linux_slim_direct_vm_static_relay_mirror_and_failed_boot_rol
                     ),
                 );
                 if let Some(inst) = f.instances.get_mut(&id_owned) {
-                    inst["Status"] = json!("Stopped");
+                    inst.status = "Stopped".into();
                 }
             });
         }));
@@ -4822,22 +4839,25 @@ async fn linux_native_supports_custom_linux_image_id_cloud_image_id_instance_typ
     let (api, s, _) = start(None).await;
     {
         let mut f = s.lock().unwrap();
-        f.images.push(json!({
-            "ImageId": "m-lin-conn-native",
-            "ImageName": "lin-conn-native",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 30
-        }));
-        f.images.push(json!({
-            "ImageId": "m-lin-over-native",
-            "ImageName": "lin-over-native",
-            "OSType": "linux",
-            "Status": "Available",
-            "Size": 40
-        }));
-        f.available_instance_types.push("ecs.c7.2xlarge".into());
-        f.instance_types.insert("ecs.c7.2xlarge".into(), (8, 16.0));
+        f.add_image(FakeImage {
+            image_id: "m-lin-conn-native".into(),
+            image_name: "lin-conn-native".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 30,
+            ..Default::default()
+        });
+        f.add_image(FakeImage {
+            image_id: "m-lin-over-native".into(),
+            image_name: "lin-over-native".into(),
+            os_type: "linux".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            size_gb: 40,
+            ..Default::default()
+        });
+        f.add_instance_type("ecs.c7.2xlarge", 8, 16.0);
     }
 
     let home = tempfile::tempdir().unwrap();
@@ -5049,34 +5069,36 @@ async fn delete_part_retries_more_than_four_transient_dependency_violations_and_
 
     {
         let mut f = s.lock().unwrap();
-        f.vpcs.push(json!({
-            "VpcId": "vpc-retry-1",
-            "VpcName": aliyun_net::vpc_name(owner),
-            "CidrBlock": "10.77.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-retry-1",
-            "VSwitchName": aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
-            "VpcId": "vpc-retry-1",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "10.77.0.0/20",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-retry-1",
-            "SecurityGroupName": aliyun_net::sg_name(owner),
-            "VpcId": "vpc-retry-1",
-            "RegionId": "cn-hangzhou",
-            "SecurityGroupType": "enterprise",
-            "InnerAccessPolicy": "Drop",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"TagKey": k, "TagValue": v})).collect::<Vec<_>>() }
-        }));
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-retry-1".into(),
+            vpc_name: aliyun_net::vpc_name(owner),
+            cidr_block: "10.77.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-retry-1".into(),
+            vswitch_name: aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
+            vpc_id: "vpc-retry-1".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "10.77.0.0/20".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-retry-1".into(),
+            sg_name: aliyun_net::sg_name(owner),
+            vpc_id: "vpc-retry-1".into(),
+            region_id: "cn-hangzhou".into(),
+            sg_type: "enterprise".into(),
+            inner_access_policy: "Drop".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
     }
 
     for (rtype, rid, action) in [
@@ -5118,55 +5140,51 @@ async fn delete_part_retries_more_than_four_transient_dependency_violations_and_
         let mut f = s.lock().unwrap();
         f.calls.clear();
         f.transient_dependency_errors = 0;
-        f.vpcs.push(json!({
-            "VpcId": "vpc-blocked-1",
-            "VpcName": aliyun_net::vpc_name(owner),
-            "CidrBlock": "10.77.0.0/16",
-            "RegionId": "cn-hangzhou",
-            "IsDefault": false,
-            "Status": "Available",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
-        }));
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-blocked-1",
-            "VSwitchName": aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
-            "VpcId": "vpc-blocked-1",
-            "ZoneId": "cn-hangzhou-h",
-            "CidrBlock": "10.77.0.0/20",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
-        }));
-        f.security_groups.push(json!({
-            "SecurityGroupId": "sg-blocked-1",
-            "SecurityGroupName": aliyun_net::sg_name(owner),
-            "VpcId": "vpc-blocked-1",
-            "RegionId": "cn-hangzhou",
-            "SecurityGroupType": "enterprise",
-            "InnerAccessPolicy": "Drop",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"TagKey": k, "TagValue": v})).collect::<Vec<_>>() }
-        }));
-        f.instances.insert(
-            "i-foreign-blocker".into(),
-            json!({
-                "InstanceId": "i-foreign-blocker",
-                "InstanceName": "foreign-box",
-                "RegionId": "cn-hangzhou",
-                "ZoneId": "cn-hangzhou-h",
-                "Status": "Running",
-                "VpcAttributes": {
-                    "VpcId": "vpc-blocked-1",
-                    "VSwitchId": "vsw-blocked-1"
-                },
-                "SecurityGroupIds": {
-                    "SecurityGroupId": ["sg-blocked-1"]
-                },
-                "Tags": { "Tag": [
-                    { "TagKey": "cua-managed", "TagValue": "true" },
-                    { "TagKey": "cua-owner", "TagValue": "other-owner" }
-                ]}
-            }),
-        );
+        f.seed_vpc(FakeVpc {
+            vpc_id: "vpc-blocked-1".into(),
+            vpc_name: aliyun_net::vpc_name(owner),
+            cidr_block: "10.77.0.0/16".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-blocked-1".into(),
+            vswitch_name: aliyun_net::vswitch_name(owner, "cn-hangzhou-h"),
+            vpc_id: "vpc-blocked-1".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            cidr_block: "10.77.0.0/20".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
+        f.seed_sg(FakeSg {
+            sg_id: "sg-blocked-1".into(),
+            sg_name: aliyun_net::sg_name(owner),
+            vpc_id: "vpc-blocked-1".into(),
+            region_id: "cn-hangzhou".into(),
+            sg_type: "enterprise".into(),
+            inner_access_policy: "Drop".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
+        f.seed_instance(FakeInstance {
+            instance_id: "i-foreign-blocker".into(),
+            instance_name: "foreign-box".into(),
+            region_id: "cn-hangzhou".into(),
+            zone_id: "cn-hangzhou-h".into(),
+            status: "Running".into(),
+            vpc_id: "vpc-blocked-1".into(),
+            vswitch_id: "vsw-blocked-1".into(),
+            security_group_id: "sg-blocked-1".into(),
+            tags: BTreeMap::from([
+                ("cua-managed".into(), "true".into()),
+                ("cua-owner".into(), "other-owner".into()),
+            ]),
+            ..Default::default()
+        });
     }
 
     let t0 = Instant::now();
@@ -5317,9 +5335,9 @@ async fn aliyun_ecs_windows_auto_falls_back_when_c7_xlarge_unavailable() {
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
         let mut f = s.lock().unwrap();
-        f.available_instance_types = vec!["ecs.e-c1m2.large".into(), "ecs.e-c1m2.xlarge".into()];
-        f.instance_types
-            .insert("ecs.e-c1m2.xlarge".into(), (4, 8.0));
+        f.available_instance_types =
+            Some(vec!["ecs.e-c1m2.large".into(), "ecs.e-c1m2.xlarge".into()]);
+        f.add_instance_type("ecs.e-c1m2.xlarge", 4, 8.0);
         f.on_run_instance = Some(Arc::new(move |_id, params| {
             for i in 1..=10 {
                 if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
@@ -5414,16 +5432,17 @@ async fn aliyun_net_delete_part_retries_dependency_violation_network_interface_p
 
     {
         let mut f = s.lock().unwrap();
-        f.vswitches.push(json!({
-            "VSwitchId": "vsw-eni-retry",
-            "VSwitchName": aliyun_net::vswitch_name(owner, "ap-southeast-1a"),
-            "VpcId": "vpc-eni-retry",
-            "ZoneId": "ap-southeast-1a",
-            "CidrBlock": "10.77.0.0/20",
-            "RegionId": "cn-hangzhou",
-            "Status": "Available",
-            "Tags": { "Tag": tags.iter().map(|(k, v)| json!({"Key": k, "Value": v})).collect::<Vec<_>>() }
-        }));
+        f.seed_vswitch(FakeVSwitch {
+            vswitch_id: "vsw-eni-retry".into(),
+            vswitch_name: aliyun_net::vswitch_name(owner, "ap-southeast-1a"),
+            vpc_id: "vpc-eni-retry".into(),
+            zone_id: "ap-southeast-1a".into(),
+            cidr_block: "10.77.0.0/20".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Available".into(),
+            tags: tags.clone(),
+            ..Default::default()
+        });
         f.transient_dependency_errors = 30;
         f.transient_dependency_code = Some("DependencyViolation.NetworkInterface".into());
     }
@@ -5586,16 +5605,17 @@ async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
         let mut f = s.lock().unwrap();
-        f.zones = vec!["ap-southeast-1a".into(), "ap-southeast-1b".into()];
-        f.instance_types.insert("ecs.c8y.xlarge".into(), (4, 8.0));
-        f.instance_types.insert("ecs.gn7i.xlarge".into(), (4, 8.0));
-        f.instance_types.insert("ecs.ebmg7.xlarge".into(), (4, 8.0));
-        f.instance_types
-            .insert("ecs.t6-c1m2.xlarge".into(), (4, 8.0));
-        f.instance_types.insert("ecs.c9i.xlarge".into(), (4, 8.0));
-        f.instance_types
-            .insert("ecs.u2a-c1m2.xlarge".into(), (4, 8.0));
-        f.instance_types.insert("ecs.g8i.2xlarge".into(), (8, 16.0));
+        f.set_zones(
+            "ap-southeast-1",
+            vec!["ap-southeast-1a".into(), "ap-southeast-1b".into()],
+        );
+        f.add_instance_type("ecs.c8y.xlarge", 4, 8.0);
+        f.add_instance_type("ecs.gn7i.xlarge", 4, 8.0);
+        f.add_instance_type("ecs.ebmg7.xlarge", 4, 8.0);
+        f.add_instance_type("ecs.t6-c1m2.xlarge", 4, 8.0);
+        f.add_instance_type("ecs.c9i.xlarge", 4, 8.0);
+        f.add_instance_type("ecs.u2a-c1m2.xlarge", 4, 8.0);
+        f.add_instance_type("ecs.g8i.2xlarge", 8, 16.0);
         f.instance_type_details
             .insert("ecs.c8y.xlarge".into(), json!({ "CpuArchitecture": "ARM" }));
         f.instance_type_details.insert(
@@ -5747,14 +5767,10 @@ async fn dynamic_instance_type_selection_queries_cores_memory_filters_with_stock
             "RunInstances must align with the WithStock zone of ecs.c9i.xlarge"
         );
         let run_vsw = run.params.get("VSwitchId").unwrap();
-        let vsw = f
-            .vswitches
-            .iter()
-            .find(|v| v["VSwitchId"].as_str() == Some(run_vsw.as_str()))
-            .unwrap();
+        let vsw = f.vswitches.get(run_vsw.as_str()).unwrap();
         assert_eq!(
-            vsw["ZoneId"].as_str(),
-            Some("ap-southeast-1b"),
+            vsw.zone_id.as_str(),
+            "ap-southeast-1b",
             "created VSwitch must be in the WithStock zone of the selected instance type"
         );
     }
@@ -5821,9 +5837,8 @@ async fn lookup_instance_type_sends_repeat_list_and_requires_exact_match() {
     let c = conn(&api);
     {
         let mut f = s.lock().unwrap();
-        f.instance_types.insert("ecs.t1.xsmall".into(), (1, 0.5));
-        f.instance_types
-            .insert("ecs.u2a-c1m2.xlarge".into(), (4, 8.0));
+        f.add_instance_type("ecs.t1.xsmall", 1, 0.5);
+        f.add_instance_type("ecs.u2a-c1m2.xlarge", 4, 8.0);
     }
 
     let (cpus, mem_mb, _) = api
@@ -5883,11 +5898,11 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
         let relay = relay.clone();
         let mock_url = mock_spacesd.url();
         let mut f = s.lock().unwrap();
-        f.zones = vec!["ap-southeast-1a".into()];
+        f.set_zones("ap-southeast-1", vec!["ap-southeast-1a".into()]);
         let mut supported = Vec::new();
         for idx in 1..=10 {
             let id = format!("ecs.d10-{idx:02}.xlarge");
-            f.instance_types.insert(id.clone(), (2, 4.0));
+            f.add_instance_type(&id, 2, 4.0);
             f.instance_type_details
                 .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
             supported.push(json!({
@@ -5912,7 +5927,7 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
                 json!({ "CpuArchitecture": "X86", "GPUAmount": 0 }),
             ),
         ] {
-            f.instance_types.insert(id.into(), (4, 8.0));
+            f.add_instance_type(id, 4, 8.0);
             f.instance_type_details.insert(id.into(), details);
             supported.push(json!({
                 "Value": id,
@@ -6006,7 +6021,7 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
         let mut supported = Vec::new();
         for idx in 1..=21 {
             let id = format!("ecs.a-small-{idx:02}.large");
-            f.instance_types.insert(id.clone(), (2, 4.0));
+            f.add_instance_type(&id, 2, 4.0);
             f.instance_type_details
                 .insert(id.clone(), json!({ "CpuArchitecture": "X86" }));
             supported.push(json!({
@@ -6015,7 +6030,7 @@ async fn dynamic_instance_selection_chunks_repeat_list_by_10_paginates_next_toke
                 "StatusCategory": "WithStock"
             }));
         }
-        f.instance_types.insert("ecs.c9a.xlarge".into(), (4, 8.0));
+        f.add_instance_type("ecs.c9a.xlarge", 4, 8.0);
         f.instance_type_details.insert(
             "ecs.c9a.xlarge".into(),
             json!({ "CpuArchitecture": "X86", "GPUAmount": 0 }),

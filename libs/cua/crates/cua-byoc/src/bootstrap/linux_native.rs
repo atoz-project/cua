@@ -181,34 +181,20 @@ shutdown -h +{minutes} 'cua: this sandbox reached its time limit' || true\n"
 
     let version = cua_host::driver::SPACESD_VERSION.trim();
     let repo = cua_host::driver::RELEASE_REPOSITORY;
-    let (custom_url, pinned_sha) = match spacesd_download_url
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-    {
-        Some(raw) => match raw.split_once('#') {
-            Some((u, frag)) => (
-                Some(u),
-                frag.strip_prefix("sha256=")
-                    .map(|h| h.trim().to_ascii_lowercase())
-                    .unwrap_or_default(),
-            ),
-            None => (Some(raw), String::new()),
-        },
-        None => (None, String::new()),
-    };
+    let resolved_custom = super::resolve_spacesd_download(
+        spacesd_download_url,
+        version,
+        None,
+        "cua-spacesd-linux-{arch}.tar.gz",
+    );
+    let pinned_sha = resolved_custom
+        .as_ref()
+        .and_then(|(_, sha)| *sha)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
 
-    let (resolve_url, safe_dl_url) = match custom_url {
-        Some(u) => {
-            let expanded = u.replace("{version}", version);
-            let resolved = match expanded.split_once('?') {
-                Some((path, query)) if path.ends_with('/') => {
-                    format!("{path}cua-spacesd-linux-{{arch}}.tar.gz?{query}")
-                }
-                None if expanded.ends_with('/') => {
-                    format!("{expanded}cua-spacesd-linux-{{arch}}.tar.gz")
-                }
-                _ => expanded,
-            };
+    let (resolve_url, safe_dl_url) = match resolved_custom {
+        Some((resolved, _)) => {
             let safe = cua_sandbox_core::byoc::redact_url(&resolved);
             (
                 format!(
