@@ -147,8 +147,8 @@ jobs:
         include:
           - { label: linux-x64-gnu, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, container: "debian:11", lib: libcua_sdk.so, exe: cua }
           - { label: linux-arm64-gnu, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, container: "debian:11", lib: libcua_sdk.so, exe: cua }
-          - { label: darwin-arm64, runner: macos-15-intel, target: aarch64-apple-darwin, container: "", lib: libcua_sdk.dylib, exe: cua }
-          - { label: darwin-x64, runner: macos-15-intel, target: x86_64-apple-darwin, container: "", lib: libcua_sdk.dylib, exe: cua }
+          - { label: darwin-arm64, runner: macos-26, target: aarch64-apple-darwin, container: "", lib: libcua_sdk.dylib, exe: cua }
+          - { label: darwin-x64, runner: macos-26, target: x86_64-apple-darwin, container: "", lib: libcua_sdk.dylib, exe: cua }
           - { label: win32-x64-msvc, runner: windows-latest, target: x86_64-pc-windows-msvc, container: "", lib: cua_sdk.dll, exe: cua.exe }
           - { label: win32-arm64-msvc, runner: windows-11-arm, target: aarch64-pc-windows-msvc, container: "", lib: cua_sdk.dll, exe: cua.exe }
     defaults:
@@ -402,7 +402,7 @@ jobs:
           - { platform: linux, arch: x86_64, runner: ubuntu-latest, native: linux-x64-gnu, lib: libcua_sdk.so }
           - { platform: linux, arch: arm64, runner: ubuntu-24.04-arm, native: linux-arm64-gnu, lib: libcua_sdk.so }
           # One wheel per macOS arch: a universal2 wheel is over PyPI's 100 MB file limit.
-          - { platform: darwin, arch: arm64, runner: macos-15-intel, native: darwin-arm64, lib: libcua_sdk.dylib }
+          - { platform: darwin, arch: arm64, runner: macos-26, native: darwin-arm64, lib: libcua_sdk.dylib }
           - { platform: darwin, arch: x86_64, runner: macos-15-intel, native: darwin-x64, lib: libcua_sdk.dylib }
           - { platform: windows, arch: x86_64, runner: windows-latest, native: win32-x64-msvc, lib: cua_sdk.dll }
           - { platform: windows, arch: arm64, runner: windows-11-arm, native: win32-arm64-msvc, lib: cua_sdk.dll }
@@ -471,7 +471,6 @@ jobs:
       - name: Check the wheel ships the static cua-spacesd in cua/bin/
         run: .github/scripts/check_static_spacesd_packaged.sh libs/cua/python/dist
       - name: Import the wheel
-        if: matrix.arch != 'arm64' || runner.arch == 'ARM64'
         working-directory: libs/cua/python
         run: |
           VERSION="${{ needs.version.outputs.version }}"
@@ -558,12 +557,11 @@ jobs:
   xcframework-slice:
     name: xcframework-slice (${{ matrix.target }})
     needs: version
-    runs-on: macos-15-intel
+    runs-on: macos-26
     # A slice takes about 25 minutes.
     timeout-minutes: 60
     strategy:
       fail-fast: true
-      max-parallel: 2
       matrix:
         target:
           - aarch64-apple-darwin
@@ -595,8 +593,8 @@ jobs:
 
   xcframework:
     needs: [version, xcframework-slice]
-    runs-on: macos-15-intel
-    timeout-minutes: 30
+    runs-on: macos-26
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/download-artifact@v4
@@ -692,7 +690,7 @@ jobs:
         run: |
           # npm requires a dist-tag for a prerelease version; keep it off `latest`.
           flags=(--access public)
-          [[ "$VERSION" == *-* || "$CANONICAL" != true ]] && flags+=(--tag next)
+          [[ "$VERSION" == *-* ]] && flags+=(--tag next)
           if [ "$CANONICAL" = true ]; then
             flags+=(--provenance)
           else
