@@ -1149,6 +1149,20 @@ impl Spaces {
         crate::cloud::custom_relay_origin(url, default_url)
     }
 
+    /// Whether `machine_id` is a Static Relay Space (registry credential stores
+    /// both a non-empty relay URL and a static env token).
+    pub(crate) fn is_static_relay_machine(&self, machine_id: &str) -> bool {
+        let key = format!("relay:{machine_id}");
+        self.inner
+            .registry
+            .credential(&key)
+            .ok()
+            .flatten()
+            .is_some_and(|cred| {
+                cred.url.as_deref().is_some_and(|u| !u.is_empty()) && cred.token.is_some()
+            })
+    }
+
     pub(crate) async fn relay_directory(
         &self,
         want: Option<&str>,

@@ -65,15 +65,19 @@ impl Spaces {
             )));
         }
         let id = SpaceId::parse(&info.id)?;
+        let static_relay = matches!(
+            &id,
+            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id)
+        );
         #[cfg(feature = "spaces-agents")]
         self.rename_on_relay(&info, &id, &name).await?;
         #[cfg(not(feature = "spaces-agents"))]
-        if matches!(id, SpaceId::Relay { .. }) {
+        if matches!(id, SpaceId::Relay { .. }) && !static_relay {
             return Err(Error::Unsupported(
                 "renaming a Space on the relay needs cua-spaces' spaces-agents feature".into(),
             ));
         }
-        if !matches!(id, SpaceId::Relay { .. }) {
+        if !matches!(id, SpaceId::Relay { .. }) || static_relay {
             let kept = if name == info.name {
                 String::new()
             } else {

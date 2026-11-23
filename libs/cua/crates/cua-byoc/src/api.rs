@@ -127,6 +127,7 @@ impl PreparedProvision {
         if self.candidate_zones.is_some() {
             spec.candidate_zones = self.candidate_zones.clone();
         }
+        spec.prepared = true;
     }
 }
 

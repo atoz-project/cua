@@ -536,13 +536,7 @@ impl CloudApi for AliyunEcs {
             .ok_or_else(|| Error::InvalidArgument("aliyun-ecs: missing cua-owner tag".into()))?;
 
         let mut resolved_spec;
-        let spec = if !spec.machine_type.trim().is_empty()
-            && spec
-                .cloud_image_id
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
-            && spec.disk_gb > 0
-        {
+        let spec = if spec.prepared {
             validate_disk_gb(spec.disk_gb)?;
             spec
         } else {

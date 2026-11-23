@@ -462,3 +462,58 @@ async fn canonical_fake_preserves_client_token_idempotency_across_requests() {
         "idempotent ClientToken replay must not create a second instance"
     );
 }
+
+#[tokio::test]
+async fn direct_provision_unprepared_cloud_image_id_runs_prepare_and_fails_validation() {
+    let (api, s) = start_fake(Duration::from_millis(5)).await;
+    api.stage_secret(&Target {
+        provider: "aliyun-ecs".into(),
+        token: Some("LTAI_TEST_AK:secret123".into()),
+        ..Default::default()
+    });
+    let conn = api
+        .resolve(&Target {
+            provider: "aliyun-ecs".into(),
+            region: Some("cn-hangzhou".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut spec = ProvisionSpec {
+        name: "cua-direct-unprepared-1".into(),
+        family: "linux".into(),
+        image: "linux".into(),
+        kind: "container".into(),
+        arch: "amd64".into(),
+        machine_type: "ecs.g7.large".into(),
+        disk_gb: 60,
+        cloud_image_id: Some("m-missing".into()),
+        tags: model::tags("owner-unprep", "unprep-sb", "cloud-unprep", 1_900_000_000),
+        ttl_secs: 3600,
+        prepared: false,
+        ..Default::default()
+    };
+    assert!(format!("{spec:?}").contains("prepared: false"), "{spec:?}");
+
+    let err = api
+        .provision(&conn, &spec)
+        .await
+        .expect_err("unprepared direct provision with unknown cloud_image_id must fail validation");
+    assert!(
+        err.to_string().contains("m-missing"),
+        "expected missing image error, got: {err}"
+    );
+    assert!(
+        count_action(&s, "DescribeImages") >= 1,
+        "expected prepare_provision image lookup before launch"
+    );
+    assert_eq!(
+        count_action(&s, "RunInstances"),
+        0,
+        "must not launch an instance when image validation fails"
+    );
+    assert!(s.lock().unwrap().instances.is_empty());
+
+    cua_byoc::api::PreparedProvision::default().apply_to(&mut spec);
+    assert!(spec.prepared);
+}

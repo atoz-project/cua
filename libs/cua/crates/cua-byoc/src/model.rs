@@ -720,6 +720,9 @@ pub struct ProvisionSpec {
     /// Optional ordered availability zones where the selected shape has stock,
     /// populated by [`crate::CloudApi::prepare_provision`].
     pub candidate_zones: Option<Vec<String>>,
+    /// Whether [`crate::CloudApi::prepare_provision`] has already resolved and
+    /// validated sizing, Cloud Image ID, and stock zones onto this spec.
+    pub prepared: bool,
 }
 
 impl std::fmt::Debug for ProvisionSpec {
@@ -740,6 +743,7 @@ impl std::fmt::Debug for ProvisionSpec {
             .field("region", &self.region)
             .field("cloud_image_id", &self.cloud_image_id)
             .field("candidate_zones", &self.candidate_zones)
+            .field("prepared", &self.prepared)
             .field(
                 "spacesd_download_url",
                 &self

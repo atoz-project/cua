@@ -2198,7 +2198,7 @@ impl std::fmt::Debug for CloudTarget {
             .field("project", &self.project)
             .field("environment", &self.environment)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .field("relay_url", &self.relay_url)
+            .field("relay_url", &self.relay_url.as_deref().map(redact_url))
             .field("relay_mode", &self.relay_mode)
             .field(
                 "relay_token",
@@ -2425,6 +2425,7 @@ mod tests {
     fn cloud_target_debug_redacts_url_credentials_and_query() {
         let t = CloudTarget {
             provider: "aliyun-ecs".into(),
+            relay_url: Some("https://user:pw@relay.example.com/?sig=SECRET".into()),
             spacesd_download_url: Some(
                 "https://dluser:MyPass998877@mirror.example.com/cua.exe?sig=DeadBeefCafe9988#sha256=abab"
                     .into(),
@@ -2432,6 +2433,9 @@ mod tests {
             ..Default::default()
         };
         let dbg = format!("{t:?}");
+        assert!(!dbg.contains("pw"), "{dbg}");
+        assert!(!dbg.contains("SECRET"), "{dbg}");
+        assert!(dbg.contains("https://relay.example.com/"), "{dbg}");
         assert!(!dbg.contains("MyPass998877"), "{dbg}");
         assert!(!dbg.contains("DeadBeefCafe9988"), "{dbg}");
         assert!(
