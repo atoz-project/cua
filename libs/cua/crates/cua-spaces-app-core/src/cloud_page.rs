@@ -430,13 +430,12 @@ pub fn input_from_status(status: &serde_json::Value, now: u64, can_approve: bool
 }
 
 /// "AWS", "Google Cloud", ...; empty for a cloud this build does not know.
-pub fn cloud_name(id: &str) -> &'static str {
+pub fn cloud_name(id: &str) -> &str {
     match id {
-        "aws" => "AWS",
-        "gcp" => "Google Cloud",
-        "azure" => "Microsoft Azure",
         "hetzner" => "Hetzner",
-        "modal" => "Modal",
+        "aws" | "gcp" | "azure" | "modal" | "aliyun-ecs" => {
+            cua_spaces_contract::inputs::provider_title(id)
+        }
         _ => "",
     }
 }
@@ -538,6 +537,10 @@ pub fn region_label(region: &str) -> String {
         "hel1" => "Helsinki",
         "ash" => "Ashburn",
         "hil" => "Hillsboro",
+        "cn-hangzhou" => "Hangzhou",
+        "cn-shanghai" => "Shanghai",
+        "cn-beijing" => "Beijing",
+        "cn-shenzhen" => "Shenzhen",
         _ => "",
     };
     if place.is_empty() {
@@ -656,6 +659,17 @@ fn console_url(c: &CloudInput) -> Option<(String, String)> {
             "https://console.cloud.google.com/compute/instances".into(),
         )),
         "modal" => Some(("Open Modal".into(), "https://modal.com/apps".into())),
+        "aliyun-ecs" => {
+            let region = if c.region.is_empty() {
+                "cn-hangzhou"
+            } else {
+                &c.region
+            };
+            Some((
+                "Open Alibaba Cloud ECS".into(),
+                format!("https://ecs.console.aliyun.com/server/region/{region}"),
+            ))
+        }
         _ => None,
     }
 }
@@ -1513,5 +1527,23 @@ mod tests {
             false,
         );
         assert!(!old.providers[0].can_approve && old.providers[0].suggest_auth.is_empty());
+    }
+
+    #[test]
+    fn cloud_name_matches_byoc_provider_title_for_all_cloud_locations() {
+        for &id in cua_sandbox_core::CLOUD_LOCATIONS {
+            let expected = if id == "hetzner" {
+                "Hetzner"
+            } else {
+                cua_sandbox_core::byoc::provider_title(id)
+            };
+            assert_eq!(cloud_name(id), expected, "{id}");
+            assert_eq!(
+                cua_spaces_contract::inputs::provider_title(id),
+                cua_sandbox_core::byoc::provider_title(id),
+                "{id}"
+            );
+        }
+        assert_eq!(cloud_name("unknown"), "");
     }
 }

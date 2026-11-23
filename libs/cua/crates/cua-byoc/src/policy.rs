@@ -23,6 +23,11 @@ pub fn aws_policy_json() -> &'static str {
     include_str!("../policy/aws-policy.json")
 }
 
+/// The RAM policy document (JSON) for the `aliyun-ecs` provider.
+pub fn aliyun_ecs_policy_json() -> &'static str {
+    include_str!("../policy/aliyun-ecs-policy.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,6 +38,18 @@ mod tests {
     const AWSNET_SOURCE: &str = include_str!("awsnet.rs");
     const AWS_SHARES_SOURCE: &str = include_str!("aws_shares.rs");
     const GCP_SOURCE: &str = include_str!("gcp.rs");
+    const ALIYUN_MOD_SOURCE: &str = include_str!("aliyun/mod.rs");
+    const ALIYUN_AUTH_SOURCE: &str = include_str!("aliyun/auth.rs");
+    const ALIYUN_CLIENT_SOURCE: &str = include_str!("aliyun/client.rs");
+    const ALIYUN_LIFECYCLE_SOURCE: &str = include_str!("aliyun/lifecycle.rs");
+    const ALIYUN_SIZING_SOURCE: &str = include_str!("aliyun/sizing.rs");
+    const ALIYUN_IMAGE_SOURCE: &str = include_str!("aliyun/image.rs");
+    const ALIYUN_NET_SOURCE: &str = include_str!("aliyun/net.rs");
+    const ALIYUN_VPC_SOURCE: &str = include_str!("aliyun/vpc.rs");
+    const ALIYUN_SG_SOURCE: &str = include_str!("aliyun/security_group.rs");
+    const ALIYUN_ZONES_SOURCE: &str = include_str!("aliyun/zones.rs");
+    const ALIYUN_PREFLIGHT_SOURCE: &str = include_str!("aliyun/preflight.rs");
+    const ALIYUN_EXISTING_VPC_SOURCE: &str = include_str!("aliyun/existing_vpc.rs");
     const DOCS: &str =
         include_str!("../../../../../docs/content/docs/cua-sdk/guides/your-cloud-safety.mdx");
 
@@ -356,5 +373,282 @@ mod tests {
         }
         assert!(DOCS.contains("## Least-privilege access"));
         assert!(DOCS_URL.ends_with("#least-privilege-access"));
+    }
+
+    /// Resource types an Alibaba Cloud RAM request cannot tag, so `ecs:RunInstances`
+    /// or `ecs:CreateSecurityGroup` may reference them without a tag condition.
+    const ALIYUN_UNTAGGED_OK: &[&str] = &[
+        "image/",
+        "vswitch/",
+        "networkinterface/",
+        "securitygroup/",
+        "vpc/",
+    ];
+
+    /// Implicit Alibaba Cloud RAM actions evaluated when `Tag.N` parameters are
+    /// supplied during `RunInstances` / `CreateVpc` / `CreateVSwitch` / `CreateSecurityGroup`.
+    const ALIYUN_IMPLICIT: &[&str] = &["ecs:TagResources", "vpc:TagResources"];
+
+    fn aliyun_policy() -> Value {
+        serde_json::from_str(aliyun_ecs_policy_json()).expect("the aliyun policy is JSON")
+    }
+
+    fn aliyun_statements() -> Vec<Value> {
+        aliyun_policy()["Statement"]
+            .as_array()
+            .expect("Statement")
+            .clone()
+    }
+
+    fn allowed_aliyun_actions() -> BTreeSet<String> {
+        aliyun_statements()
+            .iter()
+            .filter(|s| s["Effect"] == "Allow")
+            .flat_map(|s| strings(&s["Action"]))
+            .collect()
+    }
+
+    fn used_aliyun_actions(sources: &[&str]) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for src in sources {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            let b = code.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'"' {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < b.len() && b[end] != b'"' && b[end] != b'\n' && b[end] != b'\\' {
+                        end += 1;
+                    }
+                    if end < b.len() && b[end] == b'"' {
+                        let lit = &code[start..end];
+                        let is_pascal = !lit.is_empty()
+                            && lit.as_bytes()[0].is_ascii_uppercase()
+                            && lit.bytes().all(|c| c.is_ascii_alphanumeric());
+                        if is_pascal {
+                            let mut j = end + 1;
+                            while j < b.len() && b[j].is_ascii_whitespace() {
+                                j += 1;
+                            }
+                            if b.get(j) == Some(&b',') {
+                                j += 1;
+                                while j < b.len() && b[j].is_ascii_whitespace() {
+                                    j += 1;
+                                }
+                                let rest = &code[j..];
+                                let svc = [
+                                    ("STS_API_VERSION", "sts"),
+                                    ("ECS_API_VERSION", "ecs"),
+                                    ("VPC_API_VERSION", "vpc"),
+                                ]
+                                .into_iter()
+                                .find(|(ver, _)| {
+                                    rest.starts_with(ver)
+                                        && !rest.as_bytes().get(ver.len()).is_some_and(|c| {
+                                            c.is_ascii_alphanumeric() || *c == b'_'
+                                        })
+                                });
+                                if let Some((_, prefix)) = svc {
+                                    out.insert(format!("{prefix}:{lit}"));
+                                }
+                            }
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            if code.contains("tag_params(") {
+                out.insert("ecs:TagResources".into());
+                out.insert("vpc:TagResources".into());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_aliyun_policy_is_valid_and_every_statement_is_complete() {
+        let p = aliyun_policy();
+        assert_eq!(p["Version"], "1");
+        let stmts = aliyun_statements();
+        assert!(!stmts.is_empty(), "aliyun policy has no Statement");
+        let mut sids = BTreeSet::new();
+        for s in stmts {
+            let sid = s["Sid"].as_str().expect("every statement has a Sid");
+            assert!(sids.insert(sid.to_string()), "duplicate Sid {sid}");
+            assert!(
+                !sid.is_empty() && sid.chars().all(|c| c.is_ascii_alphanumeric()),
+                "Sid {sid} must be non-empty alphanumeric"
+            );
+            assert!(
+                matches!(s["Effect"].as_str(), Some("Allow" | "Deny")),
+                "{sid}"
+            );
+            assert!(!strings(&s["Action"]).is_empty(), "{sid} has no Action");
+            assert!(!strings(&s["Resource"]).is_empty(), "{sid} has no Resource");
+            assert!(s.get("NotAction").is_none() && s.get("NotResource").is_none());
+            for a in strings(&s["Action"]) {
+                assert!(!a.contains('*'), "{sid}: wildcard action {a}");
+                assert!(!a.starts_with("ram:"), "{sid}: forbidden ram action {a}");
+            }
+        }
+        assert!(
+            aliyun_ecs_policy_json()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .count()
+                < 6144,
+            "RAM custom policies must stay under 6,144 characters (whitespace not counted)"
+        );
+    }
+
+    #[test]
+    fn every_aliyun_call_the_provider_makes_is_allowed() {
+        let used = used_aliyun_actions(&[
+            ALIYUN_MOD_SOURCE,
+            ALIYUN_AUTH_SOURCE,
+            ALIYUN_CLIENT_SOURCE,
+            ALIYUN_LIFECYCLE_SOURCE,
+            ALIYUN_SIZING_SOURCE,
+            ALIYUN_IMAGE_SOURCE,
+            ALIYUN_NET_SOURCE,
+            ALIYUN_VPC_SOURCE,
+            ALIYUN_SG_SOURCE,
+            ALIYUN_ZONES_SOURCE,
+            ALIYUN_PREFLIGHT_SOURCE,
+            ALIYUN_EXISTING_VPC_SOURCE,
+        ]);
+        for known in [
+            "sts:GetCallerIdentity",
+            "ecs:DescribeRegions",
+            "ecs:DescribeZones",
+            "ecs:DescribeAvailableResource",
+            "ecs:DescribeImages",
+            "ecs:DescribeInstanceTypes",
+            "ecs:DescribeInstances",
+            "ecs:DescribeSecurityGroups",
+            "ecs:DescribeSecurityGroupAttribute",
+            "vpc:DescribeVpcs",
+            "vpc:DescribeVSwitches",
+            "ecs:RunInstances",
+            "ecs:CreateSecurityGroup",
+            "vpc:CreateVpc",
+            "vpc:CreateVSwitch",
+            "ecs:AuthorizeSecurityGroupEgress",
+            "ecs:StartInstance",
+            "ecs:StopInstance",
+            "ecs:DeleteInstance",
+            "ecs:DeleteSecurityGroup",
+            "vpc:DeleteVSwitch",
+            "vpc:DeleteVpc",
+            "ecs:GetInstanceConsoleOutput",
+        ] {
+            assert!(used.contains(known), "scanner missed {known}: {used:?}");
+        }
+        let allowed = allowed_aliyun_actions();
+        let missing: Vec<_> = used.difference(&allowed).collect();
+        assert!(
+            missing.is_empty(),
+            "aliyun provider sources call {missing:?} but policy/aliyun-ecs-policy.json does not allow it: \
+             add it (tag-scoped if it mutates anything) and update your-cloud-safety.mdx"
+        );
+        let stale: Vec<_> = allowed
+            .difference(&used)
+            .filter(|a| !ALIYUN_IMPLICIT.contains(&a.as_str()))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "policy/aliyun-ecs-policy.json allows {stale:?} but aliyun provider sources never call it: remove it"
+        );
+    }
+
+    #[test]
+    fn nothing_that_changes_aliyun_lacks_the_cua_tag_condition() {
+        const MUTATING: &[&str] = &[
+            "Run",
+            "Create",
+            "Delete",
+            "Terminate",
+            "Stop",
+            "Start",
+            "Authorize",
+            "Revoke",
+            "Modify",
+            "Attach",
+            "Detach",
+            "Associate",
+            "Disassociate",
+            "Reboot",
+            "Put",
+            "Allocate",
+            "Release",
+            "Tag",
+        ];
+        for s in aliyun_statements()
+            .iter()
+            .filter(|s| s["Effect"] == "Allow")
+        {
+            let sid = s["Sid"].as_str().unwrap();
+            let acts = strings(&s["Action"]);
+            let changes_or_console = acts.iter().any(|a| {
+                let op = a.split(':').nth(1).unwrap_or("");
+                MUTATING.iter().any(|m| op.starts_with(m)) || a == "ecs:GetInstanceConsoleOutput"
+            });
+            if !changes_or_console {
+                continue;
+            }
+            let cond = s["Condition"].to_string();
+            let tagged = cond.contains("acs:RequestTag/cua-managed")
+                || cond.contains("acs:ResourceTag/cua-managed");
+            if tagged {
+                continue;
+            }
+            let res = strings(&s["Resource"]);
+            let reference_only = acts
+                .iter()
+                .all(|a| a == "ecs:RunInstances" || a == "ecs:CreateSecurityGroup")
+                && res
+                    .iter()
+                    .all(|r| ALIYUN_UNTAGGED_OK.iter().any(|u| r.contains(u)));
+            assert!(
+                reference_only,
+                "{sid}: {acts:?} mutates or reads sensitive console without a cua-managed tag condition"
+            );
+        }
+        for tag_act in ["ecs:TagResources", "vpc:TagResources"] {
+            let stmt = aliyun_statements()
+                .into_iter()
+                .find(|s| strings(&s["Action"]).contains(&tag_act.to_string()))
+                .unwrap_or_else(|| panic!("missing {tag_act} statement"));
+            assert!(
+                stmt["Condition"]
+                    .to_string()
+                    .contains("acs:RequestTag/cua-managed"),
+                "{tag_act} must require acs:RequestTag/cua-managed"
+            );
+        }
+        for a in allowed_aliyun_actions() {
+            assert!(!a.starts_with("ram:"), "{a}");
+        }
+    }
+
+    #[test]
+    fn the_docs_show_the_aliyun_policy_verbatim() {
+        assert!(DOCS.contains("## Least-privilege access"));
+        assert!(
+            DOCS.contains(aliyun_ecs_policy_json().trim()),
+            "docs/content/docs/cua-sdk/guides/your-cloud-safety.mdx must contain \
+             crates/cua-byoc/policy/aliyun-ecs-policy.json verbatim under ## Least-privilege access"
+        );
+        assert!(
+            DOCS.contains("100.100.100.200"),
+            "your-cloud-safety.mdx must explain the 100.100.100.200 metadata block"
+        );
+        assert!(
+            DOCS.contains("cua-managed"),
+            "your-cloud-safety.mdx must explain cua-managed tag scoping"
+        );
     }
 }

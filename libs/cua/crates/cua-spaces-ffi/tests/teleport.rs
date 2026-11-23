@@ -149,6 +149,9 @@ fn direct(url: &str) -> SandboxCreateOptions {
         spacesd: None,
         profile: None,
         forkable: None,
+        disk_gb: None,
+        cloud_image_id: None,
+        instance_type: None,
     }
 }
 

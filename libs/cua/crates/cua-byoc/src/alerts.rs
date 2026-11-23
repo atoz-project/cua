@@ -40,14 +40,7 @@ fn path(home: &Path) -> PathBuf {
 
 /// How people name the cloud `provider`.
 pub fn title_of(provider: &str) -> &str {
-    match provider {
-        "aws" => "AWS",
-        "gcp" => "Google Cloud",
-        "azure" => "Microsoft Azure",
-        "hetzner" => "Hetzner",
-        "modal" => "Modal",
-        other => other,
-    }
+    cua_sandbox_core::byoc::provider_title(provider)
 }
 
 /// The alerts `conn` is due now that `spent_usd` is spent this month (at
@@ -170,7 +163,10 @@ mod tests {
     fn conn(budget: Option<f64>) -> Connection {
         Connection {
             provider: "aws".into(),
-            budget_usd_month: budget,
+            extras: crate::model::ConnectionExtras {
+                budget_usd_month: budget,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -225,6 +221,19 @@ mod tests {
         assert_eq!(
             percents(due(dir.path(), &conn(Some(200.0)), 100.0, OCT).unwrap()),
             vec![50]
+        );
+    }
+
+    #[test]
+    fn aliyun_ecs_title_is_human_readable() {
+        assert_eq!(title_of("aliyun-ecs"), "Alibaba Cloud ECS");
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = conn(Some(100.0));
+        c.provider = "aliyun-ecs".into();
+        let a = due(dir.path(), &c, 100.0, OCT).unwrap();
+        assert_eq!(
+            a[0].title_line(),
+            "Alibaba Cloud ECS reached its monthly budget"
         );
     }
 }

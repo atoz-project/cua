@@ -298,6 +298,8 @@ async fn dispatch(
                 name,
                 cpus: a.cpus,
                 memory_mb: a.memory_mb,
+                disk_gb: a.disk_gb,
+                cloud_image_id: a.cloud_image_id.clone(),
                 timeout: a.timeout.map(Duration::from_secs),
                 wait: a.wait,
                 reuse: a.reuse.unwrap_or(false),
@@ -403,13 +405,13 @@ async fn dispatch(
         "cloud_test" => {
             let a: i::CloudTest = args(tool, a)?;
             let c = spaces.sandboxes().clouds()?;
-            Ok(json_of(&c.test(&cloud_target(a.target)).await?))
+            Ok(json_of(&c.test(&cloud_target(a.target)?).await?))
         }
         "cloud_connect" => {
             let a: i::CloudConnect = args(tool, a)?;
             let c = spaces.sandboxes().clouds()?;
             let req = cua_sandbox_core::byoc::ConnectRequest {
-                target: cloud_target(a.target),
+                target: cloud_target(a.target)?,
                 make_default: a.make_default.unwrap_or(false),
                 ttl_hours: a.ttl_hours,
                 auth: a.auth,
@@ -1059,17 +1061,35 @@ fn json_of<T: serde::Serialize>(v: &T) -> ToolOutcome {
 }
 
 /// A `cloud_*` target, trimmed.
-fn cloud_target(t: i::CloudTarget) -> cua_sandbox_core::byoc::CloudTarget {
+fn cloud_target(t: i::CloudTarget) -> Result<cua_sandbox_core::byoc::CloudTarget> {
     let some = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
-    cua_sandbox_core::byoc::CloudTarget {
+    let trim_keep_empty = |s: Option<String>| s.map(|v| v.trim().to_string());
+    let relay_mode = t
+        .relay_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(cua_sandbox_core::byoc::RelayMode::parse)
+        .transpose()?;
+    Ok(cua_sandbox_core::byoc::CloudTarget {
         provider: t.provider.trim().to_ascii_lowercase(),
         profile: some(t.profile),
         region: some(t.region),
         zone: some(t.zone),
         project: some(t.project),
         environment: some(t.environment),
-        token: some(t.token),
-    }
+        token: trim_keep_empty(t.token),
+        relay_url: trim_keep_empty(t.relay_url),
+        relay_mode,
+        relay_token: trim_keep_empty(t.relay_token),
+        spacesd_download_url: trim_keep_empty(t.spacesd_download_url),
+        vpc_id: trim_keep_empty(t.vpc_id),
+        vswitch_id: trim_keep_empty(t.vswitch_id),
+        no_public_ip: t.no_public_ip.unwrap_or(false),
+        windows_image_id: trim_keep_empty(t.windows_image_id),
+        linux_image_id: trim_keep_empty(t.linux_image_id),
+        instance_type: trim_keep_empty(t.instance_type),
+    })
 }
 
 /// The capability a contract tool belongs to when an extension serves it
@@ -1657,4 +1677,55 @@ async fn tool_stream_space_window(spaces: &Spaces, tool: &str, a: Value) -> Resu
         window.window_id,
         s.id()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_target_preserves_empty_explicit_token() {
+        let out = cloud_target(i::CloudTarget {
+            provider: "aliyun-ecs".into(),
+            token: Some("  \n".into()),
+            relay_token: Some(" \t ".into()),
+            spacesd_download_url: Some(" https://mirror.example/cua-spacesd.exe ".into()),
+            vpc_id: Some("  ".into()),
+            vswitch_id: Some(" vsw-1 ".into()),
+            no_public_ip: Some(true),
+            windows_image_id: Some("  ".into()),
+            linux_image_id: Some(" m-lin ".into()),
+            instance_type: Some(" ecs.c7.xlarge ".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(out.token.as_deref(), Some(""));
+        assert_eq!(out.relay_token.as_deref(), Some(""));
+        assert_eq!(
+            out.spacesd_download_url.as_deref(),
+            Some("https://mirror.example/cua-spacesd.exe")
+        );
+        assert_eq!(out.vpc_id.as_deref(), Some(""));
+        assert_eq!(out.vswitch_id.as_deref(), Some("vsw-1"));
+        assert!(out.no_public_ip);
+        assert_eq!(out.windows_image_id.as_deref(), Some(""));
+        assert_eq!(out.linux_image_id.as_deref(), Some("m-lin"));
+        assert_eq!(out.instance_type.as_deref(), Some("ecs.c7.xlarge"));
+
+        let omitted = cloud_target(i::CloudTarget {
+            provider: "aliyun-ecs".into(),
+            token: None,
+            relay_token: None,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(omitted.token, None);
+        assert_eq!(omitted.relay_token, None);
+        assert_eq!(omitted.vpc_id, None);
+        assert_eq!(omitted.vswitch_id, None);
+        assert!(!omitted.no_public_ip);
+        assert_eq!(omitted.windows_image_id, None);
+        assert_eq!(omitted.linux_image_id, None);
+        assert_eq!(omitted.instance_type, None);
+    }
 }

@@ -322,6 +322,13 @@ pub struct CreateOptions {
     /// share its pages ([`Sandboxes::checkpoint`], [`Sandboxes::fork`]). It
     /// never claims a warm-pool member. Other kinds ignore it.
     pub forkable: bool,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
+    /// Per-create cloud instance type override (`aliyun-ecs`: `ecs.g7.xlarge`).
+    pub instance_type: Option<String>,
+    /// Lifetime backstop (`cua sb create --ttl`). `None` uses the provider default.
+    pub ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for CreateOptions {
@@ -365,6 +372,9 @@ impl std::fmt::Debug for CreateOptions {
             .field("mounts", &self.mounts)
             .field("ephemeral_name", &self.ephemeral_name)
             .field("forkable", &self.forkable)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("instance_type", &self.instance_type)
+            .field("ttl", &self.ttl)
             .finish()
     }
 }
@@ -408,6 +418,9 @@ impl CreateOptions {
             mounts: vec![],
             ephemeral_name: None,
             forkable: false,
+            cloud_image_id: None,
+            instance_type: None,
+            ttl: None,
         }
     }
 
@@ -853,11 +866,21 @@ impl Sandboxes {
         report(Progress::phase(Phase::Preparing).detail(&options.image));
         options.apply_placement()?;
         options.validate_sidecars()?;
-        if options.disk_gb.is_some_and(|g| g > 0) && options.provider != ProviderKind::Local {
+        if options.disk_gb.is_some_and(|g| g > 0)
+            && !matches!(
+                options.provider,
+                ProviderKind::Local | ProviderKind::Contrib
+            )
+        {
             return Err(Error::InvalidArgument(
                 "disk_gb sizes local VMs only: provider sandboxes boot the image's disk".into(),
             ));
         }
+        crate::byoc::validate_cloud_vm_overrides(
+            options.provider == ProviderKind::Contrib,
+            options.cloud_image_id.as_deref(),
+            options.instance_type.as_deref(),
+        )?;
         let options = self.build_image(options).await?;
         let preexisting = match (&options.provider, options.name.as_deref()) {
             (ProviderKind::Local, Some(name)) if !name.is_empty() => {
@@ -2776,16 +2799,26 @@ impl Sandbox {
             Target::Direct { .. } => (Kind::Auto, Runtime::Auto),
             Target::Contrib { provider, instance } => {
                 let caps = provider.0.capabilities();
-                let kind = match caps.kinds.first() {
-                    Some(crate::RunKind::Container) => Kind::Container,
-                    Some(crate::RunKind::Vm) => Kind::Vm,
-                    None => Kind::Auto,
-                };
                 let runtime = instance
                     .details
                     .get("runtime")
                     .map(String::as_str)
                     .unwrap_or(caps.runtime);
+                let kind = match instance
+                    .details
+                    .get("kind")
+                    .map(String::as_str)
+                    .or_else(|| instance.details.get("runtime").map(String::as_str))
+                {
+                    Some("native" | "vm") => Kind::Vm,
+                    Some("docker" | "container" | "docker-on-vm") => Kind::Container,
+                    Some("microvm") => Kind::MicroVm,
+                    _ => match caps.kinds.first() {
+                        Some(crate::RunKind::Container) => Kind::Container,
+                        Some(crate::RunKind::Vm) => Kind::Vm,
+                        None => Kind::Auto,
+                    },
+                };
                 (kind, Runtime::parse(runtime).unwrap_or(Runtime::Auto))
             }
         }
@@ -2914,7 +2947,9 @@ impl Sandbox {
             Ok(caps) if !caps.initialized => {}
             _ => return Ok(client),
         }
-        let token = held.unwrap_or_else(mint_env_token);
+        let token = held
+            .or_else(|| client.token().map(str::to_string))
+            .unwrap_or_else(mint_env_token);
         // A driver's first token makes it this Space's machine: it renews
         // its per-machine secrets with fresh entropy. That matters when the
         // guest was resumed from a memory snapshot other Spaces share (a
@@ -3047,7 +3082,9 @@ impl Sandbox {
                 }
                 if let Some(o) = provider.0.connect_options(instance, port) {
                     let mut o = o.map_err(|e| not_available(e.to_string()))?;
-                    o.token = token.clone();
+                    if token.is_some() {
+                        o.token = token.clone();
+                    }
                     o
                 } else {
                     let ep = provider
@@ -3062,7 +3099,9 @@ impl Sandbox {
                     }
                     let mut o =
                         ConnectOptions::parse(&ep.url).map_err(|e| not_available(e.to_string()))?;
-                    o.token = token.clone();
+                    if token.is_some() {
+                        o.token = token.clone();
+                    }
                     o
                 }
             }
@@ -4035,15 +4074,25 @@ fn local_env_token_keeping(o: &CreateOptions, recorded: Option<String>) -> Optio
     }
 }
 
-fn local_env_token(o: &CreateOptions) -> Option<String> {
-    let given = o
-        .env
+fn given_env_token(o: &CreateOptions) -> Option<String> {
+    o.env
         .get("CUA_SPACESD_TOKEN")
         .or_else(|| o.env.get("CUA_ENV_TOKEN"))
         .or(o.env_token.as_ref())
         .filter(|t| !t.is_empty())
-        .cloned();
-    given.or_else(|| (!o.os.eq_ignore_ascii_case("windows")).then(mint_env_token))
+        .cloned()
+}
+
+fn local_env_token(o: &CreateOptions) -> Option<String> {
+    given_env_token(o).or_else(|| (!o.os.eq_ignore_ascii_case("windows")).then(mint_env_token))
+}
+
+fn contrib_env_token(o: &CreateOptions, env_to_entrypoint: bool) -> Option<String> {
+    if env_to_entrypoint {
+        given_env_token(o).or_else(|| Some(mint_env_token()))
+    } else {
+        o.env_token.clone().filter(|t| !t.is_empty())
+    }
 }
 
 #[cfg(test)]

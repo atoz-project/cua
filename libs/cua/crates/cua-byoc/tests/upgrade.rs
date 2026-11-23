@@ -156,20 +156,30 @@ fn every_new_link_key_is_kept_in_links_json() {
         account: "a".into(),
         ttl_hours: 1,
         connected_at: "t".into(),
-        auth: Auth::aws("conn_1", "arn"),
-        budget_usd_month: Some(1.0),
-        max_size: Some(MaxSize {
-            vcpu: 1,
-            mem_gib: 1,
-        }),
+        extras: cua_byoc::ConnectionExtras {
+            auth: Auth::aws("conn_1", "arn"),
+            budget_usd_month: Some(1.0),
+            max_size: Some(MaxSize {
+                vcpu: 1,
+                mem_gib: 1,
+                disk_gib: Some(100),
+            }),
+            relay_url: Some("https://relay.example.com".into()),
+            relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
+            windows_image_id: Some("m-win-default".into()),
+            linux_image_id: Some("m-lin-default".into()),
+            instance_type: Some("ecs.c7.xlarge".into()),
+        },
     };
     let link = Link {
         account: "a".into(),
         connected_at: "t".into(),
         profile: "p".into(),
-        auth: full.auth.clone(),
-        budget_usd_month: full.budget_usd_month,
-        max_size: full.max_size,
+        extras: full.extras.clone(),
     };
     let link_keys = keys(&serde_json::to_value(&link).unwrap());
     let now = keys(&serde_json::to_value(&full).unwrap());
@@ -459,12 +469,16 @@ fn oidc_aws() -> Connection {
         account: "123456789012".into(),
         connected_at: "2026-10-24T10:00:00Z".into(),
         ttl_hours: 4,
-        auth: Auth::aws("conn_1", "arn:aws:iam::123456789012:role/cua-spaces"),
-        budget_usd_month: Some(200.0),
-        max_size: Some(MaxSize {
-            vcpu: 4,
-            mem_gib: 16,
-        }),
+        extras: cua_byoc::ConnectionExtras {
+            auth: Auth::aws("conn_1", "arn:aws:iam::123456789012:role/cua-spaces"),
+            budget_usd_month: Some(200.0),
+            max_size: Some(MaxSize {
+                vcpu: 4,
+                mem_gib: 16,
+                disk_gib: None,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -529,10 +543,13 @@ async fn a_home_this_cua_wrote_survives_a_released_cua_writing_it() {
         region: "fsn1".into(),
         account: "my-project".into(),
         connected_at: "2026-10-24T11:00:00Z".into(),
-        auth: Auth::Sealed {
-            conn_id: "conn_2".into(),
+        extras: cua_byoc::ConnectionExtras {
+            auth: Auth::Sealed {
+                conn_id: "conn_2".into(),
+            },
+            budget_usd_month: Some(50.0),
+            ..Default::default()
         },
-        budget_usd_month: Some(50.0),
         ..Default::default()
     };
     store.connect(sealed.clone()).unwrap();
@@ -567,7 +584,7 @@ async fn a_home_this_cua_wrote_survives_a_released_cua_writing_it() {
     // ...and the AWS link it made is its own (a CLI link, profile kept).
     let aws = back.connection("aws").unwrap().unwrap();
     assert_eq!(
-        (aws.auth, aws.profile.as_str()),
+        (aws.auth.clone(), aws.profile.as_str()),
         (Auth::Cli, "upgrade-fake")
     );
     assert_eq!(aws.budget_usd_month, None);

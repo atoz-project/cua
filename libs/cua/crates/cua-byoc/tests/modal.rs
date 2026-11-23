@@ -21,6 +21,49 @@ use cua_sandbox_core::placement::Runtime;
 use cua_sandbox_core::{CreateOptions, ProviderKind, Sandboxes};
 use serde_json::{Value, json};
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ModalEnvGuard {
+    prev_id: Option<String>,
+    prev_secret: Option<String>,
+}
+
+impl ModalEnvGuard {
+    fn set(id: Option<&str>, secret: Option<&str>) -> Self {
+        let prev_id = std::env::var("MODAL_TOKEN_ID").ok();
+        let prev_secret = std::env::var("MODAL_TOKEN_SECRET").ok();
+        unsafe {
+            match id {
+                Some(v) => std::env::set_var("MODAL_TOKEN_ID", v),
+                None => std::env::remove_var("MODAL_TOKEN_ID"),
+            }
+            match secret {
+                Some(v) => std::env::set_var("MODAL_TOKEN_SECRET", v),
+                None => std::env::remove_var("MODAL_TOKEN_SECRET"),
+            }
+        }
+        Self {
+            prev_id,
+            prev_secret,
+        }
+    }
+}
+
+impl Drop for ModalEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev_id {
+                Some(v) => std::env::set_var("MODAL_TOKEN_ID", v),
+                None => std::env::remove_var("MODAL_TOKEN_ID"),
+            }
+            match &self.prev_secret {
+                Some(v) => std::env::set_var("MODAL_TOKEN_SECRET", v),
+                None => std::env::remove_var("MODAL_TOKEN_SECRET"),
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct FakeModal {
     /// Calls signed in with a token: (request, token id, token secret).
@@ -149,6 +192,7 @@ fn create(name: &str) -> CreateOptions {
 
 #[tokio::test]
 async fn a_modal_sandbox_joins_the_relay_and_is_deleted_with_its_machine() {
+    let _env_lock = ENV_LOCK.lock().await;
     let (_dir, fake, sandboxes) = world().await;
     let clouds = sandboxes.clouds().unwrap();
 
@@ -298,6 +342,7 @@ fn target() -> Target {
 
 #[tokio::test]
 async fn a_throttled_modal_call_is_retried_a_few_times_but_a_create_never() {
+    let _env_lock = ENV_LOCK.lock().await;
     let (_dir, fake, sandboxes) = world().await;
     let clouds = sandboxes.clouds().unwrap();
     // Two "unavailable" answers, then it works.
@@ -347,6 +392,7 @@ mod sealed_support;
 #[cfg(feature = "federation")]
 #[tokio::test]
 async fn a_sealed_modal_token_signs_in_the_helper_and_nothing_else_sees_it() {
+    let _env_lock = ENV_LOCK.lock().await;
     use cua_byoc::CloudApi as _;
     use cua_byoc::federation::IssuerClient;
     use cua_byoc::sealed::PoolSealer;
@@ -441,4 +487,73 @@ async fn a_sealed_modal_token_signs_in_the_helper_and_nothing_else_sees_it() {
         "ak-a"
     );
     assert!(cua_byoc::modal::profile_token(toml, Some("c")).is_none());
+}
+
+#[cfg(feature = "federation")]
+#[tokio::test]
+async fn empty_token_stdin_does_not_fall_back_to_ambient_credentials_when_sealing() {
+    use cua_byoc::CloudApi as _;
+    use cua_byoc::federation::IssuerClient;
+    use cua_byoc::sealed::PoolSealer;
+    use cua_sandbox_core::byoc::{CloudManager, ConnectRequest};
+    use sealed_support::{FakeIssuer, FakePool};
+
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = ModalEnvGuard::set(Some("ak-env"), Some("as-env"));
+
+    let home = tempfile::tempdir().unwrap();
+    let toml = home.path().join("modal.toml");
+    std::fs::write(
+        &toml,
+        "[cuaai]\ntoken_id = \"ak-toml\"\ntoken_secret = \"as-toml\"\nactive = true\n",
+    )
+    .unwrap();
+    let fake = Arc::new(FakeModal::default());
+    let api = Arc::new(ModalApi::with(
+        fake.clone(),
+        Arc::new(FixedConfigSource(ImageConfig::default())),
+        Some(toml),
+    ));
+    let issuer = Arc::new(FakeIssuer::default());
+    let pool = FakePool::new();
+    let clouds = cua_byoc::Clouds::new(
+        home.path(),
+        vec![api.clone() as Arc<dyn cua_byoc::CloudApi>],
+        Arc::new(cua_byoc::Store::new(home.path())),
+    )
+    .with_issuer(issuer.clone() as Arc<dyn IssuerClient>)
+    .with_sealer(pool.join("laptop") as Arc<dyn PoolSealer>);
+
+    let omitted = Target {
+        provider: "modal".into(),
+        token: None,
+        ..Default::default()
+    };
+    assert!(api.local_secret(&omitted).is_some());
+
+    for empty in ["", "   \n"] {
+        let tgt = Target {
+            provider: "modal".into(),
+            token: Some(empty.into()),
+            ..Default::default()
+        };
+        assert!(
+            api.local_secret(&tgt).is_none(),
+            "local_secret fell through for {empty:?}"
+        );
+        let req = ConnectRequest {
+            target: tgt,
+            auth: Some("sealed".into()),
+            budget_usd_month: Some(30.0),
+            ..Default::default()
+        };
+        let err = clouds.connect_with(&req).await.unwrap_err();
+        assert!(
+            matches!(err, cua_sandbox_core::Error::InvalidArgument(_)),
+            "expected InvalidArgument for {empty:?}, got {err:?}"
+        );
+    }
+    assert!(fake.requests.lock().unwrap().is_empty());
+    assert!(fake.with_token.lock().unwrap().is_empty());
+    assert!(issuer.conns.lock().unwrap().is_empty());
 }

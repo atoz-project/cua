@@ -2185,6 +2185,7 @@ dependencies = [
  "cua-home",
  "cua-image",
  "cua-repo-cache",
+ "cua-spaces-contract",
  "cua-spacesd-client",
  "cua-vmm",
  "futures-util",
@@ -2377,6 +2378,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

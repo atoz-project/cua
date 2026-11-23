@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! `cua cloud`: Spaces in your own cloud account (AWS, Google Cloud,
-//! Hetzner, Modal) as a location for sandboxes and Spaces. The providers are the
-//! sandbox layer's (`cua-byoc`); this `cua` reaches them through the
-//! `cloud_*` tools, in the daemon when one runs, else in process.
+//! Hetzner, Modal, Alibaba Cloud ECS) as a location for sandboxes and Spaces.
+//! The providers are the sandbox layer's (`cua-byoc`); this `cua` reaches them
+//! through the `cloud_*` tools, in the daemon when one runs, else in process.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -79,6 +79,25 @@ Azure (always without a stored key):
      and a machine is validated.
   Verify: cua cloud status azure
 
+Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
+  Resolves credentials in order: --token-stdin (<access_key_id>:<access_key_secret>),
+  ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET, --profile <name>
+  in ~/.aliyun/config.json, saved credential store, or the active `current`
+  profile in ~/.aliyun/config.json. Default region: `cn-hangzhou`.
+    cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16
+    cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
+  Optional existing VPC attachment and private-only networking (--no-public-ip):
+    cua cloud connect aliyun-ecs --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
+  Optional default Cloud Image IDs and instance type:
+    cua cloud connect aliyun-ecs --windows-image-id m-win11 --linux-image-id m-ubuntu --instance-type ecs.c7.2xlarge
+  Verify: cua cloud status aliyun-ecs
+
+Self-hosted relay (per connection, default https://relay.cua.ai in Account Relay Mode):
+  Account Relay Mode on a custom relay keeps dynamic machine registration and JWKS:
+    cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
+  Static Relay Mode uses a shared relay token and per-sandbox env tokens (no cua auth login):
+    cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1
+
 Other clouds use their own CLI sign-in on this device.
 `cua cloud trust <cloud>` prints the trust setup file (aws, gcp, azure).
 Docs for agents: https://cua.ai/docs/spaces/guides/connect-a-cloud
@@ -104,18 +123,27 @@ Examples:
   # Seal the Hetzner token this device already has
   cua cloud connect hetzner --sealed --budget 50
   # Spaces there delete themselves after 4 hours (default 8; 0: never)
-  cua cloud connect aws --ttl-hours 4";
+  cua cloud connect aws --ttl-hours 4
+  # Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile
+  cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8
+  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou
+  cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou --spacesd-download-url https://mirror.example.com/cua-spacesd.exe
+  cua cloud connect aliyun-ecs --profile oauth --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
+  # Self-hosted relay: Account Relay Mode or Static Relay Mode
+  cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
+  cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1";
 
 /// Where in a cloud account Spaces go.
 #[derive(Args, Debug, Clone, Default)]
 pub struct TargetArgs {
-    /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`.
     pub provider: String,
-    /// AWS profile (`~/.aws/config`) or Modal profile (`~/.modal.toml`).
+    /// AWS profile (`~/.aws/config`), Modal profile (`~/.modal.toml`), or
+    /// Alibaba Cloud CLI profile (`~/.aliyun/config.json`).
     #[arg(long)]
     pub profile: Option<String>,
-    /// AWS, Google Cloud or Azure region, or Hetzner location (default
-    /// `fsn1`).
+    /// AWS, Google Cloud, Azure or Alibaba Cloud region, or Hetzner location
+    /// (default `fsn1` for Hetzner, `cn-hangzhou` for `aliyun-ecs`).
     #[arg(long)]
     pub region: Option<String>,
     /// Google Cloud zone (default: the region's `-a` zone).
@@ -127,22 +155,75 @@ pub struct TargetArgs {
     /// Modal environment (default: the profile's).
     #[arg(long)]
     pub environment: Option<String>,
-    /// Hetzner or Modal: read the API token from stdin (Hetzner: a Read &
-    /// Write project token, otherwise `HCLOUD_TOKEN`, the saved token or the
-    /// hcloud CLI's context; Modal: `<token id>:<token secret>`). Once the
-    /// checks pass it is sealed to your devices, or with --no-sealed saved
-    /// in this device's Cua credential store (Hetzner).
+    /// Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey
+    /// pair from stdin (Hetzner: Read & Write project token; Modal: `<token
+    /// id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`).
+    /// Hetzner and Modal seal to your devices when a budget is given (or with
+    /// --no-sealed save on this device); Alibaba Cloud ECS saves into this
+    /// device's Cua credential store.
     #[arg(long)]
     pub token_stdin: bool,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[arg(long, value_name = "URL")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to
+    /// `account`).
+    #[arg(long, value_parser = ["account", "static"])]
+    pub relay_mode: Option<String>,
+    /// Static Relay Mode: read the shared static relay registration token
+    /// from stdin (never pass tokens in argv). When combined with
+    /// `--token-stdin`, line 1 is the cloud token and line 2 is the relay
+    /// token.
+    #[arg(long)]
+    pub relay_token_stdin: bool,
+    /// Custom `cua-spacesd` binary or `.tar.gz` download URL override for
+    /// Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment).
+    #[arg(long, value_name = "URL")]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+    /// with `--vswitch-id`.
+    #[arg(long, value_name = "VPC_ID")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired
+    /// with `--vpc-id`.
+    #[arg(long, value_name = "VSWITCH_ID")]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[arg(long)]
+    pub no_public_ip: bool,
+    /// Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g.
+    /// golden Windows 10/11/Server image) for Windows sandboxes.
+    #[arg(long, value_name = "IMAGE_ID")]
+    pub windows_image_id: Option<String>,
+    /// Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux
+    /// sandboxes.
+    #[arg(long, value_name = "IMAGE_ID")]
+    pub linux_image_id: Option<String>,
+    /// Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`).
+    #[arg(long, value_name = "TYPE")]
+    pub instance_type: Option<String>,
 }
 
 impl TargetArgs {
     fn target(&self) -> CloudTarget {
-        let token = self
-            .token_stdin
-            .then(|| std::io::read_to_string(std::io::stdin()).unwrap_or_default())
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
+        self.target_with_stdin(|| std::io::read_to_string(std::io::stdin()).unwrap_or_default())
+    }
+
+    fn target_with_stdin(&self, read_stdin: impl FnOnce() -> String) -> CloudTarget {
+        let (token, relay_token) = match (self.token_stdin, self.relay_token_stdin) {
+            (true, true) => {
+                let raw = read_stdin();
+                let mut lines = raw.lines();
+                let tok = lines.next().unwrap_or("").trim().to_string();
+                let relay = lines.next().unwrap_or("").trim().to_string();
+                (Some(tok), Some(relay))
+            }
+            (true, false) => (Some(read_stdin().trim().to_string()), None),
+            (false, true) => (None, Some(read_stdin().trim().to_string())),
+            (false, false) => (None, None),
+        };
         CloudTarget {
             token,
             provider: self.provider.trim().to_ascii_lowercase(),
@@ -151,12 +232,23 @@ impl TargetArgs {
             zone: self.zone.clone(),
             project: self.project.clone(),
             environment: self.environment.clone(),
+            relay_url: self.relay_url.clone(),
+            relay_mode: self.relay_mode.clone(),
+            relay_token,
+            spacesd_download_url: self.spacesd_download_url.clone(),
+            vpc_id: self.vpc_id.clone(),
+            vswitch_id: self.vswitch_id.clone(),
+            no_public_ip: self.no_public_ip,
+            windows_image_id: self.windows_image_id.clone(),
+            linux_image_id: self.linux_image_id.clone(),
+            instance_type: self.instance_type.clone(),
         }
     }
 }
 
 /// `cua cloud`.
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CloudCmd {
     /// Your clouds: found credentials, the connected account and region,
     /// what each runs at what hourly cost, and what Cua created there.
@@ -167,7 +259,7 @@ pub enum CloudCmd {
   cua cloud status aws --json"
     )]
     Status {
-        /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`).
+        /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
         provider: Option<String>,
     },
     /// Connect a cloud account Spaces can be created in. Never prompts and
@@ -290,7 +382,7 @@ pub enum CloudCmd {
   # delete everything Cua created in the account, then disconnect
   cua cloud disconnect aws --delete")]
     Disconnect {
-        /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+        /// `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`.
         provider: String,
         /// Delete everything Cua created there first; disconnect only
         /// once the cloud confirms nothing is left.
@@ -1333,6 +1425,34 @@ fn limits_line(p: &cua_sdk::CloudProvider) -> Option<String> {
             format!("Token sealed; can open it: {}.", p.holders.join(", "))
         });
     }
+    if p.relay_mode.as_deref() == Some("static") {
+        let url = p.relay_url.as_deref().unwrap_or_default();
+        parts.push(format!("Static Relay Mode ({url})."));
+    } else if let Some(url) = p
+        .relay_url
+        .as_deref()
+        .filter(|u| !u.is_empty() && *u != "https://relay.cua.ai")
+    {
+        parts.push(format!("Relay: {url}."));
+    }
+    if let Some(url) = p.spacesd_download_url.as_deref().filter(|u| !u.is_empty()) {
+        parts.push(format!("cua-spacesd mirror: {url}."));
+    }
+    if let (Some(vpc), Some(vsw)) = (p.vpc_id.as_deref(), p.vswitch_id.as_deref()) {
+        parts.push(format!("Existing VPC {vpc} / {vsw}."));
+    }
+    if p.no_public_ip {
+        parts.push("Private-only (--no-public-ip).".into());
+    }
+    if let Some(id) = p.windows_image_id.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("Windows Cloud Image ID: {id}."));
+    }
+    if let Some(id) = p.linux_image_id.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("Linux Cloud Image ID: {id}."));
+    }
+    if let Some(t) = p.instance_type.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(format!("Default instance type: {t}."));
+    }
     match p.approval.as_str() {
         "connection" => parts.push("A person approves it in Cua Spaces.".into()),
         "limits" => parts.push("A person approves the new limits in Cua Spaces.".into()),
@@ -1413,11 +1533,13 @@ fn usd(v: f64) -> String {
     }
 }
 
-/// "4 vCPU and 16 GB" of "4x16".
+/// "4 vCPU and 16 GB" of "4x16" (or "4 vCPU, 16 GB, and 100 GB disk" of "4x16x100").
 fn size_words(s: &str) -> String {
-    match s.split_once('x') {
-        Some((c, m)) => format!("{c} vCPU and {m} GB"),
-        None => s.to_string(),
+    let parts: Vec<&str> = s.split('x').collect();
+    match parts.as_slice() {
+        [c, m] => format!("{c} vCPU and {m} GB"),
+        [c, m, d] => format!("{c} vCPU, {m} GB, and {d} GB disk"),
+        _ => s.to_string(),
     }
 }
 
@@ -1450,6 +1572,34 @@ fn connect_lines(c: &cua_sdk::CloudConnected) -> Vec<String> {
         }
         if p.auth == "oidc" {
             out.push("Signs in through Cua (no stored key)".into());
+        }
+        if p.relay_mode.as_deref() == Some("static") {
+            let url = p.relay_url.as_deref().unwrap_or_default();
+            out.push(format!("Relay: {url} (static)"));
+        } else if let Some(url) = p
+            .relay_url
+            .as_deref()
+            .filter(|u| !u.is_empty() && *u != "https://relay.cua.ai")
+        {
+            out.push(format!("Relay: {url} (account)"));
+        }
+        if let Some(url) = p.spacesd_download_url.as_deref().filter(|u| !u.is_empty()) {
+            out.push(format!("cua-spacesd mirror: {url}"));
+        }
+        if let (Some(vpc), Some(vsw)) = (p.vpc_id.as_deref(), p.vswitch_id.as_deref()) {
+            out.push(format!("VPC: {vpc} (VSwitch {vsw})"));
+        }
+        if p.no_public_ip {
+            out.push("Public IP: disabled (--no-public-ip)".into());
+        }
+        if let Some(id) = p.windows_image_id.as_deref().filter(|s| !s.is_empty()) {
+            out.push(format!("Windows Cloud Image ID: {id}"));
+        }
+        if let Some(id) = p.linux_image_id.as_deref().filter(|s| !s.is_empty()) {
+            out.push(format!("Linux Cloud Image ID: {id}"));
+        }
+        if let Some(t) = p.instance_type.as_deref().filter(|s| !s.is_empty()) {
+            out.push(format!("Default instance type: {t}"));
         }
     }
     for ch in &c.checks {
@@ -1516,6 +1666,15 @@ fn provider_json(p: &cua_sdk::CloudProvider) -> serde_json::Value {
         "suggest_auth": p.suggest_auth,
         "issue": p.issue,
         "holders": p.holders,
+        "relay_url": p.relay_url,
+        "relay_mode": p.relay_mode,
+        "spacesd_download_url": p.spacesd_download_url,
+        "vpc_id": p.vpc_id,
+        "vswitch_id": p.vswitch_id,
+        "no_public_ip": p.no_public_ip,
+        "windows_image_id": p.windows_image_id,
+        "linux_image_id": p.linux_image_id,
+        "instance_type": p.instance_type,
         "kinds": p.kinds.iter().map(|k| serde_json::json!({
             "image": k.image, "kind": k.kind, "supported": k.supported, "reason": k.reason,
             "machine_type": k.machine_type, "usd_per_hour": k.usd_per_hour,
@@ -1549,574 +1708,4 @@ fn status_json(s: &cua_sdk::CloudStatus) -> serde_json::Value {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[derive(Parser)]
-    struct T {
-        #[command(subcommand)]
-        cmd: CloudCmd,
-    }
-
-    fn parse(a: &[&str]) -> CloudCmd {
-        T::try_parse_from(std::iter::once("cloud").chain(a.iter().copied()))
-            .unwrap()
-            .cmd
-    }
-
-    fn parse_err(a: &[&str]) -> bool {
-        T::try_parse_from(std::iter::once("cloud").chain(a.iter().copied())).is_err()
-    }
-
-    #[test]
-    fn an_audit_line_names_who_did_what() {
-        let e = cua_sdk::CloudAuditEntry {
-            ts: "2026-10-21T09:00:00Z".into(),
-            action: "resource_deleted".into(),
-            provider: "aws".into(),
-            kind: "instance".into(),
-            id: "i-1".into(),
-            space: "research".into(),
-            actor: "auto-sweep".into(),
-            outcome: "ok".into(),
-            detail: "expired".into(),
-            source: String::new(),
-        };
-        let l = audit_line(&e);
-        assert!(
-            l.ends_with("instance i-1 · research · auto-sweep · ok · expired"),
-            "{l}"
-        );
-        assert_eq!(audit_json(&e)["actor"], "auto-sweep");
-    }
-
-    #[test]
-    fn approve_parses_and_hint_lines_are_short_and_plain() {
-        assert!(matches!(
-            parse(&["approve", "aws"]),
-            CloudCmd::Approve { provider, deny: false } if provider == "aws"
-        ));
-        assert!(matches!(
-            parse(&["approve", "aws", "--deny"]),
-            CloudCmd::Approve { deny: true, .. }
-        ));
-        assert!(parse_err(&["approve"]));
-        let p = cua_sdk::CloudProvider {
-            name: "aws".into(),
-            title: "AWS".into(),
-            connected: true,
-            auth: "cli".into(),
-            suggest_auth: "oidc".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            hint_lines(&p),
-            vec!["  Switch to OIDC (no stored key): cua cloud connect aws --oidc".to_string()]
-        );
-        let p = cua_sdk::CloudProvider {
-            name: "aws".into(),
-            title: "AWS".into(),
-            connected: true,
-            auth: "oidc".into(),
-            approval: "limits".into(),
-            approval_agent: "researcher".into(),
-            pending_budget_usd_month: Some(500.0),
-            can_approve: true,
-            ..Default::default()
-        };
-        let l = hint_lines(&p);
-        assert_eq!(
-            l[0],
-            "  Agent researcher asks for a budget of $500 a month."
-        );
-        assert!(l[1].contains("cua cloud approve aws --deny"), "{l:?}");
-        // An agent's shell gets no approve line (it could not run it).
-        let agent = cua_sdk::CloudProvider {
-            can_approve: false,
-            ..p
-        };
-        assert!(hint_lines(&agent).is_empty());
-        for line in hint_lines(&cua_sdk::CloudProvider {
-            issue: "AWS was disconnected from your Cua account.".into(),
-            ..Default::default()
-        }) {
-            assert!(!line.contains('\u{b7}'), "no dot chains: {line}");
-        }
-        let j = provider_json(&agent);
-        for k in [
-            "approval_agent",
-            "pending_budget_usd_month",
-            "pending_max_size",
-            "can_approve",
-            "suggest_auth",
-            "issue",
-        ] {
-            assert!(j.get(k).is_some(), "{k} missing from --json");
-        }
-    }
-
-    #[test]
-    fn a_connected_cloud_prints_its_place_once() {
-        let p = cua_sdk::CloudProvider {
-            name: "gcp".into(),
-            title: "Google Cloud".into(),
-            connected: true,
-            label: "Google Cloud \u{b7} us-central1".into(),
-            account: "cua-byoc-test".into(),
-            ..Default::default()
-        };
-        let l = provider_line(&p);
-        assert_eq!(l.matches("Google Cloud").count(), 1, "{l}");
-        assert!(l.contains("connected · us-central1 · cua-byoc-test"), "{l}");
-    }
-
-    #[test]
-    fn connect_takes_the_agent_flags_and_never_prompts() {
-        match parse(&[
-            "connect",
-            "aws",
-            "--oidc",
-            "--region",
-            "us-west-2",
-            "--budget",
-            "200",
-            "--max-size",
-            "4x16",
-            "--account-id",
-            "123456789012",
-            "--check",
-        ]) {
-            CloudCmd::Connect {
-                target,
-                oidc,
-                budget,
-                max_size,
-                account_id,
-                check,
-                role_arn,
-                ..
-            } => {
-                assert_eq!(target.provider, "aws");
-                assert!(oidc && check);
-                assert_eq!(budget, Some(200.0));
-                assert_eq!(max_size.as_deref(), Some("4x16"));
-                assert_eq!(account_id.as_deref(), Some("123456789012"));
-                assert_eq!(role_arn, None);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(parse_err(&["connect", "aws", "--budget", "lots"]));
-        match parse(&[
-            "connect",
-            "gcp",
-            "--oidc",
-            "--project",
-            "my-project",
-            "--project-number",
-            "123456789012",
-            "--service-account",
-            "cua@my-project.iam.gserviceaccount.com",
-            "--budget",
-            "200",
-            "--check",
-        ]) {
-            CloudCmd::Connect {
-                target,
-                project_number,
-                service_account,
-                ..
-            } => {
-                assert_eq!(target.project.as_deref(), Some("my-project"));
-                assert_eq!(project_number.as_deref(), Some("123456789012"));
-                assert_eq!(
-                    service_account.as_deref(),
-                    Some("cua@my-project.iam.gserviceaccount.com")
-                );
-            }
-            other => panic!("{other:?}"),
-        }
-        match parse(&[
-            "connect",
-            "azure",
-            "--region",
-            "westus2",
-            "--budget",
-            "200",
-            "--subscription",
-            "s",
-            "--tenant",
-            "t",
-            "--client-id",
-            "c",
-            "--resource-group",
-            "rg",
-            "--check",
-        ]) {
-            CloudCmd::Connect {
-                target,
-                oidc,
-                subscription_id,
-                tenant_id,
-                client_id,
-                resource_group,
-                check,
-                ..
-            } => {
-                assert_eq!(target.provider, "azure");
-                // Azure needs no --oidc: it has no other way.
-                assert!(!oidc && check);
-                assert_eq!(
-                    (
-                        subscription_id.as_deref(),
-                        tenant_id.as_deref(),
-                        client_id.as_deref(),
-                        resource_group.as_deref()
-                    ),
-                    (Some("s"), Some("t"), Some("c"), Some("rg"))
-                );
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(
-            parse(&["trust", "gcp"]),
-            CloudCmd::Trust { cloud } if cloud == "gcp"
-        ));
-        // The help an agent follows names every status, the exit codes and
-        // the steps.
-        for word in [
-            "needs-trust",
-            "checking",
-            "waiting-for-approval",
-            "connected",
-            "failed",
-            "0 connected, 10",
-            "11 it waits on a",
-            "--account-id <ID> --check",
-            "cua cloud status aws",
-            "--project-number <N> --check",
-            "cua cloud status gcp",
-            "--subscription --tenant --client-id --check",
-            "cua cloud status azure",
-            "https://cua.ai/docs/spaces/guides/connect-a-cloud",
-        ] {
-            assert!(CONNECT_HELP.contains(word), "{word}");
-        }
-    }
-
-    #[test]
-    fn hetzner_and_modal_seal_their_token_unless_told_not_to() {
-        match parse(&[
-            "connect",
-            "hetzner",
-            "--token-stdin",
-            "--region",
-            "fsn1",
-            "--budget",
-            "50",
-            "--max-size",
-            "4x8",
-        ]) {
-            CloudCmd::Connect {
-                target,
-                sealed,
-                no_sealed,
-                oidc,
-                budget,
-                ..
-            } => {
-                assert!(target.token_stdin);
-                // Neither: the default (sealed with pool keys and a budget).
-                assert!(!sealed && !no_sealed && !oidc);
-                assert_eq!(budget, Some(50.0));
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(
-            parse(&["connect", "hetzner", "--sealed", "--budget", "50"]),
-            CloudCmd::Connect { sealed: true, .. }
-        ));
-        assert!(matches!(
-            parse(&["connect", "hetzner", "--no-sealed", "--token-stdin"]),
-            CloudCmd::Connect {
-                no_sealed: true,
-                ..
-            }
-        ));
-        assert!(parse_err(&[
-            "connect",
-            "hetzner",
-            "--sealed",
-            "--no-sealed"
-        ]));
-        assert!(parse_err(&["connect", "aws", "--oidc", "--sealed"]));
-        for word in [
-            "--token-stdin --region fsn1 --budget 50",
-            "--no-sealed",
-            "<token id>:<token secret>",
-            "can open it",
-            "--sealed without a token",
-        ] {
-            assert!(CONNECT_HELP.contains(word), "{word}");
-        }
-        // Status says who can open it.
-        let p = cua_sdk::CloudProvider {
-            name: "hetzner".into(),
-            title: "Hetzner".into(),
-            connected: true,
-            auth: "sealed".into(),
-            holders: vec!["Dillon's MacBook".into(), "studio".into()],
-            ..Default::default()
-        };
-        assert_eq!(
-            limits_line(&p).unwrap(),
-            "  Token sealed; can open it: Dillon's MacBook, studio."
-        );
-        assert_eq!(provider_json(&p)["holders"][1], "studio");
-    }
-
-    fn outcome(status: &str, next: Option<cua_sdk::CloudNext>) -> cua_sdk::CloudConnected {
-        cua_sdk::CloudConnected {
-            provider: cua_sdk::CloudProvider {
-                name: "aws".into(),
-                title: "AWS".into(),
-                status: status.into(),
-                region: "us-west-2".into(),
-                auth: "oidc".into(),
-                budget_usd_month: Some(200.0),
-                max_size: "4x16".into(),
-                connected: status == "connected",
-                ..Default::default()
-            },
-            next,
-            verify: "cua cloud status aws".into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn every_connect_ends_with_status_next_and_verify() {
-        let run = |r: &str| cua_sdk::CloudNext {
-            run: Some(r.into()),
-            why: "w".into(),
-            ..Default::default()
-        };
-        let open = cua_sdk::CloudNext {
-            open: Some("https://us-west-2.console.aws.amazon.com/cloudshell/home".into()),
-            paste: Some("curl … && aws cloudformation deploy …".into()),
-            why: "AWS does not trust Cua yet.".into(),
-            ..Default::default()
-        };
-        assert_eq!(connect_exit_code(&outcome("connected", None)), 0);
-        assert_eq!(connect_exit_code(&outcome("checking", Some(run("x")))), 10);
-        assert_eq!(connect_exit_code(&outcome("failed", Some(run("x")))), 10);
-        assert_eq!(
-            connect_exit_code(&outcome("needs-trust", Some(open.clone()))),
-            11
-        );
-        assert_eq!(
-            connect_exit_code(&outcome(
-                "waiting-for-approval",
-                Some(cua_sdk::CloudNext {
-                    why: "a person approves".into(),
-                    ..Default::default()
-                })
-            )),
-            11
-        );
-        assert_eq!(connect_exit_code(&outcome("failed", None)), 1);
-        assert_eq!(
-            plain_error("invalid argument: invalid argument: max size"),
-            "invalid argument: max size"
-        );
-        assert_eq!(plain_error("cloud: aws: x"), "cloud: aws: x");
-
-        let v = connect_json(&outcome("needs-trust", Some(open.clone())));
-        assert_eq!(v["status"], "needs-trust");
-        assert_eq!(v["verify"], "cua cloud status aws");
-        assert!(v["next"]["open"].as_str().unwrap().contains("cloudshell"));
-        assert!(v["next"].get("run").is_none());
-        assert_eq!(v["checks"], serde_json::json!([]));
-        assert_eq!(v["provider"]["budget_usd_month"], 200.0);
-        assert!(connect_json(&outcome("connected", None))["next"].is_null());
-
-        let lines = connect_lines(&outcome("needs-trust", Some(open)));
-        assert_eq!(lines[0], "AWS: needs trust");
-        assert!(
-            lines.contains(&"Budget: $200 a month".to_string()),
-            "{lines:?}"
-        );
-        assert!(lines.contains(&"Machines up to 4 vCPU and 16 GB".to_string()));
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("Next, for a person: open https://"))
-        );
-        assert!(lines.iter().any(|l| l.starts_with("Paste there: ")));
-        assert_eq!(lines.last().unwrap(), "Verify: cua cloud status aws");
-        // Short plain lines: no "a · b · c" chains.
-        assert!(lines.iter().all(|l| !l.contains('\u{b7}')), "{lines:?}");
-        let done = connect_lines(&outcome("connected", None));
-        assert_eq!(done[0], "AWS: connected");
-        assert!(done.contains(&"Create a Space there: cua spaces create --on aws".to_string()));
-    }
-
-    #[test]
-    fn the_commands_parse() {
-        match parse(&["connect", "aws", "--region", "us-west-2", "--default"]) {
-            CloudCmd::Connect {
-                target,
-                make_default,
-                ttl_hours,
-                ..
-            } => {
-                assert_eq!(target.target().provider, "aws");
-                assert_eq!(target.region.as_deref(), Some("us-west-2"));
-                assert!(make_default);
-                assert_eq!(ttl_hours, None);
-            }
-            other => panic!("{other:?}"),
-        }
-        match parse(&["sweep", "gcp"]) {
-            CloudCmd::Sweep {
-                provider,
-                delete,
-                all,
-            } => assert_eq!(
-                (provider.as_deref(), delete, all),
-                (Some("gcp"), false, false)
-            ),
-            other => panic!("{other:?}"),
-        }
-        match parse(&[
-            "add",
-            "aws",
-            "--count",
-            "2",
-            "--type",
-            "g6.xlarge",
-            "--ttl-hours",
-            "6",
-            "--tag",
-            "team=ml",
-        ]) {
-            CloudCmd::Add {
-                cloud: AddCloud::Aws(a),
-            } => {
-                assert_eq!((a.count, a.instance_type.as_str()), (2, "g6.xlarge"));
-                assert_eq!(
-                    (a.ttl_hours, a.tags.as_slice()),
-                    (Some(6), &["team=ml".to_string()][..])
-                );
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(
-            parse(&["add", "aws", "--down", "--name", "aws-3"]),
-            CloudCmd::Add { cloud: AddCloud::Aws(a) } if a.down && a.name.as_deref() == Some("aws-3")
-        ));
-        assert!(parse_err(&["add", "aws", "--list", "--down"]));
-        assert!(matches!(
-            parse(&["disconnect", "AWS"]),
-            CloudCmd::Disconnect { provider, delete: false } if provider == "AWS"
-        ));
-        assert!(matches!(
-            parse(&["disconnect", "aws", "--delete"]),
-            CloudCmd::Disconnect { delete: true, .. }
-        ));
-        assert!(matches!(
-            parse(&["audit"]),
-            CloudCmd::Audit {
-                limit: 50,
-                cloud: None
-            }
-        ));
-        assert!(matches!(
-            parse(&["audit", "--limit", "7", "--cloud", "aws"]),
-            CloudCmd::Audit { limit: 7, cloud: Some(c) } if c == "aws"
-        ));
-        assert!(matches!(
-            parse(&["cost"]),
-            CloudCmd::Cost { by, format, since: None, cloud: None } if by == "space" && format == "table"
-        ));
-        assert!(matches!(
-            parse(&["cost", "--by", "day", "--since", "2026-10-01", "--format", "csv", "--cloud", "aws"]),
-            CloudCmd::Cost { by, format, since: Some(d), cloud: Some(c) }
-                if by == "day" && format == "csv" && d == "2026-10-01" && c == "aws"
-        ));
-        assert!(parse_err(&["cost", "--by", "week"]));
-        assert!(parse_err(&["cost", "--format", "xml"]));
-        assert!(parse_err(&["audit", "--limit", "many"]));
-        assert!(matches!(
-            parse(&["ls"]),
-            CloudCmd::Status { provider: None }
-        ));
-        match parse(&["connect", "hetzner", "--token-stdin", "--region", "nbg1"]) {
-            CloudCmd::Connect { target, .. } => {
-                assert_eq!(target.provider, "hetzner");
-                assert!(target.token_stdin);
-                assert_eq!(target.region.as_deref(), Some("nbg1"));
-            }
-            other => panic!("{other:?}"),
-        }
-        // Without the flag the token is never read from stdin.
-        match parse(&["connect", "hetzner"]) {
-            CloudCmd::Connect { target, .. } => {
-                assert!(!target.token_stdin);
-                assert_eq!(target.target().token, None);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(
-            parse(&["test", "MODAL", "--environment", "e"]),
-            CloudCmd::Test { target } if target.target().provider == "modal"
-        ));
-    }
-
-    #[test]
-    fn cost_prints_plain_columns_and_a_stable_csv() {
-        let r = cua_sdk::CloudCostReport {
-            by: "space".into(),
-            since: "2026-10-01".into(),
-            until: "2026-10-24T12:00:00Z".into(),
-            rows: vec![
-                cua_sdk::CloudCostRow {
-                    key: "research".into(),
-                    usd: 4.5,
-                    hours: 9.0,
-                    machines: 2,
-                },
-                cua_sdk::CloudCostRow {
-                    key: "a,b".into(),
-                    usd: 1.0,
-                    hours: 1.0,
-                    machines: 1,
-                },
-            ],
-            total_usd: 5.5,
-        };
-        // Scripts read this header: only ever add columns at the end.
-        assert_eq!(COST_CSV_HEADER, "key,usd,hours,machines");
-        assert_eq!(
-            cost_csv(&r.rows),
-            "key,usd,hours,machines\nresearch,4.50,9.00,2\n\"a,b\",1.00,1.00,1\n"
-        );
-        let t = cost_table(&r);
-        assert!(t[0].starts_with("Space"), "{t:?}");
-        assert!(t[1].contains("$4.50"), "{t:?}");
-        assert_eq!(
-            t[3],
-            "Total $5.50 since 2026-10-01 (estimated from list prices)."
-        );
-        assert!(
-            t.iter().all(|l| !l.contains('\u{b7}')),
-            "no dot chains: {t:?}"
-        );
-        let empty = cua_sdk::CloudCostReport {
-            since: "2026-10-01".into(),
-            ..Default::default()
-        };
-        assert_eq!(cost_table(&empty), vec!["Nothing ran since 2026-10-01."]);
-        assert_eq!(cost_json(&r)["rows"][0]["key"], "research");
-    }
-}
+mod tests;

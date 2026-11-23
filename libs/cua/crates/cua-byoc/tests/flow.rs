@@ -506,6 +506,7 @@ async fn a_connections_own_limits_refuse_a_machine_before_any_cloud_call() {
     conn.max_size = Some(cua_byoc::MaxSize {
         vcpu: 1,
         mem_gib: 1,
+        disk_gib: None,
     });
     store.connect(conn.clone()).unwrap();
     let mut big = create("big");

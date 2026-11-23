@@ -665,23 +665,12 @@ async fn settings(c: SettingsChange, json: bool, out: &mut dyn Write) -> Result<
             out,
             format!(
                 "Share edge:      {host} in {} (about ${usd:.0} a month)",
-                cloud_title(cloud)
+                cua_sandbox_core::byoc::provider_title(cloud)
             ),
         ),
         None => line(out, "Share edge:      none"),
     }
     Ok(0)
-}
-
-/// `AWS` for `aws`.
-fn cloud_title(cloud: &str) -> String {
-    match cloud {
-        "aws" => "AWS".into(),
-        "gcp" => "Google Cloud".into(),
-        "azure" => "Azure".into(),
-        "hetzner" => "Hetzner".into(),
-        other => other.to_owned(),
-    }
 }
 
 async fn ls(json: bool, out: &mut dyn Write) -> Result<i32, CuaError> {

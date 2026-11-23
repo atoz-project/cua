@@ -51,15 +51,28 @@ impl std::fmt::Debug for Join {
 
 impl Join {
     /// The owner policy the guest's cua-spacesd enforces (the host policy
-    /// shape): the owner, sharing on, the relay's allowlist trusted.
+    /// shape): the owner (when account-backed), sharing on, the relay's
+    /// allowlist trusted.
     pub fn policy_json(&self) -> String {
-        serde_json::json!({
-            "owner": self.owner,
-            "owner_email": (!self.owner_email.is_empty()).then_some(&self.owner_email),
-            "sharing": true,
-            "trust_relay_allowlist": true,
-        })
-        .to_string()
+        let mut obj = serde_json::Map::new();
+        if !self.owner.is_empty() {
+            obj.insert(
+                "owner".into(),
+                serde_json::Value::String(self.owner.clone()),
+            );
+        }
+        if !self.owner_email.is_empty() {
+            obj.insert(
+                "owner_email".into(),
+                serde_json::Value::String(self.owner_email.clone()),
+            );
+        }
+        obj.insert("sharing".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "trust_relay_allowlist".into(),
+            serde_json::Value::Bool(true),
+        );
+        serde_json::Value::Object(obj).to_string()
     }
 
     /// The environment `cua-spacesd join` reads to join as this machine
@@ -74,9 +87,11 @@ impl Join {
             ("CUA_ENV_RELAY_URL".into(), self.relay_url.clone()),
             ("CUA_RELAY_TOKEN".into(), self.machine_token.clone()),
             ("CUA_ENV_MACHINE_ID".into(), self.machine_id.clone()),
-            ("CUA_RELAY_JWKS_JSON".into(), self.jwks_json.clone()),
             ("CUA_HOST_POLICY_JSON".into(), self.policy_json()),
         ]));
+        if !self.jwks_json.trim().is_empty() {
+            env.insert("CUA_RELAY_JWKS_JSON".into(), self.jwks_json.clone());
+        }
         env
     }
 }
@@ -152,6 +167,22 @@ impl RelayAccess {
     pub fn with_device(mut self, device: Arc<DeviceAuth>) -> Self {
         self.device = Some(device);
         self
+    }
+
+    /// Returns a `RelayAccess` targeting `url`, rebinding `device` if present.
+    pub fn rebind(&self, url: &str) -> Result<Self> {
+        if url == self.url {
+            return Ok(self.clone());
+        }
+        let device = match &self.device {
+            Some(d) => Some(Arc::new(d.rebind(url).map_err(relay_err)?)),
+            None => None,
+        };
+        Ok(RelayAccess {
+            url: url.to_string(),
+            tokens: self.tokens.clone(),
+            device,
+        })
     }
 
     /// The relay of `CUA_RELAY_URL` (else relay.cua.ai), the `cua auth
@@ -369,6 +400,16 @@ impl RelayAccess {
     }
 }
 
+mod static_relay;
+
+pub use static_relay::ConnectionRelay;
+#[cfg(feature = "aliyun-ecs")]
+pub(crate) use static_relay::secret_store;
+pub(crate) use static_relay::{
+    clear_env_tokens, clear_static_relay_token, load_static_relay_token, probe_relay_check,
+    remove_env_token, save_static_relay_token,
+};
+
 /// The relay gateway bearer: the account token plus this device's
 /// session header, fetched per call.
 struct Bearer(RelayAccess);
@@ -430,5 +471,28 @@ mod tests {
         let policy: serde_json::Value = serde_json::from_str(&j.policy_json()).unwrap();
         assert_eq!(policy["owner"], "acct");
         assert!(!format!("{j:?}").contains("cmt_secret"));
+    }
+
+    #[test]
+    fn static_join_omits_empty_jwks_and_owner_and_redacts_token() {
+        let j = Join {
+            relay_url: "https://relay.selfhosted.example".into(),
+            machine_id: "cloud-0123456789abcdef".into(),
+            machine_token: "static_secret_tok".into(),
+            jwks_json: String::new(),
+            owner: String::new(),
+            owner_email: String::new(),
+        };
+        let env = j.guest_env();
+        assert!(!env.contains_key("CUA_RELAY_JWKS_JSON"), "{env:?}");
+        assert_eq!(env["CUA_ENV_RELAY_URL"], "https://relay.selfhosted.example");
+        assert_eq!(env["CUA_RELAY_TOKEN"], "static_secret_tok");
+        assert_eq!(env["CUA_ENV_MACHINE_ID"], "cloud-0123456789abcdef");
+        let policy: serde_json::Value = serde_json::from_str(&j.policy_json()).unwrap();
+        assert!(policy.get("owner").is_none(), "{policy}");
+        assert!(policy.get("owner_email").is_none(), "{policy}");
+        assert_eq!(policy["sharing"], true);
+        assert_eq!(policy["trust_relay_allowlist"], true);
+        assert!(!format!("{j:?}").contains("static_secret_tok"));
     }
 }

@@ -68,6 +68,9 @@ impl Provider for Fake {
                 supported: true,
                 ..Default::default()
             }],
+            oses: vec!["linux"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
         }
     }
 
@@ -132,12 +135,47 @@ fn registry() -> FakeRegistry {
         Some("ghcr.io/trycua/linux:24.04"),
         &m,
     );
+    r.put_manifest(
+        "ghcr.io/trycua/linux",
+        Some("ghcr.io/trycua/linux:24.04-slim"),
+        &m,
+    );
     r.index("ghcr.io/example/vm-only:1", &["amd64"], true, None);
     r.index("ghcr.io/example/arm-only:1", &["arm64"], false, None);
     r
 }
 
+struct CountingSource {
+    inner: FakeRegistry,
+    calls: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl cua_image::registry::ManifestSource for CountingSource {
+    async fn manifest(
+        &self,
+        reference: &str,
+    ) -> cua_image::Result<(cua_image::manifest::Manifest, String)> {
+        self.calls.lock().unwrap().push(reference.to_string());
+        self.inner.manifest(reference).await
+    }
+
+    async fn blob(
+        &self,
+        reference: &str,
+        desc: &cua_image::manifest::Descriptor,
+    ) -> cua_image::Result<Vec<u8>> {
+        self.inner.blob(reference, desc).await
+    }
+}
+
+static SOURCE_LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+fn source_lock() -> &'static Arc<tokio::sync::Mutex<()>> {
+    SOURCE_LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+}
+
 struct Env {
+    _source_guard: tokio::sync::OwnedMutexGuard<()>,
     _dir: tempfile::TempDir,
     _mock: MockServer,
     fake: Arc<Fake>,
@@ -145,6 +183,7 @@ struct Env {
 }
 
 async fn env(env_to_entrypoint: bool) -> Env {
+    let guard = source_lock().clone().lock_owned().await;
     cua_image::resolve::set_source(Some(Arc::new(registry())));
     let dir = tempfile::tempdir().unwrap();
     let mock = MockServer::start(MockAuth::default()).await;
@@ -154,6 +193,7 @@ async fn env(env_to_entrypoint: bool) -> Env {
         .state_dir(dir.path().join("sandboxes"))
         .build();
     Env {
+        _source_guard: guard,
         _dir: dir,
         _mock: mock,
         fake,
@@ -418,4 +458,544 @@ async fn a_gpu_type_reaches_the_provider() {
         1,
         "refused before a call"
     );
+}
+
+struct MultiOsFake {
+    spacesd: String,
+    created: Mutex<Vec<ProviderCreate>>,
+    live: Mutex<BTreeMap<String, ProviderInstance>>,
+}
+
+impl MultiOsFake {
+    fn new(spacesd: String) -> Arc<Self> {
+        Arc::new(Self {
+            spacesd,
+            created: Mutex::default(),
+            live: Mutex::default(),
+        })
+    }
+}
+
+#[async_trait]
+impl Provider for MultiOsFake {
+    fn name(&self) -> &'static str {
+        "aliyun-ecs"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            kinds: vec![RunKind::Container, RunKind::Vm],
+            runtime: "docker",
+            arches: vec!["amd64"],
+            image_mode: ImageMode::Direct,
+            ports: PortExposure::Https,
+            command: false,
+            env_to_entrypoint: true,
+            private_registry: false,
+            suspend: true,
+            max_cpus: None,
+            max_memory_mb: None,
+            credential_env: &[],
+            gpus: vec![],
+            oses: vec!["linux", "windows"],
+            custom_disk_gb: true,
+            custom_cloud_image: true,
+        }
+    }
+
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux", "windows"]
+    }
+
+    fn check_configured(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
+        self.created.lock().unwrap().push(spec.clone());
+        let id = format!("i-win-{}", self.created.lock().unwrap().len());
+        let mut i = ProviderInstance::new(&id, &spec.name, Status::Running);
+        i.details.insert(
+            "runtime".into(),
+            if spec.runtime == cua_sandbox_core::placement::Runtime::Auto {
+                "native".into()
+            } else {
+                spec.runtime.as_str().into()
+            },
+        );
+        self.live.lock().unwrap().insert(id, i.clone());
+        Ok(i)
+    }
+
+    async fn get(&self, id: &str) -> Result<ProviderInstance> {
+        self.live
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(id.into()))
+    }
+
+    async fn list(&self) -> Result<Vec<ProviderInstance>> {
+        Ok(self.live.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        self.live.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn endpoint(&self, _: &ProviderInstance, port: u16) -> Result<ServiceEndpoint> {
+        Ok(ServiceEndpoint {
+            url: if port == 3211 {
+                self.spacesd.clone()
+            } else {
+                format!("http://127.0.0.1:9/{port}")
+            },
+            headers: vec![],
+        })
+    }
+}
+
+struct CapableCloud {
+    spacesd: String,
+    created: Mutex<Vec<ProviderCreate>>,
+}
+
+#[async_trait]
+impl Provider for CapableCloud {
+    fn name(&self) -> &'static str {
+        "aliyun-ecs"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            kinds: vec![RunKind::Container, RunKind::Vm],
+            runtime: "docker-on-vm",
+            arches: vec!["amd64"],
+            image_mode: ImageMode::Direct,
+            ports: PortExposure::Https,
+            command: false,
+            env_to_entrypoint: true,
+            private_registry: false,
+            suspend: true,
+            max_cpus: None,
+            max_memory_mb: None,
+            credential_env: &[],
+            gpus: vec![],
+            oses: vec!["linux", "windows"],
+            custom_disk_gb: true,
+            custom_cloud_image: true,
+        }
+    }
+
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux", "windows"]
+    }
+
+    fn check_configured(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
+        self.created.lock().unwrap().push(spec.clone());
+        Ok(ProviderInstance::new(
+            format!("vm-{}", self.created.lock().unwrap().len()),
+            &spec.name,
+            Status::Running,
+        ))
+    }
+
+    async fn get(&self, id: &str) -> Result<ProviderInstance> {
+        Ok(ProviderInstance::new(id, id, Status::Running))
+    }
+
+    async fn list(&self) -> Result<Vec<ProviderInstance>> {
+        Ok(vec![])
+    }
+
+    async fn delete(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn endpoint(&self, _: &ProviderInstance, port: u16) -> Result<ServiceEndpoint> {
+        Ok(ServiceEndpoint {
+            url: if port == 3211 {
+                self.spacesd.clone()
+            } else {
+                format!("http://127.0.0.1:9/{port}")
+            },
+            headers: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn windows_direct_vm_bypasses_oci_and_rejects_docker_or_container_kind() {
+    let _guard = source_lock().clone().lock_owned().await;
+    cua_image::resolve::set_source(Some(Arc::new(registry())));
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start(MockAuth::default()).await;
+    let fake = MultiOsFake::new(mock.url());
+    let sbx = Sandboxes::builder()
+        .provider(fake.clone())
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o.contrib = Some("aliyun-ecs".into());
+    o.name = Some("win-direct-a".into());
+    o.os = "windows".into();
+    o.kind = cua_sandbox_core::placement::Kind::Vm;
+    o.runtime = cua_sandbox_core::placement::Runtime::Other("native".into());
+    let sb = sbx.create(o).await.unwrap();
+    assert_eq!(
+        sb.placement(),
+        (
+            cua_sandbox_core::placement::Kind::Vm,
+            cua_sandbox_core::placement::Runtime::Other("native".into())
+        )
+    );
+    let spec = fake.created.lock().unwrap()[0].clone();
+    assert_eq!(spec.image.kind, RunKind::Vm);
+    let minted = sb
+        .env_token()
+        .expect("Windows contrib with env_to_entrypoint=true must mint env_token");
+    assert_eq!(
+        spec.env.get("CUA_ENV_TOKEN").map(String::as_str),
+        Some(minted.as_str())
+    );
+
+    let raw_state =
+        std::fs::read_to_string(dir.path().join("sandboxes/win-direct-a.json")).unwrap();
+    let state_json: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
+    assert_eq!(state_json["image"]["kind"], "vm");
+    assert_eq!(state_json["env_token"], minted);
+
+    let mut bad_rt = CreateOptions::new(ProviderKind::Contrib, "windows");
+    bad_rt.contrib = Some("aliyun-ecs".into());
+    bad_rt.os = "windows".into();
+    bad_rt.runtime = cua_sandbox_core::placement::Runtime::Other("docker".into());
+    let err = sbx.create(bad_rt).await.unwrap_err();
+    assert!(matches!(err, Error::UnsupportedImage(_)), "{err:?}");
+
+    let mut bad_kind = CreateOptions::new(ProviderKind::Contrib, "windows");
+    bad_kind.contrib = Some("aliyun-ecs".into());
+    bad_kind.os = "windows".into();
+    bad_kind.kind = cua_sandbox_core::placement::Kind::Container;
+    let err = sbx.create(bad_kind).await.unwrap_err();
+    assert!(matches!(err, Error::UnsupportedImage(_)), "{err:?}");
+    assert_eq!(fake.created.lock().unwrap().len(), 1);
+}
+
+struct ConnectOptsTokenFake {
+    spacesd: String,
+    expected_token: String,
+    live: Mutex<BTreeMap<String, ProviderInstance>>,
+}
+
+#[async_trait]
+impl Provider for ConnectOptsTokenFake {
+    fn name(&self) -> &'static str {
+        "e2b"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            kinds: vec![RunKind::Vm],
+            runtime: "native",
+            arches: vec!["amd64"],
+            image_mode: ImageMode::Direct,
+            ports: PortExposure::Https,
+            command: false,
+            env_to_entrypoint: false,
+            private_registry: false,
+            suspend: false,
+            max_cpus: None,
+            max_memory_mb: None,
+            credential_env: &[],
+            gpus: vec![],
+            oses: vec!["linux", "windows"],
+            custom_disk_gb: false,
+            custom_cloud_image: false,
+        }
+    }
+
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux", "windows"]
+    }
+
+    fn check_configured(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
+        let i = ProviderInstance::new("i-tok-1", &spec.name, Status::Running);
+        self.live.lock().unwrap().insert(i.id.clone(), i.clone());
+        Ok(i)
+    }
+
+    async fn get(&self, id: &str) -> Result<ProviderInstance> {
+        self.live
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Error::NotFound(id.into()))
+    }
+
+    async fn list(&self) -> Result<Vec<ProviderInstance>> {
+        Ok(self.live.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        self.live.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    fn endpoint(&self, _: &ProviderInstance, _port: u16) -> Result<ServiceEndpoint> {
+        Ok(ServiceEndpoint {
+            url: self.spacesd.clone(),
+            headers: vec![],
+        })
+    }
+
+    fn connect_options(
+        &self,
+        _instance: &ProviderInstance,
+        _port: u16,
+    ) -> Option<Result<cua_spacesd_client::ConnectOptions>> {
+        let mut opts = match cua_spacesd_client::ConnectOptions::parse(&self.spacesd) {
+            Ok(o) => o,
+            Err(e) => return Some(Err(Error::InvalidArgument(e.to_string()))),
+        };
+        opts.token = Some(self.expected_token.clone());
+        Some(Ok(opts))
+    }
+}
+
+#[tokio::test]
+async fn spacesd_with_preserves_connect_options_token_when_caps_uninitialized() {
+    let _guard = source_lock().clone().lock_owned().await;
+    cua_image::resolve::set_source(Some(Arc::new(registry())));
+    let dir = tempfile::tempdir().unwrap();
+    let expected = "static-env-token-preserved-1234";
+    let mock = MockServer::start(MockAuth {
+        token: Some(expected.into()),
+        ..Default::default()
+    })
+    .await;
+    let fake = Arc::new(ConnectOptsTokenFake {
+        spacesd: mock.url(),
+        expected_token: expected.into(),
+        live: Mutex::default(),
+    });
+    let sbx = Sandboxes::builder()
+        .provider(fake)
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    let mut o = CreateOptions::new(ProviderKind::Contrib, "windows");
+    o.contrib = Some("e2b".into());
+    o.name = Some("win-static-tok".into());
+    o.os = "windows".into();
+    let sb = sbx.create(o).await.unwrap();
+    assert!(sb.env_token().is_none());
+
+    let client = sb.spacesd().await.unwrap();
+    assert_eq!(client.token(), Some(expected));
+    assert_eq!(sb.env_token().as_deref(), Some(expected));
+    client.health().await.unwrap();
+}
+
+#[tokio::test]
+async fn non_capable_provider_refuses_disk_gb_cloud_image_and_instance_type() {
+    let e = env(false).await;
+
+    let mut disk_o = opts("ghcr.io/trycua/linux:24.04");
+    disk_o.disk_gb = Some(60);
+    let err = e.sbx.create(disk_o).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("disk_gb sizes local VMs only"),
+        "{err}"
+    );
+
+    let mut img_o = opts("ghcr.io/trycua/linux:24.04");
+    img_o.cloud_image_id = Some("m-custom-1".into());
+    let err = e.sbx.create(img_o).await.unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+
+    let mut type_o = opts("ghcr.io/trycua/linux:24.04");
+    type_o.instance_type = Some("ecs.g7.large".into());
+    let err = e.sbx.create(type_o).await.unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+
+    assert!(e.fake.created.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn capable_cloud_forwards_cloud_image_id_disk_gb_instance_type_and_bypasses_oci_for_windows()
+{
+    let _guard = source_lock().clone().lock_owned().await;
+    cua_image::resolve::set_source(Some(Arc::new(registry())));
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start(MockAuth::default()).await;
+    let cloud = Arc::new(CapableCloud {
+        spacesd: mock.url(),
+        created: Mutex::default(),
+    });
+    let sbx = Sandboxes::builder()
+        .provider(cloud.clone())
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    let mut win = CreateOptions::new(ProviderKind::Contrib, "windows:11");
+    win.contrib = Some("aliyun-ecs".into());
+    win.os = "windows".into();
+    win.cloud_image_id = Some(" m-win11-golden ".into());
+    win.disk_gb = Some(100);
+    win.instance_type = Some(" ecs.c7.2xlarge ".into());
+    let sb = sbx.create(win).await.unwrap();
+    drop(sb);
+
+    let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
+    win_official.contrib = Some("aliyun-ecs".into());
+    win_official.os = "windows".into();
+    sbx.create(win_official).await.unwrap();
+
+    let mut lin = CreateOptions::new(ProviderKind::Contrib, "ghcr.io/trycua/linux:24.04");
+    lin.contrib = Some("aliyun-ecs".into());
+    lin.cloud_image_id = Some("m-ubuntu-golden".into());
+    lin.disk_gb = Some(80);
+    sbx.create(lin).await.unwrap();
+
+    let specs = cloud.created.lock().unwrap();
+    assert_eq!(specs.len(), 3);
+    assert_eq!(specs[0].cloud_image_id.as_deref(), Some("m-win11-golden"));
+    assert_eq!(specs[0].disk_gb, Some(100));
+    assert_eq!(specs[0].instance_type.as_deref(), Some("ecs.c7.2xlarge"));
+    assert_eq!(specs[1].cloud_image_id, None);
+    assert_eq!(specs[2].cloud_image_id.as_deref(), Some("m-ubuntu-golden"));
+    assert_eq!(specs[2].disk_gb, Some(80));
+    assert!(
+        specs[2]
+            .image
+            .pinned_ref
+            .starts_with("ghcr.io/trycua/linux")
+    );
+}
+
+#[tokio::test]
+async fn linux_with_os_windows_is_rejected_and_direct_vm_bypasses_oci_while_docker_resolves() {
+    let _guard = source_lock().clone().lock_owned().await;
+    let counting = Arc::new(CountingSource {
+        inner: registry(),
+        calls: Mutex::default(),
+    });
+    cua_image::resolve::set_source(Some(counting.clone()));
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start(MockAuth::default()).await;
+    let cloud = Arc::new(CapableCloud {
+        spacesd: mock.url(),
+        created: Mutex::default(),
+    });
+    let sbx = Sandboxes::builder()
+        .provider(cloud.clone())
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    for img in ["linux", "linux-slim", "ghcr.io/trycua/linux:24.04"] {
+        let mut bad = CreateOptions::new(ProviderKind::Contrib, img);
+        bad.contrib = Some("aliyun-ecs".into());
+        bad.os = "windows".into();
+        bad.cloud_image_id = Some("m-win11".into());
+        let err = sbx.create(bad).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument for os=windows + {img}, got {err:?}"
+        );
+    }
+    assert!(counting.calls.lock().unwrap().is_empty());
+
+    for (img, cid) in [("linux", "m-ubuntu"), ("linux-slim", "m-slim")] {
+        let mut native = CreateOptions::new(ProviderKind::Contrib, img);
+        native.contrib = Some("aliyun-ecs".into());
+        native.runtime = cua_sandbox_core::placement::Runtime::Other("native".into());
+        native.cloud_image_id = Some(cid.into());
+        sbx.create(native).await.unwrap();
+    }
+    assert!(
+        counting.calls.lock().unwrap().is_empty(),
+        "Direct VM must make 0 ManifestSource calls, got: {:?}",
+        *counting.calls.lock().unwrap()
+    );
+
+    for (img, cid) in [("linux", "m-ubuntu"), ("linux-slim", "m-slim")] {
+        let mut docker = CreateOptions::new(ProviderKind::Contrib, img);
+        docker.contrib = Some("aliyun-ecs".into());
+        docker.cloud_image_id = Some(cid.into());
+        sbx.create(docker).await.unwrap();
+    }
+    let calls = counting.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            "ghcr.io/trycua/linux:24.04".to_string(),
+            "ghcr.io/trycua/linux:24.04-slim".to_string(),
+        ]
+    );
+    cua_image::resolve::set_source(Some(Arc::new(registry())));
+}
+
+#[tokio::test]
+async fn disk_gb_zero_and_whitespace_cloud_image_or_instance_type_fail_invalid_argument() {
+    let e = env(false).await;
+    let mock = MockServer::start(MockAuth::default()).await;
+    let cloud = Arc::new(CapableCloud {
+        spacesd: mock.url(),
+        created: Mutex::default(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let sbx = Sandboxes::builder()
+        .provider(cloud.clone())
+        .state_dir(dir.path().join("sandboxes"))
+        .build();
+
+    let mut e2b_zero = opts("ghcr.io/trycua/linux:24.04");
+    e2b_zero.disk_gb = Some(0);
+    let err = e.sbx.create(e2b_zero).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    let mut ali_zero = CreateOptions::new(ProviderKind::Contrib, "windows");
+    ali_zero.contrib = Some("aliyun-ecs".into());
+    ali_zero.os = "windows".into();
+    ali_zero.disk_gb = Some(0);
+    let err = sbx.create(ali_zero).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    for bad in ["", "   ", "m-foo bar", "m-foo\tbar"] {
+        let mut o1 = CreateOptions::new(ProviderKind::Contrib, "windows");
+        o1.contrib = Some("aliyun-ecs".into());
+        o1.os = "windows".into();
+        o1.cloud_image_id = Some(bad.into());
+        let err = sbx.create(o1).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "cloud_image_id {bad:?}: {err:?}"
+        );
+
+        let mut o2 = CreateOptions::new(ProviderKind::Contrib, "windows");
+        o2.contrib = Some("aliyun-ecs".into());
+        o2.os = "windows".into();
+        o2.instance_type = Some(bad.into());
+        let err = sbx.create(o2).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "instance_type {bad:?}: {err:?}"
+        );
+    }
+
+    assert!(e.fake.created.lock().unwrap().is_empty());
+    assert!(cloud.created.lock().unwrap().is_empty());
 }

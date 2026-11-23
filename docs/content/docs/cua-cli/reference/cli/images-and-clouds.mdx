@@ -424,7 +424,7 @@ Alias: `cua cloud ls`.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<PROVIDER>` | string | optional | Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`). |
+| `<PROVIDER>` | string | optional | Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`). |
 
 **Examples**
 
@@ -499,6 +499,25 @@ Azure (always without a stored key):
      and a machine is validated.
   Verify: cua cloud status azure
 
+Alibaba Cloud ECS (RAM sub-account AccessKey, `AK` mode):
+  Resolves credentials in order: --token-stdin (&lt;access_key_id&gt;:&lt;access_key_secret&gt;),
+  ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET, --profile &lt;name&gt;
+  in ~/.aliyun/config.json, saved credential store, or the active `current`
+  profile in ~/.aliyun/config.json. Default region: `cn-hangzhou`.
+    cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16
+    cua cloud connect aliyun-ecs --profile webhook_manager --region cn-shanghai
+  Optional existing VPC attachment and private-only networking (--no-public-ip):
+    cua cloud connect aliyun-ecs --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
+  Optional default Cloud Image IDs and instance type:
+    cua cloud connect aliyun-ecs --windows-image-id m-win11 --linux-image-id m-ubuntu --instance-type ecs.c7.2xlarge
+  Verify: cua cloud status aliyun-ecs
+
+Self-hosted relay (per connection, default https://relay.cua.ai in Account Relay Mode):
+  Account Relay Mode on a custom relay keeps dynamic machine registration and JWKS:
+    cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
+  Static Relay Mode uses a shared relay token and per-sandbox env tokens (no cua auth login):
+    cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1
+
 Other clouds use their own CLI sign-in on this device.
 `cua cloud trust <cloud>` prints the trust setup file (aws, gcp, azure).
 Docs for agents: https://cua.ai/docs/spaces/guides/connect-a-cloud
@@ -509,15 +528,23 @@ cua cloud connect [OPTIONS] <PROVIDER>
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<PROVIDER>` | string | required | `aws`, `azure`, `gcp`, `hetzner` or `modal`. |
+| `<PROVIDER>` | string | required | `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`. |
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| <span id="cua-cloud-connect--profile"></span>`--profile` | string |  | AWS profile (`~/.aws/config`) or Modal profile (`~/.modal.toml`). |
-| <span id="cua-cloud-connect--region"></span>`--region` | string |  | AWS, Google Cloud or Azure region, or Hetzner location (default `fsn1`). |
+| <span id="cua-cloud-connect--profile"></span>`--profile` | string |  | AWS profile (`~/.aws/config`), Modal profile (`~/.modal.toml`), or Alibaba Cloud CLI profile (`~/.aliyun/config.json`). |
+| <span id="cua-cloud-connect--region"></span>`--region` | string |  | AWS, Google Cloud, Azure or Alibaba Cloud region, or Hetzner location (default `fsn1` for Hetzner, `cn-hangzhou` for `aliyun-ecs`). |
 | <span id="cua-cloud-connect--zone"></span>`--zone` | string |  | Google Cloud zone (default: the region's `-a` zone). |
 | <span id="cua-cloud-connect--project"></span>`--project` | string |  | Google Cloud project (default: `gcloud config get project`). |
 | <span id="cua-cloud-connect--environment"></span>`--environment` | string |  | Modal environment (default: the profile's). |
+| <span id="cua-cloud-connect--relay-url"></span>`--relay-url` | string |  | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
+| <span id="cua-cloud-connect--relay-mode"></span>`--relay-mode` | `account` \| `static` |  | Relay authentication mode (`account` or `static`; defaults to `account`). |
+| <span id="cua-cloud-connect--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Custom `cua-spacesd` binary or `.tar.gz` download URL override for Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment). |
+| <span id="cua-cloud-connect--vpc-id"></span>`--vpc-id` | string |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `--vswitch-id`. |
+| <span id="cua-cloud-connect--vswitch-id"></span>`--vswitch-id` | string |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `--vpc-id`. |
+| <span id="cua-cloud-connect--windows-image-id"></span>`--windows-image-id` | string |  | Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g. golden Windows 10/11/Server image) for Windows sandboxes. |
+| <span id="cua-cloud-connect--linux-image-id"></span>`--linux-image-id` | string |  | Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux sandboxes. |
+| <span id="cua-cloud-connect--instance-type"></span>`--instance-type` | string |  | Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`). |
 | <span id="cua-cloud-connect--ttl-hours"></span>`--ttl-hours` | integer |  | Delete each Space there after this many hours (default 8; 0: never; Modal caps a sandbox at 24; a Hetzner server shuts itself down then and `cua cloud sweep --delete` removes it). |
 | <span id="cua-cloud-connect--budget"></span>`--budget` | number |  | The most Cua may spend there per calendar month, in US dollars. New machines are refused once it is reached; stopping and deleting always works. Needed with --oidc. |
 | <span id="cua-cloud-connect--max-size"></span>`--max-size` | string |  | The largest machine Cua may create there: vCPUs x GB, for example 4x16. |
@@ -529,7 +556,9 @@ cua cloud connect [OPTIONS] <PROVIDER>
 | <span id="cua-cloud-connect--tenant"></span>`--tenant` | string |  | Azure: the Microsoft Entra tenant id (the template's tenantId). |
 | <span id="cua-cloud-connect--client-id"></span>`--client-id` | string |  | Azure: the cua-spaces managed identity's client id (the template's clientId). |
 | <span id="cua-cloud-connect--resource-group"></span>`--resource-group` | string |  | Azure: the resource group Cua works in, the only one its roles reach (default cua-spaces). |
-| <span id="cua-cloud-connect--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner or Modal: read the API token from stdin (Hetzner: a Read & Write project token, otherwise `HCLOUD_TOKEN`, the saved token or the hcloud CLI's context; Modal: `<token id>:<token secret>`). Once the checks pass it is sealed to your devices, or with --no-sealed saved in this device's Cua credential store (Hetzner). |
+| <span id="cua-cloud-connect--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store. |
+| <span id="cua-cloud-connect--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). When combined with `--token-stdin`, line 1 is the cloud token and line 2 is the relay token. |
+| <span id="cua-cloud-connect--no-public-ip"></span>`--no-public-ip` | boolean | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
 | <span id="cua-cloud-connect--default"></span>`--default` | boolean | `false` | Also make it the default location (`default.on`). |
 | <span id="cua-cloud-connect--oidc"></span>`--oidc` | boolean | `false` | Link without a stored key: Cua's issuer signs 15-minute tokens your account trusts (AWS, Google Cloud; Azure always). |
 | <span id="cua-cloud-connect--sealed"></span>`--sealed` | boolean |  | Hetzner, Modal: seal the API token to your devices (the token given on stdin, else the one this device has). The default when this device has the account's pool keys and a budget is given. |
@@ -567,6 +596,16 @@ cua cloud connect hetzner --sealed --budget 50
 
 # Spaces there delete themselves after 4 hours (default 8; 0: never)
 cua cloud connect aws --ttl-hours 4
+
+# Alibaba Cloud ECS: RAM AccessKey via stdin or ~/.aliyun/config.json profile
+cua cloud connect aliyun-ecs --token-stdin --region cn-hangzhou --budget 50 --max-size 4x16 --ttl-hours 8
+cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou
+cua cloud connect aliyun-ecs --profile oauth --region cn-hangzhou --spacesd-download-url https://mirror.example.com/cua-spacesd.exe
+cua cloud connect aliyun-ecs --profile oauth --vpc-id vpc-xxx --vswitch-id vsw-yyy --no-public-ip
+
+# Self-hosted relay: Account Relay Mode or Static Relay Mode
+cua cloud connect aws --relay-url https://relay.example.com --region us-west-2
+cua cloud connect hetzner --relay-mode static --relay-url https://relay.example.com --relay-token-stdin --region fsn1
 ```
 
 ### `cua cloud approve`
@@ -623,16 +662,26 @@ cua cloud test [OPTIONS] <PROVIDER>
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<PROVIDER>` | string | required | `aws`, `azure`, `gcp`, `hetzner` or `modal`. |
+| `<PROVIDER>` | string | required | `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`. |
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| <span id="cua-cloud-test--profile"></span>`--profile` | string |  | AWS profile (`~/.aws/config`) or Modal profile (`~/.modal.toml`). |
-| <span id="cua-cloud-test--region"></span>`--region` | string |  | AWS, Google Cloud or Azure region, or Hetzner location (default `fsn1`). |
+| <span id="cua-cloud-test--profile"></span>`--profile` | string |  | AWS profile (`~/.aws/config`), Modal profile (`~/.modal.toml`), or Alibaba Cloud CLI profile (`~/.aliyun/config.json`). |
+| <span id="cua-cloud-test--region"></span>`--region` | string |  | AWS, Google Cloud, Azure or Alibaba Cloud region, or Hetzner location (default `fsn1` for Hetzner, `cn-hangzhou` for `aliyun-ecs`). |
 | <span id="cua-cloud-test--zone"></span>`--zone` | string |  | Google Cloud zone (default: the region's `-a` zone). |
 | <span id="cua-cloud-test--project"></span>`--project` | string |  | Google Cloud project (default: `gcloud config get project`). |
 | <span id="cua-cloud-test--environment"></span>`--environment` | string |  | Modal environment (default: the profile's). |
-| <span id="cua-cloud-test--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner or Modal: read the API token from stdin (Hetzner: a Read & Write project token, otherwise `HCLOUD_TOKEN`, the saved token or the hcloud CLI's context; Modal: `<token id>:<token secret>`). Once the checks pass it is sealed to your devices, or with --no-sealed saved in this device's Cua credential store (Hetzner). |
+| <span id="cua-cloud-test--relay-url"></span>`--relay-url` | string |  | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
+| <span id="cua-cloud-test--relay-mode"></span>`--relay-mode` | `account` \| `static` |  | Relay authentication mode (`account` or `static`; defaults to `account`). |
+| <span id="cua-cloud-test--spacesd-download-url"></span>`--spacesd-download-url` | string |  | Custom `cua-spacesd` binary or `.tar.gz` download URL override for Direct VM sandboxes (`--runtime native`, with optional `#sha256=<64 hex>` fragment). |
+| <span id="cua-cloud-test--vpc-id"></span>`--vpc-id` | string |  | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `--vswitch-id`. |
+| <span id="cua-cloud-test--vswitch-id"></span>`--vswitch-id` | string |  | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `--vpc-id`. |
+| <span id="cua-cloud-test--windows-image-id"></span>`--windows-image-id` | string |  | Alibaba Cloud ECS: default Windows Cloud Image ID (`m-xxx`, e.g. golden Windows 10/11/Server image) for Windows sandboxes. |
+| <span id="cua-cloud-test--linux-image-id"></span>`--linux-image-id` | string |  | Alibaba Cloud ECS: default Linux Cloud Image ID (`m-xxx`) for Linux sandboxes. |
+| <span id="cua-cloud-test--instance-type"></span>`--instance-type` | string |  | Alibaba Cloud ECS: default instance type (e.g. `ecs.c7.2xlarge`). |
+| <span id="cua-cloud-test--token-stdin"></span>`--token-stdin` | boolean | `false` | Hetzner, Modal or Alibaba Cloud ECS: read the API token / AccessKey pair from stdin (Hetzner: Read & Write project token; Modal: `<token id>:<token secret>`; Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`). Hetzner and Modal seal to your devices when a budget is given (or with --no-sealed save on this device); Alibaba Cloud ECS saves into this device's Cua credential store. |
+| <span id="cua-cloud-test--relay-token-stdin"></span>`--relay-token-stdin` | boolean | `false` | Static Relay Mode: read the shared static relay registration token from stdin (never pass tokens in argv). When combined with `--token-stdin`, line 1 is the cloud token and line 2 is the relay token. |
+| <span id="cua-cloud-test--no-public-ip"></span>`--no-public-ip` | boolean | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
 
 **Examples**
 
@@ -651,7 +700,7 @@ cua cloud disconnect [OPTIONS] <PROVIDER>
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
-| `<PROVIDER>` | string | required | `aws`, `azure`, `gcp`, `hetzner` or `modal`. |
+| `<PROVIDER>` | string | required | `aws`, `azure`, `gcp`, `hetzner`, `modal` or `aliyun-ecs`. |
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |

@@ -252,6 +252,7 @@ pub(crate) mod imp {
             widen: r.widen,
             // Opting out travels as the `cua.relay=off` label.
             relay: None,
+            cloud_image_id: opt(r.cloud_image_id),
         })
     }
 

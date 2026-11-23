@@ -1570,13 +1570,23 @@ their own CLI sign-in; Hetzner takes its API token in `token` (or
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `provider` | `String` |  | `aws`, `gcp`, `hetzner` or `modal`. |
-| `profile` | `Option<String>` | `None` | AWS or Modal profile. |
-| `region` | `Option<String>` | `None` | AWS or GCP region, or Hetzner location (`fsn1`). |
+| `provider` | `String` |  | `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`. |
+| `profile` | `Option<String>` | `None` | AWS, Modal, or Alibaba Cloud CLI profile. |
+| `region` | `Option<String>` | `None` | AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`). |
 | `zone` | `Option<String>` | `None` | GCP zone. |
 | `project` | `Option<String>` | `None` | GCP project. |
 | `environment` | `Option<String>` | `None` | Modal environment. |
-| `token` | `Option<String>` | `None` | Hetzner: the project's Read & Write API token. Secret: used for the checks, saved in the Cua credential store when they pass, never printed. |
+| `token` | `Option<String>` | `None` | Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair. Secret: used for the checks, saved in the Cua credential store when they pass, never printed. |
+| `relay_url` / `relayUrl` | `Option<String>` | `None` | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
+| `relay_mode` / `relayMode` | `Option<String>` | `None` | Relay authentication mode (`account` or `static`; defaults to `account`). |
+| `relay_token` / `relayToken` | `Option<String>` | `None` | Shared static relay registration token for Static Relay Mode. Secret: never printed or stored in plaintext config. |
+| `spacesd_download_url` / `spacesdDownloadUrl` | `Option<String>` | `None` | Optional custom `cua-spacesd` binary mirror URL (with optional `#sha256=<64 hex>` fragment). |
+| `vpc_id` / `vpcId` | `Option<String>` | `None` | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `vswitch_id`. |
+| `vswitch_id` / `vswitchId` | `Option<String>` | `None` | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `vpc_id`. |
+| `no_public_ip` / `noPublicIp` | `bool` | `false` | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
+| `windows_image_id` / `windowsImageId` | `Option<String>` | `None` | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
+| `linux_image_id` / `linuxImageId` | `Option<String>` | `None` | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
+| `instance_type` / `instanceType` | `Option<String>` | `None` | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
 
 ## `CloudStatus` record
 
@@ -1627,6 +1637,15 @@ Returned by [`Spaces.cloud_approve`](#spacescloud_approve).
 | `suggest_auth` / `suggestAuth` | `String` |  | `oidc` when this link could switch to linking without a stored key (an AWS link through the CLI sign-in), else empty. |
 | `issue` | `String` |  | What is wrong with the link and what to do, one sentence, or empty. |
 | `holders` | `Vec<String>` |  | `sealed`: the devices that can open the account's API token ("Can open it"). |
+| `relay_url` / `relayUrl` | `Option<String>` |  | Per-connection relay base URL (`https://relay.cua.ai` by default), or `None` when not connected. |
+| `relay_mode` / `relayMode` | `Option<String>` | `None` | Relay authentication mode (`account` or `static`), or `None` when not connected. |
+| `spacesd_download_url` / `spacesdDownloadUrl` | `Option<String>` | `None` | Optional custom `cua-spacesd` binary mirror URL. |
+| `vpc_id` / `vpcId` | `Option<String>` | `None` | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`. |
+| `vswitch_id` / `vswitchId` | `Option<String>` | `None` | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`. |
+| `no_public_ip` / `noPublicIp` | `bool` | `false` | Whether public IPv4 assignment is disabled (`aliyun-ecs` only). |
+| `windows_image_id` / `windowsImageId` | `Option<String>` | `None` | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
+| `linux_image_id` / `linuxImageId` | `Option<String>` | `None` | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
+| `instance_type` / `instanceType` | `Option<String>` | `None` | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
 
 ## `CloudKind` record
 

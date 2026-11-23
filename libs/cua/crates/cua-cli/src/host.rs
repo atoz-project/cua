@@ -480,6 +480,10 @@ Examples:
         /// <cloud>` or `--on auto`; default: the pool picks).
         #[arg(long)]
         instance_type: Option<String>,
+        /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+        /// distinct from `IMAGE` (the Sandbox Image).
+        #[arg(long, value_name = "IMAGE_ID")]
+        cloud_image_id: Option<String>,
         /// The cloud region or location of that host (default: the pool
         /// picks, near you).
         #[arg(long)]
@@ -1749,6 +1753,7 @@ pub async fn run_spaces_sdk(
             children,
             forkable,
             instance_type,
+            cloud_image_id,
             region,
             volumes,
             label,
@@ -1785,6 +1790,19 @@ pub async fn run_spaces_sdk(
                     "--count {count}: create 1 to 8 Spaces at a time"
                 )));
             }
+            if disk_gb == Some(0) {
+                return Err(CuaError::InvalidArgument(
+                    "--disk-gb must be greater than 0".into(),
+                ));
+            }
+            let cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+                "--cloud-image-id",
+                cloud_image_id.as_deref(),
+            )?;
+            let instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+                "--instance-type",
+                instance_type.as_deref(),
+            )?;
             // A plain word that names no location is one of your machines.
             let on = on
                 .map(|o| {
@@ -1809,6 +1827,7 @@ pub async fn run_spaces_sdk(
                 durable,
                 forkable: forkable.then_some(true),
                 instance_type: instance_type.clone(),
+                cloud_image_id: cloud_image_id.clone(),
                 region: region.clone(),
                 volumes: volumes.clone(),
                 labels: labels.clone(),
@@ -4631,6 +4650,40 @@ mod tests {
         }
         <W as clap::Parser>::try_parse_from(std::iter::once("spaces").chain(args.iter().copied()))
             .map(|w| w.c)
+    }
+
+    #[test]
+    fn spaces_create_parses_cloud_image_id_disk_gb_and_instance_type() {
+        match parse_spaces(&[
+            "create",
+            "windows",
+            "--on",
+            "aliyun-ecs",
+            "--cloud-image-id",
+            "m-win11-space",
+            "--disk-gb",
+            "90",
+            "--instance-type",
+            "ecs.c7.2xlarge",
+        ])
+        .unwrap()
+        {
+            SpacesCmd::Create {
+                image,
+                on,
+                cloud_image_id,
+                disk_gb,
+                instance_type,
+                ..
+            } => {
+                assert_eq!(image.as_deref(), Some("windows"));
+                assert_eq!(on.as_deref(), Some("aliyun-ecs"));
+                assert_eq!(cloud_image_id.as_deref(), Some("m-win11-space"));
+                assert_eq!(disk_gb, Some(90));
+                assert_eq!(instance_type.as_deref(), Some("ecs.c7.2xlarge"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `cua host setup` (and `status`) always says whether the desktop is

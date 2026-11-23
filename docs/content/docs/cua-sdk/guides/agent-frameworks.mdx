@@ -7,7 +7,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 Each recipe gives a third-party agent its own desktop instead of yours.
 Sandboxes run on this machine by default; to run them in your own AWS, Google
-Cloud or Modal account, see [Choose where sandboxes run](/cua-sdk/guides/your-cloud).
+Cloud, Azure, Hetzner, Modal or Alibaba Cloud ECS account, see [Choose where sandboxes run](/cua-sdk/guides/your-cloud).
 The Python script needs Python `>=3.11,<3.14` with
 [`uv`](https://docs.astral.sh/uv/) and pins `cua-sandbox==0.11.11`. Your
 controller owns the sandbox and must delete it.
@@ -27,7 +27,7 @@ uv run run_openai_agents.py
 ```
 
 The sandbox runs on this machine. To run it in your own cloud, connect the
-account with `cua cloud connect` and set `CUA_ON=aws` (or `gcp`, `modal`)
+account with `cua cloud connect` and set `CUA_ON=aws` (or `gcp`, `modal`, `aliyun-ecs`)
 before `uv run`.
 
 The run drives an XFCE terminal through Cua Driver, reconnects the same

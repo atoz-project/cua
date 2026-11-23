@@ -2430,6 +2430,8 @@ dependencies = [
  "cua-spaces",
  "cua-spacesd-client",
  "cua-vmm",
+ "hex",
+ "hmac 0.12.1",
  "humantime",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -3157,6 +3159,7 @@ dependencies = [
  "cua-image",
  "cua-repo-cache",
  "cua-sandbox-core",
+ "cua-spaces-contract",
  "cua-spacesd-client",
  "cua-vmm",
  "futures-util",
@@ -3458,6 +3461,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

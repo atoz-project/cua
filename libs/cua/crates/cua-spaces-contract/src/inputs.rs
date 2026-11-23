@@ -193,6 +193,13 @@ pub struct CreateSpace {
     /// Memory for each Space, in MiB. Default: the location's default size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u64>,
+    /// Grow the boot disk to this many GiB (local VMs and `aliyun-ecs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gb: Option<u32>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_image_id: Option<String>,
     /// Return a reachable registered Space in the same location that has
     /// the requested services instead of creating one (get-or-create).
     /// Default false.
@@ -1952,16 +1959,16 @@ fn drop_null_option(schema: &mut serde_json::Value) {
     }
 }
 
-/// Which cloud a `cloud_*` tool acts on: `aws`, `azure`, `gcp`, `hetzner` or
-/// `modal`.
+/// Which cloud a `cloud_*` tool acts on: `aws`, `azure`, `gcp`, `hetzner`,
+/// `modal`, or `aliyun-ecs`.
 pub type CloudArg = String;
 
 /// `cloud_status`: the clouds Spaces can be created in, and what Cua
 /// created in them.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudStatus {
-    /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`). Default:
-    /// every one.
+    /// Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
+    /// Default: every one.
     #[serde(default)]
     pub provider: Option<CloudArg>,
 }
@@ -2094,16 +2101,16 @@ pub struct CloudReconcile {}
 /// store.
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudTarget {
-    /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: CloudArg,
     /// AWS: the profile in `~/.aws/config` (default: `default`, or
     /// `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the
-    /// active one).
+    /// active one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`.
     #[serde(default)]
     pub profile: Option<String>,
     /// AWS region (default: the profile's, else `us-west-2`), Hetzner location
-    /// (default `fsn1`), GCP region (default `us-central1`) or Azure region
-    /// (default `westus2`).
+    /// (default `fsn1`), GCP region (default `us-central1`), Azure region
+    /// (default `westus2`), or Alibaba Cloud region (default `cn-hangzhou`).
     #[serde(default)]
     pub region: Option<String>,
     /// GCP zone in the region (default: its `-a` zone).
@@ -2119,12 +2126,67 @@ pub struct CloudTarget {
     pub environment: Option<String>,
     /// Hetzner: the project's Read & Write API token (default:
     /// `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).
-    /// Modal: `<token id>:<token secret>`. Secret: never logged or
+    /// Modal: `<token id>:<token secret>`. Alibaba Cloud ECS:
+    /// `<access_key_id>:<access_key_secret>`. Secret: never logged or
     /// returned; sealed to the account's devices on connect (or, Hetzner
-    /// with `auth: cli`, saved in this device's Cua credential store).
+    /// and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua
+    /// credential store).
     #[serde(default)]
     pub token: Option<String>,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to
+    /// `account`).
+    #[serde(default)]
+    pub relay_mode: Option<String>,
+    /// Shared static relay registration token for Static Relay Mode.
+    /// Secret: never logged, returned, or stored in plaintext config.
+    #[serde(default)]
+    pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default)]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+    /// with `vswitch_id`.
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+    /// paired with `vpc_id`.
+    #[serde(default)]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[serde(default)]
+    pub no_public_ip: Option<bool>,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
+
+/// Human-readable title for a cloud provider location (`aws` -> `"AWS"`),
+/// shared by wasm32-safe UI crates that cannot depend on `cua-sandbox-core`.
+pub fn provider_title(name: &str) -> &str {
+    match name {
+        "aliyun-ecs" => "Alibaba Cloud ECS",
+        "aws" => "AWS",
+        "gcp" => "Google Cloud",
+        "azure" => "Microsoft Azure",
+        "hetzner" => "Hetzner Cloud",
+        "modal" => "Modal",
+        _ => name,
+    }
+}
+
+pub use crate::url_redact::redact_url;
 
 impl std::fmt::Debug for CloudTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2136,6 +2198,22 @@ impl std::fmt::Debug for CloudTarget {
             .field("project", &self.project)
             .field("environment", &self.environment)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("relay_url", &self.relay_url.as_deref().map(redact_url))
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "relay_token",
+                &self.relay_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "spacesd_download_url",
+                &self.spacesd_download_url.as_deref().map(redact_url),
+            )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -2227,7 +2305,7 @@ pub struct CloudTest {
 /// `cloud_disconnect`: forget a connected cloud.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudDisconnect {
-    /// `aws`, `azure`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: CloudArg,
     /// Delete everything Cua created in that cloud first, and disconnect
     /// only once the cloud confirms nothing is left. Default false: the
@@ -2240,7 +2318,7 @@ pub struct CloudDisconnect {
 /// on a cloud: its link, or a raise of its limits.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudApprove {
-    /// `aws`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: CloudArg,
     /// Decline instead: an agent's raise is dropped (the limits in force
     /// stay), an agent's link that was never approved is disconnected.
@@ -2255,7 +2333,8 @@ pub struct CloudAudit {
     /// How many of the newest entries (default 50, at most 1000).
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one.
+    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
+    /// Default: every one.
     #[serde(default)]
     pub provider: Option<CloudArg>,
 }
@@ -2264,7 +2343,8 @@ pub struct CloudAudit {
 /// estimated from list price times runtime.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CloudCost {
-    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one.
+    /// Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
+    /// Default: every one.
     #[serde(default)]
     pub provider: Option<CloudArg>,
     /// One row per `space`, `agent`, `day` (UTC) or `cloud`. Default `space`.
@@ -2335,4 +2415,107 @@ pub struct PrewarmList {}
 pub struct PrewarmRemove {
     /// The prewarm (`pw-xxxxxx`).
     pub id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_target_debug_redacts_url_credentials_and_query() {
+        let t = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            relay_url: Some("https://user:pw@relay.example.com/?sig=SECRET".into()),
+            spacesd_download_url: Some(
+                "https://dluser:MyPass998877@mirror.example.com/cua.exe?sig=DeadBeefCafe9988#sha256=abab"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains("pw"), "{dbg}");
+        assert!(!dbg.contains("SECRET"), "{dbg}");
+        assert!(dbg.contains("https://relay.example.com/"), "{dbg}");
+        assert!(!dbg.contains("MyPass998877"), "{dbg}");
+        assert!(!dbg.contains("DeadBeefCafe9988"), "{dbg}");
+        assert!(
+            dbg.contains("https://mirror.example.com/cua.exe#sha256=abab"),
+            "{dbg}"
+        );
+    }
+
+    #[test]
+    fn redact_url_blocks_confusion_and_bypass_vectors_in_debug() {
+        for bad in [
+            "https://user:secret_pass?@evil.com/bin",
+            "https://user:secret_pass#@evil.com/bin",
+            "https://user:secret_pass\\?@evil.com/bin",
+            "https://user:secret_pass:8080/@evil.com/bin",
+            "https://user:secret_pass/foo@evil.com",
+            "https://user:123456#@evil.com/bin",
+            "https://user:8080?x=@evil.com/bin",
+            "https://user:s3cr3t secret/@evil.com/bin?sig=DeadBeef",
+            "https://user:8080/@evil.com/bin",
+            "https://ada@org:p4ssw0rd/@evil.com/bin",
+            "https://ada@org:8080/@evil.com/bin",
+            "https://ada@org:secret@mirror.example.com/bin",
+            "https://user:s3cr3t\\@mirror.example.com/bin",
+            "https://example.com:0/bin",
+            "https://example.com:/bin",
+            "https://example.com:08080/bin",
+        ] {
+            assert_eq!(redact_url(bad), "<redacted>", "{bad:?}");
+            let dbg = format!(
+                "{:?}",
+                CloudTarget {
+                    provider: "aliyun-ecs".into(),
+                    spacesd_download_url: Some(bad.into()),
+                    ..Default::default()
+                }
+            );
+            for leak in [
+                "secret_pass",
+                "s3cr3t",
+                "p4ssw0rd",
+                "123456",
+                "8080",
+                "08080",
+                "DeadBeef",
+                "ada@org",
+                "evil.com",
+            ] {
+                assert!(!dbg.contains(leak), "leaked {leak:?} for {bad:?}: {dbg}");
+            }
+        }
+        let dbg_sha = format!(
+            "{:?}",
+            CloudTarget {
+                provider: "aliyun-ecs".into(),
+                spacesd_download_url: Some(
+                    "https://mirror.example.com/bin#sha256=user:s3cr3t@evil.com".into()
+                ),
+                ..Default::default()
+            }
+        );
+        assert!(!dbg_sha.contains("s3cr3t") && !dbg_sha.contains("user:"));
+        assert_eq!(
+            redact_url("https://mirror.example.com/cua-{version}-{arch}.tar.gz"),
+            "https://mirror.example.com/cua-{version}-{arch}.tar.gz"
+        );
+        assert_eq!(
+            redact_url("http://localhost:8080/@cua/cua-spacesd"),
+            "http://localhost:8080/@cua/cua-spacesd"
+        );
+        assert_eq!(
+            redact_url("http://[::1]:8080/cua-spacesd"),
+            "http://[::1]:8080/cua-spacesd"
+        );
+        let sha64 = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            redact_url(&format!(
+                "https://mirror.example.com/bin?user=ada@example.com&sig=AbCd#sha256={sha64}"
+            )),
+            format!("https://mirror.example.com/bin#sha256={sha64}")
+        );
+    }
 }

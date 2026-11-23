@@ -151,6 +151,14 @@ pub struct CreateRequest {
     /// shared file, so its checkpoints take milliseconds and forks of them
     /// share its pages. Other kinds ignore it.
     pub forkable: bool,
+    /// Requested boot disk size in GiB (`None`: provider/OS default).
+    pub disk_gb: Option<u32>,
+    /// Per-create Cloud Image ID override (e.g. `m-xxx`).
+    pub cloud_image_id: Option<String>,
+    /// Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+    pub instance_type: Option<String>,
+    /// Lifetime backstop (`cua sb create --ttl`). `None` uses the provider default.
+    pub ttl: Option<Duration>,
 }
 
 impl std::fmt::Debug for CreateRequest {
@@ -190,6 +198,10 @@ impl std::fmt::Debug for CreateRequest {
             .field("spacesd", &self.spacesd)
             .field("profile", &self.profile)
             .field("forkable", &self.forkable)
+            .field("disk_gb", &self.disk_gb)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("instance_type", &self.instance_type)
+            .field("ttl", &self.ttl)
             .finish()
     }
 }
@@ -2021,6 +2033,21 @@ pub(crate) fn options_from(
     o.headless = req.headless;
     o.spacesd = req.spacesd;
     o.forkable = req.forkable;
+    if req.disk_gb == Some(0) {
+        return Err(Error::InvalidArgument(
+            "disk_gb must be greater than 0".into(),
+        ));
+    }
+    o.disk_gb = req.disk_gb;
+    o.cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+        "cloud_image_id",
+        req.cloud_image_id.as_deref(),
+    )?;
+    o.instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+        "instance_type",
+        req.instance_type.as_deref(),
+    )?;
+    o.ttl = req.ttl;
     o.kind = kind;
     o.runtime = runtime;
     o.apply_profile(profile, cpus_given, memory_given);

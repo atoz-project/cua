@@ -18,6 +18,7 @@
 pub mod inputs;
 pub mod names;
 pub mod presence;
+pub mod url_redact;
 
 use serde::Serialize;
 

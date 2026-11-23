@@ -43,20 +43,6 @@ pub struct Verdict {
     pub reason: String,
 }
 
-/// The order a sweep deletes in: machines first, then what they used (a
-/// security group), then the parts of a cloud network from the inside out
-/// (subnets, route table, internet gateway), the network last.
-fn delete_rank(resource_type: &str) -> u8 {
-    match resource_type {
-        "instance" | "sandbox" => 0,
-        "subnet" => 2,
-        "route_table" => 3,
-        "internet_gateway" => 4,
-        "vpc" => 5,
-        _ => 1,
-    }
-}
-
 /// The sweeper's decision for `r`, as the cloud shows it with `tags`,
 /// given this home's `records`. Pure, so the rules are tested directly.
 pub fn verdict(
@@ -79,11 +65,7 @@ pub fn verdict(
     if !model::is_ours(tags, owner) {
         return keep("not Cua's (tags): never touched");
     }
-    let recorded = records.iter().find(|x| {
-        x.provider == r.provider
-            && x.resource_type == r.resource_type
-            && ((!x.id.is_empty() && x.id == r.id) || (!x.name.is_empty() && x.name == r.name))
-    });
+    let recorded = records.iter().find(|x| x.same_identity(r));
     let expires = recorded
         .map(|x| x.expires)
         .filter(|e| *e > 0)
@@ -204,7 +186,7 @@ pub async fn sweep_provider(
                     if r.region.is_empty() {
                         r.region = c.region.clone();
                     }
-                    if !listed.iter().any(|x| same(x, &r)) {
+                    if !listed.iter().any(|x| x.same_identity(&r)) {
                         listed.push(r);
                     }
                 }
@@ -231,7 +213,7 @@ pub async fn sweep_provider(
     let mut out = Vec::new();
     // Instances and sandboxes first, shared resources after them.
     let mut ordered: Vec<&Resource> = listed.iter().collect();
-    ordered.sort_by_key(|r| delete_rank(&r.resource_type));
+    ordered.sort_by_key(|r| r.delete_rank());
     for r in ordered {
         if r.state == "terminated" {
             continue;
@@ -267,25 +249,22 @@ pub async fn sweep_provider(
                     // with the other relay machines left behind).
                     let machine = records
                         .iter()
-                        .find(|x| same(x, r))
+                        .find(|x| x.same_identity(r))
                         .map(|x| x.machine.clone())
                         .filter(|m| !m.is_empty())
                         .or_else(|| r.tags.get(model::tag::MACHINE).cloned())
                         .filter(|m| !m.is_empty());
-                    for rec in records.iter().filter(|x| same(x, r)) {
+                    for rec in records.iter().filter(|x| x.same_identity(r)) {
                         let _ = store.forget(rec);
                     }
                     if let Some(m) = machine {
-                        let _ = store.record(Resource {
-                            provider: r.provider.clone(),
-                            id: m.clone(),
-                            resource_type: model::RELAY_MACHINE.into(),
-                            name: m.clone(),
-                            machine: m,
-                            created: t,
-                            state: "orphaned".into(),
-                            ..Default::default()
-                        });
+                        crate::relay::ConnectionRelay::cleanup_deleted_machine(
+                            conn,
+                            store,
+                            &r.provider,
+                            &m,
+                            t,
+                        );
                     }
                 }
                 Err(e) => {
@@ -311,22 +290,31 @@ pub async fn sweep_provider(
         if rec.id.is_empty() && t.saturating_sub(rec.created) < GRACE_SECS {
             continue;
         }
-        if listed.iter().any(|r| same(rec, r)) {
+        if listed.iter().any(|r| rec.same_identity(r)) {
             continue;
         }
-        // Not in the listing. Gone only if the cloud, asked where the
-        // record says it lives, says so; otherwise it is simply not seen
-        // and stays recorded.
+        // Not in the listing. Gone or no longer Cua-owned only if the cloud,
+        // asked where the record says it lives, says so; otherwise it is
+        // simply not seen and stays recorded.
         let scoped = swept.iter().any(|c| in_scope(rec, c));
-        let gone = rec.id.is_empty()
-            || (scoped
-                && match provider.describe(conn_for(&rec.region), rec).await {
-                    Ok(None) => true,
-                    Ok(Some((state, _))) => state == "terminated",
-                    Err(_) => false,
-                });
+        let gone_reason = if rec.id.is_empty() {
+            Some("no longer in the cloud")
+        } else if scoped {
+            match provider.describe(conn_for(&rec.region), rec).await {
+                Ok(None) => Some("no longer in the cloud"),
+                Ok(Some((state, _))) if state == "terminated" => Some("no longer in the cloud"),
+                Ok(Some((_, tags))) if !model::is_ours(&tags, &owner) => {
+                    Some("not Cua-owned in the cloud")
+                }
+                Ok(Some(_)) | Err(_) => None,
+            }
+        } else {
+            None
+        };
         let mut w = rec.wire(t);
-        if gone && forget_missing {
+        if let Some(reason) = gone_reason
+            && forget_missing
+        {
             if !dry_run {
                 let _ = store.forget(rec);
             }
@@ -338,7 +326,7 @@ pub async fn sweep_provider(
                 } else {
                     "forgotten".into()
                 },
-                reason: "no longer in the cloud".into(),
+                reason: reason.into(),
             });
         } else if !rec.id.is_empty() {
             let reason = if !scoped {
@@ -365,15 +353,132 @@ pub async fn sweep_provider(
     Ok(out)
 }
 
-pub(crate) fn same(a: &Resource, b: &Resource) -> bool {
-    a.provider == b.provider
-        && a.resource_type == b.resource_type
-        && ((!a.id.is_empty() && a.id == b.id) || (!a.name.is_empty() && a.name == b.name))
-}
-
 /// A report from the rows of every provider.
 pub fn report(dry_run: bool, resources: Vec<CloudSweepItem>) -> CloudSweepReport {
     CloudSweepReport { dry_run, resources }
+}
+
+/// One resource `live_resources` found, and why it could not be confirmed (if it could not).
+pub(crate) struct Live {
+    pub resource: Resource,
+    pub unverified: Option<String>,
+}
+
+/// What to do about resources the connection cannot see.
+pub(crate) fn unverified_hint(rs: &[Live]) -> String {
+    if rs.iter().all(|l| l.unverified.is_none()) {
+        return String::new();
+    }
+    " An unverified one is recorded but this connection cannot see it (another region, \
+     or the cloud did not answer): it was NOT assumed deleted. Connect the cloud again \
+     with the region it is in (`cua cloud connect <cloud> --region <region>`) and delete it there."
+        .to_string()
+}
+
+/// "instance i-1, instance i-2 (unverified: recorded in eu-west-1, ...) and 3 more".
+pub(crate) fn describe_live(rs: &[Live]) -> String {
+    const SHOWN: usize = 5;
+    let mut s = rs
+        .iter()
+        .take(SHOWN)
+        .map(|l| {
+            let r = &l.resource;
+            let id = if r.id.is_empty() { &r.name } else { &r.id };
+            match &l.unverified {
+                Some(why) => format!("{} {id} (unverified: {why})", r.resource_type),
+                None => format!("{} {id}", r.resource_type),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if rs.len() > SHOWN {
+        s.push_str(&format!(" and {} more", rs.len() - SHOWN));
+    }
+    s
+}
+
+/// Every Cua resource of `provider` that may still be there: what the cloud
+/// lists by this owner's tags, plus recorded ones it did not list.
+pub(crate) async fn live_resources(
+    store: &Store,
+    has_relay: bool,
+    p: &dyn CloudApi,
+    conn: &Connection,
+    shared: bool,
+) -> Result<Vec<Live>> {
+    let owner = store.owner_id().map_err(cua_sandbox_core::Error::Io)?;
+    let listed = p.list_owned(conn, &owner).await?;
+    let wanted =
+        |r: &Resource| shared || matches!(r.resource_type.as_str(), "instance" | "sandbox");
+    let t = now();
+    let mut out: Vec<Live> = listed
+        .iter()
+        .filter(|r| r.state != "terminated" && wanted(r))
+        .map(|r| Live {
+            resource: r.clone(),
+            unverified: None,
+        })
+        .collect();
+    for rec in store
+        .resources()
+        .map_err(cua_sandbox_core::Error::Io)?
+        .into_iter()
+        .filter(|r| r.provider == p.name())
+    {
+        if listed.iter().any(|r| rec.same_identity(r)) {
+            continue;
+        }
+        if rec.resource_type == model::RELAY_MACHINE {
+            if shared && has_relay {
+                out.push(Live {
+                    resource: rec,
+                    unverified: None,
+                });
+            }
+            continue;
+        }
+        if !wanted(&rec) {
+            continue;
+        }
+        if rec.id.is_empty() {
+            if t.saturating_sub(rec.created) < GRACE_SECS {
+                out.push(Live {
+                    resource: rec,
+                    unverified: None,
+                });
+            }
+            continue;
+        }
+        let unverified = if rec.region.is_empty() && !in_scope(&rec, conn) {
+            Some(format!(
+                "recorded in an unknown region, outside this connection's {}",
+                conn.region
+            ))
+        } else {
+            let mut there = conn.clone();
+            if !rec.region.is_empty() && rec.region != conn.region {
+                there.region = rec.region.clone();
+                there.zone = String::new();
+            }
+            match p.describe(&there, &rec).await {
+                Ok(Some((state, tags)))
+                    if state != "terminated" && model::is_ours(&tags, &owner) =>
+                {
+                    None
+                }
+                Ok(_) => continue,
+                Err(e) => Some(format!(
+                    "recorded in {}, could not be checked: {e}",
+                    there.region
+                )),
+            }
+        };
+        out.push(Live {
+            resource: rec,
+            unverified,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -526,5 +631,45 @@ mod tests {
         assert!(!verdict(&sg, &t, "me", &[], false, false, NOW).delete);
         assert!(!verdict(&sg, &t, "me", &[], true, true, NOW).delete);
         assert!(verdict(&sg, &t, "me", &[], true, false, NOW).delete);
+    }
+
+    #[test]
+    fn delete_rank_orders_inside_out_with_vswitch_after_security_group() {
+        assert!(
+            Resource::delete_rank_for("instance") < Resource::delete_rank_for("security_group")
+        );
+        assert!(Resource::delete_rank_for("security_group") < Resource::delete_rank_for("vswitch"));
+        assert_eq!(
+            Resource::delete_rank_for("vswitch"),
+            Resource::delete_rank_for("subnet")
+        );
+        assert!(Resource::delete_rank_for("vswitch") < Resource::delete_rank_for("vpc"));
+    }
+
+    #[test]
+    fn same_distinguishes_distinct_ids_with_same_name_and_matches_pending() {
+        let sg1 = Resource {
+            provider: "aliyun-ecs".into(),
+            resource_type: "security_group".into(),
+            id: "sg-1".into(),
+            name: "cua-sandboxes-owner1".into(),
+            ..Default::default()
+        };
+        let sg2 = Resource {
+            id: "sg-2".into(),
+            ..sg1.clone()
+        };
+        let sg1_unnamed = Resource {
+            name: String::new(),
+            ..sg1.clone()
+        };
+        let pending = Resource {
+            id: String::new(),
+            ..sg1.clone()
+        };
+        assert!(!sg1.same_identity(&sg2));
+        assert!(sg1.same_identity(&sg1_unnamed));
+        assert!(pending.same_identity(&sg1));
+        assert!(sg2.same_identity(&pending));
     }
 }

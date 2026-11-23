@@ -45,7 +45,7 @@ pub struct CloudKind {
 }
 
 /// One cloud as `cloud_status` lists it.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, uniffi::Record)]
+#[derive(Clone, PartialEq, Default, Deserialize, uniffi::Record)]
 pub struct CloudProvider {
     /// `aws`, `gcp`, `hetzner`, `modal`.
     pub name: String,
@@ -128,6 +128,94 @@ pub struct CloudProvider {
     /// ("Can open it").
     #[serde(default)]
     pub holders: Vec<String>,
+    /// Per-connection relay base URL (`https://relay.cua.ai` by default),
+    /// or `None` when not connected.
+    #[serde(default)]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`), or `None` when
+    /// not connected.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub relay_mode: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub vswitch_id: Option<String>,
+    /// Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+    #[serde(default)]
+    #[uniffi(default = false)]
+    pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default)]
+    #[uniffi(default = None)]
+    pub instance_type: Option<String>,
+}
+
+impl std::fmt::Debug for CloudProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudProvider")
+            .field("name", &self.name)
+            .field("title", &self.title)
+            .field("tier", &self.tier)
+            .field("connected", &self.connected)
+            .field("default", &self.default)
+            .field("credentials", &self.credentials)
+            .field("account", &self.account)
+            .field("profile", &self.profile)
+            .field("region", &self.region)
+            .field("zone", &self.zone)
+            .field("project", &self.project)
+            .field("environment", &self.environment)
+            .field("label", &self.label)
+            .field("ttl_hours", &self.ttl_hours)
+            .field("kinds", &self.kinds)
+            .field("auth", &self.auth)
+            .field("status", &self.status)
+            .field("budget_usd_month", &self.budget_usd_month)
+            .field("max_size", &self.max_size)
+            .field("spent_month", &self.spent_month)
+            .field("running", &self.running)
+            .field("approval", &self.approval)
+            .field("approval_agent", &self.approval_agent)
+            .field("pending_budget_usd_month", &self.pending_budget_usd_month)
+            .field("pending_max_size", &self.pending_max_size)
+            .field("can_approve", &self.can_approve)
+            .field("suggest_auth", &self.suggest_auth)
+            .field("issue", &self.issue)
+            .field("holders", &self.holders)
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
+            .finish()
+    }
 }
 
 /// The next step of a `cloud_connect`: a command for the agent, or a page
@@ -367,12 +455,12 @@ pub struct CloudSweepReport {
 /// `HCLOUD_TOKEN`).
 #[derive(Clone, PartialEq, Default, uniffi::Record)]
 pub struct CloudTarget {
-    /// `aws`, `gcp`, `hetzner` or `modal`.
+    /// `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
     pub provider: String,
-    /// AWS or Modal profile.
+    /// AWS, Modal, or Alibaba Cloud CLI profile.
     #[uniffi(default = None)]
     pub profile: Option<String>,
-    /// AWS or GCP region, or Hetzner location (`fsn1`).
+    /// AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
     #[uniffi(default = None)]
     pub region: Option<String>,
     /// GCP zone.
@@ -384,11 +472,47 @@ pub struct CloudTarget {
     /// Modal environment.
     #[uniffi(default = None)]
     pub environment: Option<String>,
-    /// Hetzner: the project's Read & Write API token. Secret: used for the
-    /// checks, saved in the Cua credential store when they pass, never
-    /// printed.
+    /// Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+    /// Secret: used for the checks, saved in the Cua credential store when
+    /// they pass, never printed.
     #[uniffi(default = None)]
     pub token: Option<String>,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[uniffi(default = None)]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to `account`).
+    #[uniffi(default = None)]
+    pub relay_mode: Option<String>,
+    /// Shared static relay registration token for Static Relay Mode. Secret:
+    /// never printed or stored in plaintext config.
+    #[uniffi(default = None)]
+    pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[uniffi(default = None)]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+    /// with `vswitch_id`.
+    #[uniffi(default = None)]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+    /// paired with `vpc_id`.
+    #[uniffi(default = None)]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[uniffi(default = false)]
+    pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[uniffi(default = None)]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[uniffi(default = None)]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[uniffi(default = None)]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
@@ -401,6 +525,25 @@ impl std::fmt::Debug for CloudTarget {
             .field("project", &self.project)
             .field("environment", &self.environment)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("relay_url", &self.relay_url)
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "relay_token",
+                &self.relay_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
             .finish()
     }
 }
@@ -415,7 +558,35 @@ impl CloudTarget {
             "project": self.project,
             "environment": self.environment,
             "token": self.token,
+            "relay_url": self.relay_url,
+            "relay_mode": self.relay_mode,
+            "relay_token": self.relay_token,
+            "spacesd_download_url": self.spacesd_download_url,
+            "vpc_id": self.vpc_id,
+            "vswitch_id": self.vswitch_id,
+            "no_public_ip": self.no_public_ip,
+            "windows_image_id": self.windows_image_id,
+            "linux_image_id": self.linux_image_id,
+            "instance_type": self.instance_type,
         })
+    }
+
+    fn extra_target_fields_asked(&self) -> Vec<&'static str> {
+        [
+            ("relay_url", self.relay_url.is_some()),
+            ("relay_mode", self.relay_mode.is_some()),
+            ("relay_token", self.relay_token.is_some()),
+            ("spacesd_download_url", self.spacesd_download_url.is_some()),
+            ("vpc_id", self.vpc_id.is_some()),
+            ("vswitch_id", self.vswitch_id.is_some()),
+            ("no_public_ip", self.no_public_ip),
+            ("windows_image_id", self.windows_image_id.is_some()),
+            ("linux_image_id", self.linux_image_id.is_some()),
+            ("instance_type", self.instance_type.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(k, set)| set.then_some(k))
+        .collect()
     }
 }
 
@@ -503,24 +674,26 @@ impl Spaces {
             let mut args = target.args();
             args["make_default"] = json!(make_default);
             args["ttl_hours"] = json!(ttl_hours);
+            let mut asked: Vec<&str> = target.extra_target_fields_asked();
             if let Some(o) = options {
                 // An older daemon ignores fields it does not know and would
-                // link through the CLI sign-in instead: refuse first.
-                let asked: Vec<&str> = [
-                    ("auth", o.auth.is_some()),
-                    ("budget_usd_month", o.budget_usd_month.is_some()),
-                    ("max_size", o.max_size.is_some()),
-                    ("account_id", o.account_id.is_some()),
-                    ("role_arn", o.role_arn.is_some()),
-                    ("check", o.check),
-                ]
-                .into_iter()
-                .filter_map(|(k, set)| set.then_some(k))
-                .collect();
+                // link through the CLI sign-in or default relay/VPC instead: refuse first.
+                asked.extend(
+                    [
+                        ("auth", o.auth.is_some()),
+                        ("budget_usd_month", o.budget_usd_month.is_some()),
+                        ("max_size", o.max_size.is_some()),
+                        ("account_id", o.account_id.is_some()),
+                        ("role_arn", o.role_arn.is_some()),
+                        ("check", o.check),
+                    ]
+                    .into_iter()
+                    .filter_map(|(k, set)| set.then_some(k)),
+                );
                 host.require_fields(
                     "cloud_connect",
                     &asked,
-                    "link a cloud with OIDC, a budget or a largest machine",
+                    "link a cloud with OIDC, a budget, a largest machine, custom relay, or existing VPC",
                 )
                 .await?;
                 args["auth"] = json!(o.auth);
@@ -536,6 +709,13 @@ impl Spaces {
                 args["resource_group"] = json!(o.resource_group);
                 args["check"] = json!(o.check);
                 args["agent"] = json!(o.agent);
+            } else if !asked.is_empty() {
+                host.require_fields(
+                    "cloud_connect",
+                    &asked,
+                    "connect a cloud with a custom/static relay, existing VPC, or default Cloud Image IDs",
+                )
+                .await?;
             }
             connected(host.tool_value("cloud_connect", args).await?)
         })
@@ -560,7 +740,19 @@ impl Spaces {
     /// Checks a cloud account without creating anything.
     pub async fn cloud_test(&self, target: CloudTarget) -> Result<CloudTestReport> {
         let host = self.tool_caller();
-        run(async move { parse(host.tool_value("cloud_test", target.args()).await?) }).await
+        run(async move {
+            let asked = target.extra_target_fields_asked();
+            if !asked.is_empty() {
+                host.require_fields(
+                    "cloud_test",
+                    &asked,
+                    "test a cloud with a custom/static relay, existing VPC, or default Cloud Image IDs",
+                )
+                .await?;
+            }
+            parse(host.tool_value("cloud_test", target.args()).await?)
+        })
+        .await
     }
 
     /// Forgets a connected cloud. Refused (listing them) while Cua
@@ -721,5 +913,72 @@ mod tests {
         assert!(r.dry_run);
         assert_eq!(r.resources[0].resource.resource_type, "instance");
         assert_eq!(r.resources[0].action, "delete");
+
+        let target = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            relay_url: Some("https://relay.example.com".into()),
+            relay_mode: Some("static".into()),
+            relay_token: Some("super-secret-relay-token".into()),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
+            ..Default::default()
+        };
+        assert!(!format!("{target:?}").contains("super-secret-relay-token"));
+        let args = target.args();
+        assert_eq!(args["relay_url"], "https://relay.example.com");
+        assert_eq!(args["relay_mode"], "static");
+        assert_eq!(args["relay_token"], "super-secret-relay-token");
+        assert_eq!(
+            args["spacesd_download_url"],
+            "https://mirror.example.com/cua-spacesd.exe"
+        );
+        assert_eq!(args["vpc_id"], "vpc-123");
+        assert_eq!(args["vswitch_id"], "vsw-456");
+        assert_eq!(args["no_public_ip"], true);
+        let p_wire = serde_json::to_value(cua_spaces::cloud::CloudProvider {
+            name: "aliyun-ecs".into(),
+            relay_url: Some("https://relay.example.com".into()),
+            relay_mode: Some(cua_sandbox_core::byoc::RelayMode::Static),
+            spacesd_download_url: Some("https://mirror.example.com/cua-spacesd.exe".into()),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let p_sdk: CloudProvider = parse(p_wire).unwrap();
+        assert_eq!(p_sdk.relay_mode.as_deref(), Some("static"));
+        assert_eq!(
+            p_sdk.relay_url.as_deref(),
+            Some("https://relay.example.com")
+        );
+        assert_eq!(
+            p_sdk.spacesd_download_url.as_deref(),
+            Some("https://mirror.example.com/cua-spacesd.exe")
+        );
+        assert_eq!(p_sdk.vpc_id.as_deref(), Some("vpc-123"));
+        assert_eq!(p_sdk.vswitch_id.as_deref(), Some("vsw-456"));
+        assert!(p_sdk.no_public_ip);
+
+        let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab";
+        let secret_target = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let t_dbg = format!("{secret_target:?}");
+        assert!(!t_dbg.contains("MyPass998877"), "{t_dbg}");
+        assert!(!t_dbg.contains("DeadBeefCafe9988"), "{t_dbg}");
+
+        let secret_provider = CloudProvider {
+            name: "aliyun-ecs".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            ..Default::default()
+        };
+        let p_dbg = format!("{secret_provider:?}");
+        assert!(!p_dbg.contains("MyPass998877"), "{p_dbg}");
+        assert!(!p_dbg.contains("DeadBeefCafe9988"), "{p_dbg}");
     }
 }

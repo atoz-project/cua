@@ -275,40 +275,146 @@ pub struct MaxSize {
     pub vcpu: u32,
     /// Memory, GiB.
     pub mem_gib: u32,
+    /// Optional disk size cap, GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
 }
 
 impl MaxSize {
-    /// Parses `4x16` (4 vCPUs, 16 GiB).
+    /// Parses `4x16` (4 vCPUs, 16 GiB) or `4x16x100` (plus 100 GiB disk cap).
     pub fn parse(s: &str) -> Option<MaxSize> {
-        let (c, m) = s
-            .trim()
-            .to_ascii_lowercase()
-            .split_once('x')
-            .map(|(a, b)| {
+        let lower = s.trim().to_ascii_lowercase();
+        let parts: Vec<&str> = lower.split('x').collect();
+        fn strip_gb(raw: &str) -> &str {
+            raw.trim()
+                .trim_end_matches("gib")
+                .trim_end_matches("gb")
+                .trim()
+        }
+        let (vcpu, mem_gib, disk_gib) = match parts.as_slice() {
+            [c, m] => (
+                c.trim().parse::<u32>().ok()?,
+                strip_gb(m).parse::<u32>().ok()?,
+                None,
+            ),
+            [c, m, d] => {
+                let d: u32 = strip_gb(d).parse().ok()?;
+                if d == 0 {
+                    return None;
+                }
                 (
-                    a.trim().to_string(),
-                    b.trim()
-                        .trim_end_matches("gb")
-                        .trim_end_matches("gib")
-                        .to_string(),
+                    c.trim().parse::<u32>().ok()?,
+                    strip_gb(m).parse::<u32>().ok()?,
+                    Some(d),
                 )
-            })?;
-        let m = MaxSize {
-            vcpu: c.parse().ok()?,
-            mem_gib: m.parse().ok()?,
+            }
+            _ => return None,
         };
-        (m.vcpu > 0 && m.mem_gib > 0).then_some(m)
+        (vcpu > 0 && mem_gib > 0).then_some(MaxSize {
+            vcpu,
+            mem_gib,
+            disk_gib,
+        })
     }
 
     /// Whether a machine of `vcpus` and `memory_mb` fits.
     pub fn fits(&self, vcpus: u32, memory_mb: u64) -> bool {
         vcpus <= self.vcpu && memory_mb <= u64::from(self.mem_gib) * 1024
     }
+
+    /// Whether a boot disk of `disk_gb` fits (always true when no disk cap is set).
+    pub fn fits_disk(&self, disk_gb: u32) -> bool {
+        self.disk_gib.is_none_or(|max| disk_gb <= max)
+    }
 }
 
 impl std::fmt::Display for MaxSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}x{}", self.vcpu, self.mem_gib)
+        match self.disk_gib {
+            Some(d) => write!(f, "{}x{}x{d}", self.vcpu, self.mem_gib),
+            None => write!(f, "{}x{}", self.vcpu, self.mem_gib),
+        }
+    }
+}
+
+/// Extended per-connection options stored inline on [`Connection`] and mirrored
+/// in `links.json` via `#[serde(flatten)]` so an older `cua` cannot drop them.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConnectionExtras {
+    /// How it reaches the cloud (absent: the CLI sign-in, as every
+    /// connection made before federation).
+    #[serde(default, skip_serializing_if = "Auth::is_cli")]
+    pub auth: Auth,
+    /// The most Cua may spend here per calendar month (UTC), US dollars.
+    /// New machines are refused once it is reached; stop and delete still
+    /// work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd_month: Option<f64>,
+    /// The largest machine Cua may create here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<MaxSize>,
+    /// Per-connection relay base URL (`None`: official `https://relay.cua.ai`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`None`: Account Relay Mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<cua_sandbox_core::byoc::RelayMode>,
+    /// Optional custom `cua-spacesd` binary mirror URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// Disable public IPv4 assignment (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl std::fmt::Debug for ConnectionExtras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionExtras")
+            .field("auth", &self.auth)
+            .field("budget_usd_month", &self.budget_usd_month)
+            .field("max_size", &self.max_size)
+            .field(
+                "relay_url",
+                &self
+                    .relay_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field("relay_mode", &self.relay_mode)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field("vpc_id", &self.vpc_id)
+            .field("vswitch_id", &self.vswitch_id)
+            .field("no_public_ip", &self.no_public_ip)
+            .field("windows_image_id", &self.windows_image_id)
+            .field("linux_image_id", &self.linux_image_id)
+            .field("instance_type", &self.instance_type)
+            .finish()
     }
 }
 
@@ -343,18 +449,22 @@ pub struct Connection {
     /// When it was connected (RFC 3339).
     #[serde(default)]
     pub connected_at: String,
-    /// How it reaches the cloud (absent: the CLI sign-in, as every
-    /// connection made before federation).
-    #[serde(default, skip_serializing_if = "Auth::is_cli")]
-    pub auth: Auth,
-    /// The most Cua may spend here per calendar month (UTC), US dollars.
-    /// New machines are refused once it is reached; stop and delete still
-    /// work.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_usd_month: Option<f64>,
-    /// The largest machine Cua may create here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_size: Option<MaxSize>,
+    /// Extended connection options serialized flat alongside the base fields.
+    #[serde(flatten)]
+    pub extras: ConnectionExtras,
+}
+
+impl std::ops::Deref for Connection {
+    type Target = ConnectionExtras;
+    fn deref(&self) -> &Self::Target {
+        &self.extras
+    }
+}
+
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.extras
+    }
 }
 
 fn default_ttl() -> u32 {
@@ -365,6 +475,31 @@ fn default_ttl() -> u32 {
 pub const DEFAULT_TTL_HOURS: u32 = 8;
 
 impl Connection {
+    /// Effective relay mode (`Account` when unset).
+    pub fn effective_relay_mode(&self) -> cua_sandbox_core::byoc::RelayMode {
+        self.relay_mode.unwrap_or_default()
+    }
+
+    /// Whether this connection uses Static Relay Mode.
+    pub fn is_static_relay(&self) -> bool {
+        self.effective_relay_mode() == cua_sandbox_core::byoc::RelayMode::Static
+    }
+
+    /// Effective relay base URL (`default` when `relay_url` is unset or empty).
+    pub fn effective_relay_url<'a>(&'a self, default: &'a str) -> &'a str {
+        self.relay_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .unwrap_or(default)
+    }
+
+    /// Whether this connection carries any extended options (federated auth,
+    /// limits, custom relay, mirror URL, existing VPC, or image/sizing defaults)
+    /// that an older cua would drop when rewriting `state.json`.
+    pub fn has_extended_options(&self) -> bool {
+        self.extras != ConnectionExtras::default()
+    }
+
     /// "AWS · us-west-2", "Google Cloud · my-project", "Modal · main".
     pub fn label(&self, title: &str) -> String {
         let place = [&self.region, &self.project, &self.environment]
@@ -440,6 +575,38 @@ impl Resource {
         self.expires > 0 && now >= self.expires
     }
 
+    /// Whether `self` and `other` refer to the same cloud resource: same
+    /// provider and type, and the same cloud id (or, while one is pending,
+    /// the same name).
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.resource_type == other.resource_type
+            && if !self.id.is_empty() && !other.id.is_empty() {
+                self.id == other.id
+            } else {
+                !self.name.is_empty() && self.name == other.name
+            }
+    }
+
+    /// Teardown priority (lower deletes first): machines first, then security
+    /// groups / shared parts, then network parts from the inside out (subnets/
+    /// vswitches, route tables, internet gateways), and the VPC last.
+    pub fn delete_rank(&self) -> u8 {
+        Self::delete_rank_for(&self.resource_type)
+    }
+
+    /// Teardown priority for a `resource_type` string.
+    pub fn delete_rank_for(resource_type: &str) -> u8 {
+        match resource_type {
+            "instance" | "sandbox" => 0,
+            "subnet" | "vswitch" => 2,
+            "route_table" => 3,
+            "internet_gateway" => 4,
+            "vpc" => 5,
+            _ => 1,
+        }
+    }
+
     /// The wire row.
     pub fn wire(&self, now: u64) -> cua_sandbox_core::byoc::CloudResource {
         cua_sandbox_core::byoc::CloudResource {
@@ -481,7 +648,7 @@ pub const STARTED_BY: &str = "started_by";
 pub const DEFAULT_VPC: &str = "default_vpc";
 
 /// What one Space asks a provider for.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ProvisionSpec {
     /// The resource name Cua chose (`cua-space-<hex>`), unique per create.
     pub name: String,
@@ -491,8 +658,12 @@ pub struct ProvisionSpec {
     pub image: String,
     /// `container` or `vm` (what the Space is).
     pub kind: String,
-    /// The machine type Cua picked ([`crate::Provider::kinds`]).
+    /// The machine type Cua picked ([`crate::Provider::kinds`]), or empty
+    /// to let [`crate::CloudApi::prepare_provision`] pick an available default.
     pub machine_type: String,
+    /// Whether `machine_type` was explicitly requested by the user/connection
+    /// (`--instance-type`), disabling automatic availability fallback.
+    pub machine_type_explicit: bool,
     /// Boot disk in GiB.
     pub disk_gb: u32,
     /// VM tier: the cloud-init user data (runs the image with Docker and
@@ -538,6 +709,54 @@ pub struct ProvisionSpec {
     /// Network rules the Space asked for, for a cloud that enforces them
     /// on its own side (Modal; [`crate::CloudApi::takes_network_rules`]).
     pub network: Option<crate::modal_net::NetworkRequest>,
+    /// Direct VM (`windows`): optional custom `cua-spacesd` binary mirror URL.
+    pub spacesd_download_url: Option<String>,
+    /// Direct VM (`windows`): generated Administrator password for AutoLogon
+    /// and ECS `RunInstances` `Password`. Secret: never printed or logged.
+    pub desktop_password: Option<String>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
+    /// Optional ordered availability zones where the selected shape has stock,
+    /// populated by [`crate::CloudApi::prepare_provision`].
+    pub candidate_zones: Option<Vec<String>>,
+    /// Whether [`crate::CloudApi::prepare_provision`] has already resolved and
+    /// validated sizing, Cloud Image ID, and stock zones onto this spec.
+    pub prepared: bool,
+}
+
+impl std::fmt::Debug for ProvisionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionSpec")
+            .field("name", &self.name)
+            .field("family", &self.family)
+            .field("image", &self.image)
+            .field("kind", &self.kind)
+            .field("machine_type", &self.machine_type)
+            .field("disk_gb", &self.disk_gb)
+            .field("arch", &self.arch)
+            .field("runtime", &self.runtime)
+            .field("cpus", &self.cpus)
+            .field("memory_mb", &self.memory_mb)
+            .field("ttl_secs", &self.ttl_secs)
+            .field("role", &self.role)
+            .field("region", &self.region)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("candidate_zones", &self.candidate_zones)
+            .field("prepared", &self.prepared)
+            .field(
+                "spacesd_download_url",
+                &self
+                    .spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url),
+            )
+            .field(
+                "desktop_password",
+                &self.desktop_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProvisionSpec {
@@ -670,5 +889,81 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(m.label("Modal"), "Modal \u{b7} cua-byoc");
+    }
+
+    #[test]
+    fn connection_and_provision_spec_debug_redact_url_secrets() {
+        let secret_url = "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256=abab";
+        let secret_relay = "https://ruser:RelayPass1122@relay.example.com?tok=RelayQuery33";
+        let conn = Connection {
+            provider: "aliyun-ecs".into(),
+            extras: ConnectionExtras {
+                relay_url: Some(secret_relay.into()),
+                spacesd_download_url: Some(secret_url.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let c_dbg = format!("{conn:?}");
+        assert!(!c_dbg.contains("MyPass998877"), "{c_dbg}");
+        assert!(!c_dbg.contains("DeadBeefCafe9988"), "{c_dbg}");
+        assert!(!c_dbg.contains("RelayPass1122"), "{c_dbg}");
+        assert!(!c_dbg.contains("RelayQuery33"), "{c_dbg}");
+        assert!(
+            c_dbg.contains("https://mirror.example.com/cua-spacesd.exe#sha256=abab"),
+            "{c_dbg}"
+        );
+        assert!(c_dbg.contains("https://relay.example.com"), "{c_dbg}");
+
+        let spec = ProvisionSpec {
+            name: "test".into(),
+            spacesd_download_url: Some(secret_url.into()),
+            desktop_password: Some("WinPass!99".into()),
+            ..Default::default()
+        };
+        let s_dbg = format!("{spec:?}");
+        assert!(!s_dbg.contains("WinPass!99"), "{s_dbg}");
+        assert!(!s_dbg.contains("MyPass998877"), "{s_dbg}");
+        assert!(!s_dbg.contains("DeadBeefCafe9988"), "{s_dbg}");
+        assert!(
+            s_dbg.contains("https://mirror.example.com/cua-spacesd.exe#sha256=abab"),
+            "{s_dbg}"
+        );
+    }
+
+    #[test]
+    fn connection_json_is_flat_and_byte_compatible() {
+        let sample = r#"{
+  "provider": "aliyun-ecs",
+  "profile": "",
+  "region": "cn-hangzhou",
+  "zone": "",
+  "project": "",
+  "environment": "",
+  "account": "123456789012",
+  "ttl_hours": 8,
+  "connected_at": "2026-11-22T00:00:00Z",
+  "budget_usd_month": 50.0,
+  "max_size": {
+    "vcpu": 4,
+    "mem_gib": 16,
+    "disk_gib": 100
+  },
+  "relay_url": "https://relay.example.com",
+  "relay_mode": "static",
+  "spacesd_download_url": "https://mirror.example.com/cua-spacesd.exe",
+  "vpc_id": "vpc-123",
+  "vswitch_id": "vsw-456",
+  "no_public_ip": true,
+  "windows_image_id": "m-win",
+  "linux_image_id": "m-lin",
+  "instance_type": "ecs.c7.xlarge"
+}"#;
+        let conn: Connection = serde_json::from_str(sample).unwrap();
+        assert!(conn.has_extended_options());
+        assert_eq!(conn.vpc_id.as_deref(), Some("vpc-123"));
+        assert!(conn.no_public_ip);
+        let serialized = serde_json::to_string_pretty(&conn).unwrap();
+        assert_eq!(serialized, sample);
     }
 }

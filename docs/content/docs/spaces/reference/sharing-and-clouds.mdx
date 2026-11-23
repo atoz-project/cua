@@ -326,7 +326,7 @@ Sandboxes and Spaces can run in the user's own cloud account: on="aws" (EC2), "a
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `provider` | `string` | none | Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`). Default: every one. |
+| `provider` | `string` | none | Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`). Default: every one. |
 
 #### Result
 
@@ -362,20 +362,30 @@ Without auth it keeps how the cloud is linked already (an OIDC or sealed link st
 | `check` | `boolean` | none | `oidc`: run the check that proves the link works (a check token, the exchange with the cloud, a dry run; nothing is created). The link is saved only once it passes. |
 | `client_id` | `string` | none | Azure: the client id of the `cua-spaces` managed identity (its `clientId` output). |
 | `environment` | `string` | none | Modal environment (default: the profile's). |
+| `instance_type` | `string` | none | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
+| `linux_image_id` | `string` | none | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
 | `make_default` | `boolean` | `false` | Also make it the default location (`default.on`). Default false. |
 | `max_size` | `string` | none | The largest machine Cua may create there: `<vCPUs>x<GB>`, for example `4x16`. |
-| `profile` | `string` | none | AWS: the profile in `~/.aws/config` (default: `default`, or `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the active one). |
+| `no_public_ip` | `boolean` | none | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
+| `profile` | `string` | none | AWS: the profile in `~/.aws/config` (default: `default`, or `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the active one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`. |
 | `project` | `string` | none | GCP project id (default: `gcloud config get project`). Hetzner and Modal with a sealed token: a name for the project or workspace (default `default`), to tell several apart. |
 | `project_number` | `string` | none | Google Cloud `oidc`: the project number (the trust script prints it; giving it implies `oidc`). The project id is `target.project`. |
-| `provider` | `string` | required | `aws`, `azure`, `gcp`, `hetzner` or `modal`. |
-| `region` | `string` | none | AWS region (default: the profile's, else `us-west-2`), Hetzner location (default `fsn1`), GCP region (default `us-central1`) or Azure region (default `westus2`). |
+| `provider` | `string` | required | `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`. |
+| `region` | `string` | none | AWS region (default: the profile's, else `us-west-2`), Hetzner location (default `fsn1`), GCP region (default `us-central1`), Azure region (default `westus2`), or Alibaba Cloud region (default `cn-hangzhou`). |
+| `relay_mode` | `string` | none | Relay authentication mode (`account` or `static`; defaults to `account`). |
+| `relay_token` | `string` | none | Shared static relay registration token for Static Relay Mode. Secret: never logged, returned, or stored in plaintext config. |
+| `relay_url` | `string` | none | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
 | `resource_group` | `string` | none | Azure: the resource group Cua works in, and the only one its roles reach (default `cua-spaces`). |
 | `role_arn` | `string` | none | AWS `oidc`: the role ARN, only when it is not named `cua-spaces`. |
 | `service_account` | `string` | none | Google Cloud `oidc`: a service account to act as. Default: none, the federated identity calls Google directly. |
+| `spacesd_download_url` | `string` | none | Optional custom `cua-spacesd` binary mirror URL (with optional `#sha256=<64 hex>` fragment). |
 | `subscription_id` | `string` | none | Azure: the subscription id (the trust template's `subscriptionId` output). |
 | `tenant_id` | `string` | none | Azure: the Microsoft Entra tenant id (its `tenantId` output). |
-| `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner with `auth: cli`, saved in this device's Cua credential store). |
+| `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua credential store). |
 | `ttl_hours` | `integer` | `8` | Every Space created there deletes itself after this many hours (the instance or sandbox terminates, the sweeper removes what is left). Default 8; 0 keeps Spaces until you delete them (Modal caps a sandbox at 24). At least 0. |
+| `vpc_id` | `string` | none | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `vswitch_id`. |
+| `vswitch_id` | `string` | none | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `vpc_id`. |
+| `windows_image_id` | `string` | none | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
 | `zone` | `string` | none | GCP zone in the region (default: its `-a` zone). |
 
 #### Result
@@ -406,11 +416,21 @@ Creates nothing: it signs in with the cloud's own CLI credentials (or, for a lin
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `environment` | `string` | none | Modal environment (default: the profile's). |
-| `profile` | `string` | none | AWS: the profile in `~/.aws/config` (default: `default`, or `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the active one). |
+| `instance_type` | `string` | none | Default cloud instance type (`aliyun-ecs`: `--instance-type`). |
+| `linux_image_id` | `string` | none | Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`). |
+| `no_public_ip` | `boolean` | none | Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`, `aliyun-ecs` only). |
+| `profile` | `string` | none | AWS: the profile in `~/.aws/config` (default: `default`, or `AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the active one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`. |
 | `project` | `string` | none | GCP project id (default: `gcloud config get project`). Hetzner and Modal with a sealed token: a name for the project or workspace (default `default`), to tell several apart. |
-| `provider` | `string` | required | `aws`, `azure`, `gcp`, `hetzner` or `modal`. |
-| `region` | `string` | none | AWS region (default: the profile's, else `us-west-2`), Hetzner location (default `fsn1`), GCP region (default `us-central1`) or Azure region (default `westus2`). |
-| `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner with `auth: cli`, saved in this device's Cua credential store). |
+| `provider` | `string` | required | `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`. |
+| `region` | `string` | none | AWS region (default: the profile's, else `us-west-2`), Hetzner location (default `fsn1`), GCP region (default `us-central1`), Azure region (default `westus2`), or Alibaba Cloud region (default `cn-hangzhou`). |
+| `relay_mode` | `string` | none | Relay authentication mode (`account` or `static`; defaults to `account`). |
+| `relay_token` | `string` | none | Shared static relay registration token for Static Relay Mode. Secret: never logged, returned, or stored in plaintext config. |
+| `relay_url` | `string` | none | Per-connection relay base URL (defaults to `https://relay.cua.ai` in Account Relay Mode). |
+| `spacesd_download_url` | `string` | none | Optional custom `cua-spacesd` binary mirror URL (with optional `#sha256=<64 hex>` fragment). |
+| `token` | `string` | none | Hetzner: the project's Read & Write API token (default: `HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context). Modal: `<token id>:<token secret>`. Alibaba Cloud ECS: `<access_key_id>:<access_key_secret>`. Secret: never logged or returned; sealed to the account's devices on connect (or, Hetzner and Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua credential store). |
+| `vpc_id` | `string` | none | Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired with `vswitch_id`. |
+| `vswitch_id` | `string` | none | Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be paired with `vpc_id`. |
+| `windows_image_id` | `string` | none | Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`). |
 | `zone` | `string` | none | GCP zone in the region (default: its `-a` zone). |
 
 #### Result
@@ -441,7 +461,7 @@ Refuses (a `cloud` error listing them) while Cua-created instances or sandboxes 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `delete` | `boolean` | `false` | Delete everything Cua created in that cloud first, and disconnect only once the cloud confirms nothing is left. Default false: the call is refused (listing them) while Cua resources still run there. |
-| `provider` | `string` | required | `aws`, `azure`, `gcp`, `hetzner` or `modal`. |
+| `provider` | `string` | required | `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`. |
 
 #### Result
 
@@ -471,7 +491,7 @@ Only for a person, never for an agent: no MCP server lists or runs it, the daemo
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `deny` | `boolean` | `false` | Decline instead: an agent's raise is dropped (the limits in force stay), an agent's link that was never approved is disconnected. Default false. |
-| `provider` | `string` | required | `aws`, `gcp`, `hetzner` or `modal`. |
+| `provider` | `string` | required | `aws`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`. |
 
 #### Result
 
@@ -819,7 +839,7 @@ Reads the append-only audit log under the cua home (cloud/audit.jsonl, rotated a
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `limit` | `integer` | none | How many of the newest entries (default 50, at most 1000). At least 0. |
-| `provider` | `string` | none | Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one. |
+| `provider` | `string` | none | Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`). Default: every one. |
 
 #### Result
 
@@ -849,7 +869,7 @@ Estimates what the machines Cua created cost: each one's list price times how lo
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `by` | `string` | `space` | One row per `space`, `agent`, `day` (UTC) or `cloud`. Default `space`. |
-| `provider` | `string` | none | Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one. |
+| `provider` | `string` | none | Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`). Default: every one. |
 | `since` | `string` | none | The first day counted, `YYYY-MM-DD` (UTC). Default: the first of this month. |
 
 #### Result

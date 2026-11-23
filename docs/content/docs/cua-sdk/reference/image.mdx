@@ -1002,6 +1002,9 @@ Options for `Sandboxes.create`.
 | `spacesd` | `Option<bool>` | `None` | Whether an image without cua-spacesd gets a static one injected, so any OCI image is a full Space (local containers and microVMs: exec, files, ports). `None` (the default): yes. `Some(false)` runs the image as it is. |
 | `profile` | `Option<String>` | `None` | A size profile: defaults for what is left unset. `"rollout"`: 1 vCPU, 1024 MiB and `headless` (a local VM gets no display hardware, so many more fit on one machine), for RL rollouts and agent episodes that mostly wait. `None` or `"default"`: 2 vCPUs, 4096 MiB. |
 | `forkable` | `Option<bool>` | `None` | A fork source (a "bake" sandbox): a local QEMU VM's guest RAM is a shared file, so its checkpoints take milliseconds and forks of them share its pages (`Sandboxes.checkpoint`, `Sandboxes.fork`). Other kinds ignore it. `None` (the default): not one. |
+| `disk_gb` / `diskGb` | `Option<u32>` | `None` | Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default). |
+| `cloud_image_id` / `cloudImageId` | `Option<String>` | `None` | Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`), distinct from `image` (the Sandbox Image). |
+| `instance_type` / `instanceType` | `Option<String>` | `None` | Per-create cloud instance type override (e.g. `ecs.g7.xlarge`). |
 
 ## `ReadinessProbe` record
 

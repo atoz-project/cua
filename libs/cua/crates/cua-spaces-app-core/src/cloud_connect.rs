@@ -449,7 +449,10 @@ pub fn connected_clouds_from_status(
 
 /// Whether `on` (a `default.on` value) names one of the user's clouds.
 pub fn is_cloud_word(on: &str) -> bool {
-    matches!(on, "aws" | "azure" | "gcp" | "hetzner" | "modal")
+    matches!(
+        on,
+        "aws" | "azure" | "gcp" | "hetzner" | "modal" | "aliyun-ecs"
+    )
 }
 
 /// The sheet's first state.
@@ -527,6 +530,17 @@ fn touches_of(name: &str) -> Vec<String> {
                 .into(),
             "Remove everything Cua created with `cua cloud sweep modal --all --delete`.".into(),
         ],
+        "aliyun-ecs" => vec![
+            "Creates one ECS instance per sandbox, plus a dedicated zero-ingress security group \
+             and VPC when needed. No RAM users or keys are created."
+                .into(),
+            common.into(),
+            "Costs are billed to your Alibaba Cloud account. Each sandbox ends itself after its \
+             time limit (8 hours by default)."
+                .into(),
+            "Remove everything Cua created with `cua cloud sweep aliyun-ecs --all --delete`."
+                .into(),
+        ],
         _ => vec![],
     }
 }
@@ -550,7 +564,7 @@ fn field_of(p: &CloudProviderInput) -> (&'static str, &'static str, &str) {
 }
 
 fn has_profile(p: &CloudProviderInput) -> bool {
-    matches!(p.name.as_str(), "aws" | "modal")
+    matches!(p.name.as_str(), "aws" | "modal" | "aliyun-ecs")
 }
 
 fn has_token(p: &CloudProviderInput) -> bool {
@@ -1264,5 +1278,13 @@ mod tests {
                 .any(|l| l.contains("cua cloud sweep hetzner --all --delete"))
         );
         assert!(is_cloud_word("hetzner"));
+        assert!(is_cloud_word("aliyun-ecs"));
+        let aliyun = touches_of("aliyun-ecs");
+        assert!(aliyun.iter().any(|l| l.contains("ECS instance")));
+        assert!(
+            aliyun
+                .iter()
+                .any(|l| l.contains("cua cloud sweep aliyun-ecs --all --delete"))
+        );
     }
 }

@@ -363,6 +363,30 @@ deployment. Nothing is created.
 cua cloud status azure
 ```
 
+## Alibaba Cloud ECS
+
+Alibaba Cloud ECS (`aliyun-ecs`) uses a RAM sub-account AccessKey pair (or an
+`AK`-mode profile in `~/.aliyun/config.json`) with the
+[least-privilege RAM policy](/cua-sdk/guides/your-cloud-safety#alibaba-cloud-ecs).
+Never print or store the AccessKey secret yourself; pipe
+`<access_key_id>:<access_key_secret>` via `--token-stdin` or use a local
+profile.
+
+```bash test="cli-shape" id="agents-connect-aliyun-ecs"
+cua cloud connect aliyun-ecs --region cn-hangzhou --budget 200 --max-size 4x16
+```
+
+To target a self-hosted relay without `cua auth login` (Static Relay Mode),
+pass `--relay-url`, `--relay-mode static` and `--relay-token-stdin`:
+
+```bash test="cli-shape" id="agents-connect-aliyun-ecs-static-relay"
+printf '%s\n' "$RELAY_TOKEN" | cua cloud connect aliyun-ecs \
+  --region cn-hangzhou \
+  --relay-url https://relay.example.com \
+  --relay-mode static \
+  --relay-token-stdin
+```
+
 ## Other clouds
 
 Hetzner and Modal link with a token sealed to the person's computers (see

@@ -305,3 +305,154 @@ async fn the_creating_host_deletes_it_for_the_owner() {
     assert!(w.fake.account.lock().unwrap().resources.is_empty());
     assert!(w.relay.machine(&machine).is_none());
 }
+
+#[tokio::test]
+async fn static_relay_cloud_space_works_without_cua_auth_login() {
+    use base64::Engine as _;
+    use cua_sandbox_core::byoc::RelayMode;
+    use cua_spacesd_client::testing::{MockAuth, MockServer};
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_static_token("static-spaces-tok");
+    relay.set_account_auth(false);
+    let mock = MockServer::start(MockAuth::default()).await;
+
+    let fake = FakeProvider::new("aws", Tier::Vm);
+    {
+        let relay = relay.clone();
+        let mock_url = mock.url();
+        fake.on_boot(Arc::new(move |spec, _| {
+            let machine = spec.tags[model::tag::MACHINE].clone();
+            let marker = "path: /etc/cua/sandbox.env\n";
+            let at = spec.user_data.find(marker).unwrap();
+            let rest = &spec.user_data[at..];
+            let c = rest.find("content: ").unwrap() + "content: ".len();
+            let end = rest[c..].find('\n').unwrap_or(rest.len() - c);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(rest[c..c + end].trim())
+                .unwrap();
+            let env_file = String::from_utf8(bytes).unwrap();
+            let env_tok = env_file
+                .lines()
+                .find_map(|l| l.strip_prefix("CUA_ENV_TOKEN="))
+                .unwrap()
+                .to_string();
+            relay.tunnel(&machine, &mock_url);
+            relay.set_static_online(&machine, true, Some(&env_tok));
+        }));
+    }
+
+    struct NoLogin;
+    #[async_trait::async_trait]
+    impl cua_host::relay::AccountTokens for NoLogin {
+        async fn access_token(&self) -> cua_host::Result<String> {
+            Err(cua_host::Error::Unauthenticated("not logged in".into()))
+        }
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(dir.path().join("sandboxes")),
+        dir.path(),
+        vec![fake.clone()],
+        RelayAccess::new(relay.url.clone(), Arc::new(NoLogin)),
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect(
+            &Target {
+                provider: "aws".into(),
+                relay_url: Some(relay.url.clone()),
+                relay_mode: Some(RelayMode::Static),
+                relay_token: Some("static-spaces-tok".into()),
+                ..Default::default()
+            },
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let spaces = Spaces::builder()
+        .home(dir.path())
+        .sandboxes(sandboxes.clone())
+        .build();
+
+    let created = spaces
+        .create(SpaceCreate {
+            on: Some(On::Provider("aws".into())),
+            image: Some("registry.invalid/trycua/linux:24.04".into()),
+            name: Some("Static Box".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .ready()
+        .unwrap();
+    assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
+    assert_eq!(created.name, "static-box");
+
+    let listed = spaces.list().unwrap();
+    let row = listed.iter().find(|i| i.id == created.id).unwrap();
+    assert_eq!(
+        (
+            row.cloud.as_str(),
+            row.cloud_place.as_str(),
+            row.cloud_delete.as_str()
+        ),
+        ("aws", "Fake \u{b7} fake-1", "here")
+    );
+    let found = spaces.find(&created.id).await.unwrap();
+    assert_eq!(found.id, created.id);
+
+    let sp = spaces.space(&created.id).await.unwrap();
+    let out = sp
+        .bash("echo static-spaces", std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(out.render().contains("static-spaces"), "{}", out.render());
+
+    let off = spaces.stop(&created.id).await.unwrap();
+    assert_eq!(off.state, "stopped");
+    let on = spaces.start(&created.id).await.unwrap();
+    assert_eq!(on.state, "running");
+
+    let msg = spaces.delete(&created.id).await.unwrap();
+    assert!(msg.contains("in your cloud"), "{msg}");
+    assert!(fake.account.lock().unwrap().resources.is_empty());
+    assert!(spaces.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn spaces_create_forwards_cloud_image_id_disk_gb_and_instance_type_to_provider() {
+    let w = world().await;
+    {
+        let mut acct = w.fake.account.lock().unwrap();
+        acct.allow_custom_image_and_sizing = true;
+        acct.supported_oses = Some(&["linux", "windows"]);
+    }
+    let created = w
+        .spaces
+        .create(SpaceCreate {
+            on: Some(On::Provider("aws".into())),
+            image: Some("windows".into()),
+            name: Some("Win Space".into()),
+            disk_gb: Some(90),
+            instance_type: Some("ecs.c7.2xlarge".into()),
+            cloud_image_id: Some("m-win11-space".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .ready()
+        .unwrap();
+    assert!(created.id.starts_with("relay:cloud-"), "{}", created.id);
+    let specs = w.fake.account.lock().unwrap().specs.clone();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].cloud_image_id.as_deref(), Some("m-win11-space"));
+    assert_eq!(specs[0].disk_gb, 90);
+    assert_eq!(specs[0].machine_type, "ecs.c7.2xlarge");
+    assert_eq!(specs[0].family, "windows");
+}

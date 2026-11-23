@@ -508,20 +508,23 @@ impl Spaces {
         let Some(machine) = machine else {
             return Ok(());
         };
+        if self.is_static_relay_machine(&machine) {
+            return Ok(());
+        }
         let shown = info.shown_name().to_string();
         let refused = || {
             Error::Relay(cua_host::Error::PermissionDenied(format!(
                 "{shown} is shared with you. Only its owner can rename it."
             )))
         };
-        let relay = match self.relay_account() {
-            Some(r) => r,
+        let relay = if self.relay_account().is_some() {
+            self.relay_for_machine(&machine)?
+        } else if relay_space {
             // Not signed in: the relay's own "sign in" error.
-            None if relay_space => self.relay()?,
-            None => {
-                tracing::info!(space = %info.id, "renamed here only: not signed in to the relay");
-                return Ok(());
-            }
+            self.relay()?
+        } else {
+            tracing::info!(space = %info.id, "renamed here only: not signed in to the relay");
+            return Ok(());
         };
         let token = relay.tokens.access_token().await?;
         let client = relay.client().await?;

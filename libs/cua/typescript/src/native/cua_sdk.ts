@@ -5620,7 +5620,45 @@ export type CloudProvider = {
      * `sealed`: the devices that can open the account's API token
      * ("Can open it").
      */
-    holders: Array<string>
+    holders: Array<string>,
+    /**
+     * Per-connection relay base URL (`https://relay.cua.ai` by default),
+     * or `None` when not connected.
+     */
+    relayUrl?: string,
+    /**
+     * Relay authentication mode (`account` or `static`), or `None` when
+     * not connected.
+     */
+    relayMode?: string,
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL.
+     */
+    spacesdDownloadUrl?: string,
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+     */
+    vpcId?: string,
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+     */
+    vswitchId?: string,
+    /**
+     * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+     */
+    noPublicIp: boolean,
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    windowsImageId?: string,
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    linuxImageId?: string,
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    instanceType?: string
 }
 
 /**
@@ -5628,6 +5666,14 @@ export type CloudProvider = {
  */
 export const CloudProvider = (() => {
     const defaults = () => ({
+        relayMode: undefined,
+        spacesdDownloadUrl: undefined,
+        vpcId: undefined,
+        vswitchId: undefined,
+        noPublicIp: false,
+        windowsImageId: undefined,
+        linuxImageId: undefined,
+        instanceType: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<CloudProvider, ReturnType<typeof defaults>>(defaults);
@@ -5672,7 +5718,16 @@ const FfiConverterTypeCloudProvider = (() => {
                 canApprove: FfiConverterBool.read(from),
                 suggestAuth: FfiConverterString.read(from),
                 issue: FfiConverterString.read(from),
-                holders: FfiConverterSequenceString.read(from)
+                holders: FfiConverterSequenceString.read(from),
+                relayUrl: FfiConverterOptionalString.read(from),
+                relayMode: FfiConverterOptionalString.read(from),
+                spacesdDownloadUrl: FfiConverterOptionalString.read(from),
+                vpcId: FfiConverterOptionalString.read(from),
+                vswitchId: FfiConverterOptionalString.read(from),
+                noPublicIp: FfiConverterBool.read(from),
+                windowsImageId: FfiConverterOptionalString.read(from),
+                linuxImageId: FfiConverterOptionalString.read(from),
+                instanceType: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -5705,6 +5760,15 @@ const FfiConverterTypeCloudProvider = (() => {
             FfiConverterString.write(value.suggestAuth, into);
             FfiConverterString.write(value.issue, into);
             FfiConverterSequenceString.write(value.holders, into);
+            FfiConverterOptionalString.write(value.relayUrl, into);
+            FfiConverterOptionalString.write(value.relayMode, into);
+            FfiConverterOptionalString.write(value.spacesdDownloadUrl, into);
+            FfiConverterOptionalString.write(value.vpcId, into);
+            FfiConverterOptionalString.write(value.vswitchId, into);
+            FfiConverterBool.write(value.noPublicIp, into);
+            FfiConverterOptionalString.write(value.windowsImageId, into);
+            FfiConverterOptionalString.write(value.linuxImageId, into);
+            FfiConverterOptionalString.write(value.instanceType, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.name) +
@@ -5735,7 +5799,16 @@ const FfiConverterTypeCloudProvider = (() => {
              FfiConverterBool.allocationSize(value.canApprove) +
              FfiConverterString.allocationSize(value.suggestAuth) +
              FfiConverterString.allocationSize(value.issue) +
-             FfiConverterSequenceString.allocationSize(value.holders);
+             FfiConverterSequenceString.allocationSize(value.holders) +
+             FfiConverterOptionalString.allocationSize(value.relayUrl) +
+             FfiConverterOptionalString.allocationSize(value.relayMode) +
+             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl) +
+             FfiConverterOptionalString.allocationSize(value.vpcId) +
+             FfiConverterOptionalString.allocationSize(value.vswitchId) +
+             FfiConverterBool.allocationSize(value.noPublicIp) +
+             FfiConverterOptionalString.allocationSize(value.windowsImageId) +
+             FfiConverterOptionalString.allocationSize(value.linuxImageId) +
+             FfiConverterOptionalString.allocationSize(value.instanceType);
 
         }
     };
@@ -6323,15 +6396,15 @@ const FfiConverterTypeCloudSweepReport = (() => {
  */
 export type CloudTarget = {
     /**
-     * `aws`, `gcp`, `hetzner` or `modal`.
+     * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
      */
     provider: string,
     /**
-     * AWS or Modal profile.
+     * AWS, Modal, or Alibaba Cloud CLI profile.
      */
     profile?: string,
     /**
-     * AWS or GCP region, or Hetzner location (`fsn1`).
+     * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
      */
     region?: string,
     /**
@@ -6347,11 +6420,57 @@ export type CloudTarget = {
      */
     environment?: string,
     /**
-     * Hetzner: the project's Read & Write API token. Secret: used for the
-     * checks, saved in the Cua credential store when they pass, never
-     * printed.
+     * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+     * Secret: used for the checks, saved in the Cua credential store when
+     * they pass, never printed.
      */
-    token?: string
+    token?: string,
+    /**
+     * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+     * in Account Relay Mode).
+     */
+    relayUrl?: string,
+    /**
+     * Relay authentication mode (`account` or `static`; defaults to `account`).
+     */
+    relayMode?: string,
+    /**
+     * Shared static relay registration token for Static Relay Mode. Secret:
+     * never printed or stored in plaintext config.
+     */
+    relayToken?: string,
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL (with optional
+     * `#sha256=<64 hex>` fragment).
+     */
+    spacesdDownloadUrl?: string,
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+     * with `vswitch_id`.
+     */
+    vpcId?: string,
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+     * paired with `vpc_id`.
+     */
+    vswitchId?: string,
+    /**
+     * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+     * `aliyun-ecs` only).
+     */
+    noPublicIp: boolean,
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    windowsImageId?: string,
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    linuxImageId?: string,
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    instanceType?: string
 }
 
 /**
@@ -6364,7 +6483,17 @@ export const CloudTarget = (() => {
         zone: undefined,
         project: undefined,
         environment: undefined,
-        token: undefined
+        token: undefined,
+        relayUrl: undefined,
+        relayMode: undefined,
+        relayToken: undefined,
+        spacesdDownloadUrl: undefined,
+        vpcId: undefined,
+        vswitchId: undefined,
+        noPublicIp: false,
+        windowsImageId: undefined,
+        linuxImageId: undefined,
+        instanceType: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<CloudTarget, ReturnType<typeof defaults>>(defaults);
@@ -6387,7 +6516,17 @@ const FfiConverterTypeCloudTarget = (() => {
                 zone: FfiConverterOptionalString.read(from),
                 project: FfiConverterOptionalString.read(from),
                 environment: FfiConverterOptionalString.read(from),
-                token: FfiConverterOptionalString.read(from)
+                token: FfiConverterOptionalString.read(from),
+                relayUrl: FfiConverterOptionalString.read(from),
+                relayMode: FfiConverterOptionalString.read(from),
+                relayToken: FfiConverterOptionalString.read(from),
+                spacesdDownloadUrl: FfiConverterOptionalString.read(from),
+                vpcId: FfiConverterOptionalString.read(from),
+                vswitchId: FfiConverterOptionalString.read(from),
+                noPublicIp: FfiConverterBool.read(from),
+                windowsImageId: FfiConverterOptionalString.read(from),
+                linuxImageId: FfiConverterOptionalString.read(from),
+                instanceType: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -6398,6 +6537,16 @@ const FfiConverterTypeCloudTarget = (() => {
             FfiConverterOptionalString.write(value.project, into);
             FfiConverterOptionalString.write(value.environment, into);
             FfiConverterOptionalString.write(value.token, into);
+            FfiConverterOptionalString.write(value.relayUrl, into);
+            FfiConverterOptionalString.write(value.relayMode, into);
+            FfiConverterOptionalString.write(value.relayToken, into);
+            FfiConverterOptionalString.write(value.spacesdDownloadUrl, into);
+            FfiConverterOptionalString.write(value.vpcId, into);
+            FfiConverterOptionalString.write(value.vswitchId, into);
+            FfiConverterBool.write(value.noPublicIp, into);
+            FfiConverterOptionalString.write(value.windowsImageId, into);
+            FfiConverterOptionalString.write(value.linuxImageId, into);
+            FfiConverterOptionalString.write(value.instanceType, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.provider) +
@@ -6406,7 +6555,17 @@ const FfiConverterTypeCloudTarget = (() => {
              FfiConverterOptionalString.allocationSize(value.zone) +
              FfiConverterOptionalString.allocationSize(value.project) +
              FfiConverterOptionalString.allocationSize(value.environment) +
-             FfiConverterOptionalString.allocationSize(value.token);
+             FfiConverterOptionalString.allocationSize(value.token) +
+             FfiConverterOptionalString.allocationSize(value.relayUrl) +
+             FfiConverterOptionalString.allocationSize(value.relayMode) +
+             FfiConverterOptionalString.allocationSize(value.relayToken) +
+             FfiConverterOptionalString.allocationSize(value.spacesdDownloadUrl) +
+             FfiConverterOptionalString.allocationSize(value.vpcId) +
+             FfiConverterOptionalString.allocationSize(value.vswitchId) +
+             FfiConverterBool.allocationSize(value.noPublicIp) +
+             FfiConverterOptionalString.allocationSize(value.windowsImageId) +
+             FfiConverterOptionalString.allocationSize(value.linuxImageId) +
+             FfiConverterOptionalString.allocationSize(value.instanceType);
 
         }
     };
@@ -17438,7 +17597,20 @@ export type SandboxCreateOptions = {
      * share its pages ([`Sandboxes::checkpoint`], [`Sandboxes::fork`]).
      * Other kinds ignore it. `None` (the default): not one.
      */
-    forkable?: boolean
+    forkable?: boolean,
+    /**
+     * Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+     */
+    diskGb?: number,
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    cloudImageId?: string,
+    /**
+     * Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+     */
+    instanceType?: string
 }
 
 /**
@@ -17473,7 +17645,10 @@ export const SandboxCreateOptions = (() => {
         headless: false,
         spacesd: undefined,
         profile: undefined,
-        forkable: undefined
+        forkable: undefined,
+        diskGb: undefined,
+        cloudImageId: undefined,
+        instanceType: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<SandboxCreateOptions, ReturnType<typeof defaults>>(defaults);
@@ -17517,7 +17692,10 @@ const FfiConverterTypeSandboxCreateOptions = (() => {
                 headless: FfiConverterBool.read(from),
                 spacesd: FfiConverterOptionalBoolean.read(from),
                 profile: FfiConverterOptionalString.read(from),
-                forkable: FfiConverterOptionalBoolean.read(from)
+                forkable: FfiConverterOptionalBoolean.read(from),
+                diskGb: FfiConverterOptionalUInt32.read(from),
+                cloudImageId: FfiConverterOptionalString.read(from),
+                instanceType: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -17549,6 +17727,9 @@ const FfiConverterTypeSandboxCreateOptions = (() => {
             FfiConverterOptionalBoolean.write(value.spacesd, into);
             FfiConverterOptionalString.write(value.profile, into);
             FfiConverterOptionalBoolean.write(value.forkable, into);
+            FfiConverterOptionalUInt32.write(value.diskGb, into);
+            FfiConverterOptionalString.write(value.cloudImageId, into);
+            FfiConverterOptionalString.write(value.instanceType, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalString.allocationSize(value.on) +
@@ -17578,7 +17759,10 @@ const FfiConverterTypeSandboxCreateOptions = (() => {
              FfiConverterBool.allocationSize(value.headless) +
              FfiConverterOptionalBoolean.allocationSize(value.spacesd) +
              FfiConverterOptionalString.allocationSize(value.profile) +
-             FfiConverterOptionalBoolean.allocationSize(value.forkable);
+             FfiConverterOptionalBoolean.allocationSize(value.forkable) +
+             FfiConverterOptionalUInt32.allocationSize(value.diskGb) +
+             FfiConverterOptionalString.allocationSize(value.cloudImageId) +
+             FfiConverterOptionalString.allocationSize(value.instanceType);
 
         }
     };
@@ -19939,7 +20123,12 @@ export type SpaceCreateOptions = {
      * Lets the Space make child Spaces of its own ([`Spaces::set_children`]).
      * `None`: off. Only a Space the machine of the runtime runs itself.
      */
-    children?: boolean
+    children?: boolean,
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    cloudImageId?: string
 }
 
 /**
@@ -19978,7 +20167,8 @@ export const SpaceCreateOptions = (() => {
         widen: undefined,
         instanceType: undefined,
         region: undefined,
-        children: undefined
+        children: undefined,
+        cloudImageId: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<SpaceCreateOptions, ReturnType<typeof defaults>>(defaults);
@@ -20026,7 +20216,8 @@ const FfiConverterTypeSpaceCreateOptions = (() => {
                 widen: FfiConverterOptionalBoolean.read(from),
                 instanceType: FfiConverterOptionalString.read(from),
                 region: FfiConverterOptionalString.read(from),
-                children: FfiConverterOptionalBoolean.read(from)
+                children: FfiConverterOptionalBoolean.read(from),
+                cloudImageId: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -20062,6 +20253,7 @@ const FfiConverterTypeSpaceCreateOptions = (() => {
             FfiConverterOptionalString.write(value.instanceType, into);
             FfiConverterOptionalString.write(value.region, into);
             FfiConverterOptionalBoolean.write(value.children, into);
+            FfiConverterOptionalString.write(value.cloudImageId, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalString.allocationSize(value.image) +
@@ -20095,7 +20287,8 @@ const FfiConverterTypeSpaceCreateOptions = (() => {
              FfiConverterOptionalBoolean.allocationSize(value.widen) +
              FfiConverterOptionalString.allocationSize(value.instanceType) +
              FfiConverterOptionalString.allocationSize(value.region) +
-             FfiConverterOptionalBoolean.allocationSize(value.children);
+             FfiConverterOptionalBoolean.allocationSize(value.children) +
+             FfiConverterOptionalString.allocationSize(value.cloudImageId);
 
         }
     };

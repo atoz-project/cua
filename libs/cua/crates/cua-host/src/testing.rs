@@ -29,6 +29,14 @@ struct Record {
     token: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct StaticMachine {
+    online: bool,
+    env_token: Option<String>,
+    relay_token: Option<String>,
+    version: String,
+}
+
 #[derive(Clone, Debug)]
 struct FakeDevice {
     account: String,
@@ -55,6 +63,12 @@ struct State_ {
     /// account token → identity
     accounts: BTreeMap<String, Identity>,
     machines: BTreeMap<String, Record>,
+    /// Shared static relay registration tokens (`Static Relay Mode`).
+    static_tokens: std::collections::BTreeSet<String>,
+    /// Static-registered machines (`machine_id` -> state).
+    static_machines: BTreeMap<String, StaticMachine>,
+    /// When true, `/v1/info` reports `"account_auth": false` (pure static relay).
+    disable_account_auth: bool,
     public_url: String,
     devices: BTreeMap<String, FakeDevice>,
     /// session token → (account, device)
@@ -1257,6 +1271,80 @@ async fn usage(State(s): State<S>, headers: HeaderMap) -> Response {
     }
 }
 
+async fn relay_connect(State(s): State<S>, headers: HeaderMap) -> Response {
+    let id = headers
+        .get("x-cua-machine-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    let valid_id = (8..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid_id {
+        return err(StatusCode::BAD_REQUEST, "missing or invalid computer id");
+    }
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+    else {
+        return err(StatusCode::UNAUTHORIZED, "invalid relay token");
+    };
+    let version = headers
+        .get("x-cua-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mut st = s.lock().unwrap();
+    if st.static_tokens.contains(&token) {
+        if st.machines.contains_key(id) {
+            return err(
+                StatusCode::CONFLICT,
+                "computer id is registered to an account",
+            );
+        }
+        if st
+            .static_machines
+            .get(id)
+            .and_then(|m| m.relay_token.as_deref())
+            .is_some_and(|t| t != token)
+        {
+            return err(
+                StatusCode::CONFLICT,
+                "computer id registered with another token",
+            );
+        }
+        let entry = st.static_machines.entry(id.to_string()).or_default();
+        entry.online = true;
+        entry.relay_token = Some(token);
+        if !version.is_empty() {
+            entry.version = version;
+        }
+        return StatusCode::OK.into_response();
+    }
+    if let Some(rec) = st.machines.get_mut(id)
+        && rec.token == token
+    {
+        rec.machine.online = true;
+        if !version.is_empty() {
+            rec.machine.version = version;
+        }
+        let owner = rec.machine.owner.id.clone();
+        use base64::Engine as _;
+        let jwks = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(fake_jwks().to_string().as_bytes());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("x-cua-relay-owner", owner)
+            .header("x-cua-relay-jwks", jwks)
+            .body(axum::body::Body::empty())
+            .expect("connect ok");
+    }
+    err(StatusCode::UNAUTHORIZED, "invalid relay token")
+}
+
 async fn proxied(
     State(s): State<S>,
     method: axum::http::Method,
@@ -1268,23 +1356,86 @@ async fn proxied(
     if let Some(r) = refused {
         return r;
     }
+    let id = uri
+        .path()
+        .strip_prefix("/m/")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let static_machine = s.lock().unwrap().static_machines.get(&id).cloned();
+    if let Some(sm) = static_machine {
+        if !sm.online {
+            if content_type.starts_with("application/grpc") {
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(axum::http::header::CONTENT_TYPE, content_type)
+                    .header("grpc-status", "14")
+                    .header("grpc-message", "the computer is not connected")
+                    .body(axum::body::Body::empty())
+                    .expect("offline");
+            }
+            return err(StatusCode::BAD_GATEWAY, "the computer is not connected");
+        }
+        let is_health = uri.path().ends_with("/health");
+        if !is_health && let Some(expected) = sm.env_token.as_deref() {
+            let given = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            if given != Some(expected) {
+                if content_type.starts_with("application/grpc") {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, content_type)
+                        .header("grpc-status", "16")
+                        .header("grpc-message", "invalid env token")
+                        .body(axum::body::Body::empty())
+                        .expect("unauthenticated");
+                }
+                return err(StatusCode::UNAUTHORIZED, "invalid env token");
+            }
+        }
+        if let Some(target) = target
+            && content_type.starts_with("application/grpc-web")
+        {
+            return forward(&target, method, &uri, &headers, payload).await;
+        }
+        if content_type.starts_with("application/grpc-web")
+            && (uri
+                .path()
+                .ends_with("/cua.env.v1.SystemService/GetCapabilities")
+                || uri.path().ends_with("/cua.env.v1.SystemService/Health"))
+        {
+            let trailers = b"grpc-status:0\r\n";
+            let mut body = Vec::with_capacity(5 + 5 + trailers.len());
+            body.extend_from_slice(&[0u8, 0, 0, 0, 0]);
+            body.push(0x80);
+            body.extend_from_slice(&(trailers.len() as u32).to_be_bytes());
+            body.extend_from_slice(trailers);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/grpc-web")
+                .body(axum::body::Body::from(body))
+                .expect("grpc-web ok");
+        }
+        if is_health {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        return err(StatusCode::BAD_GATEWAY, "the fake relay does not tunnel");
+    }
     {
         let st = s.lock().unwrap();
-        let offline = uri
-            .path()
-            .strip_prefix("/m/")
-            .and_then(|rest| rest.split('/').next())
-            .and_then(|id| st.machines.get(id))
-            .is_some_and(|r| !r.machine.online);
+        let offline = st.machines.get(&id).is_some_and(|r| !r.machine.online);
         if st.refuse_offline && offline {
             return err(StatusCode::BAD_GATEWAY, "the computer is not connected");
         }
     }
     if let Some(target) = target
-        && headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("application/grpc-web"))
+        && content_type.starts_with("application/grpc-web")
     {
         return forward(&target, method, &uri, &headers, payload).await;
     }
@@ -1431,14 +1582,16 @@ impl FakeRelay {
             .route(
                 "/v1/info",
                 get(|State(s): State<S>| async move {
+                    let st = s.lock().unwrap();
                     Json(serde_json::json!({
-                        "public_url": s.lock().unwrap().public_url,
-                        "issuer": "fake-relay",
-                        "account_auth": true,
-                        "static_tokens": false,
+                        "public_url": st.public_url,
+                        "issuer": if st.disable_account_auth { serde_json::Value::Null } else { serde_json::Value::String("fake-relay".into()) },
+                        "account_auth": !st.disable_account_auth,
+                        "static_tokens": !st.static_tokens.is_empty(),
                     }))
                 }),
             )
+            .route("/relay/v1/connect", get(relay_connect))
             .route(
                 "/.well-known/jwks.json",
                 get(|| async { Json(fake_jwks()) }),
@@ -1510,6 +1663,41 @@ impl FakeRelay {
         self.load
             .delay_ms
             .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Accepts `token` as a shared Static Relay Mode registration token.
+    pub fn add_static_token(&self, token: impl Into<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .static_tokens
+            .insert(token.into());
+    }
+
+    /// Controls whether `/v1/info` advertises `account_auth`.
+    pub fn set_account_auth(&self, enabled: bool) {
+        self.state.lock().unwrap().disable_account_auth = !enabled;
+    }
+
+    /// Marks a static-mode machine online (or offline), optionally enforcing
+    /// `Authorization: Bearer <env_token>` on `/m/<id>/...` calls.
+    pub fn set_static_online(&self, id: &str, online: bool, env_token: Option<&str>) {
+        let mut st = self.state.lock().unwrap();
+        let entry = st.static_machines.entry(id.to_string()).or_default();
+        entry.online = online;
+        if let Some(tok) = env_token {
+            entry.env_token = Some(tok.to_string());
+        }
+    }
+
+    /// Whether `id` has registered or been marked in Static Relay Mode.
+    pub fn static_machine_online(&self, id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .static_machines
+            .get(id)
+            .is_some_and(|m| m.online)
     }
 
     /// Accepts `token` as the account `id` (with `email`).

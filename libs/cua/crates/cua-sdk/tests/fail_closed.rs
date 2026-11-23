@@ -22,7 +22,10 @@ use cua_sandbox_core::{
     InstanceStatus, LocalEndpoints, LocalInstance, LocalRuntime, LocalStartSpec, LocalSummary,
     RuntimeError, RuntimeResult,
 };
-use cua_sdk::{Cua, CuaError, EgressPolicy, SandboxCreateOptions, SpaceCreateOptions};
+use cua_sdk::{
+    Cua, CuaError, EgressPolicy, SandboxCreateOptions, SpaceCreateListener, SpaceCreateOptions,
+    SpaceCreateProgress,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -187,6 +190,134 @@ async fn old_daemon() -> (Arc<Old>, Arc<Cua>) {
     );
     let cua = Cua::connect(Some(format!("http://{addr}")), Some("token".into())).unwrap();
     (old, cua)
+}
+
+/// An M5-era daemon: has `GetInfo` (without M6a sandbox features) and
+/// `ListSpaceTools` (whose `create_space` lacks `cloud_image_id` and `disk_gb`),
+/// and silently ignores proto tags added in M6a.
+#[derive(Clone)]
+struct M5Daemon<const SVC: u8>(Arc<Old>);
+
+impl<const SVC: u8> tonic::server::NamedService for M5Daemon<SVC> {
+    const NAME: &'static str = match SVC {
+        0 => "cua.daemon.v1.SpaceService",
+        1 => "cua.daemon.v1.SandboxService",
+        _ => "cua.daemon.v1.DaemonService",
+    };
+}
+
+impl<B, const SVC: u8> tower::Service<http::Request<B>> for M5Daemon<SVC>
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = BoxFut<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let old = self.0.clone();
+        match req.uri().path() {
+            "/cua.daemon.v1.DaemonService/GetInfo" => {
+                serve(req, move |_: dpb::GetInfoRequest| dpb::GetInfoResponse {
+                    version: "0.9.0-m5".into(),
+                    features: vec![
+                        "env".into(),
+                        "sandboxes".into(),
+                        "spaces".into(),
+                        "mcp".into(),
+                    ],
+                    ..Default::default()
+                })
+            }
+            "/cua.daemon.v1.SpaceService/ListSpaceTools" => {
+                serve(req, move |_: dpb::ListSpaceToolsRequest| {
+                    dpb::ListSpaceToolsResponse {
+                        tools_json: r#"{"tools":[{"name":"create_space","inputSchema":{"properties":{"image":{},"on":{},"kind":{},"runtime":{},"name":{},"cpus":{},"memory_mb":{},"instance_type":{},"region":{}}}}]}"#.into(),
+                    }
+                })
+            }
+            "/cua.daemon.v1.SpaceService/CreateSpace" => {
+                serve(req, move |r: dpb::CreateSpaceRequest| {
+                    let loc = if r.location.is_empty() {
+                        "local".to_string()
+                    } else {
+                        r.location.clone()
+                    };
+                    let id = format!("{loc}:{}", r.name);
+                    let wait = r.wait != Some(false);
+                    old.creates.lock().unwrap().push(r);
+                    dpb::CreateSpaceResponse {
+                        space: Some(dpb::Space {
+                            id,
+                            ..Default::default()
+                        }),
+                        phase: if wait { "ready" } else { "starting" }.into(),
+                        ..Default::default()
+                    }
+                })
+            }
+            "/cua.daemon.v1.SpaceService/DeleteSpace" => {
+                serve(req, move |r: dpb::DeleteSpaceRequest| {
+                    old.deleted.lock().unwrap().push(r.space);
+                    dpb::DeleteSpaceResponse {
+                        message: "deleted".into(),
+                    }
+                })
+            }
+            "/cua.daemon.v1.SandboxService/CreateSandbox" => {
+                serve(req, move |r: dpb::CreateSandboxRequest| {
+                    let name = r.name.clone();
+                    let location = if r.location.is_empty() {
+                        "local".to_string()
+                    } else {
+                        r.location.clone()
+                    };
+                    old.sandbox_creates.lock().unwrap().push(r);
+                    dpb::CreateSandboxResponse {
+                        sandbox: Some(dpb::Sandbox {
+                            name,
+                            location,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                })
+            }
+            "/cua.daemon.v1.SandboxService/DeleteSandbox" => {
+                serve(req, move |r: dpb::DeleteSandboxRequest| {
+                    old.sandboxes_deleted.lock().unwrap().push(r.name);
+                    dpb::DeleteSandboxResponse::default()
+                })
+            }
+            _ => Box::pin(async { Ok(unimplemented()) }),
+        }
+    }
+}
+
+async fn m5_daemon() -> (Arc<Old>, Arc<Cua>) {
+    let old = Arc::new(Old::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(M5Daemon::<0>(old.clone()))
+            .add_service(M5Daemon::<1>(old.clone()))
+            .add_service(M5Daemon::<2>(old.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let cua = Cua::connect(Some(format!("http://{addr}")), Some("token".into())).unwrap();
+    (old, cua)
+}
+
+struct NoopSpaceListener;
+
+impl SpaceCreateListener for NoopSpaceListener {
+    fn on_progress(&self, _: SpaceCreateProgress) {}
 }
 
 fn space(name: &str) -> SpaceCreateOptions {
@@ -472,4 +603,496 @@ async fn an_old_daemon_says_it_cannot_rename() {
         }
         other => panic!("expected CapabilityMissing, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spaces_create_cloud_image_id_fails_closed_against_old_and_m5_daemons() {
+    for (label, old, cua) in [("pre_tools", old_daemon().await), ("m5", m5_daemon().await)]
+        .into_iter()
+        .map(|(l, (o, c))| (l, o, c))
+    {
+        let e = cua
+            .spaces()
+            .create(SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                image: Some("windows".into()),
+                name: Some("sp-old-img".into()),
+                cloud_image_id: Some("m-win11-golden".into()),
+                ..Default::default()
+            })
+            .await
+            .expect_err(&format!("{label}: cloud_image_id must fail closed"));
+        assert!(
+            matches!(&e, CuaError::CapabilityMissing(m) if m.contains("too old")),
+            "{label}: expected CapabilityMissing, got {e:?}"
+        );
+
+        let e_stream = cua
+            .spaces()
+            .create_with_progress(
+                SpaceCreateOptions {
+                    on: Some("aliyun-ecs".into()),
+                    image: Some("windows".into()),
+                    name: Some("sp-old-img-stream".into()),
+                    cloud_image_id: Some("m-win11-golden".into()),
+                    ..Default::default()
+                },
+                Arc::new(NoopSpaceListener),
+            )
+            .await
+            .expect_err(&format!(
+                "{label}: create_with_progress + cloud_image_id must fail closed"
+            ));
+        assert!(
+            matches!(&e_stream, CuaError::CapabilityMissing(m) if m.contains("too old")),
+            "{label}: expected CapabilityMissing, got {e_stream:?}"
+        );
+        assert!(
+            old.creates.lock().unwrap().is_empty(),
+            "{label}: CreateSpace RPC must not be sent"
+        );
+    }
+
+    let (m5, cua_m5) = m5_daemon().await;
+    for (desc, opts) in [
+        (
+            "cloud disk_gb",
+            SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                image: Some("windows".into()),
+                name: Some("sp-m5-disk".into()),
+                disk_gb: Some(100),
+                ..Default::default()
+            },
+        ),
+        (
+            "cloud instance_type",
+            SpaceCreateOptions {
+                on: Some("aliyun-ecs".into()),
+                image: Some("linux".into()),
+                name: Some("sp-m5-inst".into()),
+                instance_type: Some("ecs.c7.2xlarge".into()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let e = cua_m5
+            .spaces()
+            .create(opts)
+            .await
+            .expect_err(&format!("{desc} must fail closed against m5 daemon"));
+        assert!(
+            matches!(&e, CuaError::CapabilityMissing(m) if m.contains("too old")),
+            "{desc}: expected CapabilityMissing, got {e:?}"
+        );
+    }
+    assert!(
+        m5.creates.lock().unwrap().is_empty(),
+        "m5 CreateSpace RPC must not be sent for unsupported cloud sizing"
+    );
+
+    // Local VM disk_gb existed before M6a and remains supported on M5 daemons.
+    let local_res = cua_m5
+        .spaces()
+        .create(SpaceCreateOptions {
+            disk_gb: Some(50),
+            ..space("sp-m5-local-disk")
+        })
+        .await
+        .expect("local disk_gb must stay backwards-compatible on M5 daemon");
+    assert_eq!(local_res.space.unwrap().id, "local:sp-m5-local-disk");
+    assert_eq!(m5.creates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sandboxes_create_m6a_fields_fail_closed_against_old_and_m5_daemons() {
+    for (label, old, cua) in [
+        ("pre_getinfo", old_daemon().await),
+        ("m5", m5_daemon().await),
+    ]
+    .into_iter()
+    .map(|(l, (o, c))| (l, o, c))
+    {
+        for (field, opts) in [
+            ("cloud_image_id", {
+                let mut o = SandboxCreateOptions::new("aliyun-ecs", "windows");
+                o.name = Some("sb-old-img".into());
+                o.cloud_image_id = Some("m-win11-golden".into());
+                o
+            }),
+            ("instance_type", {
+                let mut o = SandboxCreateOptions::new("aliyun-ecs", "windows");
+                o.name = Some("sb-old-inst".into());
+                o.instance_type = Some("ecs.c7.2xlarge".into());
+                o
+            }),
+            ("disk_gb", {
+                let mut o = SandboxCreateOptions::new("aliyun-ecs", "windows");
+                o.name = Some("sb-old-disk".into());
+                o.disk_gb = Some(120);
+                o
+            }),
+        ] {
+            let Err(e) = cua.sandboxes().create(opts.clone()).await else {
+                panic!("{label}/{field}: Sandboxes::create must fail closed");
+            };
+            assert!(
+                matches!(&e, CuaError::CapabilityMissing(m) if m.contains("too old") && m.contains(field)),
+                "{label}/{field}: expected CapabilityMissing naming {field}, got {e:?}"
+            );
+
+            let sink: cua_sandbox_core::progress::Sink = Arc::new(|_| {});
+            let Err(e_rep) = cua.sandboxes().create_reporting(opts, sink).await else {
+                panic!("{label}/{field}: Sandboxes::create_reporting must fail closed");
+            };
+            assert!(
+                matches!(&e_rep, CuaError::CapabilityMissing(m) if m.contains("too old") && m.contains(field)),
+                "{label}/{field}: expected CapabilityMissing naming {field}, got {e_rep:?}"
+            );
+        }
+        assert!(
+            old.sandbox_creates.lock().unwrap().is_empty(),
+            "{label}: CreateSandbox RPC must not be sent"
+        );
+    }
+}
+
+/// An M6a/M6b-era daemon: advertises `FEATURE_CLOUD_IMAGE_AND_SIZING` without
+/// `FEATURE_SANDBOX_TTL`, and silently ignores `CreateSandboxRequest.ttl = 46`.
+#[derive(Clone)]
+struct M6Daemon<const SVC: u8>(Arc<Old>);
+
+impl<const SVC: u8> tonic::server::NamedService for M6Daemon<SVC> {
+    const NAME: &'static str = match SVC {
+        0 => "cua.daemon.v1.SpaceService",
+        1 => "cua.daemon.v1.SandboxService",
+        _ => "cua.daemon.v1.DaemonService",
+    };
+}
+
+impl<B, const SVC: u8> tower::Service<http::Request<B>> for M6Daemon<SVC>
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = BoxFut<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let old = self.0.clone();
+        match req.uri().path() {
+            "/cua.daemon.v1.DaemonService/GetInfo" => {
+                serve(req, move |_: dpb::GetInfoRequest| dpb::GetInfoResponse {
+                    version: "0.28.0-m6".into(),
+                    features: vec![
+                        "env".into(),
+                        "sandboxes".into(),
+                        "spaces".into(),
+                        "mcp".into(),
+                        cua_daemon_core::FEATURE_CLOUD_IMAGE_AND_SIZING.into(),
+                    ],
+                    ..Default::default()
+                })
+            }
+            "/cua.daemon.v1.SandboxService/CreateSandbox" => {
+                serve(req, move |r: dpb::CreateSandboxRequest| {
+                    let name = r.name.clone();
+                    let loc = if r.location.is_empty() {
+                        "local".to_string()
+                    } else {
+                        r.location.clone()
+                    };
+                    old.sandbox_creates.lock().unwrap().push(r);
+                    dpb::CreateSandboxResponse {
+                        sandbox: Some(dpb::Sandbox {
+                            name,
+                            location: loc,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                })
+            }
+            _ => Box::pin(async { Ok(unimplemented()) }),
+        }
+    }
+}
+
+async fn m6_daemon() -> (Arc<Old>, Arc<Cua>) {
+    let old = Arc::new(Old::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(M6Daemon::<0>(old.clone()))
+            .add_service(M6Daemon::<1>(old.clone()))
+            .add_service(M6Daemon::<2>(old.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let cua = Cua::connect(Some(format!("http://{addr}")), Some("token".into())).unwrap();
+    (old, cua)
+}
+
+struct NothingToolBackend;
+
+#[async_trait]
+impl cua_spaces::mcp::ToolBackend for NothingToolBackend {
+    async fn call(&self, _: &str, _: serde_json::Value) -> cua_spaces::mcp::ToolOutcome {
+        cua_spaces::mcp::ToolOutcome::text("")
+    }
+}
+
+/// A loopback daemon supporting M6a `create_space` tools and `CreateSandbox`
+/// cloud image / sizing fields, recording received protobuf requests.
+#[derive(Clone)]
+struct CurrentMockDaemon<const SVC: u8>(Arc<Old>);
+
+impl<const SVC: u8> tonic::server::NamedService for CurrentMockDaemon<SVC> {
+    const NAME: &'static str = match SVC {
+        0 => "cua.daemon.v1.SpaceService",
+        1 => "cua.daemon.v1.SandboxService",
+        _ => "cua.daemon.v1.DaemonService",
+    };
+}
+
+impl<B, const SVC: u8> tower::Service<http::Request<B>> for CurrentMockDaemon<SVC>
+where
+    B: tonic::codegen::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = BoxFut<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let recorded = self.0.clone();
+        match req.uri().path() {
+            "/cua.daemon.v1.DaemonService/GetInfo" => {
+                serve(req, move |_: dpb::GetInfoRequest| dpb::GetInfoResponse {
+                    version: "0.29.0".into(),
+                    features: vec![
+                        "env".into(),
+                        "sandboxes".into(),
+                        "spaces".into(),
+                        "mcp".into(),
+                        cua_daemon_core::FEATURE_CLOUD_IMAGE_AND_SIZING.into(),
+                        cua_daemon_core::FEATURE_SANDBOX_TTL.into(),
+                    ],
+                    ..Default::default()
+                })
+            }
+            "/cua.daemon.v1.SpaceService/ListSpaceTools" => {
+                serve(req, move |_: dpb::ListSpaceToolsRequest| {
+                    let tools_json =
+                        cua_spaces::mcp::McpServer::remote(Arc::new(NothingToolBackend))
+                            .tools_list()
+                            .to_string();
+                    dpb::ListSpaceToolsResponse { tools_json }
+                })
+            }
+            "/cua.daemon.v1.SpaceService/CreateSpace" => {
+                serve(req, move |r: dpb::CreateSpaceRequest| {
+                    let id = format!("{}:{}", r.location, r.name);
+                    recorded.creates.lock().unwrap().push(r);
+                    dpb::CreateSpaceResponse {
+                        space: Some(dpb::Space {
+                            id,
+                            ..Default::default()
+                        }),
+                        phase: "ready".into(),
+                        ..Default::default()
+                    }
+                })
+            }
+            "/cua.daemon.v1.SandboxService/CreateSandbox" => {
+                serve(req, move |r: dpb::CreateSandboxRequest| {
+                    let name = r.name.clone();
+                    let location = r.location.clone();
+                    recorded.sandbox_creates.lock().unwrap().push(r);
+                    dpb::CreateSandboxResponse {
+                        sandbox: Some(dpb::Sandbox {
+                            name,
+                            location,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                })
+            }
+            _ => Box::pin(async { Ok(unimplemented()) }),
+        }
+    }
+}
+
+async fn current_mock_daemon() -> (Arc<Old>, Arc<Cua>) {
+    let rec = Arc::new(Old::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(CurrentMockDaemon::<0>(rec.clone()))
+            .add_service(CurrentMockDaemon::<1>(rec.clone()))
+            .add_service(CurrentMockDaemon::<2>(rec.clone()))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let cua = Cua::connect(Some(format!("http://{addr}")), Some("token".into())).unwrap();
+    (rec, cua)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_daemon_accepts_and_delivers_m6a_cloud_image_and_sizing_fields() {
+    let w = current_daemon().await;
+    let err = w
+        .cua
+        .spaces()
+        .create(SpaceCreateOptions {
+            on: Some("local".into()),
+            image: Some("linux".into()),
+            name: Some("real-sp".into()),
+            cloud_image_id: Some("m-win11-golden".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CuaError::InvalidArgument(_)),
+        "expected server InvalidArgument (capability check passed), got {err:?}"
+    );
+
+    let mut sb_opts = SandboxCreateOptions::new("aliyun-ecs", "windows");
+    sb_opts.name = Some("real-sb".into());
+    sb_opts.cloud_image_id = Some("m-win11-golden".into());
+    sb_opts.instance_type = Some("ecs.c7.2xlarge".into());
+    sb_opts.disk_gb = Some(120);
+    let Err(sb_err) = w.cua.sandboxes().create(sb_opts).await else {
+        panic!("expected ProviderNotConfigured without connected aliyun-ecs");
+    };
+    assert!(
+        matches!(sb_err, CuaError::ProviderNotConfigured(_)),
+        "expected ProviderNotConfigured (capability check passed), got {sb_err:?}"
+    );
+
+    let (rec, cua) = current_mock_daemon().await;
+    let sp = cua
+        .spaces()
+        .create(SpaceCreateOptions {
+            on: Some("aliyun-ecs".into()),
+            image: Some("windows".into()),
+            name: Some("sp-ok".into()),
+            cloud_image_id: Some("m-win11-golden".into()),
+            instance_type: Some("ecs.c7.2xlarge".into()),
+            disk_gb: Some(120),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(sp.space.unwrap().id, "aliyun-ecs:sp-ok");
+    {
+        let creates = rec.creates.lock().unwrap();
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].cloud_image_id, "m-win11-golden");
+        assert_eq!(creates[0].instance_type, "ecs.c7.2xlarge");
+        assert_eq!(creates[0].disk_gb, 120);
+    }
+
+    let mut o = SandboxCreateOptions::new("aliyun-ecs", "windows");
+    o.name = Some("sb-ok".into());
+    o.cloud_image_id = Some("m-win11-golden".into());
+    o.instance_type = Some("ecs.c7.2xlarge".into());
+    o.disk_gb = Some(120);
+    let sb = cua.sandboxes().create(o.clone()).await.unwrap();
+    assert_eq!(sb.info().name, "sb-ok");
+
+    let sink: cua_sandbox_core::progress::Sink = Arc::new(|_| {});
+    o.name = Some("sb-ok-stream".into());
+    let sb_rep = cua.sandboxes().create_reporting(o, sink).await.unwrap();
+    assert_eq!(sb_rep.info().name, "sb-ok-stream");
+
+    let sb_creates = rec.sandbox_creates.lock().unwrap();
+    assert_eq!(sb_creates.len(), 2);
+    for req in sb_creates.iter() {
+        assert_eq!(req.cloud_image_id, "m-win11-golden");
+        assert_eq!(req.instance_type, "ecs.c7.2xlarge");
+        assert_eq!(req.disk_gb, 120);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sandboxes_create_ttl_fails_closed_against_old_m5_and_m6_daemons_and_succeeds_on_current() {
+    for (label, old, cua) in [
+        ("pre_getinfo", old_daemon().await),
+        ("m5", m5_daemon().await),
+        ("m6", m6_daemon().await),
+    ]
+    .into_iter()
+    .map(|(l, (o, c))| (l, o, c))
+    {
+        for ttl in [0u32, 1800u32] {
+            let mut opts = SandboxCreateOptions::new("aliyun-ecs", "linux");
+            opts.name = Some(format!("sb-ttl-{ttl}"));
+            opts.ttl_seconds = Some(ttl);
+
+            let Err(e) = cua.sandboxes().create(opts.clone()).await else {
+                panic!("{label}/ttl={ttl}: Sandboxes::create must fail closed");
+            };
+            assert!(
+                matches!(&e, CuaError::CapabilityMissing(m) if m.contains("too old") && m.contains("ttl")),
+                "{label}/ttl={ttl}: expected CapabilityMissing naming ttl, got {e:?}"
+            );
+
+            let sink: cua_sandbox_core::progress::Sink = Arc::new(|_| {});
+            let Err(e_rep) = cua.sandboxes().create_reporting(opts, sink).await else {
+                panic!("{label}/ttl={ttl}: Sandboxes::create_reporting must fail closed");
+            };
+            assert!(
+                matches!(&e_rep, CuaError::CapabilityMissing(m) if m.contains("too old") && m.contains("ttl")),
+                "{label}/ttl={ttl}: expected CapabilityMissing naming ttl, got {e_rep:?}"
+            );
+        }
+        assert!(
+            old.sandbox_creates.lock().unwrap().is_empty(),
+            "{label}: CreateSandbox RPC must not be sent when ttl capability is missing"
+        );
+    }
+
+    let w = current_daemon().await;
+    let mut real_opts = SandboxCreateOptions::new("aliyun-ecs", "linux");
+    real_opts.name = Some("sb-real-ttl".into());
+    real_opts.ttl_seconds = Some(1800);
+    let Err(real_err) = w.cua.sandboxes().create(real_opts).await else {
+        panic!("expected ProviderNotConfigured without connected aliyun-ecs");
+    };
+    assert!(
+        matches!(real_err, CuaError::ProviderNotConfigured(_)),
+        "expected ProviderNotConfigured (ttl preflight passed), got {real_err:?}"
+    );
+
+    let (rec, cua) = current_mock_daemon().await;
+    for (idx, ttl) in [0u32, 1800u32].into_iter().enumerate() {
+        let mut o = SandboxCreateOptions::new("aliyun-ecs", "linux");
+        o.name = Some(format!("sb-ttl-ok-{idx}"));
+        o.ttl_seconds = Some(ttl);
+        let sb = cua.sandboxes().create(o.clone()).await.unwrap();
+        assert_eq!(sb.info().name, format!("sb-ttl-ok-{idx}"));
+
+        let sink: cua_sandbox_core::progress::Sink = Arc::new(|_| {});
+        o.name = Some(format!("sb-ttl-rep-{idx}"));
+        let sb_rep = cua.sandboxes().create_reporting(o, sink).await.unwrap();
+        assert_eq!(sb_rep.info().name, format!("sb-ttl-rep-{idx}"));
+    }
+    let sb_creates = rec.sandbox_creates.lock().unwrap();
+    assert_eq!(sb_creates.len(), 4);
+    assert_eq!(sb_creates[0].ttl.as_ref().map(|d| d.seconds), Some(0));
+    assert_eq!(sb_creates[1].ttl.as_ref().map(|d| d.seconds), Some(0));
+    assert_eq!(sb_creates[2].ttl.as_ref().map(|d| d.seconds), Some(1800));
+    assert_eq!(sb_creates[3].ttl.as_ref().map(|d| d.seconds), Some(1800));
 }

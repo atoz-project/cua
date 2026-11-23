@@ -2,18 +2,25 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! Your own cloud account as a sandbox location (`--on aws`, `gcp`,
-//! `modal`, `hetzner`): the records every surface shares (`cua cloud`, the SDK, the
-//! Spaces `cloud_*` tools, the apps) and [`CloudManager`], the service that
-//! connects, checks and sweeps the clouds. The providers themselves are
-//! ordinary [`crate::Provider`]s registered like the contrib ones; they live
-//! in the `cua-byoc` crate.
+//! `modal`, `hetzner`, `aliyun-ecs`): the records every surface shares
+//! (`cua cloud`, the SDK, the Spaces `cloud_*` tools, the apps) and
+//! [`CloudManager`], the service that connects, checks and sweeps the clouds.
+//! The providers themselves are ordinary [`crate::Provider`]s registered like
+//! the contrib ones; they live in the `cua-byoc` crate.
 //!
-//! Every cloud sandbox is a relay machine of the signed-in cua.ai account:
-//! the guest's cua-spacesd dials out to the relay (no inbound port), and the
-//! SDK reaches it there with the account's credentials
+//! Every cloud sandbox is a relay machine of the signed-in cua.ai account (or
+//! a self-hosted relay in Static Relay Mode): the guest's cua-spacesd dials
+//! out to the relay (no inbound port), and the SDK reaches it there
 //! ([`crate::Provider::connect_options`]). Its instance details carry
 //! [`DETAIL_RELAY_MACHINE`], which is how Spaces shows it as
 //! `relay:<machine>`.
+
+mod reports;
+mod url;
+
+pub use cua_spaces_contract::inputs::provider_title;
+pub use reports::*;
+pub use url::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +33,7 @@ pub const DETAIL_RELAY_MACHINE: &str = "relay_machine";
 /// with, so every device of the account can label it and knows where it
 /// can be deleted. No secrets.
 pub mod meta {
-    /// The provider word (`aws`, `gcp`, `hetzner`, `modal`).
+    /// The provider word (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).
     pub const PROVIDER: &str = "cua.cloud.provider";
     /// Where it runs, for people ("AWS · us-west-2").
     pub const PLACE: &str = "cua.cloud.place";
@@ -44,6 +51,29 @@ pub mod meta {
 /// The instance detail naming where a cloud sandbox runs ("AWS ·
 /// us-west-2"), shown next to its Space.
 pub const DETAIL_PLACE: &str = "place";
+
+/// Refuses cloud-only create overrides (`cloud_image_id`, `instance_type`) on
+/// non-cloud targets with a consistent provider-neutral message.
+pub fn validate_cloud_vm_overrides(
+    is_cloud_target: bool,
+    cloud_image_id: Option<&str>,
+    instance_type: Option<&str>,
+) -> Result<()> {
+    if is_cloud_target {
+        return Ok(());
+    }
+    if cloud_image_id.is_some() {
+        return Err(crate::Error::InvalidArgument(
+            "cloud_image_id applies to cloud providers only (--on <cloud>)".into(),
+        ));
+    }
+    if instance_type.is_some() {
+        return Err(crate::Error::InvalidArgument(
+            "instance_type applies to cloud providers only (--on <cloud>)".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Where a cloud's credentials were found on this machine.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -79,12 +109,97 @@ pub struct CloudKind {
     pub usd_per_hour: f64,
 }
 
+/// How a cloud connection authenticates with its relay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMode {
+    /// Backed by user account authentication and a machine directory, where
+    /// each cloud sandbox is registered dynamically under the signed-in
+    /// account.
+    #[default]
+    Account,
+    /// Self-hosted relay authenticated by a shared registration token and
+    /// per-sandbox environment tokens, requiring no account sign-in.
+    Static,
+}
+
+impl RelayMode {
+    /// Wire word (`account` or `static`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayMode::Account => "account",
+            RelayMode::Static => "static",
+        }
+    }
+
+    /// Parses `account` or `static` (case-insensitive, trimmed).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "account" => Ok(RelayMode::Account),
+            "static" => Ok(RelayMode::Static),
+            other => Err(crate::Error::InvalidArgument(format!(
+                "relay_mode {other:?} is not account or static"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for RelayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The default official Cua relay URL.
+pub const DEFAULT_RELAY_URL: &str = "https://relay.cua.ai";
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn redact_opt_url(url: &Option<String>) -> Option<String> {
+    url.as_deref().map(redact_url)
+}
+
+fn redact_secret(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
+macro_rules! debug_fields {
+    ($ds:expr, $self:expr; $($field:ident),* $(,)?) => {{
+        let mut d = $ds;
+        $(d.field(stringify!($field), &$self.$field);)*
+        d
+    }};
+}
+
+/// Validates and trims an optional identifier or token (`cloud_image_id`,
+/// `instance_type`, `--windows-image-id`, etc.), rejecting empty/whitespace-only
+/// values and values containing internal whitespace.
+pub fn normalize_optional_token(label: &str, raw: Option<&str>) -> Result<Option<String>> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::InvalidArgument(format!(
+            "{label} cannot be empty"
+        )));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(crate::Error::InvalidArgument(format!(
+            "{label} {trimmed:?} must not contain whitespace"
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// One cloud as `cloud_status` lists it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CloudProvider {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
+    /// `aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`.
     pub name: String,
-    /// `AWS`, `Google Cloud`, `Hetzner Cloud`, `Modal`.
+    /// `AWS`, `Google Cloud`, `Hetzner Cloud`, `Modal`, `Alibaba Cloud ECS`.
     pub title: String,
     /// `vm` (one VM per sandbox) or `sandbox` (one platform sandbox each).
     pub tier: String,
@@ -180,6 +295,56 @@ pub struct CloudProvider {
     /// made there unattended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holders: Vec<String>,
+    /// Per-connection relay base URL (`https://relay.cua.ai` by default),
+    /// or `None` when not connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`), or `None` when
+    /// not connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<RelayMode>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID to attach sandboxes to (`aliyun-ecs`),
+    /// or `None` for Cua's isolated VPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID to attach sandboxes to (`aliyun-ecs`),
+    /// or `None` for Cua's isolated VPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// Whether public IPv4 assignment is disabled (`InternetMaxBandwidthOut=0`)
+    /// on `aliyun-ecs`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
+}
+
+impl std::fmt::Debug for CloudProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        debug_fields!(f.debug_struct("CloudProvider"), self;
+            name, title, tier, connected, default, credentials, account, profile, region, zone,
+            project, environment, label, ttl_hours, kinds, auth, status, budget_usd_month,
+            max_size, spent_month, running, approval, approval_agent, pending_budget_usd_month,
+            pending_max_size, can_approve, suggest_auth, issue, holders, relay_url, relay_mode,
+            vpc_id, vswitch_id, no_public_ip, windows_image_id, linux_image_id, instance_type
+        )
+        .field(
+            "spacesd_download_url",
+            &redact_opt_url(&self.spacesd_download_url),
+        )
+        .finish()
+    }
 }
 
 /// The words of [`CloudProvider::status`] and [`CloudConnected`]'s outcome.
@@ -346,299 +511,6 @@ impl ConnectRequest {
     }
 }
 
-/// One thing Cua created in a cloud.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudResource {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
-    pub provider: String,
-    /// The cloud's id (`i-0abc...`, the instance name, `sb-...`).
-    pub id: String,
-    /// `instance`, `security_group`, `firewall`, `sandbox`, ...
-    #[serde(rename = "type")]
-    pub resource_type: String,
-    /// The sandbox it belongs to (`aws:<name>`), empty for shared
-    /// resources (a security group).
-    #[serde(default)]
-    pub sandbox: String,
-    /// The relay machine the sandbox joined as (its Space is
-    /// `relay:<machine>`), when it has one.
-    #[serde(default)]
-    pub machine: String,
-    /// Region (or zone).
-    #[serde(default)]
-    pub region: String,
-    /// The cloud's state (`running`, `stopped`, `terminated`, `gone`).
-    #[serde(default)]
-    pub state: String,
-    /// When Cua created it (RFC 3339).
-    #[serde(default)]
-    pub created: String,
-    /// When it expires (RFC 3339; empty: never).
-    #[serde(default)]
-    pub expires: String,
-    /// Whether it is past `expires`.
-    #[serde(default)]
-    pub expired: bool,
-    /// Who started it: the agent's name, or `user`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub started_by: String,
-    /// Estimated US dollars it cost so far (list price times runtime).
-    #[serde(default)]
-    pub cost_usd: f64,
-}
-
-/// `cloud_status`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudStatusReport {
-    /// The default location (`default.on`), for example `aws`.
-    #[serde(default)]
-    pub default_on: String,
-    /// Every cloud this build supports.
-    pub providers: Vec<CloudProvider>,
-    /// What Cua created in them.
-    #[serde(default)]
-    pub resources: Vec<CloudResource>,
-}
-
-/// One check of `cloud_test`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudCheck {
-    /// `credentials`, `permissions`, `quota`, `region`, ...
-    pub name: String,
-    /// Whether it passed.
-    pub ok: bool,
-    /// What was found, or what to fix.
-    #[serde(default)]
-    pub detail: String,
-}
-
-/// `cloud_test`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudTestReport {
-    /// The cloud.
-    pub provider: String,
-    /// Whether every check passed.
-    pub ok: bool,
-    /// The account, project or workspace the credentials reach.
-    #[serde(default)]
-    pub account: String,
-    /// The checks, in order.
-    pub checks: Vec<CloudCheck>,
-}
-
-/// `cloud_connect`: the cloud as `cloud_status` lists it (its `status`
-/// is the outcome), the checks it ran, the next step and how to verify.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudConnected {
-    /// The cloud, as `cloud_status` lists it.
-    #[serde(flatten)]
-    pub provider: CloudProvider,
-    /// The checks it ran.
-    #[serde(default)]
-    pub checks: Vec<CloudCheck>,
-    /// What to do next (`None`: nothing, it is connected).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next: Option<CloudNext>,
-    /// The command that confirms it (`cua cloud status aws`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub verify: String,
-}
-
-/// `cloud_disconnect`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudDisconnected {
-    /// The cloud.
-    pub provider: String,
-    /// Whether a connection was forgotten.
-    pub disconnected: bool,
-    /// Resources Cua still records there.
-    #[serde(default)]
-    pub left: Vec<CloudResource>,
-    /// With `delete`: what was deleted from the account first (the
-    /// receipt), each resource as `cloud_status` lists it.
-    #[serde(default)]
-    pub deleted: Vec<CloudResource>,
-}
-
-/// One line of the cloud audit log (`cloud_audit`): something Cua did in a
-/// cloud account. Never carries a secret or a token.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudAuditEntry {
-    /// When (RFC 3339, UTC).
-    pub ts: String,
-    /// `connect`, `disconnect`, `resource_recorded`, `resource_created`,
-    /// `resource_confirmed` or `resource_deleted`.
-    pub action: String,
-    /// `aws`, `gcp`, `modal`.
-    pub provider: String,
-    /// The resource type (`instance`, `sandbox`, `security_group`, ...);
-    /// empty for `connect` and `disconnect`.
-    #[serde(default)]
-    pub kind: String,
-    /// The cloud id (the name Cua chose while a create is under way).
-    #[serde(default)]
-    pub id: String,
-    /// The sandbox (Space) it belongs to; empty for shared resources.
-    #[serde(default)]
-    pub space: String,
-    /// Who did it: `user`, `sweep`, `auto-sweep`, `disconnect` or
-    /// `rollback`.
-    #[serde(default)]
-    pub actor: String,
-    /// `ok`, `failed` or `refused`.
-    #[serde(default)]
-    pub outcome: String,
-    /// A short note (the reason, or the error).
-    #[serde(default)]
-    pub detail: String,
-    /// Where it was recorded: `device` (this cua home's log) or `account`
-    /// (Cua's issuer, for clouds linked to the account: tokens issued or
-    /// refused, approvals, limit changes). Empty from an older cua: this
-    /// device.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source: String,
-}
-
-/// How `cloud_cost` groups the spend.
-pub mod cost_by {
-    /// One row per Space.
-    pub const SPACE: &str = "space";
-    /// One row per agent (`user` for what a person started).
-    pub const AGENT: &str = "agent";
-    /// One row per UTC day (`YYYY-MM-DD`).
-    pub const DAY: &str = "day";
-    /// One row per cloud.
-    pub const CLOUD: &str = "cloud";
-    /// Every grouping, in the order the docs list them.
-    pub const ALL: &[&str] = &[SPACE, AGENT, DAY, CLOUD];
-}
-
-/// One row of `cloud_cost`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudCostRow {
-    /// The Space, agent, day (`YYYY-MM-DD`) or cloud.
-    pub key: String,
-    /// Estimated US dollars (list price times runtime), to the cent.
-    pub usd: f64,
-    /// Machine hours, to the hundredth.
-    pub hours: f64,
-    /// How many machines ran.
-    pub machines: u32,
-}
-
-/// `cloud_cost`: what the machines Cua created cost, estimated from list
-/// price times runtime (the cloud's bill is the final word).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudCostReport {
-    /// `space`, `agent`, `day` or `cloud`.
-    pub by: String,
-    /// The first day counted (`YYYY-MM-DD`, UTC).
-    pub since: String,
-    /// Up to when (RFC 3339).
-    pub until: String,
-    /// The rows: by day oldest first, otherwise the costliest first.
-    pub rows: Vec<CloudCostRow>,
-    /// The sum of the rows, to the cent.
-    pub total_usd: f64,
-}
-
-/// A cloud's spend crossed a share of its monthly budget.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudBudgetAlert {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
-    pub provider: String,
-    /// `AWS`, `Google Cloud`, ...
-    pub title: String,
-    /// 50, 80 or 100.
-    pub percent: u32,
-    /// `YYYY-MM` (UTC).
-    pub month: String,
-    /// Estimated US dollars spent this month.
-    pub spent_usd: f64,
-    /// The monthly budget.
-    pub budget_usd: f64,
-}
-
-impl CloudBudgetAlert {
-    /// "AWS reached 80% of its budget".
-    pub fn title_line(&self) -> String {
-        if self.percent >= 100 {
-            format!("{} reached its monthly budget", self.title)
-        } else {
-            format!("{} reached {}% of its budget", self.title, self.percent)
-        }
-    }
-
-    /// One plain sentence with the figures and what happens next.
-    pub fn body_line(&self) -> String {
-        let figures = format!(
-            "About ${:.2} of ${:.2} spent this month.",
-            self.spent_usd, self.budget_usd
-        );
-        if self.percent >= 100 {
-            format!(
-                "{figures} New machines there are refused until next month; stopping and \
-                 deleting still work. Raise it with `cua cloud connect {} --budget <usd>`.",
-                self.provider
-            )
-        } else {
-            figures
-        }
-    }
-}
-
-/// Where budget alerts go besides the audit log: the app's notification
-/// feed, registered by the Spaces runtime. Takes the cua home and the alert.
-pub type BudgetAlertSink =
-    std::sync::Arc<dyn Fn(&std::path::Path, &CloudBudgetAlert) + Send + Sync>;
-
-fn alert_sink() -> &'static std::sync::RwLock<Option<BudgetAlertSink>> {
-    static SINK: std::sync::OnceLock<std::sync::RwLock<Option<BudgetAlertSink>>> =
-        std::sync::OnceLock::new();
-    SINK.get_or_init(Default::default)
-}
-
-/// Sets where budget alerts are posted (the last call wins).
-pub fn set_budget_alert_sink(sink: BudgetAlertSink) {
-    *alert_sink().write().expect("alert sink") = Some(sink);
-}
-
-/// Posts `alert` for the cua home `home` to the registered sink, if any;
-/// whether one was registered.
-pub fn post_budget_alert(home: &std::path::Path, alert: &CloudBudgetAlert) -> bool {
-    let sink = alert_sink().read().expect("alert sink").clone();
-    match sink {
-        Some(f) => {
-            f(home, alert);
-            true
-        }
-        None => false,
-    }
-}
-
-/// One row of `cloud_sweep`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudSweepItem {
-    /// The resource.
-    #[serde(flatten)]
-    pub resource: CloudResource,
-    /// `delete` (dry run), `deleted`, `keep`, `forget`, `forgotten` or
-    /// `failed`.
-    pub action: String,
-    /// Why.
-    #[serde(default)]
-    pub reason: String,
-}
-
-/// `cloud_sweep`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudSweepReport {
-    /// Whether nothing was deleted.
-    pub dry_run: bool,
-    /// What was found.
-    pub resources: Vec<CloudSweepItem>,
-}
-
 /// Where in a cloud account sandboxes go (`cloud_connect`, `cloud_test`).
 /// Clouds with a CLI sign-in (AWS, Google Cloud, Hetzner, Modal) use it, and Cua
 /// stores only these names. A cloud that has only an API token (Hetzner)
@@ -647,7 +519,7 @@ pub struct CloudSweepReport {
 /// logs or the connection record.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudTarget {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
+    /// `aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`.
     pub provider: String,
     /// AWS or Modal profile.
     #[serde(default)]
@@ -667,145 +539,55 @@ pub struct CloudTarget {
     /// The API token of a cloud that has no CLI sign-in (Hetzner). Secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Per-connection relay base URL (defaults to `https://relay.cua.ai`
+    /// in Account Relay Mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Relay authentication mode (`account` or `static`; defaults to `account`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<RelayMode>,
+    /// Shared static relay registration token for Static Relay Mode. Secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_token: Option<String>,
+    /// Optional custom `cua-spacesd` binary mirror URL (with optional
+    /// `#sha256=<64 hex>` fragment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacesd_download_url: Option<String>,
+    /// Existing Alibaba Cloud VPC ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpc_id: Option<String>,
+    /// Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vswitch_id: Option<String>,
+    /// Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+    /// `aliyun-ecs` only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_public_ip: bool,
+    /// Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_image_id: Option<String>,
+    /// Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_image_id: Option<String>,
+    /// Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
 }
 
 impl std::fmt::Debug for CloudTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CloudTarget")
-            .field("provider", &self.provider)
-            .field("profile", &self.profile)
-            .field("region", &self.region)
-            .field("zone", &self.zone)
-            .field("project", &self.project)
-            .field("environment", &self.environment)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
-            .finish()
+        debug_fields!(f.debug_struct("CloudTarget"), self;
+            provider, profile, region, zone, project, environment, relay_url, relay_mode,
+            vpc_id, vswitch_id, no_public_ip, windows_image_id, linux_image_id, instance_type
+        )
+        .field("token", &redact_secret(&self.token))
+        .field("relay_token", &redact_secret(&self.relay_token))
+        .field(
+            "spacesd_download_url",
+            &redact_opt_url(&self.spacesd_download_url),
+        )
+        .finish()
     }
-}
-
-/// What a linked cloud supplies to the elastic pool.
-pub mod supplies {
-    /// Machines the pool controls: each runs cua-spacesd as a host and many
-    /// Spaces run on it (AWS, GCP, Hetzner).
-    pub const HOSTS: &str = "hosts";
-    /// Spaces directly, one platform sandbox each (Modal).
-    pub const SPACES: &str = "spaces";
-}
-
-/// One machine type a linked cloud offers to the elastic pool, in one
-/// region: what the solver may add (`cua cloud plan` lists them).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct HostTypeOffer {
-    /// `aws`, `gcp`, `hetzner`, `modal`.
-    pub provider: String,
-    /// The cloud's type name (`cx33`, `c7g.xlarge`; for a Spaces supplier
-    /// a size word such as `2x4`).
-    pub type_name: String,
-    /// Region or location.
-    pub region: String,
-    /// `amd64` or `arm64`.
-    pub arch: String,
-    /// vCPUs.
-    pub vcpus: u32,
-    /// Memory, MiB.
-    pub memory_mb: u64,
-    /// Boot disk, GiB.
-    #[serde(default)]
-    pub disk_gb: u32,
-    /// It has `/dev/kvm` (runs `vm` and `microvm` Spaces).
-    #[serde(default)]
-    pub kvm: bool,
-    /// Kinds its hosts create.
-    #[serde(default)]
-    pub kinds: Vec<String>,
-    /// Accelerator, or empty.
-    #[serde(default)]
-    pub gpu: String,
-    /// On-demand USD per hour, with what every machine of it carries.
-    pub usd_per_hour: f64,
-    /// Billed in steps of this many seconds.
-    pub billing_step_secs: u64,
-    /// Minimum billed seconds.
-    pub billing_min_secs: u64,
-    /// Typical seconds from add to ready (learned when measured).
-    pub boot_secs: u32,
-    /// [`supplies::HOSTS`] or [`supplies::SPACES`].
-    pub supplies: String,
-    /// How many more machines this provider allows now.
-    #[serde(default)]
-    pub max_new: u32,
-    /// The quota pool its vCPUs count against (`hetzner/shared`); empty:
-    /// none.
-    #[serde(default)]
-    pub quota: String,
-    /// That pool's vCPU limit when the cloud says it (0: unknown).
-    #[serde(default)]
-    pub quota_vcpus: u32,
-    /// 0 in the region you linked; n > 0 in the provider's n-th nearby
-    /// region, which the pool uses only when every type it could use in the
-    /// linked region has just failed (the cloud had no capacity there).
-    #[serde(default)]
-    pub fallback: u8,
-}
-
-/// A cloud host the elastic pool added (or `cua cloud hosts add`).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct CloudHost {
-    /// Its pool name (`hetzner-3`).
-    pub name: String,
-    /// Provider.
-    pub provider: String,
-    /// Machine type.
-    pub type_name: String,
-    /// Region.
-    pub region: String,
-    /// The cloud's id.
-    #[serde(default)]
-    pub id: String,
-    /// Its relay machine once joined (empty before).
-    #[serde(default)]
-    pub machine: String,
-    /// `creating`, `booting`, `joined`, `cordoned`, `removing`, `gone`.
-    pub state: String,
-    /// Unix seconds it was created (billing starts).
-    pub started: u64,
-    /// Unix seconds it ends on its own at the latest (its TTL).
-    #[serde(default)]
-    pub expires: u64,
-    /// USD per hour.
-    pub usd_per_hour: f64,
-    /// Billing step, seconds.
-    pub billing_step_secs: u64,
-    /// Minimum billed, seconds.
-    pub billing_min_secs: u64,
-    /// Added by hand (`cua cloud hosts add`): the scaler never removes it.
-    #[serde(default)]
-    pub pinned: bool,
-}
-
-/// Adds one host.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct AddHost {
-    /// Provider.
-    pub provider: String,
-    /// Machine type.
-    pub type_name: String,
-    /// Region (empty: the connection's).
-    #[serde(default)]
-    pub region: String,
-    /// Pool name (empty: `<provider>-<n>`).
-    #[serde(default)]
-    pub name: String,
-    /// Added by hand: never removed by the scaler.
-    #[serde(default)]
-    pub pinned: bool,
-    /// Seconds until it ends on its own (0: the default, 24 h).
-    #[serde(default)]
-    pub ttl_secs: u64,
-    /// Images it pulls as soon as it joined (the ones it is added for), so
-    /// its first Spaces start without a pull.
-    #[serde(default)]
-    pub prepull: Vec<String>,
 }
 
 /// Connects, checks and sweeps your clouds (implemented in `cua-byoc`).
@@ -813,6 +595,11 @@ pub struct AddHost {
 pub trait CloudManager: Send + Sync + 'static {
     /// `cloud_status`: `provider` narrows it to one cloud.
     async fn status(&self, provider: Option<&str>) -> Result<CloudStatusReport>;
+
+    /// The configured relay mode for `provider`, if connected.
+    fn relay_mode(&self, _provider: &str) -> Option<RelayMode> {
+        None
+    }
 
     /// `cloud_test`: creates nothing.
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport>;
@@ -894,6 +681,7 @@ pub trait CloudManager: Send + Sync + 'static {
     async fn cordon_host(&self, _name: &str, _cordoned: bool) -> Result<()> {
         Err(not_built())
     }
+
     /// The automatic sweep the daemon schedules: deletes what
     /// `cloud_sweep` with `dry_run: false` (and not `all`) deletes, in
     /// every connected cloud; one failing cloud does not stop the others.
@@ -946,6 +734,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_title_maps_known_clouds_and_falls_back_to_name() {
+        assert_eq!(provider_title("aliyun-ecs"), "Alibaba Cloud ECS");
+        assert_eq!(provider_title("aws"), "AWS");
+        assert_eq!(provider_title("gcp"), "Google Cloud");
+        assert_eq!(provider_title("azure"), "Microsoft Azure");
+        assert_eq!(provider_title("hetzner"), "Hetzner Cloud");
+        assert_eq!(provider_title("modal"), "Modal");
+        assert_eq!(provider_title("custom-cloud"), "custom-cloud");
+    }
+
+    #[test]
     fn azure_and_named_google_trust_link_through_the_issuer() {
         let req = |provider: &str, f: &dyn Fn(&mut ConnectRequest)| {
             let mut r = ConnectRequest {
@@ -977,5 +776,62 @@ mod tests {
             req("azure", &|r| r.auth = Some("sealed".into())).auth_word(),
             "sealed"
         );
+    }
+
+    #[test]
+    fn relay_mode_defaults_serializes_and_target_redacts_relay_token() {
+        assert_eq!(RelayMode::default(), RelayMode::Account);
+        assert_eq!(RelayMode::Account.as_str(), "account");
+        assert_eq!(RelayMode::Static.as_str(), "static");
+        assert_eq!(RelayMode::parse("ACCOUNT").unwrap(), RelayMode::Account);
+        assert_eq!(RelayMode::parse(" static ").unwrap(), RelayMode::Static);
+        assert!(RelayMode::parse("bogus").is_err());
+
+        let t = CloudTarget {
+            provider: "hetzner".into(),
+            relay_url: Some("https://relay.example".into()),
+            relay_mode: Some(RelayMode::Static),
+            relay_token: Some("super-secret-relay-token".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains("super-secret-relay-token"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+
+        let p: CloudProvider =
+            serde_json::from_str(r#"{"name":"aws","title":"AWS","tier":"vm","connected":false}"#)
+                .unwrap();
+        assert_eq!(p.relay_url, None);
+        assert_eq!(p.relay_mode, None);
+        let serialized = serde_json::to_string(&p).unwrap();
+        assert!(!serialized.contains("relay_url"));
+        assert!(!serialized.contains("relay_mode"));
+    }
+
+    #[test]
+    fn existing_vpc_fields_default_and_skip_serializing_when_unset() {
+        let t = CloudTarget {
+            provider: "aliyun-ecs".into(),
+            vpc_id: Some("vpc-123".into()),
+            vswitch_id: Some("vsw-456".into()),
+            no_public_ip: true,
+            ..Default::default()
+        };
+        let dbg = format!("{t:?}");
+        assert!(dbg.contains("vpc-123"), "{dbg}");
+        assert!(dbg.contains("vsw-456"), "{dbg}");
+        assert!(dbg.contains("no_public_ip: true"), "{dbg}");
+
+        let p: CloudProvider = serde_json::from_str(
+            r#"{"name":"aliyun-ecs","title":"Alibaba Cloud ECS","tier":"vm","connected":false}"#,
+        )
+        .unwrap();
+        assert_eq!(p.vpc_id, None);
+        assert_eq!(p.vswitch_id, None);
+        assert!(!p.no_public_ip);
+        let serialized = serde_json::to_string(&p).unwrap();
+        assert!(!serialized.contains("vpc_id"), "{serialized}");
+        assert!(!serialized.contains("vswitch_id"), "{serialized}");
+        assert!(!serialized.contains("no_public_ip"), "{serialized}");
     }
 }

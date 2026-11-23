@@ -516,6 +516,15 @@ pub fn month_start(at: u64) -> u64 {
     (at - (d as u64 - 1) * 86_400) / 86_400 * 86_400
 }
 
+fn reject_pool_host_cloud_image_id(opts: &SpaceCreate) -> Result<()> {
+    cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+        false,
+        opts.cloud_image_id.as_deref(),
+        None,
+    )?;
+    Ok(())
+}
+
 /// The canonical Linux image (what a create that names none runs).
 fn default_linux_image() -> String {
     cua_image::canonical::canonical_image_or_linux("linux")
@@ -1019,6 +1028,9 @@ impl Spaces {
         let Ok(c) = self.sandboxes().clouds() else {
             return false;
         };
+        if c.relay_mode(provider) == Some(cua_sandbox_core::byoc::RelayMode::Static) {
+            return false;
+        }
         c.host_offers()
             .await
             .is_ok_and(|o| o.iter().any(|o| o.provider == provider))
@@ -1516,6 +1528,9 @@ impl Spaces {
                         else {
                             return Err(Error::LimitExceeded("the plan placed nothing".into()));
                         };
+                        if matches!(a.target, Target::New { .. }) {
+                            reject_pool_host_cloud_image_id(&opts)?;
+                        }
                         // About to buy a machine: let the rest of the burst
                         // arrive first (once, holding the turn), then solve
                         // again for all of it.
@@ -1605,6 +1620,9 @@ impl Spaces {
                     in_cloud.then(|| CloudInflight::new(&self.inner.elastic.cloud_inflight));
                 (target, label, guard)
             };
+            if matches!(target, Placed::Host { .. } | Placed::NewHost { .. }) {
+                reject_pool_host_cloud_image_id(&opts)?;
+            }
             let r = match target {
                 Placed::Host { name, id } => {
                     self.create_on_pool_host_settling(&name, &id, &opts).await
@@ -3053,6 +3071,140 @@ mod quota_tests {
         assert_eq!(
             machines_left("hetzner", &cloud, &l, 1000 + LEARNED_QUOTA_SECS),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn create_elastic_rejects_cloud_image_id_before_add_host() {
+        use cua_sandbox_core::byoc::{
+            AddHost, CloudAuditEntry, CloudConnected, CloudDisconnected, CloudHost, CloudManager,
+            CloudStatusReport, CloudSweepReport, CloudTarget, CloudTestReport, HostTypeOffer,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeElasticClouds {
+            add_host_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl CloudManager for FakeElasticClouds {
+            async fn status(
+                &self,
+                _provider: Option<&str>,
+            ) -> cua_sandbox_core::Result<CloudStatusReport> {
+                Ok(CloudStatusReport::default())
+            }
+            async fn test(
+                &self,
+                _target: &CloudTarget,
+            ) -> cua_sandbox_core::Result<CloudTestReport> {
+                unreachable!()
+            }
+            async fn connect(
+                &self,
+                _target: &CloudTarget,
+                _make_default: bool,
+                _ttl_hours: Option<u32>,
+            ) -> cua_sandbox_core::Result<CloudConnected> {
+                unreachable!()
+            }
+            async fn disconnect(
+                &self,
+                _provider: &str,
+                _delete: bool,
+            ) -> cua_sandbox_core::Result<CloudDisconnected> {
+                unreachable!()
+            }
+            async fn sweep(
+                &self,
+                _provider: Option<&str>,
+                _dry_run: bool,
+                _all: bool,
+            ) -> cua_sandbox_core::Result<CloudSweepReport> {
+                unreachable!()
+            }
+            async fn host_offers(&self) -> cua_sandbox_core::Result<Vec<HostTypeOffer>> {
+                Ok(vec![HostTypeOffer {
+                    provider: "hetzner".into(),
+                    type_name: "cx33".into(),
+                    region: "fsn1".into(),
+                    arch: "amd64".into(),
+                    vcpus: 16,
+                    memory_mb: 32768,
+                    disk_gb: 320,
+                    kvm: true,
+                    kinds: vec!["container".into(), "vm".into()],
+                    gpu: String::new(),
+                    usd_per_hour: 0.05,
+                    billing_step_secs: 3600,
+                    billing_min_secs: 3600,
+                    boot_secs: 30,
+                    supplies: cua_sandbox_core::byoc::supplies::HOSTS.into(),
+                    max_new: 2,
+                    quota: "shared".into(),
+                    quota_vcpus: 64,
+                    fallback: 0,
+                }])
+            }
+            async fn add_host(&self, _req: &AddHost) -> cua_sandbox_core::Result<CloudHost> {
+                self.add_host_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CloudHost {
+                    name: "hetzner-1".into(),
+                    provider: "hetzner".into(),
+                    type_name: "cx33".into(),
+                    region: "fsn1".into(),
+                    id: "h-1".into(),
+                    state: "booting".into(),
+                    ..Default::default()
+                })
+            }
+            async fn auto_sweep(&self) -> cua_sandbox_core::Result<CloudSweepReport> {
+                Ok(CloudSweepReport::default())
+            }
+            async fn audit(&self, _limit: usize) -> cua_sandbox_core::Result<Vec<CloudAuditEntry>> {
+                Ok(vec![])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let add_host_calls = Arc::new(AtomicUsize::new(0));
+        let sbx = cua_sandbox_core::Sandboxes::builder()
+            .state_dir(dir.path().join("sandboxes"))
+            .clouds(Arc::new(FakeElasticClouds {
+                add_host_calls: add_host_calls.clone(),
+            }))
+            .build();
+        let spaces = Spaces::builder().home(dir.path()).sandboxes(sbx).build();
+        spaces
+            .set_elastic_policy(&ElasticPolicy {
+                autoscale: true,
+                max_usd_per_hour: 10.0,
+                monthly_usd: 100.0,
+                max_new_hosts: 5,
+                budget_set: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let err = spaces
+            .create(crate::SpaceCreate {
+                on: Some(cua_sandbox_core::placement::On::Auto),
+                cpus: Some(12),
+                memory_mb: Some(16 * 1024),
+                cloud_image_id: Some("m-win11".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert_eq!(
+            add_host_calls.load(Ordering::SeqCst),
+            0,
+            "add_host must NOT be called when cloud_image_id is rejected on Target::New"
         );
     }
 }

@@ -22,14 +22,17 @@ use cua_sandbox_core::{Error, ServiceEndpoint, Status};
 use crate::api::{CloudApi, Result};
 use crate::audit;
 use crate::bootlog;
-use crate::bootstrap::{VmBoot, cloud_init};
+use crate::bootstrap::{
+    VmBoot, WindowsVmBoot, cloud_init, linux_native_cloud_init, windows_user_data,
+};
 use crate::model::{self, Connection, ProvisionSpec, Resource, Tier, now};
-use crate::relay::RelayAccess;
+use crate::relay::{ConnectionRelay, RelayAccess};
 use crate::state::Store;
+use crate::target::{create_family, resolve_kind_and_runtime, validate_custom_create_options};
 
 /// How long a new cloud machine may take to come online on the relay: a
-/// VM's first boot installs Docker and pulls the image.
-pub const ONLINE_WAIT: Duration = Duration::from_secs(15 * 60);
+/// VM's first boot installs Docker or runs Windows `vminit`, binary download, and AutoLogon reboot.
+pub const ONLINE_WAIT: Duration = Duration::from_secs(20 * 60);
 
 /// Instance details (`provider_details`).
 pub mod detail {
@@ -96,6 +99,30 @@ impl CloudSandboxes {
                     self.api.name()
                 ))
             })
+    }
+
+    fn connection_relay(&self, conn: &Connection) -> Result<ConnectionRelay> {
+        ConnectionRelay::for_connection(conn, &self.relay)
+    }
+
+    async fn forget_connection_machine(&self, conn: &Connection, machine: &str) {
+        match self.connection_relay(conn) {
+            Ok(relay) => {
+                relay
+                    .forget_machine(&self.store, self.api.name(), machine)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(machine, "skipping relay cleanup: {e}");
+                if conn.is_static_relay() {
+                    let _ = crate::relay::remove_env_token(
+                        self.store.home().as_deref(),
+                        self.api.name(),
+                        machine,
+                    );
+                }
+            }
+        }
     }
 
     /// What the sandbox's relay machine says about it (no secrets): every
@@ -227,7 +254,7 @@ impl CloudSandboxes {
             }
         }
         if !machine.is_empty() {
-            self.forget_machine(machine).await;
+            self.forget_connection_machine(conn, machine).await;
         }
     }
 
@@ -270,24 +297,30 @@ impl CloudSandboxes {
             });
         Some(bootlog::summary(path.as_deref(), &lines))
     }
+}
 
-    /// Removes a relay machine; when the relay cannot be reached it is
-    /// recorded for the sweeper instead of leaking.
-    async fn forget_machine(&self, machine: &str) {
-        if let Err(e) = self.relay.forget(machine).await {
-            tracing::warn!(machine, "relay machine left for the sweeper: {e}");
-            let _ = self.store.record(Resource {
-                provider: self.api.name().into(),
-                id: machine.into(),
-                resource_type: model::RELAY_MACHINE.into(),
-                name: machine.into(),
-                machine: machine.into(),
-                created: now(),
-                state: "orphaned".into(),
-                ..Default::default()
-            });
+fn extract_url_secrets(raw_url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let no_frag = raw_url.split('#').next().unwrap_or(raw_url);
+    if let Ok(u) = url::Url::parse(no_frag)
+        && (!u.username().is_empty() || u.password().is_some() || u.query().is_some())
+    {
+        out.push(raw_url.to_string());
+        out.push(no_frag.to_string());
+        if !u.username().is_empty() {
+            out.push(u.username().to_string());
+        }
+        if let Some(pw) = u.password() {
+            out.push(pw.to_string());
+        }
+        if let Some(q) = u.query() {
+            out.push(q.to_string());
+            for (_, v) in u.query_pairs() {
+                out.push(v.into_owned());
+            }
         }
     }
+    out
 }
 
 /// A state a machine does not come back from on its own.
@@ -363,9 +396,21 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         self.api.name()
     }
 
+    fn supported_oses(&self) -> &'static [&'static str] {
+        self.api.supported_oses()
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
+        let oses = self.api.supported_oses().to_vec();
+        let mut kinds = vec![RunKind::Container];
+        if self.api.runtimes().iter().any(|r| r.as_str() == "native")
+            || oses.iter().any(|o| o.eq_ignore_ascii_case("windows"))
+        {
+            kinds.push(RunKind::Vm);
+        }
+        let custom = self.api.supports_custom_image_and_sizing();
         ProviderCapabilities {
-            kinds: vec![RunKind::Container],
+            kinds,
             // The default engine (`--runtime` picks another where offered).
             runtime: match (self.api.tier(), self.api.runtimes().first()) {
                 (_, Some(cua_sandbox_core::placement::Runtime::Gvisor)) => "gvisor",
@@ -386,6 +431,9 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             credential_env: &[],
             // No GPU in your cloud (yet): GPU machine types are off.
             gpus: vec![],
+            oses,
+            custom_disk_gb: custom,
+            custom_cloud_image: custom,
         }
     }
 
@@ -410,18 +458,28 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
 
     async fn create(&self, spec: &ProviderCreate) -> Result<ProviderInstance> {
         let conn = self.connection()?;
-        let family = family_of(&spec.image.reference);
+        let family = create_family(spec);
+        if let Some(url) = conn.spacesd_download_url.as_deref() {
+            crate::target::normalize_spacesd_download_url(url)?;
+            let os_family = match family {
+                "windows" => "windows",
+                "macos" => "macos",
+                _ => "linux",
+            };
+            cua_sandbox_core::byoc::validate_spacesd_url_for_os(url, os_family)
+                .map_err(Error::InvalidArgument)?;
+        }
         let kinds = self.api.kinds(&conn);
         let offer = kinds.iter().find(|k| k.image == family).ok_or_else(|| {
+            let ran = kinds
+                .iter()
+                .filter(|k| k.supported)
+                .map(|k| k.image.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             Error::UnsupportedImage(format!(
-                "{} does not run {family} sandboxes (it runs: {})",
-                self.api.title(),
-                kinds
-                    .iter()
-                    .filter(|k| k.supported)
-                    .map(|k| k.image.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "{} does not run {family} sandboxes (it runs: {ran})",
+                self.api.title()
             ))
         })?;
         if !offer.supported {
@@ -431,19 +489,26 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 offer.reason
             )));
         }
-        // Say a budget share passed before a new machine adds to it.
-        crate::alerts::check_all(&self.store, now());
-        crate::limits::check_new_machine(
-            &conn,
-            self.api.title(),
-            Some(spec.cpus).filter(|c| *c > 0),
-            Some(spec.memory_mb).filter(|m| *m > 0),
-            offer.usd_per_hour,
-            self.store
-                .spent_for_limits(&conn, now())
-                .await
-                .map_err(Self::io)?,
-        )?;
+        let (effective_kind, effective_runtime) =
+            resolve_kind_and_runtime(self.api.as_ref(), family, spec)?;
+        let is_linux_native = matches!(self.api.tier(), Tier::Vm)
+            && matches!(family, "linux" | "linux-slim")
+            && effective_runtime == "native";
+        crate::bootstrap::validate_env_keys(&spec.env, is_linux_native)?;
+        let (cloud_image_id, spec_instance_type) =
+            validate_custom_create_options(self.api.as_ref(), spec)?;
+        let explicit_machine_type = spec_instance_type.or_else(|| {
+            conn.instance_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+        let machine_type_explicit = explicit_machine_type.is_some();
+        let mut machine_type = explicit_machine_type.unwrap_or_else(|| offer.machine_type.clone());
+        let disk_gb = spec
+            .disk_gb
+            .unwrap_or_else(|| self.api.default_disk_gb(family));
         let owner = self.store.owner_id().map_err(Self::io)?;
         let created = now();
         let ttl_secs = match spec.ttl {
@@ -455,12 +520,24 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         let machine = format!("cloud-{suffix}");
         let resource_name = format!("cua-{}-{}", self.api.name(), &suffix[..12]);
         let sandbox = format!("{}:{}", self.api.name(), spec.name);
+        let conn_relay = ConnectionRelay::for_create(
+            &conn,
+            &self.relay,
+            self.store.home().as_deref(),
+            self.api.name(),
+            self.api.title(),
+        )?;
         // The network rules the Space asked for: kept by the cloud itself or
         // refused, before anything is made (never created without them).
         let network = if spec.egress.is_empty() && !spec.no_network && !spec.protect {
             None
         } else if self.api.takes_network_rules() {
-            crate::modal_net::request(&spec.egress, spec.no_network, spec.protect, &self.relay.url)?
+            crate::modal_net::request(
+                &spec.egress,
+                spec.no_network,
+                spec.protect,
+                conn_relay.url(),
+            )?
         } else if spec.egress.is_empty() && !spec.no_network && matches!(self.api.tier(), Tier::Vm)
         {
             // Internet only, kept by the computer's own firewall.
@@ -473,19 +550,98 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                 self.api.title()
             )));
         };
-        // 1. The relay machine the sandbox joins as.
-        let join = self
-            .relay
-            .register_with(&machine, &spec.name, self.meta(&conn, &spec.name, &owner))
+        let desktop_password = if family == "windows" {
+            Some(crate::bootstrap_win::generate_desktop_password())
+        } else {
+            None
+        };
+        let mut provision = ProvisionSpec {
+            name: resource_name.clone(),
+            family: family.into(),
+            image: spec.image.pinned_ref.clone(),
+            kind: effective_kind.into(),
+            machine_type: machine_type.clone(),
+            machine_type_explicit,
+            disk_gb,
+            cpus: Some(spec.cpus),
+            memory_mb: Some(spec.memory_mb),
+            tags: BTreeMap::new(),
+            ttl_secs,
+            arch: spec.image.arch.clone(),
+            runtime: effective_runtime.clone(),
+            network,
+            spacesd_download_url: conn.spacesd_download_url.clone(),
+            desktop_password: desktop_password.clone(),
+            cloud_image_id,
+            ..Default::default()
+        };
+        // Say a budget share passed before a new machine adds to it.
+        crate::alerts::check_all(&self.store, now());
+        let spent = self
+            .store
+            .spent_for_limits(&conn, now())
+            .await
+            .map_err(Self::io)?;
+        if self.api.supports_custom_image_and_sizing() {
+            let (min_cpus, min_mem_mb) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
+            let min_usd_floor = if machine_type_explicit {
+                0.0
+            } else {
+                f64::from(min_cpus.unwrap_or(2)) * 0.01
+                    + f64::from(disk_gb) * self.api.disk_usd_per_gb_hour()
+            };
+            crate::limits::check_new_machine_with_disk(
+                &conn,
+                self.api.title(),
+                min_cpus,
+                min_mem_mb,
+                Some(disk_gb),
+                min_usd_floor,
+                spent,
+            )?;
+        }
+        let prep = self.api.prepare_provision(&conn, &provision).await?;
+        prep.apply_to(&mut provision);
+        if !provision.machine_type.is_empty() {
+            machine_type = provision.machine_type.clone();
+        } else {
+            machine_type = offer.machine_type.clone();
+            provision.machine_type = machine_type.clone();
+        }
+        let (eff_cpus, eff_mem_mb, eff_disk_gb, eff_usd) = match &prep.sizing {
+            Some(s) => (
+                Some(s.vcpus.max(spec.cpus)),
+                Some(s.memory_mb.max(spec.memory_mb)),
+                s.disk_gb.unwrap_or(disk_gb),
+                s.usd_per_hour,
+            ),
+            None => {
+                let (c, m) = self.api.check_size_for(family, spec.cpus, spec.memory_mb);
+                (c, m, disk_gb, offer.usd_per_hour)
+            }
+        };
+        crate::limits::check_new_machine_with_disk(
+            &conn,
+            self.api.title(),
+            eff_cpus,
+            eff_mem_mb,
+            Some(eff_disk_gb),
+            eff_usd,
+            spent,
+        )?;
+        let (join, static_env_token) = conn_relay
+            .prepare_join(
+                &self.store,
+                self.api.name(),
+                &machine,
+                &spec.name,
+                self.meta(&conn, &spec.name, &owner),
+                spec.env.get("CUA_ENV_TOKEN").map(String::as_str),
+            )
             .await?;
-        // The relay must be readable by this device before anything is
-        // created: a sign-in or enrollment problem found after the cloud
-        // call would bill a machine for nothing.
-        if let Err(e) = self.relay.online(&machine).await
-            && crate::relay::is_fatal(&e)
-        {
-            self.forget_machine(&machine).await;
-            return Err(e);
+        let mut guest_env = spec.env.clone();
+        if let Some(tok) = &static_env_token {
+            guest_env.insert("CUA_ENV_TOKEN".into(), tok.clone());
         }
         let mut rec = Resource {
             provider: self.api.name().into(),
@@ -509,13 +665,20 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             state: "pending".into(),
             ..Default::default()
         };
+        rec.extra.insert(detail::MACHINE_TYPE.into(), machine_type);
         rec.extra
-            .insert(detail::MACHINE_TYPE.into(), offer.machine_type.clone());
-        rec.extra.insert(
-            detail::USD_PER_HOUR.into(),
-            format!("{:.4}", offer.usd_per_hour),
-        );
-        // 2. Recorded before the cloud call.
+            .insert(detail::USD_PER_HOUR.into(), format!("{eff_usd:.4}"));
+        if matches!(self.api.tier(), Tier::Vm) {
+            let detail_rt = if effective_runtime == "native" {
+                "native"
+            } else {
+                "docker-on-vm"
+            };
+            rec.extra.insert(detail::RUNTIME.into(), detail_rt.into());
+        } else if !effective_runtime.is_empty() {
+            rec.extra
+                .insert(detail::RUNTIME.into(), effective_runtime.clone());
+        }
         self.store.record(rec.clone()).map_err(Self::io)?;
         self.store.audit(audit::of_resource(
             "resource_recorded",
@@ -524,45 +687,53 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             "ok",
             "recorded before the cloud call",
         ));
-        let mut provision = ProvisionSpec {
-            name: resource_name,
-            family: family.into(),
-            image: spec.image.pinned_ref.clone(),
-            kind: "container".into(),
-            machine_type: offer.machine_type.clone(),
-            disk_gb: disk_for(family),
-            cpus: Some(spec.cpus),
-            memory_mb: Some(spec.memory_mb),
-            tags: rec.tags.clone(),
-            ttl_secs,
-            arch: spec.image.arch.clone(),
-            runtime: runtime_word(self.api.as_ref(), &spec.runtime)?,
-            network,
-            ..Default::default()
-        };
+        provision.tags = rec.tags.clone();
         match self.api.tier() {
+            Tier::Vm if family == "windows" => {
+                let boot = WindowsVmBoot {
+                    join: &join,
+                    env: &guest_env,
+                    expires,
+                    ttl_secs,
+                    provider: self.api.name(),
+                    spacesd_download_url: conn.spacesd_download_url.as_deref(),
+                    desktop_user: "Administrator",
+                    desktop_password: desktop_password.as_deref().unwrap_or_default(),
+                };
+                provision.user_data = match prep.windows_header {
+                    Some(h) => {
+                        crate::bootstrap_win::windows_user_data_with_header(&boot, h.as_str())
+                    }
+                    None => windows_user_data(&boot),
+                };
+            }
             Tier::Vm => {
                 let (net_guard, share_slots) = VmBoot::switches();
-                provision.user_data = cloud_init(&VmBoot {
+                let boot = VmBoot {
                     join: &join,
                     image: &spec.image.pinned_ref,
-                    env: &spec.env,
+                    env: &guest_env,
                     expires,
                     ttl_secs,
                     shm_mb: 2048,
                     provider: self.api.name(),
                     net_guard,
                     share_slots,
-                });
+                };
+                provision.user_data =
+                    if matches!(family, "linux" | "linux-slim") && provision.runtime == "native" {
+                        linux_native_cloud_init(&boot, conn.spacesd_download_url.as_deref())
+                    } else {
+                        cloud_init(&boot)
+                    };
             }
             Tier::Sandbox => {
-                let mut env = spec.env.clone();
+                let mut env = guest_env.clone();
                 env.extend(join.guest_env());
                 provision.env = env;
                 provision.command = spec.command.clone();
             }
         }
-        // 3. The cloud call.
         let made = match self.api.provision(&conn, &provision).await {
             Ok(m) => m,
             Err(e) => {
@@ -597,17 +768,34 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             ));
             all.push(r);
         }
-        // 4. The guest boots and joins the relay.
         let budget = spec.timeout.max(ONLINE_WAIT);
-        let joined = self
-            .relay
-            .wait_online(&machine, budget, || self.alive(&conn, &rec))
+        let joined = conn_relay
+            .wait_online(
+                self.store.home().as_deref(),
+                self.api.name(),
+                &machine,
+                static_env_token.as_deref(),
+                budget,
+                || self.alive(&conn, &rec),
+            )
             .await;
         if let Err(e) = joined {
             // The evidence first: the rollback deletes the machine and its
             // log with it.
-            let mut secrets: Vec<&str> = vec![&join.machine_token, &join.jwks_json];
-            secrets.extend(spec.env.values().map(String::as_str));
+            let owned_secrets = conn
+                .spacesd_download_url
+                .as_deref()
+                .map(extract_url_secrets)
+                .unwrap_or_default();
+            let mut secrets: Vec<&str> = vec![&join.machine_token];
+            if !join.jwks_json.is_empty() {
+                secrets.push(&join.jwks_json);
+            }
+            if let Some(pw) = desktop_password.as_deref() {
+                secrets.push(pw);
+            }
+            secrets.extend(guest_env.values().map(String::as_str));
+            secrets.extend(owned_secrets.iter().map(String::as_str));
             let evidence = self.keep_boot_log(&conn, &all[0], &secrets).await;
             self.rollback(&conn, &owner, &all[..1], &machine).await;
             return Err(with_evidence(e, evidence));
@@ -691,7 +879,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             "deleted with its sandbox",
         ));
         if !rec.machine.is_empty() {
-            self.forget_machine(&rec.machine).await;
+            self.forget_connection_machine(&conn, &rec.machine).await;
         }
         Ok(())
     }
@@ -701,8 +889,12 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .details
             .get(DETAIL_RELAY_MACHINE)
             .ok_or_else(|| Error::NotFound(format!("the relay computer of {}", instance.id)))?;
+        let url = match self.connection() {
+            Ok(conn) => self.connection_relay(&conn)?.machine_url(machine),
+            Err(_) => self.relay.machine_url(machine),
+        };
         Ok(ServiceEndpoint {
-            url: self.relay.machine_url(machine),
+            url,
             headers: vec![],
         })
     }
@@ -713,7 +905,15 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
         _port: u16,
     ) -> Option<Result<cua_spacesd_client::ConnectOptions>> {
         let machine = instance.details.get(DETAIL_RELAY_MACHINE)?;
-        Some(self.relay.connect_options(machine))
+        let conn = match self.connection() {
+            Ok(c) => c,
+            Err(_) => return Some(self.relay.connect_options(machine)),
+        };
+        let relay = match self.connection_relay(&conn) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(relay.connect_options(self.store.home().as_deref(), self.api.name(), machine))
     }
 
     // A cloud VM stops (compute billing stops, its disk stays) and starts
@@ -749,8 +949,16 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             .ok_or_else(|| Error::NotFound(format!("{}:{id}", self.api.name())))?;
         self.api.start(&conn, &rec, &owner).await?;
         if !rec.machine.is_empty() {
-            self.relay
-                .wait_online(&rec.machine, ONLINE_WAIT, || self.alive(&conn, &rec))
+            let relay = self.connection_relay(&conn)?;
+            relay
+                .wait_online(
+                    self.store.home().as_deref(),
+                    self.api.name(),
+                    &rec.machine,
+                    None,
+                    ONLINE_WAIT,
+                    || self.alive(&conn, &rec),
+                )
                 .await?;
         }
         rec.state = "running".into();

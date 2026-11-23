@@ -1,22 +1,26 @@
 ---
 title: Use your own cloud
-description: Run sandboxes and Spaces in your own AWS, Google Cloud, Azure, Hetzner or Modal account. Connect it, create on it, what Cua creates there, costs and cleanup.
+description: Run sandboxes and Spaces in your own AWS, Google Cloud, Azure, Hetzner, Modal or Alibaba Cloud ECS account. Connect it, create on it, what Cua creates there, costs and cleanup.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 Sandboxes and Spaces can run in a cloud account you own: `--on aws` (EC2),
 `--on gcp` (Compute Engine), `--on azure` (Azure Virtual Machines),
-`--on hetzner` (Hetzner Cloud servers) or `--on modal` (Modal Sandboxes). The same images,
-SDK calls and `cua-bench` runs work there, and you pay the cloud directly.
+`--on hetzner` (Hetzner Cloud servers), `--on modal` (Modal Sandboxes) or
+`--on aliyun-ecs` (Alibaba Cloud ECS). The same images, SDK calls and
+`cua-bench` runs work there, and you pay the cloud directly.
 
-Each sandbox dials out to the cua.ai relay as a machine of your account, so
-nothing in your cloud listens on the internet. Your laptop, your agents and the
-Cua Spaces app reach it wherever they are. Streams, files and presence pass
-through relay.cua.ai, and only your machines and the accounts you share a Space
-with can reach the sandbox. The guest holds only its own machine token, never
-your account credentials. An account holds at most 32 machines, and each cloud
-sandbox uses one until you delete it.
+By default each sandbox dials out to the cua.ai relay (`relay.cua.ai`) as a
+machine of your account (Account Relay Mode), or to a self-hosted relay you
+configure per connection with `--relay-url` and `--relay-mode static` (Static
+Relay Mode), so nothing in your cloud listens on the internet. Your laptop,
+your agents and the Cua Spaces app reach it wherever they are. Streams, files
+and presence pass through the relay, and only your machines and the accounts
+you share a Space with (or holders of the static relay token) can reach the
+sandbox. The guest holds only its own machine token, never your account
+credentials. In Account Relay Mode an account holds at most 32 machines, and
+each cloud sandbox uses one until you delete it.
 
 <Callout type="warn">
   Everything here creates resources that your cloud account bills for. Cua
@@ -26,8 +30,9 @@ sandbox uses one until you delete it.
 
 ## What you need
 
-- The cloud's own CLI, signed in. Cua uses its credentials where they are and
-  stores only the names:
+- The cloud's own CLI or credentials: Cua uses existing CLI profiles where they
+  are and stores only the profile or connection names, or seals inline tokens
+  in your credential store:
   - **AWS**: a profile in `~/.aws` (access keys, SSO or an assumed role).
   - **Google Cloud**: `gcloud auth login` and a project with the Compute Engine
     API enabled.
@@ -39,8 +44,14 @@ sandbox uses one until you delete it.
   - **Azure**: nothing on this machine. Azure is always linked through Cua's
     sign-in, with no key. See
     [Link a cloud without a key](/cua-sdk/guides/your-cloud-without-a-key#azure).
-- A cua.ai sign-in (`cua auth login`). Each cloud sandbox joins the relay as a
-  machine of your account.
+  - **Alibaba Cloud ECS (`aliyun-ecs`)**: a RAM sub-account AccessKey pair via
+    `--token-stdin` (`<access_key_id>:<access_key_secret>`),
+    `ALIBABA_CLOUD_ACCESS_KEY_ID` and `ALIBABA_CLOUD_ACCESS_KEY_SECRET`, or an
+    `AK`-mode profile in `~/.aliyun/config.json` (`--profile` or the active
+    `current` profile), defaulting to `cn-hangzhou`.
+- A cua.ai sign-in (`cua auth login`) for Account Relay Mode. If you connect in
+  Static Relay Mode (`--relay-mode static --relay-url <url> --relay-token-stdin`),
+  no `cua auth login` is required.
 
 AWS and Google Cloud can also be linked with no key at all, through Cua's
 sign-in. See [Link AWS without a key](#link-aws-without-a-key) and
@@ -61,6 +72,7 @@ the machine types:
 
 ```bash test="cli-shape" id="cua-cloud-test"
 cua cloud test aws --profile default --region us-west-2
+cua cloud test aliyun-ecs --region cn-hangzhou
 ```
 
 `cua cloud connect` runs the same checks and connects only when they pass.
@@ -72,11 +84,13 @@ cua cloud connect aws --region us-west-2 --default
 cua cloud connect gcp --project my-project --region us-central1
 cua cloud connect modal --environment sandboxes
 cua cloud connect hetzner --region fsn1
+cua cloud connect aliyun-ecs --region cn-hangzhou
 ```
 
 `--ttl-hours` sets how long each sandbox there lives before it deletes itself
 (default 8; `0` keeps it until you delete it; Modal caps a sandbox at 24; a
-Hetzner server shuts itself down then, and `cua cloud sweep --delete` removes it):
+Hetzner server shuts itself down then, and `cua cloud sweep --delete` removes it).
+You can also override that lifetime per sandbox with `cua sb create --ttl <seconds>` (`0` disables auto-expiry for that sandbox):
 
 ```bash test="cli-shape" id="cua-cloud-connect-ttl"
 cua cloud connect aws --ttl-hours 2
@@ -84,6 +98,27 @@ cua cloud connect aws --ttl-hours 2
 
 The Cua Spaces app does the same from **New Space**, **Your cloud**,
 **Connect a cloud**. Hetzner asks for the API token there.
+
+### Relay modes (Account Relay and Static Relay)
+
+Every `cua cloud connect` connection can target its own relay via `--relay-url`
+(default `https://relay.cua.ai`) and `--relay-mode`:
+
+- **Account Relay Mode** (`--relay-mode account`, default): requires
+  `cua auth login`. Each sandbox registers as a machine of your Cua account.
+- **Static Relay Mode** (`--relay-mode static`): pairs `--relay-url` with
+  `--relay-token-stdin` so sandboxes dial a self-hosted relay using a generated
+  `machine_id` and per-sandbox `env_token` bearer auth without `cua auth login`.
+  The relay token is stored in Cua's credential store and never written in
+  plaintext to `state.json`.
+
+```bash test="cli-shape" id="cua-cloud-connect-static-relay"
+printf '%s\n' "$RELAY_TOKEN" | cua cloud connect aliyun-ecs \
+  --region cn-hangzhou \
+  --relay-url https://relay.example.com \
+  --relay-mode static \
+  --relay-token-stdin
+```
 
 ### Limits for one cloud
 
@@ -188,6 +223,72 @@ cua sb exec aws:research -- uname -a
 cua sb delete aws:research
 ```
 
+### Direct VM vs. Docker-on-VM
+
+On `aliyun-ecs`, a sandbox runs in one of two runtimes:
+
+- **Docker-on-VM Sandbox** (`--runtime docker`): the default for `linux` and
+  `linux-slim` (Ubuntu 24.04 with Docker; `ecs.e-c1m2.large` 2 vCPU / 4 GiB or
+  `ecs.e-c1m1.large` 2 vCPU / 2 GiB, `40 GiB` `cloud_essd` disk).
+- **Direct VM Sandbox** (`--runtime native`): the default for `windows`
+  (`4 vCPU / 8 GiB` baseline such as `ecs.c7.xlarge`; when no `--instance-type`
+  is set, Cua dynamically queries `DescribeAvailableResource` and
+  `DescribeInstanceTypes` for an in-stock `x86_64` mainstream instance type
+  matching the required compute size in the target zone, and `60 GiB`
+  `cloud_essd` disk), and optional for `linux` / `linux-slim` when you want
+  `cua-spacesd` directly on the VM OS without Docker. Linux `--runtime native`
+  attaches to an existing desktop session or starts `cua-spacesd join` headless
+  under systemd.
+
+Both Linux and Windows `--runtime native` check whether `cua-spacesd` is
+already installed in the image and otherwise download it from GitHub Releases
+or your `--spacesd-download-url` mirror (verified by SHA-256).
+
+```bash test="cli-shape" id="cua-sb-create-aliyun-native"
+cua sb create windows --on aliyun-ecs --runtime native --name win-box
+cua sb create linux --on aliyun-ecs --runtime native --name linux-vm
+```
+
+### Custom Cloud Image IDs, VPCs and binary mirrors
+
+On `aliyun-ecs`, you can configure default images, sizing, existing VPC
+attachment, and a `cua-spacesd` mirror when connecting, or override the image
+per create with `--cloud-image-id` (precedence: `--cloud-image-id` ->
+connection default `--windows-image-id` / `--linux-image-id` -> official
+Alibaba Cloud image):
+
+```bash test="cli-shape" id="cua-aliyun-ecs-custom-options"
+cua cloud connect aliyun-ecs \
+  --region cn-hangzhou \
+  --windows-image-id m-windows-custom \
+  --linux-image-id m-linux-custom \
+  --instance-type ecs.c7.xlarge \
+  --spacesd-download-url https://mirror.example.com/cua-spacesd/
+
+cua cloud connect aliyun-ecs \
+  --region cn-hangzhou \
+  --vpc-id vpc-bp1example \
+  --vswitch-id vsw-bp1example \
+  --no-public-ip
+
+cua sb create windows --on aliyun-ecs --cloud-image-id m-windows-custom --name custom-win
+```
+
+`--spacesd-download-url` (a **Spacesd Mirror URL**) applies to both Linux and
+Windows Direct VM Sandboxes (`--runtime native`). It supports `{version}` and
+`{arch}` placeholders as well as a trailing `/` directory prefix: when the path
+ends with `/`, Linux fetches `cua-spacesd-linux-<arch>.tar.gz` and Windows
+fetches `cua-spacesd-x86_64-pc-windows-msvc.exe`, each verified against its
+`.sha256` sidecar. A single-file URL can pin its digest inline with
+`#sha256=<64 hex>`, whereas a trailing-slash directory URL cannot carry a
+single-file `#sha256=` fragment and uses per-asset `.sha256` sidecars instead.
+
+When `--vpc-id` and `--vswitch-id` are both provided (in the same region), Cua
+places ECS instances in your VSwitch and creates or reuses only a Cua-tagged
+zero-ingress security group without modifying your existing security groups.
+With `--no-public-ip`, Cua sets `InternetMaxBandwidthOut=0` so instances rely on
+your VPC's NAT gateway or private route to reach the relay.
+
 From Python, including `cua-bench` runs:
 
 ```python skip="your-cloud" id="your-cloud-python"
@@ -203,7 +304,8 @@ cb run cua-bench-basic --on aws
 ```
 
 A Space is a cloud sandbox shown as the relay machine it joined as,
-`relay:<machine>`. Stop and start keep its disk (on AWS and Google Cloud):
+`relay:<machine>`. Stop and start keep its disk (on AWS, Google Cloud, Azure and
+Alibaba Cloud ECS):
 
 ```bash test="cli-shape" id="cua-spaces-create-aws"
 cua spaces create linux --on aws --name research
@@ -215,9 +317,9 @@ cua spaces delete relay:cloud-0123456789abcdef --force
 On Hetzner, `--on hetzner` takes container images only, and stopping a Space
 does not stop the charge (see [Notes for each cloud](#notes-for-each-cloud)).
 
-Agents use the same `create_space` tool with `on="aws"`, and `cloud_status`,
-`cloud_test`, `cloud_connect`, `cloud_disconnect`, `cloud_sweep` and
-`cloud_audit` from the
+Agents use the same `create_space` tool with `on="aws"` (or `"aliyun-ecs"`),
+and `cloud_status`, `cloud_test`, `cloud_connect`, `cloud_disconnect`,
+`cloud_sweep` and `cloud_audit` from the
 [Spaces contract](/spaces/reference/sharing-and-clouds#your-cloud).
 
 ## What Cua creates
@@ -229,10 +331,14 @@ Agents use the same `create_space` tool with `on="aws"`, and `cloud_status`,
 | Azure | One VM (Ubuntu 24.04, no SSH key, no managed identity) with its disk, network interface and public IPv4 address, in the connection's resource group. Docker runs the image on it. | A virtual network and a network security group, `cua-sb-<owner>`, with no rules of their own: Azure's defaults deny inbound traffic from the internet. |
 | Hetzner | One server with an IPv4 address and Docker (Ubuntu 24.04), and no SSH key. Docker runs the image on it. | One firewall, `cua-sb-<owner>`, with no rules: Hetzner drops all inbound traffic. Your project's other firewalls are never used or changed. |
 | Modal | One Modal sandbox running the image. | Nothing. |
+| Alibaba Cloud ECS | One ECS instance and its `cloud_essd` system disk (Docker-on-VM for `linux` / `linux-slim` by default; Direct VM for `windows` or `--runtime native`). | Isolated `cua-sb-<owner>` VPC, VSwitch and zero-ingress security group `cua-sandboxes-<owner>` (or only a Cua-tagged zero-ingress security group when attaching to `--vpc-id` / `--vswitch-id`). |
 
-- Nothing else is created: no IAM users or keys, and no change to existing
+- Nothing else is created: no IAM/RAM users or keys, and no change to existing
   networks, security groups or firewall rules.
-- The VM installs only Docker. The image carries its own cua-spacesd.
+- For Docker-on-VM, the VM installs only Docker and the container image carries
+  its own `cua-spacesd`. For Direct VM (`--runtime native`), the VM uses
+  pre-installed `cua-spacesd` or installs it from `--spacesd-download-url` (or
+  GitHub Releases) with SHA-256 verification.
 - Every resource carries these tags (labels on Google Cloud and Hetzner):
 
   | Tag | Value |
@@ -250,11 +356,11 @@ Agents use the same `create_space` tool with `on="aws"`, and `cloud_status`,
   `cua cloud audit`): who recorded, created, confirmed or deleted what, and
   when. Names and ids only, never a secret.
 
-Cua creates no IAM users, roles or keys, so it acts as whatever identity you
-connect (with `--oidc`, the `cua-spaces` role your own CloudFormation stack
+Cua creates no IAM or RAM users, roles or keys, so it acts as whatever identity
+you connect (with `--oidc`, the `cua-spaces` role your own CloudFormation stack
 creates). [Least privilege in your cloud](/cua-sdk/guides/your-cloud-safety)
-has the AWS policy and Google Cloud permissions for a dedicated identity, and
-what Cua keeps when a machine does not come online.
+has the AWS and Alibaba Cloud ECS policies and Google Cloud permissions for a
+dedicated identity, and what Cua keeps when a machine does not come online.
 
 ## Costs
 
@@ -262,23 +368,26 @@ what Cua keeps when a machine does not come online.
 per hour while it runs (compute and disk, not network). A stopped VM bills only
 its disk.
 
-| Cloud | `linux` | `linux-slim` |
-|---|---|---|
-| AWS | `t4g.medium` (arm64), about $0.04/hour | `t4g.small`, about $0.03/hour |
-| Google Cloud | `e2-medium`, about $0.04/hour | `e2-small`, about $0.03/hour |
-| Azure | `Standard_B2s`, about $0.05/hour | `Standard_B1ms`, about $0.03/hour |
-| Hetzner | `cx23`, about $0.0114/hour | the same |
-| Modal | 1 core (2 vCPU) and 4 GiB, about $0.24/hour | the same |
+| Cloud | `linux` | `linux-slim` | `windows` |
+|---|---|---|---|
+| AWS | `t4g.medium` (arm64), about $0.04/hour | `t4g.small`, about $0.03/hour | Not offered |
+| Google Cloud | `e2-medium`, about $0.04/hour | `e2-small`, about $0.03/hour | Not offered |
+| Azure | `Standard_B2s`, about $0.05/hour | `Standard_B1ms`, about $0.03/hour | Not offered |
+| Hetzner | `cx23`, about $0.0114/hour | the same | Not offered |
+| Modal | 1 core (2 vCPU) and 4 GiB, about $0.24/hour | the same | Not offered |
+| Alibaba Cloud ECS | `ecs.e-c1m2.large` (2 vCPU, 4 GiB), about $0.043/hour | `ecs.e-c1m1.large` (2 vCPU, 2 GiB), about $0.030/hour | `ecs.c7.xlarge` (4 vCPU, 8 GiB Direct VM), about $0.125/hour |
 
 - Hetzner: `cx23` is $0.0104/hour plus $0.001/hour for the server's IPv4
   address (checked 2026-10-22 against the Hetzner API). `cua cloud status`
   shows the live price of the type a create would pick. An Arm image uses
   `cax11`.
-- Windows and Omarchy are not offered yet. They run as VMs inside the cloud's
-  VM, which needs a nested-virtualization machine type. `cua cloud status`
-  says so next to them.
-- macOS is not offered. On AWS it would need an EC2 Mac dedicated host, which
-  has a 24-hour minimum.
+- Alibaba Cloud ECS creates `PostPaid` instances with `StoppedMode=StopCharging`
+  and native `AutoReleaseTime` (`--ttl-hours`, default `8`). Stopping a Space
+  releases compute charges (`StopCharging`) while preserving its `cloud_essd`
+  disk.
+- Windows runs as a Direct VM Sandbox on `aliyun-ecs`. Omarchy is not offered on
+  cloud providers yet, and macOS is not offered (on AWS it would need an EC2 Mac
+  dedicated host with a 24-hour minimum).
 
 ## Notes for each cloud
 
@@ -348,6 +457,44 @@ its disk.
     Go SDK. Build it with `go build` in
     `libs/cua/crates/cua-contrib/modal-helper`, and put it next to `cua`, on
     `PATH`, or in `CUA_MODAL_HELPER`.
+- **Alibaba Cloud ECS (`aliyun-ecs`)**:
+  - One region per connection (`--region`, default `cn-hangzhou`). Credentials
+    resolve in order: `--token-stdin` (`<access_key_id>:<access_key_secret>`),
+    `ALIBABA_CLOUD_ACCESS_KEY_ID` and `ALIBABA_CLOUD_ACCESS_KEY_SECRET`,
+    explicit `--profile <name>` in `~/.aliyun/config.json`, saved credentials
+    in Cua's credential store, or the active `current` profile in
+    `~/.aliyun/config.json` (`AK` mode).
+  - **Metadata isolation**: Linux instances launch with `HttpTokens=required`
+    (IMDSv2), while Windows instances launch with `HttpTokens=optional`
+    (Alibaba Cloud Windows `vminit` and `cloudbase-init` require IMDSv1) and
+    zero RAM instance role. Both Docker-on-VM containers and Direct VM guests
+    block the ECS metadata service (`100.100.100.200` and `169.254.169.254`) on
+    the guest OS firewall during first boot before any container or desktop
+    session runs.
+  - **Billing and release**: `PostPaid` with `StoppedMode=StopCharging` and
+    native ECS `AutoReleaseTime` (`--ttl-hours`, default `8`), plus an in-guest
+    TTL shutdown timer. If `RunInstances` fails or times out, Cua reads
+    `GetInstanceConsoleOutput` (redacted, saved under
+    `~/.cua/cloud/boot-logs/<id>.log`) and deletes the instance.
+  - **Windows Server vs. custom Windows 10 and Windows 11 images**:
+    - Official Alibaba Cloud Windows Server images use Alibaba Cloud `vminit`
+      (which executes `[powershell]` `UserData` scripts). If you supply a
+      custom Windows 10 or Windows 11 image via `--windows-image-id` or
+      `--cloud-image-id`, it MUST have `cloudbase-init` installed and enabled
+      so ECS executes the `#ps1_sysnative` `UserData` bootstrap script.
+    - At boot, `UserData` configures AutoLogon, an `AtLogOn` scheduled task so
+      `cua-spacesd` runs in an unlocked interactive desktop session
+      (`Session >= 1`, never Session 0), and an Event ID `24` `tscon.exe`
+      recovery task so an RDP disconnect keeps the interactive desktop active.
+    - **Screen capture (`GDI` vs. `WGC`)**: classic Win32 windows capture
+      via **GDI** (`PrintWindow`), whereas DirectComposition, WinUI3 and UWP
+      applications (such as Windows 11 Notepad, Calculator and Settings) have no
+      GDI back-buffer and capture via **WGC** (`Windows.Graphics.Capture`),
+      falling back to WARP or screen-region capture on virtual display drivers
+      where hardware WGC returns black frames. Windows Server and custom
+      Windows 10/11 images differ in WGC, D3D11 and virtual-display driver
+      support, and both require an unlocked interactive `Session >= 1` for
+      desktop capture to succeed.
 
 ## Time limits and cleanup
 
@@ -355,9 +502,10 @@ Four things end a sandbox that nobody deleted:
 
 - **It shuts itself down.** A VM runs `shutdown` at its time limit and checks
   it again after every reboot or start. Shutting down deletes it (AWS
-  terminates on shutdown; Google Cloud's run limit deletes it). On Hetzner it
-  only powers the server off (still billed) until a sweep deletes it. Modal
-  ends a sandbox at its timeout.
+  terminates on shutdown; Google Cloud's run limit deletes it; Alibaba Cloud
+  ECS sets `AutoReleaseTime` so the instance releases at expiry even if
+  stopped). On Hetzner it only powers the server off (still billed) until a
+  sweep deletes it. Modal ends a sandbox at its timeout.
 - **A failed create cleans up.** Whatever it made is deleted, and its relay
   machine is removed.
 - **`cua cloud sweep`** lists expired sandboxes and anything Cua created whose
@@ -371,6 +519,7 @@ Four things end a sandbox that nobody deleted:
 ```bash test="cli-shape" id="cua-cloud-sweep"
 cua cloud sweep
 cua cloud sweep aws --delete
+cua cloud sweep aliyun-ecs --delete
 cua cloud sweep --all --delete
 ```
 

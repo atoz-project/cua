@@ -42,6 +42,7 @@ use cua_sandbox_core::byoc::{CloudConnected, CloudNext, CloudProvider, ConnectRe
 use crate::api::{CloudApi, Result, Tested};
 use crate::manager::Clouds;
 use crate::model::{self, Connection, MaxSize};
+use crate::target::PreparedTarget;
 
 /// The checked inputs every path shares.
 struct Limits {
@@ -73,24 +74,37 @@ fn limits_of(req: &ConnectRequest) -> Result<Limits> {
 pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Result<CloudConnected> {
     let p = clouds.api(&req.target.provider)?.clone();
     let limits = limits_of(req)?;
-    // Asked, or implied (Azure; Google Cloud with a project number), else
-    // how it is linked already or the default for the cloud.
+    let existing = clouds.store().connection(p.name()).map_err(Error::Io)?;
+    let prep = PreparedTarget::prepare(
+        clouds.store().home().as_deref(),
+        p.as_ref(),
+        &req.target,
+        existing,
+    )?;
     let explicit = req
         .auth
         .as_deref()
         .map(str::trim)
         .is_some_and(|a| !a.is_empty());
     let implied = req.auth_word();
-    let auth = if explicit || implied != "cli" {
+    let mut auth = if explicit || implied != "cli" {
         implied
+    } else if prep.relay.mode == cua_sandbox_core::byoc::RelayMode::Static {
+        "cli".into()
     } else {
         default_auth(clouds, p.as_ref(), &limits).await.into()
     };
+    if auth == "cli" && p.name() == "azure" {
+        auth = "oidc".into();
+    }
+    if prep.relay.mode == cua_sandbox_core::byoc::RelayMode::Static && auth != "cli" {
+        return Err(Error::InvalidArgument(
+            "--relay-mode static cannot be combined with --oidc or --sealed".into(),
+        ));
+    }
     match auth.as_str() {
-        // Azure is linked through Cua's issuer only.
-        "cli" if p.name() == "azure" => connect_oidc(clouds, p.as_ref(), req, &limits).await,
         "cli" => {
-            if p.name() == "modal" && req.target.token.is_some() {
+            if p.name() == "modal" && prep.target.token.is_some() {
                 return Err(Error::InvalidArgument(
                     "a Modal token given to cua is sealed to your devices (add --budget, or \
                      --sealed); without sealing, Modal signs in on this device with \
@@ -98,10 +112,10 @@ pub(crate) async fn connect_with(clouds: &Clouds, req: &ConnectRequest) -> Resul
                         .into(),
                 ));
             }
-            connect_cli(clouds, p.as_ref(), req, &limits).await
+            connect_cli(clouds, p.as_ref(), req, prep, &limits).await
         }
-        "oidc" => connect_oidc(clouds, p.as_ref(), req, &limits).await,
-        "sealed" => connect_sealed(clouds, p.as_ref(), req, &limits).await,
+        "oidc" => connect_oidc(clouds, p.as_ref(), req, prep, &limits).await,
+        "sealed" => connect_sealed(clouds, p.as_ref(), req, prep, &limits).await,
         other => Err(Error::InvalidArgument(format!(
             "auth {other:?} is not cli, oidc or sealed"
         ))),
@@ -190,6 +204,7 @@ async fn connect_sealed(
     clouds: &Clouds,
     p: &dyn CloudApi,
     _req: &ConnectRequest,
+    _prep: PreparedTarget,
     _limits: &Limits,
 ) -> Result<CloudConnected> {
     Ok(outcome(
@@ -222,6 +237,7 @@ async fn connect_sealed(
     clouds: &Clouds,
     p: &dyn CloudApi,
     req: &ConnectRequest,
+    prep: PreparedTarget,
     limits: &Limits,
 ) -> Result<CloudConnected> {
     use crate::federation::{IssuerError, IssuerLimits, IssuerMaxSize, NewConnection};
@@ -284,13 +300,13 @@ async fn connect_sealed(
         return Ok(failed(e.to_string(), None));
     }
     let store = clouds.store();
-    let local = store.connection(name).map_err(Error::Io)?;
+    let local = prep.existing.clone();
     let servers = match issuer.connections().await {
         Ok(v) => v,
         Err(e) => return Ok(issuer_failed(&e)),
     };
     let key = sealed_key(name);
-    let named = req
+    let named = prep
         .target
         .project
         .as_deref()
@@ -319,7 +335,7 @@ async fn connect_sealed(
 
     // Where, and the limits (asked now, else the account's, else this
     // device's).
-    let mut target = req.target.clone();
+    let mut target = prep.target.clone();
     target.token = None;
     if target.region.as_deref().is_none_or(|r| r.trim().is_empty()) {
         target.region = server
@@ -331,6 +347,7 @@ async fn connect_sealed(
     let mut candidate = p.resolve(&target)?;
     // A sealed link signs in with its own token, never a profile.
     candidate.profile = String::new();
+    prep.apply_to(&mut candidate);
     let budget = limits
         .budget
         .or_else(|| server.as_ref().and_then(|s| s.limits.budget_usd_month))
@@ -342,6 +359,7 @@ async fn connect_sealed(
                 s.limits.max_size.map(|m| MaxSize {
                     vcpu: m.vcpu,
                     mem_gib: m.memory_gib,
+                    disk_gib: None,
                 })
             })
         })
@@ -388,13 +406,9 @@ async fn connect_sealed(
 
     // 2. The token: given now; else the account's (sealed already); else
     // the one this device has (`--sealed` seals it).
-    let given = req
-        .target
-        .token
-        .as_deref()
-        .is_some_and(|t| !t.trim().is_empty());
+    let given = prep.target.token.is_some();
     let (token, fresh) = if given {
-        match p.local_secret(&req.target) {
+        match p.local_secret(&prep.target) {
             Some(t) => (t, true),
             None => {
                 return Err(Error::InvalidArgument(format!(
@@ -414,7 +428,7 @@ async fn connect_sealed(
             Err(e) => return Ok(failed(e.to_string(), None)),
         }
     } else {
-        match p.local_secret(&req.target) {
+        match p.local_secret(&prep.target) {
             Some(t) => (t, true),
             None => {
                 return Ok(failed(
@@ -434,11 +448,31 @@ async fn connect_sealed(
     let mut staged = target.clone();
     staged.token = Some(token.expose().to_string());
     p.stage_secret(&staged);
+    let unstage = crate::api::UnstageGuard(p);
     if let Some(t) = staged.token.as_mut() {
         zeroize::Zeroize::zeroize(t);
     }
-    let tested = p.test(&candidate).await;
-    p.unstage_secret();
+    let mut tested = p.test(&candidate).await;
+    drop(unstage);
+    if let Some(url) = prep.relay.probe_url.as_deref() {
+        let check = crate::relay::probe_relay_check(url, prep.relay.mode).await;
+        if !check.ok {
+            tested.checks.push(check.clone());
+            return Ok(outcome(
+                clouds,
+                p,
+                None,
+                status::FAILED,
+                Some(CloudNext {
+                    run: Some(line(budget)),
+                    why: check.detail,
+                    ..Default::default()
+                }),
+                tested.checks,
+            ));
+        }
+        tested.checks.push(check);
+    }
     if !tested.ok() {
         return Ok(outcome(
             clouds,
@@ -525,8 +559,10 @@ async fn connect_sealed(
         .map(|m| MaxSize {
             vcpu: m.vcpu,
             mem_gib: m.memory_gib,
+            disk_gib: None,
         })
         .or(max_size);
+    crate::relay::clear_static_relay_token(store.home().as_deref(), name);
     store.connect(candidate.clone()).map_err(Error::Io)?;
     tokens.forget(name);
     let mut a = crate::audit::entry("connect", name, agent.unwrap_or("user"));
@@ -595,21 +631,19 @@ async fn connect_cli(
     clouds: &Clouds,
     p: &dyn CloudApi,
     req: &ConnectRequest,
+    prep: PreparedTarget,
     limits: &Limits,
 ) -> Result<CloudConnected> {
-    use cua_sandbox_core::byoc::CloudManager as _;
     let mut c = clouds
-        .connect(&req.target, req.make_default, req.ttl_hours)
+        .connect_prepared_with_limits(
+            p,
+            prep,
+            req.make_default,
+            req.ttl_hours,
+            limits.budget,
+            limits.max_size,
+        )
         .await?;
-    if limits.budget.is_some() || limits.max_size.is_some() {
-        let store = clouds.store();
-        if let Some(mut conn) = store.connection(p.name()).map_err(Error::Io)? {
-            conn.budget_usd_month = limits.budget.or(conn.budget_usd_month);
-            conn.max_size = limits.max_size.or(conn.max_size);
-            store.connect(conn.clone()).map_err(Error::Io)?;
-            c.provider = clouds.row(p, Some(&conn), &clouds.default_on());
-        }
-    }
     c.provider.status = status::CONNECTED.into();
     c.verify = format!("cua cloud status {}", p.name());
     Ok(c)
@@ -647,6 +681,7 @@ async fn connect_oidc(
     clouds: &Clouds,
     p: &dyn CloudApi,
     _req: &ConnectRequest,
+    _prep: PreparedTarget,
     _limits: &Limits,
 ) -> Result<CloudConnected> {
     Ok(outcome(
@@ -1213,6 +1248,7 @@ async fn connect_oidc(
     clouds: &Clouds,
     p: &dyn CloudApi,
     req: &ConnectRequest,
+    prep: PreparedTarget,
     limits: &Limits,
 ) -> Result<CloudConnected> {
     use crate::federation::{
@@ -1259,7 +1295,7 @@ async fn connect_oidc(
     // The link this device has: an OIDC one (this flow, run again), or the
     // CLI sign-in it replaces, whose region, limits and lifetime carry over
     // (and which stays in force until the check passes).
-    let linked = store.connection(p.name()).map_err(Error::Io)?;
+    let linked = prep.existing.clone();
     let local = linked.clone().filter(|c| !c.auth.is_cli());
     let cli_link = linked.filter(|c| c.auth.is_cli());
     let carried = local.as_ref().or(cli_link.as_ref());
@@ -1296,7 +1332,7 @@ async fn connect_oidc(
     }
     ids.extend(given_ids.clone());
     fed.complete(&mut ids);
-    let region = req
+    let region = prep
         .target
         .region
         .clone()
@@ -1316,6 +1352,7 @@ async fn connect_oidc(
                 s.limits.max_size.map(|m| MaxSize {
                     vcpu: m.vcpu,
                     mem_gib: m.memory_gib,
+                    disk_gib: None,
                 })
             })
         })
@@ -1327,7 +1364,7 @@ async fn connect_oidc(
         .unwrap_or(model::DEFAULT_TTL_HOURS);
     // Google Cloud: the project id people know (the script takes it).
     let project = match fed {
-        Fed::Gcp => given(&req.target.project).or_else(|| {
+        Fed::Gcp => given(&prep.target.project).or_else(|| {
             local
                 .as_ref()
                 .map(|l| l.project.clone())
@@ -1412,6 +1449,28 @@ async fn connect_oidc(
         }
     }
 
+    let relay_check = match prep.relay.probe_url.as_deref() {
+        Some(url) => {
+            let check = crate::relay::probe_relay_check(url, prep.relay.mode).await;
+            if !check.ok {
+                return Ok(outcome(
+                    clouds,
+                    p,
+                    None,
+                    status::FAILED,
+                    Some(CloudNext {
+                        run: Some(cmd.line(req.check, false)),
+                        why: check.detail.clone(),
+                        ..Default::default()
+                    }),
+                    vec![check],
+                ));
+            }
+            Some(check)
+        }
+        None => None,
+    };
+
     // 3. The account's connection on the issuer: created, or its limits
     // brought in line (an agent's raise waits for approval).
     let wanted = IssuerLimits {
@@ -1471,9 +1530,11 @@ async fn connect_oidc(
         .map(|m| MaxSize {
             vcpu: m.vcpu,
             mem_gib: m.memory_gib,
+            disk_gib: None,
         })
         .or(max_size);
     let mut candidate = fed.candidate(&server.id, &recorded, &region, req, local.as_ref());
+    prep.apply_to(&mut candidate);
     candidate.ttl_hours = ttl_hours;
     candidate.connected_at = model::rfc3339(model::now());
     candidate.budget_usd_month = budget;
@@ -1518,7 +1579,7 @@ async fn connect_oidc(
         out.provider.approval = approval.into();
         return Ok(out);
     }
-    let tested: Tested = if req.check || !proven {
+    let mut tested: Tested = if req.check || !proven {
         p.test(&candidate).await
     } else {
         let mut t = Tested {
@@ -1532,6 +1593,9 @@ async fn connect_oidc(
         );
         t
     };
+    if let Some(check) = relay_check {
+        tested.checks.push(check);
+    }
     if !tested.ok() {
         let untrusted = tested
             .checks
@@ -1580,6 +1644,7 @@ async fn connect_oidc(
     }
 
     // 5. Proven: saved on this device (replacing a CLI sign-in link).
+    crate::relay::clear_static_relay_token(store.home().as_deref(), p.name());
     store.connect(candidate.clone()).map_err(Error::Io)?;
     let mut a = crate::audit::entry("connect", p.name(), agent.unwrap_or("user"));
     a.detail = format!(
@@ -1782,6 +1847,7 @@ pub(crate) async fn merge_server_status(
                                     MaxSize {
                                         vcpu: m.vcpu,
                                         mem_gib: m.memory_gib,
+                                        disk_gib: None,
                                     }
                                     .to_string()
                                 })
@@ -1880,6 +1946,7 @@ pub(crate) async fn approve_with(
             saved.max_size = Some(MaxSize {
                 vcpu: m.vcpu,
                 mem_gib: m.memory_gib,
+                disk_gib: None,
             });
         }
         if server.status == "revoked" {

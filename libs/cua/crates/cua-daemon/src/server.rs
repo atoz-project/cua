@@ -518,7 +518,12 @@ pub async fn start(runtime: Runtime, config: ServerConfig) -> Result<DaemonHandl
     // The daemon hosts local public URLs itself.
     runtime.mark_share_host();
     let features = {
-        let mut f = vec!["env".into(), "sandboxes".into()];
+        let mut f = vec![
+            "env".into(),
+            "sandboxes".into(),
+            cua_daemon_core::FEATURE_CLOUD_IMAGE_AND_SIZING.into(),
+            cua_daemon_core::FEATURE_SANDBOX_TTL.into(),
+        ];
         if cfg!(feature = "spaces") {
             f.extend(["spaces".into(), "mcp".into()]);
         }

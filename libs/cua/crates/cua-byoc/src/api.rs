@@ -49,6 +49,85 @@ pub fn target_of(c: &Connection) -> Target {
         project: some(&c.project),
         environment: some(&c.environment),
         token: None,
+        relay_url: c.relay_url.clone(),
+        relay_mode: c.relay_mode,
+        relay_token: None,
+        spacesd_download_url: c.spacesd_download_url.clone(),
+        vpc_id: c.vpc_id.clone(),
+        vswitch_id: c.vswitch_id.clone(),
+        no_public_ip: c.no_public_ip,
+        windows_image_id: c.windows_image_id.clone(),
+        linux_image_id: c.linux_image_id.clone(),
+        instance_type: c.instance_type.clone(),
+    }
+}
+
+/// Resolved effective machine sizing (vCPUs, RAM, effective disk GiB, total
+/// hourly price including disk) returned by [`CloudApi::prepare_provision`]
+/// before `--max-size` and `--budget` preflight checks.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResolvedSizing {
+    pub machine_type: Option<String>,
+    pub vcpus: u32,
+    pub memory_mb: u64,
+    pub disk_gb: Option<u32>,
+    pub usd_per_hour: f64,
+}
+
+/// Line-1 script header for Windows Direct VM `UserData`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowsInitHeader {
+    /// `#ps1_sysnative` for `cloudbase-init` (custom Windows 10/11 images).
+    #[default]
+    CloudbaseSysnative,
+    /// `[powershell]` for Alibaba Cloud `vminit` (official Windows Server images).
+    AliyunVminit,
+}
+
+impl WindowsInitHeader {
+    /// The exact line-1 header string expected by the Windows guest init agent.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowsInitHeader::CloudbaseSysnative => crate::bootstrap_win::CLOUDBASE_HEADER,
+            WindowsInitHeader::AliyunVminit => crate::bootstrap_win::ALIYUN_VMINIT_HEADER,
+        }
+    }
+}
+
+/// Single-pass resolved sizing, Cloud Image ID, Windows init header, and
+/// candidate availability zones returned by [`CloudApi::prepare_provision`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreparedProvision {
+    pub sizing: Option<ResolvedSizing>,
+    pub cloud_image_id: Option<String>,
+    pub windows_header: Option<WindowsInitHeader>,
+    /// Optional ordered availability zones where the selected shape has stock.
+    pub candidate_zones: Option<Vec<String>>,
+}
+
+impl PreparedProvision {
+    /// Writes resolved sizing, Cloud Image ID, and stock-zone hints onto `spec`.
+    pub fn apply_to(&self, spec: &mut ProvisionSpec) {
+        if let Some(sizing) = &self.sizing {
+            if let Some(mt) = sizing
+                .machine_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                spec.machine_type = mt.to_string();
+            }
+            if let Some(disk_gb) = sizing.disk_gb {
+                spec.disk_gb = disk_gb;
+            }
+        }
+        if let Some(img) = &self.cloud_image_id {
+            spec.cloud_image_id = Some(img.clone());
+        }
+        if self.candidate_zones.is_some() {
+            spec.candidate_zones = self.candidate_zones.clone();
+        }
+        spec.prepared = true;
     }
 }
 
@@ -136,11 +215,72 @@ pub trait CloudApi: Send + Sync + 'static {
         vec![]
     }
 
+    /// Guest operating systems this cloud runs (`"linux"`, `"windows"`).
+    fn supported_oses(&self) -> &'static [&'static str] {
+        &["linux"]
+    }
+
+    /// Default boot disk size in GiB for `family`.
+    fn default_disk_gb(&self, family: &str) -> u32 {
+        crate::provider::disk_for(family)
+    }
+
+    /// Estimated hourly USD cost per GiB of boot disk storage.
+    fn disk_usd_per_gb_hour(&self) -> f64 {
+        0.0
+    }
+
+    /// Effective `(vcpus, memory_mb)` checked against `--max-size` when
+    /// creating `family`.
+    fn check_size_for(
+        &self,
+        _family: &str,
+        cpus: u32,
+        memory_mb: u64,
+    ) -> (Option<u32>, Option<u64>) {
+        (
+            Some(cpus).filter(|c| *c > 0),
+            Some(memory_mb).filter(|m| *m > 0),
+        )
+    }
     /// Whether the cloud enforces a Space's network rules itself, outside
     /// the guest ([`crate::modal_net`]). Otherwise a Space that asks for
     /// rules is refused here, never created without them.
     fn takes_network_rules(&self) -> bool {
         false
+    }
+
+    /// Whether this cloud supports connection-level default Cloud Image IDs
+    /// (`--windows-image-id`, `--linux-image-id`) and default `--instance-type`.
+    fn supports_image_defaults(&self) -> bool {
+        false
+    }
+
+    /// Whether this cloud supports per-create `--cloud-image-id`, `--instance-type`,
+    /// and `--disk` / `disk_gb` overrides.
+    fn supports_custom_image_and_sizing(&self) -> bool {
+        false
+    }
+
+    /// Whether this cloud supports attaching to an existing VPC/VSwitch and
+    /// suppressing public IP assignment (`--vpc-id`, `--vswitch-id`, `--no-public-ip`).
+    fn supports_custom_vpc(&self) -> bool {
+        false
+    }
+
+    /// Scopes any home-backed credential store to `home` (set by [`crate::clouds`]
+    /// and [`crate::install`]). Default: no-op.
+    fn scope_home(&self, _home: &std::path::Path) {}
+
+    /// Resolves effective machine sizing, Cloud Image ID, Windows init header,
+    /// and any provider-specific launch plan in a single pass before limit
+    /// checks and [`CloudApi::provision`].
+    async fn prepare_provision(
+        &self,
+        _conn: &Connection,
+        _spec: &ProvisionSpec,
+    ) -> Result<PreparedProvision> {
+        Ok(PreparedProvision::default())
     }
 
     /// Whether this machine has the cloud's CLI sign-in or config, and
@@ -247,7 +387,12 @@ pub trait CloudApi: Send + Sync + 'static {
 /// How long to wait before retry `n` (1-based) of a rate-limited or
 /// briefly unavailable cloud call: 0.25 s doubling, at most 3 retries.
 #[cfg_attr(
-    not(any(feature = "gcp", feature = "azure", feature = "modal")),
+    not(any(
+        feature = "gcp",
+        feature = "azure",
+        feature = "modal",
+        feature = "aliyun-ecs"
+    )),
     allow(dead_code)
 )]
 pub(crate) fn retry_backoff(n: u32) -> Option<std::time::Duration> {
@@ -258,9 +403,24 @@ pub(crate) fn retry_backoff(n: u32) -> Option<std::time::Duration> {
 /// did not act on the call), 500, 502 and 504 only for reads and deletes
 /// (a create that may have happened is never repeated).
 #[cfg_attr(
-    not(any(feature = "gcp", feature = "azure", feature = "modal")),
+    not(any(
+        feature = "gcp",
+        feature = "azure",
+        feature = "modal",
+        feature = "aliyun-ecs"
+    )),
     allow(dead_code)
 )]
 pub(crate) fn retryable_status(status: u16, idempotent: bool) -> bool {
     matches!(status, 429 | 503) || (idempotent && matches!(status, 500 | 502 | 504))
+}
+
+/// Drops any staged secret on a [`CloudApi`] when the guard leaves scope
+/// (including across early returns or cancelled futures).
+pub(crate) struct UnstageGuard<'a>(pub &'a dyn CloudApi);
+
+impl Drop for UnstageGuard<'_> {
+    fn drop(&mut self) {
+        self.0.unstage_secret();
+    }
 }

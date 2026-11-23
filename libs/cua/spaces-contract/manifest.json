@@ -469,6 +469,10 @@
             },
             "type": "array"
           },
+          "cloud_image_id": {
+            "description": "Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),\ndistinct from `image` (the Sandbox Image).",
+            "type": "string"
+          },
           "command": {
             "description": "Entrypoint override (argv), for example\n`[\"python\", \"-m\", \"my_mcp\", \"--port\", \"8765\"]`.",
             "items": {
@@ -494,6 +498,12 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "disk_gb": {
+            "description": "Grow the boot disk to this many GiB (local VMs and `aliyun-ecs`).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
           },
           "durable": {
             "description": "Keep it on the user's machines (with `on` `auto`): when its machine\ngoes away it is created again on another one, with the same name\n(its disk starts fresh); `list_spaces` shows it with `durable` (its\nname), and `delete_space` deletes it for good. Default false.",
@@ -7063,7 +7073,7 @@
       "input_schema": {
         "properties": {
           "provider": {
-            "description": "Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`). Default:\nevery one.",
+            "description": "Only this cloud (`aws`, `azure`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).\nDefault: every one.",
             "type": "string"
           }
         },
@@ -7137,6 +7147,14 @@
             "description": "Modal environment (default: the profile's).",
             "type": "string"
           },
+          "instance_type": {
+            "description": "Default cloud instance type (`aliyun-ecs`: `--instance-type`).",
+            "type": "string"
+          },
+          "linux_image_id": {
+            "description": "Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).",
+            "type": "string"
+          },
           "make_default": {
             "description": "Also make it the default location (`default.on`). Default false.",
             "type": "boolean"
@@ -7145,8 +7163,12 @@
             "description": "The largest machine Cua may create there: `<vCPUs>x<GB>`, for\nexample `4x16`.",
             "type": "string"
           },
+          "no_public_ip": {
+            "description": "Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,\n`aliyun-ecs` only).",
+            "type": "boolean"
+          },
           "profile": {
-            "description": "AWS: the profile in `~/.aws/config` (default: `default`, or\n`AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the\nactive one).",
+            "description": "AWS: the profile in `~/.aws/config` (default: `default`, or\n`AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the\nactive one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`.",
             "type": "string"
           },
           "project": {
@@ -7158,11 +7180,23 @@
             "type": "string"
           },
           "provider": {
-            "description": "`aws`, `azure`, `gcp`, `hetzner` or `modal`.",
+            "description": "`aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.",
             "type": "string"
           },
           "region": {
-            "description": "AWS region (default: the profile's, else `us-west-2`), Hetzner location\n(default `fsn1`), GCP region (default `us-central1`) or Azure region\n(default `westus2`).",
+            "description": "AWS region (default: the profile's, else `us-west-2`), Hetzner location\n(default `fsn1`), GCP region (default `us-central1`), Azure region\n(default `westus2`), or Alibaba Cloud region (default `cn-hangzhou`).",
+            "type": "string"
+          },
+          "relay_mode": {
+            "description": "Relay authentication mode (`account` or `static`; defaults to\n`account`).",
+            "type": "string"
+          },
+          "relay_token": {
+            "description": "Shared static relay registration token for Static Relay Mode.\nSecret: never logged, returned, or stored in plaintext config.",
+            "type": "string"
+          },
+          "relay_url": {
+            "description": "Per-connection relay base URL (defaults to `https://relay.cua.ai`\nin Account Relay Mode).",
             "type": "string"
           },
           "resource_group": {
@@ -7177,6 +7211,10 @@
             "description": "Google Cloud `oidc`: a service account to act as. Default: none,\nthe federated identity calls Google directly.",
             "type": "string"
           },
+          "spacesd_download_url": {
+            "description": "Optional custom `cua-spacesd` binary mirror URL (with optional\n`#sha256=<64 hex>` fragment).",
+            "type": "string"
+          },
           "subscription_id": {
             "description": "Azure: the subscription id (the trust template's\n`subscriptionId` output).",
             "type": "string"
@@ -7186,7 +7224,7 @@
             "type": "string"
           },
           "token": {
-            "description": "Hetzner: the project's Read & Write API token (default:\n`HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).\nModal: `<token id>:<token secret>`. Secret: never logged or\nreturned; sealed to the account's devices on connect (or, Hetzner\nwith `auth: cli`, saved in this device's Cua credential store).",
+            "description": "Hetzner: the project's Read & Write API token (default:\n`HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).\nModal: `<token id>:<token secret>`. Alibaba Cloud ECS:\n`<access_key_id>:<access_key_secret>`. Secret: never logged or\nreturned; sealed to the account's devices on connect (or, Hetzner\nand Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua\ncredential store).",
             "type": "string"
           },
           "ttl_hours": {
@@ -7194,6 +7232,18 @@
             "format": "uint32",
             "minimum": 0,
             "type": "integer"
+          },
+          "vpc_id": {
+            "description": "Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired\nwith `vswitch_id`.",
+            "type": "string"
+          },
+          "vswitch_id": {
+            "description": "Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be\npaired with `vpc_id`.",
+            "type": "string"
+          },
+          "windows_image_id": {
+            "description": "Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).",
+            "type": "string"
           },
           "zone": {
             "description": "GCP zone in the region (default: its `-a` zone).",
@@ -7247,8 +7297,20 @@
             "description": "Modal environment (default: the profile's).",
             "type": "string"
           },
+          "instance_type": {
+            "description": "Default cloud instance type (`aliyun-ecs`: `--instance-type`).",
+            "type": "string"
+          },
+          "linux_image_id": {
+            "description": "Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).",
+            "type": "string"
+          },
+          "no_public_ip": {
+            "description": "Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,\n`aliyun-ecs` only).",
+            "type": "boolean"
+          },
           "profile": {
-            "description": "AWS: the profile in `~/.aws/config` (default: `default`, or\n`AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the\nactive one).",
+            "description": "AWS: the profile in `~/.aws/config` (default: `default`, or\n`AWS_PROFILE`). Modal: the profile in `~/.modal.toml` (default: the\nactive one). Alibaba Cloud ECS: profile in `~/.aliyun/config.json`.",
             "type": "string"
           },
           "project": {
@@ -7256,15 +7318,43 @@
             "type": "string"
           },
           "provider": {
-            "description": "`aws`, `azure`, `gcp`, `hetzner` or `modal`.",
+            "description": "`aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.",
             "type": "string"
           },
           "region": {
-            "description": "AWS region (default: the profile's, else `us-west-2`), Hetzner location\n(default `fsn1`), GCP region (default `us-central1`) or Azure region\n(default `westus2`).",
+            "description": "AWS region (default: the profile's, else `us-west-2`), Hetzner location\n(default `fsn1`), GCP region (default `us-central1`), Azure region\n(default `westus2`), or Alibaba Cloud region (default `cn-hangzhou`).",
+            "type": "string"
+          },
+          "relay_mode": {
+            "description": "Relay authentication mode (`account` or `static`; defaults to\n`account`).",
+            "type": "string"
+          },
+          "relay_token": {
+            "description": "Shared static relay registration token for Static Relay Mode.\nSecret: never logged, returned, or stored in plaintext config.",
+            "type": "string"
+          },
+          "relay_url": {
+            "description": "Per-connection relay base URL (defaults to `https://relay.cua.ai`\nin Account Relay Mode).",
+            "type": "string"
+          },
+          "spacesd_download_url": {
+            "description": "Optional custom `cua-spacesd` binary mirror URL (with optional\n`#sha256=<64 hex>` fragment).",
             "type": "string"
           },
           "token": {
-            "description": "Hetzner: the project's Read & Write API token (default:\n`HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).\nModal: `<token id>:<token secret>`. Secret: never logged or\nreturned; sealed to the account's devices on connect (or, Hetzner\nwith `auth: cli`, saved in this device's Cua credential store).",
+            "description": "Hetzner: the project's Read & Write API token (default:\n`HCLOUD_TOKEN`, the saved token, or the `hcloud` CLI's context).\nModal: `<token id>:<token secret>`. Alibaba Cloud ECS:\n`<access_key_id>:<access_key_secret>`. Secret: never logged or\nreturned; sealed to the account's devices on connect (or, Hetzner\nand Alibaba Cloud ECS with `auth: cli`, saved in this device's Cua\ncredential store).",
+            "type": "string"
+          },
+          "vpc_id": {
+            "description": "Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired\nwith `vswitch_id`.",
+            "type": "string"
+          },
+          "vswitch_id": {
+            "description": "Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be\npaired with `vpc_id`.",
+            "type": "string"
+          },
+          "windows_image_id": {
+            "description": "Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).",
             "type": "string"
           },
           "zone": {
@@ -7320,7 +7410,7 @@
             "type": "boolean"
           },
           "provider": {
-            "description": "`aws`, `azure`, `gcp`, `hetzner` or `modal`.",
+            "description": "`aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.",
             "type": "string"
           }
         },
@@ -7373,7 +7463,7 @@
             "type": "boolean"
           },
           "provider": {
-            "description": "`aws`, `gcp`, `hetzner` or `modal`.",
+            "description": "`aws`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.",
             "type": "string"
           }
         },
@@ -8044,7 +8134,7 @@
             "type": "integer"
           },
           "provider": {
-            "description": "Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one.",
+            "description": "Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).\nDefault: every one.",
             "type": "string"
           }
         },
@@ -8091,7 +8181,7 @@
             "type": "string"
           },
           "provider": {
-            "description": "Only this cloud (`aws`, `gcp`, `hetzner`, `modal`). Default: every one.",
+            "description": "Only this cloud (`aws`, `gcp`, `hetzner`, `modal`, `aliyun-ecs`).\nDefault: every one.",
             "type": "string"
           },
           "since": {

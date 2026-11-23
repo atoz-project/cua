@@ -22431,6 +22431,44 @@ public struct CloudProvider: Equatable, Hashable {
      * ("Can open it").
      */
     public var holders: [String]
+    /**
+     * Per-connection relay base URL (`https://relay.cua.ai` by default),
+     * or `None` when not connected.
+     */
+    public var relayUrl: String?
+    /**
+     * Relay authentication mode (`account` or `static`), or `None` when
+     * not connected.
+     */
+    public var relayMode: String?
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL.
+     */
+    public var spacesdDownloadUrl: String?
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+     */
+    public var vpcId: String?
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+     */
+    public var vswitchId: String?
+    /**
+     * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+     */
+    public var noPublicIp: Bool
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    public var windowsImageId: String?
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    public var linuxImageId: String?
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    public var instanceType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -22503,7 +22541,36 @@ public struct CloudProvider: Equatable, Hashable {
         /**
          * `sealed`: the devices that can open the account's API token
          * ("Can open it").
-         */holders: [String]) {
+         */holders: [String],
+        /**
+         * Per-connection relay base URL (`https://relay.cua.ai` by default),
+         * or `None` when not connected.
+         */relayUrl: String?,
+        /**
+         * Relay authentication mode (`account` or `static`), or `None` when
+         * not connected.
+         */relayMode: String? = nil,
+        /**
+         * Optional custom `cua-spacesd` binary mirror URL.
+         */spacesdDownloadUrl: String? = nil,
+        /**
+         * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only), or `None`.
+         */vpcId: String? = nil,
+        /**
+         * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only), or `None`.
+         */vswitchId: String? = nil,
+        /**
+         * Whether public IPv4 assignment is disabled (`aliyun-ecs` only).
+         */noPublicIp: Bool = false,
+        /**
+         * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+         */windowsImageId: String? = nil,
+        /**
+         * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+         */linuxImageId: String? = nil,
+        /**
+         * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+         */instanceType: String? = nil) {
         self.name = name
         self.title = title
         self.tier = tier
@@ -22533,6 +22600,15 @@ public struct CloudProvider: Equatable, Hashable {
         self.suggestAuth = suggestAuth
         self.issue = issue
         self.holders = holders
+        self.relayUrl = relayUrl
+        self.relayMode = relayMode
+        self.spacesdDownloadUrl = spacesdDownloadUrl
+        self.vpcId = vpcId
+        self.vswitchId = vswitchId
+        self.noPublicIp = noPublicIp
+        self.windowsImageId = windowsImageId
+        self.linuxImageId = linuxImageId
+        self.instanceType = instanceType
     }
 
 
@@ -22579,7 +22655,16 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
                 canApprove: FfiConverterBool.read(from: &buf),
                 suggestAuth: FfiConverterString.read(from: &buf),
                 issue: FfiConverterString.read(from: &buf),
-                holders: FfiConverterSequenceString.read(from: &buf)
+                holders: FfiConverterSequenceString.read(from: &buf),
+                relayUrl: FfiConverterOptionString.read(from: &buf),
+                relayMode: FfiConverterOptionString.read(from: &buf),
+                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf),
+                vpcId: FfiConverterOptionString.read(from: &buf),
+                vswitchId: FfiConverterOptionString.read(from: &buf),
+                noPublicIp: FfiConverterBool.read(from: &buf),
+                windowsImageId: FfiConverterOptionString.read(from: &buf),
+                linuxImageId: FfiConverterOptionString.read(from: &buf),
+                instanceType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -22613,6 +22698,15 @@ public struct FfiConverterTypeCloudProvider: FfiConverterRustBuffer {
         FfiConverterString.write(value.suggestAuth, into: &buf)
         FfiConverterString.write(value.issue, into: &buf)
         FfiConverterSequenceString.write(value.holders, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayMode, into: &buf)
+        FfiConverterOptionString.write(value.spacesdDownloadUrl, into: &buf)
+        FfiConverterOptionString.write(value.vpcId, into: &buf)
+        FfiConverterOptionString.write(value.vswitchId, into: &buf)
+        FfiConverterBool.write(value.noPublicIp, into: &buf)
+        FfiConverterOptionString.write(value.windowsImageId, into: &buf)
+        FfiConverterOptionString.write(value.linuxImageId, into: &buf)
+        FfiConverterOptionString.write(value.instanceType, into: &buf)
     }
 }
 
@@ -22981,15 +23075,15 @@ public func FfiConverterTypeCloudSweepReport_lower(_ value: CloudSweepReport) ->
  */
 public struct CloudTarget: Equatable, Hashable {
     /**
-     * `aws`, `gcp`, `hetzner` or `modal`.
+     * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
      */
     public var provider: String
     /**
-     * AWS or Modal profile.
+     * AWS, Modal, or Alibaba Cloud CLI profile.
      */
     public var profile: String?
     /**
-     * AWS or GCP region, or Hetzner location (`fsn1`).
+     * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
      */
     public var region: String?
     /**
@@ -23005,23 +23099,69 @@ public struct CloudTarget: Equatable, Hashable {
      */
     public var environment: String?
     /**
-     * Hetzner: the project's Read & Write API token. Secret: used for the
-     * checks, saved in the Cua credential store when they pass, never
-     * printed.
+     * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+     * Secret: used for the checks, saved in the Cua credential store when
+     * they pass, never printed.
      */
     public var token: String?
+    /**
+     * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+     * in Account Relay Mode).
+     */
+    public var relayUrl: String?
+    /**
+     * Relay authentication mode (`account` or `static`; defaults to `account`).
+     */
+    public var relayMode: String?
+    /**
+     * Shared static relay registration token for Static Relay Mode. Secret:
+     * never printed or stored in plaintext config.
+     */
+    public var relayToken: String?
+    /**
+     * Optional custom `cua-spacesd` binary mirror URL (with optional
+     * `#sha256=<64 hex>` fragment).
+     */
+    public var spacesdDownloadUrl: String?
+    /**
+     * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+     * with `vswitch_id`.
+     */
+    public var vpcId: String?
+    /**
+     * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+     * paired with `vpc_id`.
+     */
+    public var vswitchId: String?
+    /**
+     * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+     * `aliyun-ecs` only).
+     */
+    public var noPublicIp: Bool
+    /**
+     * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+     */
+    public var windowsImageId: String?
+    /**
+     * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+     */
+    public var linuxImageId: String?
+    /**
+     * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+     */
+    public var instanceType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * `aws`, `gcp`, `hetzner` or `modal`.
+         * `aws`, `azure`, `gcp`, `hetzner`, `modal`, or `aliyun-ecs`.
          */provider: String,
         /**
-         * AWS or Modal profile.
+         * AWS, Modal, or Alibaba Cloud CLI profile.
          */profile: String? = nil,
         /**
-         * AWS or GCP region, or Hetzner location (`fsn1`).
+         * AWS, GCP, Azure, or Alibaba Cloud region, or Hetzner location (`fsn1`).
          */region: String? = nil,
         /**
          * GCP zone.
@@ -23033,10 +23173,46 @@ public struct CloudTarget: Equatable, Hashable {
          * Modal environment.
          */environment: String? = nil,
         /**
-         * Hetzner: the project's Read & Write API token. Secret: used for the
-         * checks, saved in the Cua credential store when they pass, never
-         * printed.
-         */token: String? = nil) {
+         * Hetzner / Modal / Alibaba Cloud ECS: the API token or AccessKey pair.
+         * Secret: used for the checks, saved in the Cua credential store when
+         * they pass, never printed.
+         */token: String? = nil,
+        /**
+         * Per-connection relay base URL (defaults to `https://relay.cua.ai`
+         * in Account Relay Mode).
+         */relayUrl: String? = nil,
+        /**
+         * Relay authentication mode (`account` or `static`; defaults to `account`).
+         */relayMode: String? = nil,
+        /**
+         * Shared static relay registration token for Static Relay Mode. Secret:
+         * never printed or stored in plaintext config.
+         */relayToken: String? = nil,
+        /**
+         * Optional custom `cua-spacesd` binary mirror URL (with optional
+         * `#sha256=<64 hex>` fragment).
+         */spacesdDownloadUrl: String? = nil,
+        /**
+         * Existing Alibaba Cloud VPC ID (`aliyun-ecs` only). Must be paired
+         * with `vswitch_id`.
+         */vpcId: String? = nil,
+        /**
+         * Existing Alibaba Cloud VSwitch ID (`aliyun-ecs` only). Must be
+         * paired with `vpc_id`.
+         */vswitchId: String? = nil,
+        /**
+         * Do not assign a public IPv4 address (`InternetMaxBandwidthOut=0`,
+         * `aliyun-ecs` only).
+         */noPublicIp: Bool = false,
+        /**
+         * Default Windows Cloud Image ID (`aliyun-ecs`: `--windows-image-id`).
+         */windowsImageId: String? = nil,
+        /**
+         * Default Linux Cloud Image ID (`aliyun-ecs`: `--linux-image-id`).
+         */linuxImageId: String? = nil,
+        /**
+         * Default cloud instance type (`aliyun-ecs`: `--instance-type`).
+         */instanceType: String? = nil) {
         self.provider = provider
         self.profile = profile
         self.region = region
@@ -23044,6 +23220,16 @@ public struct CloudTarget: Equatable, Hashable {
         self.project = project
         self.environment = environment
         self.token = token
+        self.relayUrl = relayUrl
+        self.relayMode = relayMode
+        self.relayToken = relayToken
+        self.spacesdDownloadUrl = spacesdDownloadUrl
+        self.vpcId = vpcId
+        self.vswitchId = vswitchId
+        self.noPublicIp = noPublicIp
+        self.windowsImageId = windowsImageId
+        self.linuxImageId = linuxImageId
+        self.instanceType = instanceType
     }
 
 
@@ -23068,7 +23254,17 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
                 zone: FfiConverterOptionString.read(from: &buf),
                 project: FfiConverterOptionString.read(from: &buf),
                 environment: FfiConverterOptionString.read(from: &buf),
-                token: FfiConverterOptionString.read(from: &buf)
+                token: FfiConverterOptionString.read(from: &buf),
+                relayUrl: FfiConverterOptionString.read(from: &buf),
+                relayMode: FfiConverterOptionString.read(from: &buf),
+                relayToken: FfiConverterOptionString.read(from: &buf),
+                spacesdDownloadUrl: FfiConverterOptionString.read(from: &buf),
+                vpcId: FfiConverterOptionString.read(from: &buf),
+                vswitchId: FfiConverterOptionString.read(from: &buf),
+                noPublicIp: FfiConverterBool.read(from: &buf),
+                windowsImageId: FfiConverterOptionString.read(from: &buf),
+                linuxImageId: FfiConverterOptionString.read(from: &buf),
+                instanceType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -23080,6 +23276,16 @@ public struct FfiConverterTypeCloudTarget: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.project, into: &buf)
         FfiConverterOptionString.write(value.environment, into: &buf)
         FfiConverterOptionString.write(value.token, into: &buf)
+        FfiConverterOptionString.write(value.relayUrl, into: &buf)
+        FfiConverterOptionString.write(value.relayMode, into: &buf)
+        FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterOptionString.write(value.spacesdDownloadUrl, into: &buf)
+        FfiConverterOptionString.write(value.vpcId, into: &buf)
+        FfiConverterOptionString.write(value.vswitchId, into: &buf)
+        FfiConverterBool.write(value.noPublicIp, into: &buf)
+        FfiConverterOptionString.write(value.windowsImageId, into: &buf)
+        FfiConverterOptionString.write(value.linuxImageId, into: &buf)
+        FfiConverterOptionString.write(value.instanceType, into: &buf)
     }
 }
 
@@ -36283,6 +36489,19 @@ public struct SandboxCreateOptions: Equatable, Hashable {
      * Other kinds ignore it. `None` (the default): not one.
      */
     public var forkable: Bool?
+    /**
+     * Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+     */
+    public var diskGb: UInt32?
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    public var cloudImageId: String?
+    /**
+     * Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+     */
+    public var instanceType: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -36419,7 +36638,17 @@ public struct SandboxCreateOptions: Equatable, Hashable {
          * shared file, so its checkpoints take milliseconds and forks of them
          * share its pages ([`Sandboxes::checkpoint`], [`Sandboxes::fork`]).
          * Other kinds ignore it. `None` (the default): not one.
-         */forkable: Bool? = nil) {
+         */forkable: Bool? = nil,
+        /**
+         * Grow a cloud VM's boot disk to this many GiB (`None`: provider/OS default).
+         */diskGb: UInt32? = nil,
+        /**
+         * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+         * distinct from `image` (the Sandbox Image).
+         */cloudImageId: String? = nil,
+        /**
+         * Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+         */instanceType: String? = nil) {
         self.on = on
         self.kind = kind
         self.runtime = runtime
@@ -36448,6 +36677,9 @@ public struct SandboxCreateOptions: Equatable, Hashable {
         self.spacesd = spacesd
         self.profile = profile
         self.forkable = forkable
+        self.diskGb = diskGb
+        self.cloudImageId = cloudImageId
+        self.instanceType = instanceType
     }
 
 
@@ -36493,7 +36725,10 @@ public struct FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer {
                 headless: FfiConverterBool.read(from: &buf),
                 spacesd: FfiConverterOptionBool.read(from: &buf),
                 profile: FfiConverterOptionString.read(from: &buf),
-                forkable: FfiConverterOptionBool.read(from: &buf)
+                forkable: FfiConverterOptionBool.read(from: &buf),
+                diskGb: FfiConverterOptionUInt32.read(from: &buf),
+                cloudImageId: FfiConverterOptionString.read(from: &buf),
+                instanceType: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -36526,6 +36761,9 @@ public struct FfiConverterTypeSandboxCreateOptions: FfiConverterRustBuffer {
         FfiConverterOptionBool.write(value.spacesd, into: &buf)
         FfiConverterOptionString.write(value.profile, into: &buf)
         FfiConverterOptionBool.write(value.forkable, into: &buf)
+        FfiConverterOptionUInt32.write(value.diskGb, into: &buf)
+        FfiConverterOptionString.write(value.cloudImageId, into: &buf)
+        FfiConverterOptionString.write(value.instanceType, into: &buf)
     }
 }
 
@@ -39249,6 +39487,11 @@ public struct SpaceCreateOptions: Equatable, Hashable {
      * `None`: off. Only a Space the machine of the runtime runs itself.
      */
     public var children: Bool?
+    /**
+     * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+     * distinct from `image` (the Sandbox Image).
+     */
+    public var cloudImageId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -39403,7 +39646,11 @@ public struct SpaceCreateOptions: Equatable, Hashable {
         /**
          * Lets the Space make child Spaces of its own ([`Spaces::set_children`]).
          * `None`: off. Only a Space the machine of the runtime runs itself.
-         */children: Bool? = nil) {
+         */children: Bool? = nil,
+        /**
+         * Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+         * distinct from `image` (the Sandbox Image).
+         */cloudImageId: String? = nil) {
         self.image = image
         self.on = on
         self.kind = kind
@@ -39436,6 +39683,7 @@ public struct SpaceCreateOptions: Equatable, Hashable {
         self.instanceType = instanceType
         self.region = region
         self.children = children
+        self.cloudImageId = cloudImageId
     }
 
 
@@ -39485,7 +39733,8 @@ public struct FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer {
                 widen: FfiConverterOptionBool.read(from: &buf),
                 instanceType: FfiConverterOptionString.read(from: &buf),
                 region: FfiConverterOptionString.read(from: &buf),
-                children: FfiConverterOptionBool.read(from: &buf)
+                children: FfiConverterOptionBool.read(from: &buf),
+                cloudImageId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -39522,6 +39771,7 @@ public struct FfiConverterTypeSpaceCreateOptions: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.instanceType, into: &buf)
         FfiConverterOptionString.write(value.region, into: &buf)
         FfiConverterOptionBool.write(value.children, into: &buf)
+        FfiConverterOptionString.write(value.cloudImageId, into: &buf)
     }
 }
 

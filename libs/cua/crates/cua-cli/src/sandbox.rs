@@ -166,9 +166,16 @@ pub struct CreateArgs {
     /// mode; containers reject it in legacy mode, and Lume rejects it.
     #[arg(long, value_parser = ["default", "none"])]
     network: Option<String>,
-    /// Disk size (accepted; the image decides today).
+    /// Disk size, e.g. `60GB` or `80` (sizes cloud VMs such as `aliyun-ecs`).
     #[arg(long)]
     disk: Option<String>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `IMAGE` (the Sandbox Image such as `windows` or `linux`).
+    #[arg(long, value_name = "IMAGE_ID")]
+    cloud_image_id: Option<String>,
+    /// Per-create cloud instance type override (e.g. `ecs.g7.xlarge`).
+    #[arg(long, value_name = "TYPE")]
+    instance_type: Option<String>,
     /// Expose a guest port: NAME=PORT (a named service) or PORT (repeatable).
     #[arg(long = "port", visible_alias = "service", value_parser = parse_port_spec)]
     ports: Vec<(Option<String>, u16)>,
@@ -284,6 +291,8 @@ impl std::fmt::Debug for CreateArgs {
             .field("memory", &self.memory)
             .field("network", &self.network)
             .field("disk", &self.disk)
+            .field("cloud_image_id", &self.cloud_image_id)
+            .field("instance_type", &self.instance_type)
             .field("ports", &self.ports)
             .field("wait", &self.wait)
             .field("ready_timeout", &self.ready_timeout)
@@ -1552,11 +1561,48 @@ pub fn parse_memory(s: &str) -> Result<u64, CuaError> {
     Ok(mib as u64)
 }
 
+pub fn parse_disk_gb(s: &str) -> Result<u32, CuaError> {
+    let t = s.trim().to_ascii_uppercase();
+    let bad = || {
+        CuaError::InvalidArgument(format!(
+            "bad disk size {s:?} (use e.g. 60GB, 80G, or 80 GiB)"
+        ))
+    };
+    let num = t
+        .strip_suffix("GIB")
+        .or_else(|| t.strip_suffix("GB"))
+        .or_else(|| t.strip_suffix('G'))
+        .unwrap_or(t.as_str())
+        .trim();
+    let v: u32 = num.parse().map_err(|_| bad())?;
+    if v == 0 {
+        return Err(bad());
+    }
+    Ok(v)
+}
+
 /// Largest bare (unit-less, GB) memory number accepted.
 pub const MAX_BARE_MEMORY_GB: f64 = 512.0;
 
 /// Largest memory a sandbox can ask for: 1 TiB.
 pub const MAX_MEMORY_MIB: u64 = 1024 * 1024;
+
+fn check_windows_build_note(
+    on: &On,
+    resolved: &str,
+    iso: Option<&std::path::Path>,
+    sha256: Option<&str>,
+) -> Result<(), CuaError> {
+    if *on == On::Local {
+        windows_build_note(resolved, iso, sha256)
+    } else if iso.is_some() {
+        Err(CuaError::InvalidArgument(
+            "--iso applies only to local Windows VMs (`--on local`)".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// For a Windows image built on this computer (`windows:11`): checks and
 /// remembers `--iso` (the daemon that builds reads it back), or says what the
@@ -1975,7 +2021,7 @@ async fn create(
             {
                 return Err(CuaError::InvalidArgument(EMBEDDED_VM_REFUSED.into()));
             }
-            windows_build_note(&resolved, a.iso.as_deref(), a.iso_sha256.as_deref())?;
+            check_windows_build_note(&on, &resolved, a.iso.as_deref(), a.iso_sha256.as_deref())?;
             o.image = resolved;
             o.os = os;
         }
@@ -1987,9 +2033,19 @@ async fn create(
     o.cpus = a.cpu;
     o.memory_mb = a.memory.as_deref().map(parse_memory).transpose()?;
     o.network = a.network.clone();
-    if a.disk.is_some() {
+    if matches!(on, On::Provider(_)) {
+        o.disk_gb = a.disk.as_deref().map(parse_disk_gb).transpose()?;
+    } else if a.disk.is_some() {
         eprintln!("note: --disk is ignored (the image decides the disk size)");
     }
+    o.cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+        "--cloud-image-id",
+        a.cloud_image_id.as_deref(),
+    )?;
+    o.instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+        "--instance-type",
+        a.instance_type.as_deref(),
+    )?;
     for (name, port) in &a.ports {
         match name {
             Some(n) => {
@@ -4178,6 +4234,14 @@ mod tests {
         assert_eq!(r, "ghcr.io/trycua/windows:11");
         assert_eq!(os.as_deref(), Some("windows"));
         assert!(cua_image::windows::build::local_build_target(&r).is_some());
+        assert!(
+            check_windows_build_note(&On::Provider("aliyun-ecs".into()), &r, None, None).is_ok()
+        );
+        let cloud_iso =
+            check_windows_build_note(&On::Provider("aliyun-ecs".into()), &r, Some(iso), None)
+                .unwrap_err()
+                .to_string();
+        assert!(cloud_iso.contains("--on local"), "{cloud_iso}");
     }
 
     #[tokio::test]
@@ -4306,6 +4370,21 @@ mod tests {
         assert_eq!(t.a.runtime, Some(Runtime::Qemu));
         let t = p(&["--on", "direct:[::1]:3211"]).unwrap();
         assert_eq!(t.a.on, Some(On::Direct("[::1]:3211".into())));
+        let t = p(&["--on", "aliyun-ecs", "--runtime", "native"]).unwrap();
+        assert_eq!(t.a.on, Some(On::Provider("aliyun-ecs".into())));
+        assert_eq!(t.a.runtime, Some(Runtime::Other("native".into())));
+        let t_slim = p(&[
+            "--tier",
+            "slim",
+            "--on",
+            "aliyun-ecs",
+            "--runtime",
+            "native",
+        ])
+        .unwrap();
+        assert_eq!(t_slim.a.tier.as_deref(), Some("slim"));
+        assert_eq!(t_slim.a.on, Some(On::Provider("aliyun-ecs".into())));
+        assert_eq!(t_slim.a.runtime, Some(Runtime::Other("native".into())));
         // Engines and kinds are not locations; the error points at the flag.
         for (bad, hint) in [
             ("qemu", "--runtime qemu"),
@@ -4851,5 +4930,68 @@ mod tests {
             confirm_delete(false, true, || false),
             DeleteConfirmation::Declined
         );
+    }
+
+    #[test]
+    fn parse_disk_gb_and_create_cloud_image_flags() {
+        assert_eq!(parse_disk_gb("80").unwrap(), 80);
+        assert_eq!(parse_disk_gb("60G").unwrap(), 60);
+        assert_eq!(parse_disk_gb(" 100gb ").unwrap(), 100);
+        assert_eq!(parse_disk_gb("120GiB").unwrap(), 120);
+        assert!(parse_disk_gb("0").is_err());
+        assert!(parse_disk_gb("80MB").is_err());
+        assert!(parse_disk_gb("abc").is_err());
+
+        assert_eq!(
+            cua_sandbox_core::byoc::normalize_optional_token("--cloud-image-id", Some(" m-win11 "))
+                .unwrap()
+                .as_deref(),
+            Some("m-win11")
+        );
+        assert_eq!(
+            cua_sandbox_core::byoc::normalize_optional_token("--cloud-image-id", None).unwrap(),
+            None
+        );
+        for bad in ["", "   ", "m-foo bar"] {
+            assert!(
+                cua_sandbox_core::byoc::normalize_optional_token("--cloud-image-id", Some(bad))
+                    .is_err()
+            );
+            assert!(
+                cua_sandbox_core::byoc::normalize_optional_token("--instance-type", Some(bad))
+                    .is_err()
+            );
+        }
+
+        #[derive(clap::Parser)]
+        struct W {
+            #[command(subcommand)]
+            cmd: SandboxCmd,
+        }
+        let parsed = <W as clap::Parser>::try_parse_from([
+            "sb",
+            "create",
+            "windows",
+            "--on",
+            "aliyun-ecs",
+            "--cloud-image-id",
+            "m-win11-golden",
+            "--disk",
+            "80GB",
+            "--instance-type",
+            "ecs.c7.2xlarge",
+        ])
+        .unwrap()
+        .cmd;
+        match parsed {
+            SandboxCmd::Create(a) => {
+                assert_eq!(a.image.as_deref(), Some("windows"));
+                assert_eq!(a.on, Some(On::Provider("aliyun-ecs".into())));
+                assert_eq!(a.cloud_image_id.as_deref(), Some("m-win11-golden"));
+                assert_eq!(a.disk.as_deref(), Some("80GB"));
+                assert_eq!(a.instance_type.as_deref(), Some("ecs.c7.2xlarge"));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -1008,6 +1008,9 @@ message CreateSpaceRequest {
   // Let the Space make child Spaces of its own (`SetSpaceChildren`).
   // Unset: off.
   optional bool children = 33;
+  // Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+  // distinct from `image` (the Sandbox Image).
+  string cloud_image_id = 34;
 }
 
 // Request for `SpaceService.SetSpaceChildren`.

@@ -144,6 +144,9 @@ pub struct SpaceCreate {
     /// is signed in and sharing (the `relay.spaces` setting), and a child
     /// follows its parent's `off`.
     pub relay: Option<bool>,
+    /// Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`),
+    /// distinct from `image` (the Sandbox Image).
+    pub cloud_image_id: Option<String>,
 }
 
 impl std::fmt::Debug for SpaceCreate {
@@ -183,6 +186,7 @@ impl std::fmt::Debug for SpaceCreate {
             .field("instance_type", &self.instance_type)
             .field("region", &self.region)
             .field("relay", &self.relay)
+            .field("cloud_image_id", &self.cloud_image_id)
             .finish()
     }
 }
@@ -868,6 +872,7 @@ impl Spaces {
             .map(|r| {
                 let mut info = SpaceInfo::from_record(r)?;
                 (info.power, info.power_state) = self.power_of(&info.id);
+                self.apply_cloud_metadata(&mut info);
                 info.stop_reason = self.stop_reason_of(&info.id);
                 Ok(info)
             })
@@ -1127,11 +1132,60 @@ impl Spaces {
 
     const RELAY_MAX_AGE: Duration = Duration::from_secs(10);
 
+    /// Custom Account-mode relay origin recorded for `machine_id`, when a
+    /// registry credential stores a relay URL without a static env token and
+    /// its origin differs from `default_url`.
+    pub(crate) fn custom_account_relay_origin(
+        &self,
+        machine_id: &str,
+        default_url: &str,
+    ) -> Option<String> {
+        let key = format!("relay:{machine_id}");
+        let cred = self.inner.registry.credential(&key).ok().flatten()?;
+        if cred.token.is_some() {
+            return None;
+        }
+        let url = cred.url.as_deref()?;
+        crate::cloud::custom_relay_origin(url, default_url)
+    }
+
+    /// Whether `machine_id` is a Static Relay Space (registry credential stores
+    /// both a non-empty relay URL and a static env token).
+    pub(crate) fn is_static_relay_machine(&self, machine_id: &str) -> bool {
+        let key = format!("relay:{machine_id}");
+        self.inner
+            .registry
+            .credential(&key)
+            .ok()
+            .flatten()
+            .is_some_and(|cred| {
+                cred.url.as_deref().is_some_and(|u| !u.is_empty()) && cred.token.is_some()
+            })
+    }
+
     pub(crate) async fn relay_directory(
         &self,
         want: Option<&str>,
     ) -> Result<Vec<crate::relay::RelayMachine>> {
-        let relay = self.relay()?;
+        let mut relay = self.relay()?;
+        if let Some(origin) = want.and_then(|id| self.custom_account_relay_origin(id, &relay.url)) {
+            relay = relay.rebind(&origin)?;
+            let token = relay.tokens.access_token().await?;
+            let client = cua_host::RelayClient::new(&relay.url)?;
+            let machines = match &relay.device {
+                Some(d) => d.machines_for(&client, &token).await?,
+                None => client.machines(&token).await?,
+            };
+            let mut cache = self.inner.relay_cache.lock().expect("relay cache");
+            for m in &machines {
+                if let Some(existing) = cache.iter_mut().find(|e| e.id == m.id) {
+                    *existing = m.clone();
+                } else {
+                    cache.push(m.clone());
+                }
+            }
+            return Ok(machines);
+        }
         let mut read_at = self.inner.relay_read.lock().await;
         let cached = self.inner.relay_cache.lock().expect("relay cache").clone();
         let listed = want.is_some_and(|id| cached.iter().any(|m| m.id == id));
@@ -1243,10 +1297,17 @@ impl Spaces {
         let id = self.resolve(space)?;
         let key = id.to_string();
         if let SpaceId::Relay { machine_id } = &id
-            && self.relay_account().is_some()
-            && self.inner.registry.get(&key)?.is_none()
+            && let Some(account) = self.relay_account()
         {
-            self.relay_directory(Some(machine_id)).await?;
+            if self.inner.registry.get(&key)?.is_none() {
+                self.relay_directory(Some(machine_id)).await?;
+            } else if self
+                .custom_account_relay_origin(machine_id, &account.url)
+                .is_some()
+                && let Err(e) = self.relay_directory(Some(machine_id)).await
+            {
+                tracing::debug!(machine = %machine_id, error = %e, "custom relay directory not read");
+            }
         }
         self.list()?
             .into_iter()
@@ -1659,7 +1720,24 @@ impl Spaces {
             .registry
             .get(&id.to_string())?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        SpaceInfo::from_record(&record)
+        let mut info = SpaceInfo::from_record(&record)?;
+        self.apply_cloud_metadata(&mut info);
+        Ok(info)
+    }
+
+    fn apply_cloud_metadata(&self, info: &mut SpaceInfo) {
+        if let Ok(SpaceId::Relay { machine_id }) = SpaceId::parse(&info.id)
+            && let Some((provider, place)) =
+                self.inner.sandboxes.cloud_of_relay_machine(&machine_id)
+        {
+            info.cloud = provider;
+            info.cloud_place = place.clone();
+            info.host_name = place;
+            info.cloud_delete = crate::cloud::DELETE_HERE.into();
+            if let Ok(Some(sandbox)) = self.inner.sandboxes.by_relay_machine(&machine_id) {
+                (info.power, info.power_state) = self.sandbox_power(&sandbox);
+            }
+        }
     }
 
     /// Keeps what a relay machine's cua-spacesd answered at connect (its
@@ -2307,58 +2385,119 @@ impl Spaces {
             // Cua Cloud has ended: a legacy `cloud:` Space cannot connect.
             SpaceId::Cloud { .. } => return Err(cua_sandbox_core::Error::CloudEnded.into()),
             SpaceId::Relay { machine_id } => {
-                let relay = self.relay()?;
-                // A Space one of your own machines provides prefers the mesh
-                // (often a LAN neighbour); others follow `CUA_MESH`.
-                // ... and so does a host whose routed Spaces ride its channel.
-                let provided = self.provided_by_a_host(machine_id, record).await
-                    || self.routes_through(machine_id);
-                let policy = if provided {
-                    crate::mesh::policy_for_provided()
-                } else {
-                    crate::mesh::policy()
-                };
-                // The WireGuard®-based mesh first (end to end, direct when
-                // possible); the relay's HTTPS path when the relay or the
-                // machine does not speak it yet (see `crate::mesh`).
-                match crate::mesh::connect_options(
-                    &self.inner.mesh,
-                    crate::mesh::Via::Account(&relay),
-                    machine_id,
-                    policy,
-                )
-                .await?
+                if let Ok(Some(sb_name)) = self.inner.sandboxes.by_relay_machine(machine_id)
+                    && let Ok(sandbox) = self.inner.sandboxes.connect(&sb_name).await
                 {
-                    crate::mesh::Route::Mesh(o, route) => {
-                        tracing::info!(machine = %machine_id, route = %route.describe(), "relay Space over the mesh");
-                        self.inner.mesh.note_routed(
-                            &id.to_string(),
-                            &crate::mesh::Via::Account(&relay),
-                            provided,
-                        );
-                        (Some(*o), None, Some(route))
+                    let kind = sandbox
+                        .image_info()
+                        .map(|i| i.variant.clone())
+                        .unwrap_or_else(|| match sandbox.placement().0 {
+                            cua_sandbox_core::placement::Kind::Vm => "vm".into(),
+                            cua_sandbox_core::placement::Kind::MicroVm => "microvm".into(),
+                            _ => "container".into(),
+                        });
+                    let arch = sandbox
+                        .image_info()
+                        .and_then(|i| i.arch.clone())
+                        .unwrap_or_default();
+                    platform = Some((kind, arch));
+                    if let Some(i) = sandbox.image_info() {
+                        image = Some((i.reference.clone(), i.digest.clone()));
                     }
-                    crate::mesh::Route::Relay { fallback: why } => {
-                        fallback = why;
-                        if policy.uses_mesh() {
-                            // Its driver may join the mesh a moment later:
-                            // move there once it has (`Spaces::space`).
-                            self.inner.mesh.note_fallback(
+                }
+                if let (Some(url), Some(token)) = (
+                    credential.url.as_deref().filter(|u| !u.is_empty()),
+                    credential.token.as_deref(),
+                ) {
+                    let mut o = ConnectOptions::parse(url)?;
+                    o.token = Some(token.to_string());
+                    let relay_url = o.endpoint.origin();
+                    let mut route = Some(crate::ChannelRoute::Relay(relay_url.clone()));
+                    let via = crate::mesh::Via::Static {
+                        relay: &relay_url,
+                        token,
+                    };
+                    match crate::mesh::connect_options(
+                        &self.inner.mesh,
+                        crate::mesh::Via::Static {
+                            relay: &relay_url,
+                            token,
+                        },
+                        machine_id,
+                        crate::mesh::policy(),
+                    )
+                    .await?
+                    {
+                        crate::mesh::Route::Mesh(m, via_mesh) => {
+                            tracing::info!(machine = %machine_id, "relay Space over the mesh");
+                            self.inner.mesh.note_routed(&id.to_string(), &via, false);
+                            o = *m;
+                            route = Some(via_mesh);
+                        }
+                        crate::mesh::Route::Relay { fallback: why } => fallback = why,
+                    }
+                    (Some(o), None, route)
+                } else {
+                    let mut relay = self.relay()?;
+                    if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
+                        let _ = ConnectOptions::parse(url)?;
+                        if let Some(origin) = crate::cloud::custom_relay_origin(url, &relay.url) {
+                            relay = relay.rebind(&origin)?;
+                        }
+                    }
+                    // A Space one of your own machines provides prefers the mesh
+                    // (often a LAN neighbour); others follow `CUA_MESH`.
+                    // ... and so does a host whose routed Spaces ride its channel.
+                    let provided = self.provided_by_a_host(machine_id, record).await
+                        || self.routes_through(machine_id);
+                    let policy = if provided {
+                        crate::mesh::policy_for_provided()
+                    } else {
+                        crate::mesh::policy()
+                    };
+                    // The WireGuard®-based mesh first (end to end, direct when
+                    // possible); the relay's HTTPS path when the relay or the
+                    // machine does not speak it yet (see `crate::mesh`).
+                    match crate::mesh::connect_options(
+                        &self.inner.mesh,
+                        crate::mesh::Via::Account(&relay),
+                        machine_id,
+                        policy,
+                    )
+                    .await?
+                    {
+                        crate::mesh::Route::Mesh(o, route) => {
+                            tracing::info!(machine = %machine_id, route = %route.describe(), "relay Space over the mesh");
+                            self.inner.mesh.note_routed(
                                 &id.to_string(),
                                 &crate::mesh::Via::Account(&relay),
-                                machine_id,
+                                provided,
                             );
+                            (Some(*o), None, Some(route))
                         }
-                        let url = cua_host::RelayClient::new(&relay.url)?.machine_url(machine_id);
-                        // The account token rides in `authorization` and
-                        // this device's session next to it, fetched (and
-                        // refreshed) per call; the relay checks both and
-                        // swaps them for its signed identity assertion.
-                        let route = crate::ChannelRoute::Relay(relay.url.clone());
-                        let bearer = crate::relay::RelayBearer { account: relay };
-                        let mut o = ConnectOptions::parse(&url)?.gateway(Arc::new(bearer));
-                        o.token = credential.token.clone();
-                        (Some(o), None, Some(route))
+                        crate::mesh::Route::Relay { fallback: why } => {
+                            fallback = why;
+                            if policy.uses_mesh() {
+                                // Its driver may join the mesh a moment later:
+                                // move there once it has (`Spaces::space`).
+                                self.inner.mesh.note_fallback(
+                                    &id.to_string(),
+                                    &crate::mesh::Via::Account(&relay),
+                                    machine_id,
+                                );
+                            }
+                            let url =
+                                cua_host::RelayClient::new(&relay.url)?.machine_url(machine_id);
+                            // The account token rides in `authorization` and
+                            // this device's session next to it, fetched (and
+                            // refreshed) per call; the relay checks both and
+                            // swaps them for its signed identity assertion.
+                            let route = crate::ChannelRoute::Relay(relay.url.clone());
+                            let bearer = crate::relay::RelayBearer { account: relay };
+                            let mut o = ConnectOptions::parse(&url)?.gateway(Arc::new(bearer));
+                            o.token = credential.token.clone();
+                            (Some(o), None, Some(route))
+                        }
                     }
                 }
             }
@@ -3094,6 +3233,17 @@ impl Spaces {
 
     async fn create_inner_body(&self, mut opts: SpaceCreate) -> Result<SpaceCreated> {
         use cua_sandbox_core::placement;
+        if opts.disk_gb == Some(0) {
+            return Err(Error::invalid("disk_gb must be greater than 0"));
+        }
+        opts.cloud_image_id = cua_sandbox_core::byoc::normalize_optional_token(
+            "cloud_image_id",
+            opts.cloud_image_id.as_deref(),
+        )?;
+        opts.instance_type = cua_sandbox_core::byoc::normalize_optional_token(
+            "instance_type",
+            opts.instance_type.as_deref(),
+        )?;
         let omitted = opts.on.is_none();
         // A child made on another of your computers joins its parent's tree
         // there: the computer gets the tree's id, qualified with this one.
@@ -3109,6 +3259,11 @@ impl Spaces {
                 .and_then(|s| s.default_on())
                 .map_err(|e| Error::invalid(e.to_string()))?,
         };
+        cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+            !matches!(on, On::Local | On::Host(_) | On::Cloud),
+            opts.cloud_image_id.as_deref(),
+            None,
+        )?;
         // No location given and none configured: this machine first, then
         // the linked clouds when it is full and a budget is set
         // (`placement.overflow`). An explicit `local` never overflows.
@@ -3154,6 +3309,11 @@ impl Spaces {
             if self.elastic_has_clouds().await {
                 return boxed(move || self.create_on_auto_elastic(opts)).await;
             }
+            cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+                false,
+                opts.cloud_image_id.as_deref(),
+                None,
+            )?;
             return boxed(move || self.create_on_auto(opts)).await;
         }
         if let On::Host(query) = &on {
@@ -3242,6 +3402,11 @@ impl Spaces {
         {
             return Ok(SpaceCreated::Ready { info, reused: true });
         }
+        cua_sandbox_core::byoc::validate_cloud_vm_overrides(
+            false,
+            opts.cloud_image_id.as_deref(),
+            None,
+        )?;
         let name = sanitize_label(&opts.name.unwrap_or_else(|| self.fresh_name()));
         let local = LocalProvision {
             image: opts.image,
@@ -3339,7 +3504,10 @@ impl Spaces {
             create.cpus,
             create.memory_mb,
         );
-        create.disk_gb = opts.disk_gb.filter(|g| *g > 0);
+        if opts.disk_gb == Some(0) {
+            return Err(Error::invalid("disk_gb must be greater than 0"));
+        }
+        create.disk_gb = opts.disk_gb;
         create.env = opts.env.clone();
         create.env.insert("CUA_ENV_TOKEN".into(), token.clone());
         create.env_token = Some(token.clone());
@@ -4032,10 +4200,18 @@ impl Spaces {
     /// off and on. A Space one of your machines provides says so in its
     /// relay row instead ([`relay_info`]).
     pub fn power_of(&self, id: &str) -> (String, String) {
-        let Ok(SpaceId::Local { name }) = SpaceId::parse(id) else {
-            return Default::default();
-        };
-        self.sandbox_power(&name)
+        match SpaceId::parse(id) {
+            Ok(SpaceId::Local { name }) => self.sandbox_power(&name),
+            Ok(SpaceId::Relay { machine_id }) => self
+                .inner
+                .sandboxes
+                .by_relay_machine(&machine_id)
+                .ok()
+                .flatten()
+                .map(|name| self.sandbox_power(&name))
+                .unwrap_or_default(),
+            _ => Default::default(),
+        }
     }
 
     /// [`SpaceInfo::stop_reason`] of the Space `id`: why its local sandbox
@@ -4948,6 +5124,65 @@ mod tests {
             "my-space-000000002a",
         ] {
             assert!(!is_generated_name(other), "{other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_cloud_image_id_on_non_provider_routes_and_whitespace() {
+        let home = tempfile::tempdir().unwrap();
+        let spaces = Spaces::builder().home(home.path()).build();
+        for (on, reuse) in [
+            (Some(On::Local), false),
+            (Some(On::Local), true),
+            (Some(On::Auto), false),
+            (Some(On::Host("remote-mac".into())), false),
+        ] {
+            let err = spaces
+                .create(SpaceCreate {
+                    on: on.clone(),
+                    reuse,
+                    cloud_image_id: Some("m-win11".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "expected InvalidArgument for on={on:?} reuse={reuse}, got: {err:?}"
+            );
+        }
+        for bad in ["", "   ", "m-foo bar"] {
+            let err = spaces
+                .create(SpaceCreate {
+                    on: Some(On::Provider("aliyun-ecs".into())),
+                    cloud_image_id: Some(bad.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "cloud_image_id {bad:?}: {err:?}"
+            );
+        }
+        for on in [
+            Some(On::Local),
+            Some(On::Auto),
+            Some(On::Host("remote-mac".into())),
+            Some(On::Provider("aliyun-ecs".into())),
+        ] {
+            let err = spaces
+                .create(SpaceCreate {
+                    on: on.clone(),
+                    disk_gb: Some(0),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "disk_gb=Some(0) for on={on:?}: {err:?}"
+            );
         }
     }
 }

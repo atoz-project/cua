@@ -69,6 +69,23 @@ impl RelayAccount {
         self
     }
 
+    /// Returns a `RelayAccount` targeting `url`, rebinding `device` if present.
+    pub fn rebind(&self, url: &str) -> cua_host::Result<Self> {
+        if url.trim_end_matches('/') == self.url.trim_end_matches('/') {
+            return Ok(self.clone());
+        }
+        let device = match &self.device {
+            Some(d) => Some(Arc::new(d.rebind(url)?)),
+            None => None,
+        };
+        Ok(Self {
+            url: url.to_string(),
+            tokens: self.tokens.clone(),
+            device,
+            spaces_api: self.spaces_api.clone(),
+        })
+    }
+
     /// This device's session, when it has one.
     pub async fn device_session(&self) -> Option<String> {
         match &self.device {
@@ -240,6 +257,16 @@ pub fn adopt_machine_name(home: &std::path::Path, relay_url: &str, machine_id: &
 }
 
 impl crate::Spaces {
+    /// The relay account for `machine_id`, rebound to its custom Account-mode
+    /// relay origin when one is recorded in the registry.
+    pub(crate) fn relay_for_machine(&self, machine_id: &str) -> crate::Result<RelayAccount> {
+        let relay = self.relay()?;
+        if let Some(origin) = self.custom_account_relay_origin(machine_id, &relay.url) {
+            return Ok(relay.rebind(&origin)?);
+        }
+        Ok(relay)
+    }
+
     /// Removes `relay:<machine_id>` from the account's relay directory and
     /// forgets it here. Only the machine's owner may: a machine shared with
     /// you is refused here, and the relay refuses anyone but the owner
@@ -256,7 +283,7 @@ impl crate::Spaces {
     ) -> crate::Result<Option<RelayMachine>> {
         use crate::Error;
         let id = format!("relay:{machine_id}");
-        let relay = self.relay()?;
+        let relay = self.relay_for_machine(machine_id)?;
         let token = relay.tokens.access_token().await?;
         let client = relay.client().await?;
         let m = match client.machine(&token, machine_id).await {
@@ -362,7 +389,10 @@ impl crate::Spaces {
     #[cfg_attr(not(feature = "spaces-agents"), allow(dead_code))]
     pub(crate) fn adopt_relay_machine_name(&self, machine_id: &str, name: &str) {
         if let Some(account) = self.relay_account() {
-            adopt_machine_name(self.home_dir(), &account.url, machine_id, name);
+            let url = self
+                .custom_account_relay_origin(machine_id, &account.url)
+                .unwrap_or(account.url);
+            adopt_machine_name(self.home_dir(), &url, machine_id, name);
         }
         for m in self
             .inner
@@ -511,5 +541,425 @@ mod account_tests {
         assert!(!account_changed(&s("a"), &s("a")));
         assert!(!account_changed(&None, &s("b")));
         assert!(!account_changed(&s("a"), &None));
+    }
+
+    type SeenReq = (String, String, Option<String>, Option<String>);
+
+    async fn spawn_device_mock_relay(
+        machine_id: String,
+        session_token: String,
+    ) -> (String, Arc<std::sync::Mutex<Vec<SeenReq>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_bg = seen.clone();
+        let machine_name = Arc::new(std::sync::Mutex::new("custom-sb".to_string()));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let seen_conn = seen_bg.clone();
+                let machine_id = machine_id.clone();
+                let machine_name = machine_name.clone();
+                let session_token = session_token.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&chunk[..n]);
+                        if header_end.is_none()
+                            && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let end = pos + 4;
+                            header_end = Some(end);
+                            let hdrs = String::from_utf8_lossy(&raw[..pos]);
+                            for line in hdrs.lines().skip(1) {
+                                if let Some((k, v)) = line.split_once(':')
+                                    && k.eq_ignore_ascii_case("content-length")
+                                {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                        if let Some(end) = header_end
+                            && raw.len() >= end + content_len
+                        {
+                            break;
+                        }
+                    }
+                    if raw.is_empty() {
+                        return;
+                    }
+                    let req_head = String::from_utf8_lossy(&raw[..header_end.unwrap_or(raw.len())]);
+                    let req_body = header_end
+                        .map(|end| &raw[end..raw.len().min(end + content_len)])
+                        .unwrap_or_default();
+                    let mut lines = req_head.lines();
+                    let first = lines.next().unwrap_or_default();
+                    let mut parts = first.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let path = parts.next().unwrap_or_default().to_string();
+                    let mut auth = None;
+                    let mut dev_sess = None;
+                    for line in lines {
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("authorization") {
+                                auth = Some(v.trim().to_string());
+                            } else if k.eq_ignore_ascii_case(cua_host::relay::DEVICE_SESSION_HEADER)
+                            {
+                                dev_sess = Some(v.trim().to_string());
+                            }
+                        }
+                    }
+                    seen_conn
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone(), auth, dev_sess));
+                    let make_machine_json = |name: &str| {
+                        serde_json::json!({
+                            "id": machine_id,
+                            "name": name,
+                            "online": false,
+                            "role": "owner",
+                            "owner": {"id": "acct-1", "email": "ada@example.com"},
+                            "meta": {
+                                "cua.cloud.provider": "aws",
+                                "cua.cloud.place": "AWS · us-west-2"
+                            }
+                        })
+                    };
+                    let base_path = path.split_once('?').map_or(path.as_str(), |(p, _)| p);
+                    let machine_path = format!("/v1/machines/{machine_id}");
+                    let (status, body) = if method == "POST" && base_path == "/v1/devices/session" {
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "session": session_token,
+                                "expires_at": 4_102_444_800u64,
+                            })
+                            .to_string(),
+                        )
+                    } else if method == "GET" && base_path == "/v1/machines" {
+                        let name = machine_name.lock().unwrap().clone();
+                        (
+                            "200 OK",
+                            serde_json::json!({"machines": [make_machine_json(&name)]}).to_string(),
+                        )
+                    } else if method == "GET" && base_path == machine_path {
+                        let name = machine_name.lock().unwrap().clone();
+                        ("200 OK", make_machine_json(&name).to_string())
+                    } else if method == "PATCH" && base_path == machine_path {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(req_body)
+                            && let Some(new_name) = v.get("name").and_then(|n| n.as_str())
+                        {
+                            *machine_name.lock().unwrap() = new_name.to_string();
+                        }
+                        let name = machine_name.lock().unwrap().clone();
+                        ("200 OK", make_machine_json(&name).to_string())
+                    } else if method == "DELETE" && base_path == machine_path {
+                        ("204 No Content", String::new())
+                    } else {
+                        ("404 Not Found", r#"{"error":"not found"}"#.into())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn rebind_rebinds_device_auth_and_isolates_default_session() {
+        let (default_url, default_seen) =
+            spawn_device_mock_relay("m-default".into(), "sess-default".into()).await;
+        let (custom_url, custom_seen) =
+            spawn_device_mock_relay("m-custom".into(), "sess-custom".into()).await;
+
+        let (_, pkcs8) = cua_host::DeviceKey::generate().unwrap();
+        let slot: Arc<dyn cua_host::KeySlot> = Arc::new(cua_host::MemoryKeySlot::default());
+        slot.save(&pkcs8).unwrap();
+        let tokens: Arc<dyn AccountTokens> = Arc::new(StaticToken("acct-bearer".into()));
+        let device =
+            Arc::new(DeviceAuth::new(&default_url, tokens.clone(), slot, "test-device").unwrap());
+        let account = RelayAccount::new(&default_url, tokens).with_device(device);
+
+        // Warm the default relay's cached device session before rebinding.
+        assert_eq!(
+            account.device_session().await.as_deref(),
+            Some("sess-default")
+        );
+
+        // Unchanged URL returns a clone keeping the original device binding and session.
+        let same = account.rebind(&default_url).unwrap();
+        assert_eq!(same.url, default_url);
+        assert_eq!(same.device.as_ref().unwrap().relay_url(), default_url);
+        assert_eq!(same.device_session().await.as_deref(), Some("sess-default"));
+
+        // Rebinding to a custom origin binds DeviceAuth to the custom relay and
+        // opens a fresh session there instead of reusing the default session.
+        let rebound = account.rebind(&custom_url).unwrap();
+        assert_eq!(rebound.url, custom_url);
+        assert_eq!(rebound.device.as_ref().unwrap().relay_url(), custom_url);
+        assert_eq!(
+            rebound.device_session().await.as_deref(),
+            Some("sess-custom")
+        );
+
+        // End-to-end through Spaces: relay_directory, connect_with (RelayBearer),
+        // and forget_relay_machine all target the custom relay with its own session
+        // and never leak the default relay's session.
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = crate::Spaces::builder()
+            .home(dir.path())
+            .relay(account)
+            .build();
+        let record = cua_proto::daemon::v1::Space {
+            id: "relay:m-custom".into(),
+            name: "custom-sb".into(),
+            ..Default::default()
+        };
+        spaces
+            .inner
+            .registry
+            .upsert(
+                record,
+                crate::registry::Credential {
+                    url: Some(format!("{custom_url}/m/m-custom")),
+                    token: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let listed = spaces.relay_directory(Some("m-custom")).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "m-custom");
+
+        // HTTPS relay fallback (connect_with -> RelayBearer) must also use the
+        // rebound device session on the custom relay.
+        let _ = spaces.space("relay:m-custom").await;
+
+        // Directory cleanup (forget_relay_machine) must target the custom relay
+        // with the custom session rather than the default relay.
+        let removed = spaces
+            .forget_relay_machine("m-custom", false)
+            .await
+            .unwrap();
+        assert_eq!(removed.as_ref().map(|m| m.id.as_str()), Some("m-custom"));
+
+        let custom_reqs = custom_seen.lock().unwrap().clone();
+        assert!(
+            custom_reqs
+                .iter()
+                .all(|(_, _, _, sess)| sess.as_deref() != Some("sess-default")),
+            "default relay session leaked to custom relay: {custom_reqs:?}"
+        );
+        assert!(
+            custom_reqs.iter().any(|(m, p, _, sess)| {
+                m == "GET" && p == "/v1/machines" && sess.as_deref() == Some("sess-custom")
+            }),
+            "expected custom relay GET /v1/machines with custom session: {custom_reqs:?}"
+        );
+        assert!(
+            custom_reqs.iter().any(|(_, p, _, sess)| {
+                p.starts_with("/m/m-custom") && sess.as_deref() == Some("sess-custom")
+            }),
+            "expected custom relay /m/m-custom with custom session: {custom_reqs:?}"
+        );
+        assert!(
+            custom_reqs.iter().any(|(m, p, _, sess)| {
+                m == "DELETE"
+                    && p.starts_with("/v1/machines/m-custom")
+                    && sess.as_deref() == Some("sess-custom")
+            }),
+            "expected custom relay DELETE /v1/machines/m-custom with custom session: {custom_reqs:?}"
+        );
+
+        let default_reqs = default_seen.lock().unwrap().clone();
+        assert!(
+            default_reqs.iter().all(|(_, p, _, _)| {
+                !p.starts_with("/m/m-custom") && !p.starts_with("/v1/machines/m-custom")
+            }),
+            "default relay must not receive custom-relay machine calls: {default_reqs:?}"
+        );
+    }
+
+    #[cfg(feature = "spaces-agents")]
+    #[tokio::test]
+    async fn rename_custom_account_relay_space_uses_rebound_device_auth() {
+        let (default_url, default_seen) =
+            spawn_device_mock_relay("m-default".into(), "sess-default".into()).await;
+        let (custom_url, custom_seen) =
+            spawn_device_mock_relay("m-custom".into(), "sess-custom".into()).await;
+
+        let (_, pkcs8) = cua_host::DeviceKey::generate().unwrap();
+        let slot: Arc<dyn cua_host::KeySlot> = Arc::new(cua_host::MemoryKeySlot::default());
+        slot.save(&pkcs8).unwrap();
+        let tokens: Arc<dyn AccountTokens> = Arc::new(StaticToken("acct-bearer".into()));
+        let device =
+            Arc::new(DeviceAuth::new(&default_url, tokens.clone(), slot, "test-device").unwrap());
+        let account = RelayAccount::new(&default_url, tokens).with_device(device);
+
+        // Warm the default relay's session so any accidental default-relay use is visible.
+        assert_eq!(
+            account.device_session().await.as_deref(),
+            Some("sess-default")
+        );
+        default_seen.lock().unwrap().clear();
+
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = crate::Spaces::builder()
+            .home(dir.path())
+            .relay(account)
+            .build();
+        let record = cua_proto::daemon::v1::Space {
+            id: "relay:m-custom".into(),
+            name: "custom-sb".into(),
+            ..Default::default()
+        };
+        spaces
+            .inner
+            .registry
+            .upsert(
+                record,
+                crate::registry::Credential {
+                    url: Some(format!("{custom_url}/m/m-custom")),
+                    token: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let saved_machine: RelayMachine = serde_json::from_value(serde_json::json!({
+            "id": "m-custom",
+            "name": "custom-sb",
+            "online": false,
+            "role": "owner",
+            "owner": {"id": "acct-1", "email": "ada@example.com"}
+        }))
+        .unwrap();
+        crate::listing::save_directory(dir.path(), &custom_url, &[saved_machine]);
+
+        let rebound = spaces.relay_for_machine("m-custom").unwrap();
+        assert_eq!(rebound.url, custom_url);
+        assert!(rebound.device.is_some());
+        assert_eq!(rebound.device.as_ref().unwrap().relay_url(), custom_url);
+
+        let renamed = spaces
+            .rename("relay:m-custom", "renamed-custom")
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, "relay:m-custom");
+        assert_eq!(renamed.shown_name(), "renamed-custom");
+
+        let custom_reqs = custom_seen.lock().unwrap().clone();
+        assert!(
+            custom_reqs
+                .iter()
+                .all(|(_, _, _, sess)| sess.as_deref() != Some("sess-default")),
+            "default relay session leaked to custom relay: {custom_reqs:?}"
+        );
+        assert!(
+            custom_reqs.iter().any(|(m, p, _, sess)| {
+                m == "GET" && p == "/v1/machines/m-custom" && sess.as_deref() == Some("sess-custom")
+            }),
+            "expected GET /v1/machines/m-custom on custom relay with rebound device session: {custom_reqs:?}"
+        );
+        assert!(
+            custom_reqs.iter().any(|(m, p, _, sess)| {
+                m == "PATCH"
+                    && p == "/v1/machines/m-custom"
+                    && sess.as_deref() == Some("sess-custom")
+            }),
+            "expected PATCH /v1/machines/m-custom on custom relay with rebound device session: {custom_reqs:?}"
+        );
+        assert!(
+            default_seen.lock().unwrap().is_empty(),
+            "default relay must never be called when renaming a custom-relay Space: {:?}",
+            default_seen.lock().unwrap()
+        );
+        let saved = crate::listing::load_directory(dir.path(), &custom_url);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "renamed-custom");
+    }
+
+    #[tokio::test]
+    async fn rename_static_relay_space_while_signed_out_succeeds_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = crate::Spaces::builder().home(dir.path()).build();
+        spaces
+            .inner
+            .registry
+            .upsert(
+                cua_proto::daemon::v1::Space {
+                    id: "relay:m-static".into(),
+                    name: "static-sb".into(),
+                    ..Default::default()
+                },
+                crate::registry::Credential {
+                    url: Some("https://static-relay.example.com/m/m-static".into()),
+                    token: Some("static-env-token".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let renamed = spaces
+            .rename("relay:m-static", "renamed-static")
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, "relay:m-static");
+        assert_eq!(renamed.name, "static-sb");
+        assert_eq!(renamed.display_name, "renamed-static");
+        assert_eq!(renamed.shown_name(), "renamed-static");
+        assert_eq!(
+            spaces.resolve("renamed-static").unwrap().to_string(),
+            "relay:m-static"
+        );
+
+        let reloaded = crate::Spaces::builder().home(dir.path()).build();
+        assert_eq!(
+            reloaded.find("relay:m-static").await.unwrap().shown_name(),
+            "renamed-static"
+        );
+
+        // Non-static relay Space while signed out still requires signing in.
+        spaces
+            .inner
+            .registry
+            .upsert(
+                cua_proto::daemon::v1::Space {
+                    id: "relay:m-account".into(),
+                    name: "acct-sb".into(),
+                    ..Default::default()
+                },
+                crate::registry::Credential {
+                    url: Some("https://custom-relay.example.com/m/m-account".into()),
+                    token: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let err = spaces
+            .rename("relay:m-account", "acct-renamed")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cua auth login"), "{err}");
     }
 }

@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditLog, CloudAuditEntry};
-use crate::model::{Auth, Connection, MaxSize, Resource};
+use crate::model::{Connection, Resource};
 
 /// The profile a federated (`oidc`, `sealed`) link has on disk. No AWS or
 /// Modal config names it, so a cua from before federation that reads the
@@ -81,39 +81,42 @@ pub struct Link {
     /// The profile it had (empty for a federated link).
     #[serde(default)]
     pub profile: String,
-    /// [`Connection::auth`].
-    #[serde(default, skip_serializing_if = "Auth::is_cli")]
-    pub auth: Auth,
-    /// [`Connection::budget_usd_month`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_usd_month: Option<f64>,
-    /// [`Connection::max_size`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_size: Option<MaxSize>,
+    /// Extended connection options serialized flat alongside the header fields.
+    #[serde(flatten)]
+    pub extras: crate::model::ConnectionExtras,
+}
+
+impl std::ops::Deref for Link {
+    type Target = crate::model::ConnectionExtras;
+    fn deref(&self) -> &Self::Target {
+        &self.extras
+    }
+}
+
+impl std::ops::DerefMut for Link {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.extras
+    }
 }
 
 impl Link {
     /// What `c` has that an older cua would drop, if anything.
     fn of(c: &Connection) -> Option<Link> {
-        if c.auth.is_cli() && c.budget_usd_month.is_none() && c.max_size.is_none() {
+        if !c.has_extended_options() {
             return None;
         }
         Some(Link {
             account: c.account.clone(),
             connected_at: c.connected_at.clone(),
             profile: c.profile.clone(),
-            auth: c.auth.clone(),
-            budget_usd_month: c.budget_usd_month,
-            max_size: c.max_size,
+            extras: c.extras.clone(),
         })
     }
 
     /// Whether `c` is this link after an older cua wrote it back: its new
     /// keys gone, the rest as it was.
     fn stripped(&self, c: &Connection) -> bool {
-        c.auth.is_cli()
-            && c.budget_usd_month.is_none()
-            && c.max_size.is_none()
+        !c.has_extended_options()
             && c.account == self.account
             && c.connected_at == self.connected_at
     }
@@ -302,9 +305,7 @@ impl Store {
                     "restored the link's {} auth and limits an older cua left out",
                     l.auth.as_str()
                 );
-                c.auth = l.auth.clone();
-                c.budget_usd_month = l.budget_usd_month;
-                c.max_size = l.max_size;
+                c.extras = l.extras.clone();
             }
             if c.profile == FEDERATED_PROFILE {
                 c.profile = String::new();
@@ -426,7 +427,8 @@ impl Store {
     pub fn record(&self, mut r: Resource) -> std::io::Result<()> {
         let provider = r.provider.clone();
         self.update(|s| {
-            let earlier: Vec<&Resource> = s.resources.iter().filter(|x| same(x, &r)).collect();
+            let earlier: Vec<&Resource> =
+                s.resources.iter().filter(|x| x.same_identity(&r)).collect();
             let started_by = earlier
                 .iter()
                 .find_map(|x| x.extra.get(crate::model::STARTED_BY).cloned());
@@ -442,7 +444,7 @@ impl Store {
                     r.extra.insert(crate::model::STARTED_BY.into(), who);
                 }
             }
-            s.resources.retain(|x| !same(x, &r));
+            s.resources.retain(|x| !x.same_identity(&r));
             s.resources.push(r);
         })?;
         self.share_spend(&provider);
@@ -460,8 +462,13 @@ impl Store {
     fn forget_quietly(&self, r: &Resource) -> std::io::Result<()> {
         self.update(|s| {
             let t = crate::model::now();
-            let gone: Vec<Resource> = s.resources.iter().filter(|x| same(x, r)).cloned().collect();
-            s.resources.retain(|x| !same(x, r));
+            let gone: Vec<Resource> = s
+                .resources
+                .iter()
+                .filter(|x| x.same_identity(r))
+                .cloned()
+                .collect();
+            s.resources.retain(|x| !x.same_identity(r));
             for g in gone.iter().filter(|g| !g.pending()) {
                 // Its run, for `cloud_cost` (a record, not a gate).
                 if let Some(u) = crate::usage::Usage::of(g, t)
@@ -524,14 +531,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
-}
-
-/// The same resource: same provider and type, and the same cloud id (or,
-/// while one is pending, the same name).
-fn same(a: &Resource, b: &Resource) -> bool {
-    a.provider == b.provider
-        && a.resource_type == b.resource_type
-        && ((!a.id.is_empty() && a.id == b.id) || (!a.name.is_empty() && a.name == b.name))
 }
 
 #[cfg(test)]
@@ -681,12 +680,19 @@ mod tests {
         let c = Connection {
             provider: "aws".into(),
             region: "us-west-2".into(),
-            auth: crate::model::Auth::aws("conn_1", "arn:aws:iam::123456789012:role/cua-spaces"),
-            budget_usd_month: Some(200.0),
-            max_size: Some(crate::model::MaxSize {
-                vcpu: 4,
-                mem_gib: 16,
-            }),
+            extras: crate::model::ConnectionExtras {
+                auth: crate::model::Auth::aws(
+                    "conn_1",
+                    "arn:aws:iam::123456789012:role/cua-spaces",
+                ),
+                budget_usd_month: Some(200.0),
+                max_size: Some(crate::model::MaxSize {
+                    vcpu: 4,
+                    mem_gib: 16,
+                    disk_gib: None,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         s.connect(c.clone()).unwrap();
@@ -729,12 +735,19 @@ mod tests {
             region: "us-west-2".into(),
             account: "123456789012".into(),
             connected_at: "2026-10-24T10:00:00Z".into(),
-            auth: crate::model::Auth::aws("conn_1", "arn:aws:iam::123456789012:role/cua-spaces"),
-            budget_usd_month: Some(200.0),
-            max_size: Some(crate::model::MaxSize {
-                vcpu: 4,
-                mem_gib: 16,
-            }),
+            extras: crate::model::ConnectionExtras {
+                auth: crate::model::Auth::aws(
+                    "conn_1",
+                    "arn:aws:iam::123456789012:role/cua-spaces",
+                ),
+                budget_usd_month: Some(200.0),
+                max_size: Some(crate::model::MaxSize {
+                    vcpu: 4,
+                    mem_gib: 16,
+                    disk_gib: None,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -748,7 +761,10 @@ mod tests {
             region: "nbg1".into(),
             account: "my-project".into(),
             connected_at: "2026-10-20T10:00:00Z".into(),
-            budget_usd_month: Some(50.0),
+            extras: crate::model::ConnectionExtras {
+                budget_usd_month: Some(50.0),
+                ..Default::default()
+            },
             ..Default::default()
         };
         s.connect(oidc_link()).unwrap();
@@ -840,5 +856,79 @@ mod tests {
         assert_eq!(s.connection("aws").unwrap().unwrap().region, "us-west-2");
         assert!(s.disconnect("aws").unwrap());
         assert!(!s.disconnect("aws").unwrap());
+    }
+
+    #[test]
+    fn distinct_ids_with_same_name_do_not_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::new(dir.path());
+        let sg1 = Resource {
+            provider: "aliyun-ecs".into(),
+            resource_type: "security_group".into(),
+            id: "sg-1".into(),
+            name: "cua-sandboxes-owner1".into(),
+            region: "cn-hangzhou".into(),
+            ..Default::default()
+        };
+        let sg2 = Resource {
+            id: "sg-2".into(),
+            ..sg1.clone()
+        };
+        s.record(sg1.clone()).unwrap();
+        s.record(sg2.clone()).unwrap();
+        let all = s.resources().unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: Vec<&str> = all.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["sg-1", "sg-2"]);
+
+        s.forget(&sg1).unwrap();
+        let left = s.resources().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "sg-2");
+    }
+
+    #[test]
+    fn link_debug_redacts_spacesd_download_url_secrets() {
+        let link = Link {
+            account: "123456789012".into(),
+            extras: crate::model::ConnectionExtras {
+                relay_url: Some(
+                    "https://ruser:RelayPass99@relay.example.com?token=RelayTok77".into(),
+                ),
+                spacesd_download_url: Some(
+                    "https://user:SuperSecretPass@mirror.example.com/bin/cua-spacesd.exe?sig=SecretSig99#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dbg = format!("{link:?}");
+        assert!(!dbg.contains("SuperSecretPass"), "{dbg}");
+        assert!(!dbg.contains("SecretSig99"), "{dbg}");
+        assert!(!dbg.contains("RelayPass99"), "{dbg}");
+        assert!(!dbg.contains("RelayTok77"), "{dbg}");
+        assert!(dbg.contains("mirror.example.com"), "{dbg}");
+        assert!(dbg.contains("relay.example.com"), "{dbg}");
+    }
+
+    #[test]
+    fn link_json_is_flat_and_byte_compatible() {
+        let sample = r#"{
+  "account": "123456789012",
+  "connected_at": "2026-11-22T00:00:00Z",
+  "profile": "",
+  "budget_usd_month": 50.0,
+  "relay_url": "https://relay.example.com",
+  "relay_mode": "static",
+  "vpc_id": "vpc-123",
+  "vswitch_id": "vsw-456",
+  "no_public_ip": true
+}"#;
+        let link: Link = serde_json::from_str(sample).unwrap();
+        assert_eq!(link.vpc_id.as_deref(), Some("vpc-123"));
+        assert!(link.no_public_ip);
+        let serialized = serde_json::to_string_pretty(&link).unwrap();
+        assert_eq!(serialized, sample);
     }
 }

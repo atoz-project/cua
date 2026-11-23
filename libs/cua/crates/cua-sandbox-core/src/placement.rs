@@ -951,9 +951,21 @@ pub fn select(
         ));
     }
     if image.known() {
+        let native_direct_vm = matches!(on, On::Provider(_))
+            && (runtime.as_str() == "native"
+                || (*runtime == Runtime::Auto
+                    && kind == Kind::Vm
+                    && caps
+                        .runtimes(Kind::Vm)
+                        .first()
+                        .is_some_and(|r| r.as_str() == "native")));
         let fits = match kind {
-            // A microVM boots the container rootfs.
+            // A microVM boots the container rootfs; a cloud Direct VM (`--runtime native`)
+            // runs a native cloud OS image for either Linux (`Rootfs`) or disk-based families.
             Kind::Container | Kind::MicroVm => image.has(Variant::Rootfs),
+            Kind::Vm if native_direct_vm => {
+                image.has(Variant::Rootfs) || image.has(Variant::Containerdisk)
+            }
             _ => image.has(Variant::Containerdisk) || image.has(Variant::Lume),
         };
         if !fits {
@@ -1649,7 +1661,15 @@ mod tests {
 
     #[test]
     fn every_own_cloud_word_parses_as_a_location() {
-        for w in ["aws", "gcp", "hetzner", "modal", "HETZNER"] {
+        for w in [
+            "aws",
+            "gcp",
+            "hetzner",
+            "modal",
+            "aliyun-ecs",
+            "ALIYUN-ECS",
+            "HETZNER",
+        ] {
             assert_eq!(
                 On::parse(w).unwrap(),
                 On::Provider(w.to_ascii_lowercase()),
@@ -1658,9 +1678,16 @@ mod tests {
         }
         assert!(crate::provider::is_cloud_location("hetzner"));
         assert!(crate::provider::is_provider_location("hetzner"));
-        // The error for an unknown word lists hetzner among the valid ones.
+        assert!(crate::provider::is_cloud_location("aliyun-ecs"));
+        assert!(crate::provider::is_provider_location("aliyun-ecs"));
+        // Reserved per ADR-0001: not registered as a location yet.
+        for reserved in ["aliyun-sandbox", "aliyun-agent-sandbox"] {
+            assert!(!crate::provider::is_cloud_location(reserved), "{reserved}");
+            assert!(On::parse(reserved).is_err(), "{reserved}");
+        }
         let e = On::parse("hetznr").unwrap_err();
         assert!(e.valid.iter().any(|v| v == "hetzner"), "{:?}", e.valid);
+        assert!(e.valid.iter().any(|v| v == "aliyun-ecs"), "{:?}", e.valid);
     }
 
     #[test]
@@ -1695,5 +1722,33 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn direct_vm_native_runtime_allows_linux_rootfs_and_keeps_docker_default() {
+        register_provider(Capabilities {
+            name: "test-direct-vm".into(),
+            description: "test direct VM cloud".into(),
+            kinds: vec![
+                KindSupport {
+                    kind: Container,
+                    runtimes: vec![rt("docker")],
+                },
+                KindSupport {
+                    kind: Vm,
+                    runtimes: vec![rt("native")],
+                },
+            ],
+        })
+        .unwrap();
+        let on = On::parse("test-direct-vm").unwrap();
+        assert_eq!(validate(&on, Auto, &rt("native")).unwrap(), Vm);
+        let linux_rootfs = img(Some("linux"), &[Rootfs]);
+        let def = select(&on, Auto, &Runtime::Auto, &linux_rootfs, &MAC).unwrap();
+        assert_eq!((def.kind, def.runtime), (Container, rt("docker")));
+        let nat = select(&on, Auto, &rt("native"), &linux_rootfs, &MAC).unwrap();
+        assert_eq!((nat.kind, nat.runtime), (Vm, rt("native")));
+        let err = validate(&on, Auto, &Runtime::Qemu).unwrap_err();
+        assert_eq!(err.valid, ["auto", "docker", "native"]);
     }
 }

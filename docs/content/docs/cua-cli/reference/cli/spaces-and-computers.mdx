@@ -147,6 +147,7 @@ cua spaces create [OPTIONS] [IMAGE]
 | <span id="cua-spaces-create--disk-gb"></span>`--disk-gb` | integer |  | Grow a VM's disk to this many GiB. |
 | <span id="cua-spaces-create--gpu"></span>`--gpu` | string |  | A GPU: the runtime's own (`--gpu`), or an option `cua spaces gpus` lists. macOS VMs: GPU acceleration (experimental, Apple silicon; https://cua.ai/docs/lume/guides/gpu-passthrough). |
 | <span id="cua-spaces-create--instance-type"></span>`--instance-type` | string |  | The cloud machine type of the pool host it runs on (with `--on <cloud>` or `--on auto`; default: the pool picks). |
+| <span id="cua-spaces-create--cloud-image-id"></span>`--cloud-image-id` | string |  | Per-create Cloud Image ID override (e.g. Alibaba Cloud ECS `m-xxx`), distinct from `IMAGE` (the Sandbox Image). |
 | <span id="cua-spaces-create--region"></span>`--region` | string |  | The cloud region or location of that host (default: the pool picks, near you). |
 | <span id="cua-spaces-create--volume"></span>`--volume` | string |  | Mount a named volume of Cua Volume in the Space: `NAME:PATH[:ro\|:rw]`, or `NAME/SUBFOLDER:PATH[:ro\|:rw]` for a folder of it. With Secure Spaces on it is read-only unless you add `:rw`. Repeat for several. Make one with `cua volume named create`. Repeatable. |
 | <span id="cua-spaces-create--label"></span>`--label` | string |  | A label to keep with the Space (`key=value`; repeat for more; up to 64, keys up to 63 bytes, values up to 256, none empty). Not with `--durable`. Repeatable. |

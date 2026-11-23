@@ -16,12 +16,13 @@ use cua_sandbox_core::byoc::{
     CloudTestReport, HostTypeOffer,
 };
 
-use crate::api::{CloudApi, Result};
+use crate::api::{CloudApi, Result, UnstageGuard};
 use crate::audit;
 use crate::model::{self, Connection, Resource};
-use crate::relay::RelayAccess;
+use crate::relay::{ConnectionRelay, RelayAccess};
 use crate::state::Store;
 use crate::sweep;
+use crate::target::PreparedTarget;
 
 /// The clouds of one cua home.
 #[derive(Clone)]
@@ -150,6 +151,7 @@ impl Clouds {
         dry_run: bool,
         actor: &str,
     ) -> Result<Vec<CloudSweepItem>> {
+        let conn = self.store.connection(provider).map_err(Error::Io)?;
         let t = model::now();
         let mut out = Vec::new();
         for rec in self
@@ -165,34 +167,39 @@ impl Clouds {
                 reason: "a relay computer a failed create left".into(),
             };
             if !dry_run {
-                match &self.relay {
-                    Some(relay) => match relay.forget(&rec.id).await {
-                        Ok(()) => {
-                            let _ = self.store.forget(&rec);
-                            item.action = "deleted".into();
-                            self.store.audit(audit::of_resource(
-                                "resource_deleted",
-                                &rec,
-                                actor,
-                                "ok",
-                                &item.reason,
-                            ));
-                        }
-                        Err(e) => {
-                            item.action = "failed".into();
-                            item.reason = e.to_string();
-                            self.store.audit(audit::of_resource(
-                                "resource_deleted",
-                                &rec,
-                                actor,
-                                "failed",
-                                &item.reason,
-                            ));
-                        }
-                    },
-                    None => {
+                let Some(conn_relay) =
+                    ConnectionRelay::for_optional(conn.as_ref(), self.relay.as_ref())
+                else {
+                    item.action = "failed".into();
+                    item.reason = "no relay account in this process".into();
+                    out.push(item);
+                    continue;
+                };
+                match conn_relay
+                    .forget_or_err(self.store.home().as_deref(), provider, &rec.id)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = self.store.forget(&rec);
+                        item.action = "deleted".into();
+                        self.store.audit(audit::of_resource(
+                            "resource_deleted",
+                            &rec,
+                            actor,
+                            "ok",
+                            &item.reason,
+                        ));
+                    }
+                    Err(e) => {
                         item.action = "failed".into();
-                        item.reason = "no relay account in this process".into();
+                        item.reason = e.to_string();
+                        self.store.audit(audit::of_resource(
+                            "resource_deleted",
+                            &rec,
+                            actor,
+                            "failed",
+                            &item.reason,
+                        ));
                     }
                 }
             }
@@ -201,88 +208,13 @@ impl Clouds {
         Ok(out)
     }
 
-    /// Every Cua resource of `provider` that may still be there: what the
-    /// cloud lists by this owner's tags, plus recorded ones it did not
-    /// list. A recorded one is dropped only when the cloud, asked in the
-    /// record's own region, says it is gone; one the cloud cannot be asked
-    /// about (another region than the connection's, or a failed lookup) is
-    /// kept and marked unverified, never assumed deleted. Without
-    /// `shared`, only what runs and bills: instances and sandboxes.
-    async fn live(&self, p: &dyn CloudApi, conn: &Connection, shared: bool) -> Result<Vec<Live>> {
-        let owner = self.store.owner_id().map_err(Error::Io)?;
-        let listed = p.list_owned(conn, &owner).await?;
-        let wanted =
-            |r: &Resource| shared || matches!(r.resource_type.as_str(), "instance" | "sandbox");
-        let t = model::now();
-        let mut out: Vec<Live> = listed
-            .iter()
-            .filter(|r| r.state != "terminated" && wanted(r))
-            .map(|r| Live {
-                resource: r.clone(),
-                unverified: None,
-            })
-            .collect();
-        for rec in self
-            .store
-            .resources()
-            .map_err(Error::Io)?
-            .into_iter()
-            .filter(|r| r.provider == p.name())
-        {
-            if listed.iter().any(|r| sweep::same(&rec, r)) {
-                continue;
-            }
-            if rec.resource_type == model::RELAY_MACHINE {
-                if shared && self.relay.is_some() {
-                    out.push(Live {
-                        resource: rec,
-                        unverified: None,
-                    });
-                }
-                continue;
-            }
-            if !wanted(&rec) {
-                continue;
-            }
-            if rec.id.is_empty() {
-                // A create under way (an older one is stale: the sweeper
-                // forgets it).
-                if t.saturating_sub(rec.created) < sweep::GRACE_SECS {
-                    out.push(Live {
-                        resource: rec,
-                        unverified: None,
-                    });
-                }
-                continue;
-            }
-            // Asked where the record says it lives (its own region), so a
-            // host in another region is seen running, or confirmed gone.
-            let unverified = if rec.region.is_empty() && !sweep::in_scope(&rec, conn) {
-                Some(format!(
-                    "recorded in an unknown region, outside this connection's {}",
-                    conn.region
-                ))
-            } else {
-                let mut there = conn.clone();
-                if !rec.region.is_empty() && rec.region != conn.region {
-                    there.region = rec.region.clone();
-                    there.zone = String::new();
-                }
-                match p.describe(&there, &rec).await {
-                    Ok(Some((state, _))) if state != "terminated" => None,
-                    Ok(_) => continue,
-                    Err(e) => Some(format!(
-                        "recorded in {}, could not be checked: {e}",
-                        there.region
-                    )),
-                }
-            };
-            out.push(Live {
-                resource: rec,
-                unverified,
-            });
-        }
-        Ok(out)
+    async fn live(
+        &self,
+        p: &dyn CloudApi,
+        conn: &Connection,
+        shared: bool,
+    ) -> Result<Vec<sweep::Live>> {
+        sweep::live_resources(&self.store, self.relay.is_some(), p, conn, shared).await
     }
 
     /// The sweep behind `sweep`, `auto_sweep` and `disconnect --delete`;
@@ -351,7 +283,7 @@ impl Clouds {
         let after: Vec<Resource> = self.hosts.records().unwrap_or_default();
         for r in hosts_before
             .iter()
-            .filter(|r| !after.iter().any(|x| sweep::same(x, r)))
+            .filter(|r| !after.iter().any(|x| x.same_identity(r)))
         {
             let name = r
                 .extra
@@ -486,13 +418,137 @@ impl Clouds {
                 String::new()
             },
             holders: vec![],
+            relay_url: conn.map(|c| {
+                c.effective_relay_url(cua_sandbox_core::byoc::DEFAULT_RELAY_URL)
+                    .to_string()
+            }),
+            relay_mode: conn.map(|c| c.effective_relay_mode()),
+            spacesd_download_url: conn.and_then(|c| {
+                c.spacesd_download_url
+                    .as_deref()
+                    .map(cua_sandbox_core::byoc::redact_url)
+            }),
+            vpc_id: conn.and_then(|c| c.vpc_id.clone()),
+            vswitch_id: conn.and_then(|c| c.vswitch_id.clone()),
+            no_public_ip: conn.is_some_and(|c| c.no_public_ip),
+            windows_image_id: conn.and_then(|c| c.windows_image_id.clone()),
+            linux_image_id: conn.and_then(|c| c.linux_image_id.clone()),
+            instance_type: conn.and_then(|c| c.instance_type.clone()),
             ..Default::default()
         }
     }
 }
 
+impl Clouds {
+    pub(crate) async fn connect_with_limits(
+        &self,
+        target: &CloudTarget,
+        make_default: bool,
+        ttl_hours: Option<u32>,
+        budget_usd_month: Option<f64>,
+        max_size: Option<model::MaxSize>,
+    ) -> Result<CloudConnected> {
+        let p = self.api(&target.provider)?.clone();
+        let existing = self.store.connection(p.name()).map_err(Error::Io)?;
+        let prep =
+            PreparedTarget::prepare(self.store.home().as_deref(), p.as_ref(), target, existing)?;
+        self.connect_prepared_with_limits(
+            p.as_ref(),
+            prep,
+            make_default,
+            ttl_hours,
+            budget_usd_month,
+            max_size,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_prepared_with_limits(
+        &self,
+        p: &dyn CloudApi,
+        prep: PreparedTarget,
+        make_default: bool,
+        ttl_hours: Option<u32>,
+        budget_usd_month: Option<f64>,
+        max_size: Option<model::MaxSize>,
+    ) -> Result<CloudConnected> {
+        p.stage_secret(&prep.target);
+        let _unstage = UnstageGuard(p);
+        let mut conn = p.resolve(&prep.target)?;
+        prep.apply_to(&mut conn);
+        conn.budget_usd_month =
+            budget_usd_month.or_else(|| prep.existing.as_ref().and_then(|c| c.budget_usd_month));
+        conn.max_size = max_size.or_else(|| prep.existing.as_ref().and_then(|c| c.max_size));
+        let mut tested = p.test(&conn).await;
+        if let Some(url) = prep.relay.probe_url.as_deref() {
+            tested
+                .checks
+                .push(crate::relay::probe_relay_check(url, prep.relay.mode).await);
+        }
+        if !tested.ok() {
+            let failed: Vec<String> = tested
+                .checks
+                .iter()
+                .filter(|c| !c.ok)
+                .map(|c| format!("{}: {}", c.name, c.detail))
+                .collect();
+            return Err(Error::Cloud(format!(
+                "{} is not ready, nothing was connected: {}",
+                p.title(),
+                if failed.is_empty() {
+                    "no checks ran".to_string()
+                } else {
+                    failed.join("; ")
+                }
+            )));
+        }
+        conn.account = tested.account.clone();
+        conn.ttl_hours = match (p.name(), ttl_hours.unwrap_or(model::DEFAULT_TTL_HOURS)) {
+            // A Modal sandbox lives at most 24 hours.
+            ("modal", 0) => 24,
+            ("modal", h) => h.min(24),
+            (_, h) => h,
+        };
+        conn.connected_at = model::rfc3339(model::now());
+        p.persist_secret()?;
+        let home = self.store.home();
+        match prep.relay.mode {
+            cua_sandbox_core::byoc::RelayMode::Static => {
+                if let Some(tok) = prep.relay.staged_token {
+                    crate::relay::save_static_relay_token(home.as_deref(), p.name(), tok.expose())?;
+                }
+            }
+            cua_sandbox_core::byoc::RelayMode::Account => {
+                crate::relay::clear_static_relay_token(home.as_deref(), p.name());
+            }
+        }
+        self.store.connect(conn.clone()).map_err(Error::Io)?;
+        let mut a = audit::entry("connect", p.name(), "user");
+        a.detail = format!("{} ttl {}h", conn.label(p.title()), conn.ttl_hours);
+        self.store.audit(a);
+        if make_default {
+            self.make_default(p.name())?;
+        }
+        let default_on = self.default_on();
+        Ok(CloudConnected {
+            provider: self.row(p, Some(&conn), &default_on),
+            checks: tested.checks,
+            next: None,
+            verify: format!("cua cloud status {}", p.name()),
+        })
+    }
+}
+
 #[async_trait]
 impl CloudManager for Clouds {
+    fn relay_mode(&self, provider: &str) -> Option<cua_sandbox_core::byoc::RelayMode> {
+        self.store
+            .connection(provider)
+            .ok()
+            .flatten()
+            .map(|c| c.effective_relay_mode())
+    }
+
     async fn status(&self, provider: Option<&str>) -> Result<CloudStatusReport> {
         if let Some(n) = provider {
             self.api(n)?;
@@ -575,9 +631,19 @@ impl CloudManager for Clouds {
 
     async fn test(&self, target: &CloudTarget) -> Result<CloudTestReport> {
         let p = self.api(&target.provider)?;
-        p.stage_secret(target);
-        let conn = p.resolve(target)?;
-        let t = p.test(&conn).await;
+        let existing = self.store.connection(p.name()).map_err(Error::Io)?;
+        let prep =
+            PreparedTarget::prepare(self.store.home().as_deref(), p.as_ref(), target, existing)?;
+        p.stage_secret(&prep.target);
+        let _unstage = UnstageGuard(p.as_ref());
+        let mut conn = p.resolve(&prep.target)?;
+        prep.apply_to(&mut conn);
+        conn.max_size = prep.existing.as_ref().and_then(|c| c.max_size);
+        let mut t = p.test(&conn).await;
+        if let Some(url) = prep.relay.probe_url.as_deref() {
+            t.checks
+                .push(crate::relay::probe_relay_check(url, prep.relay.mode).await);
+        }
         Ok(CloudTestReport {
             provider: p.name().into(),
             ok: t.ok(),
@@ -592,50 +658,8 @@ impl CloudManager for Clouds {
         make_default: bool,
         ttl_hours: Option<u32>,
     ) -> Result<CloudConnected> {
-        let p = self.api(&target.provider)?;
-        p.stage_secret(target);
-        let mut conn = p.resolve(target)?;
-        let tested = p.test(&conn).await;
-        if !tested.ok() {
-            let failed: Vec<String> = tested
-                .checks
-                .iter()
-                .filter(|c| !c.ok)
-                .map(|c| format!("{}: {}", c.name, c.detail))
-                .collect();
-            return Err(Error::Cloud(format!(
-                "{} is not ready, nothing was connected: {}",
-                p.title(),
-                if failed.is_empty() {
-                    "no checks ran".to_string()
-                } else {
-                    failed.join("; ")
-                }
-            )));
-        }
-        conn.account = tested.account.clone();
-        conn.ttl_hours = match (p.name(), ttl_hours.unwrap_or(model::DEFAULT_TTL_HOURS)) {
-            // A Modal sandbox lives at most 24 hours.
-            ("modal", 0) => 24,
-            ("modal", h) => h.min(24),
-            (_, h) => h,
-        };
-        conn.connected_at = model::rfc3339(model::now());
-        p.persist_secret()?;
-        self.store.connect(conn.clone()).map_err(Error::Io)?;
-        let mut a = audit::entry("connect", p.name(), "user");
-        a.detail = format!("{} ttl {}h", conn.label(p.title()), conn.ttl_hours);
-        self.store.audit(a);
-        if make_default {
-            self.make_default(p.name())?;
-        }
-        let default_on = self.default_on();
-        Ok(CloudConnected {
-            provider: self.row(p.as_ref(), Some(&conn), &default_on),
-            checks: tested.checks,
-            next: None,
-            verify: format!("cua cloud status {}", p.name()),
-        })
+        self.connect_with_limits(target, make_default, ttl_hours, None, None)
+            .await
     }
 
     async fn connect_with(
@@ -668,9 +692,9 @@ impl CloudManager for Clouds {
                          The connection is kept so you can retry `cua cloud disconnect {} --delete`.",
                         p.title(),
                         left.len(),
-                        describe(&left),
+                        sweep::describe_live(&left),
                         p.name()
-                    ) + &unverified_hint(&left);
+                    ) + &sweep::unverified_hint(&left);
                     let mut a = audit::entry("disconnect", p.name(), "user");
                     a.outcome = "failed".into();
                     a.detail = format!("delete left {}", left.len());
@@ -698,9 +722,9 @@ impl CloudManager for Clouds {
                             } else {
                                 format!("{} resources", live.len())
                             },
-                            describe(&live),
+                            sweep::describe_live(&live),
                             p.name()
-                        ) + &unverified_hint(&live),
+                        ) + &sweep::unverified_hint(&live),
                     ));
                 }
             }
@@ -710,6 +734,9 @@ impl CloudManager for Clouds {
         }
         let disconnected = self.store.disconnect(p.name()).map_err(Error::Io)?;
         p.forget_secret();
+        let home = self.store.home();
+        crate::relay::clear_static_relay_token(home.as_deref(), p.name());
+        crate::relay::clear_env_tokens(home.as_deref(), p.name())?;
         if disconnected {
             let mut a = audit::entry("disconnect", p.name(), "user");
             a.detail = if delete {
@@ -875,44 +902,4 @@ fn env_words() -> Vec<String> {
     } else {
         vec![format!("CUA_ENV={}", env.name())]
     }
-}
-
-/// What to do about resources the connection cannot see.
-fn unverified_hint(rs: &[Live]) -> String {
-    if rs.iter().all(|l| l.unverified.is_none()) {
-        return String::new();
-    }
-    " An unverified one is recorded but this connection cannot see it (another region, \
-     or the cloud did not answer): it was NOT assumed deleted. Connect the cloud again \
-     with the region it is in (`cua cloud connect <cloud> --region <region>`) and delete it there."
-        .to_string()
-}
-
-/// One resource `live` found, and why it could not be confirmed (if it
-/// could not).
-struct Live {
-    resource: Resource,
-    unverified: Option<String>,
-}
-
-/// "instance i-1, instance i-2 (unverified: recorded in eu-west-1, ...) and 3 more".
-fn describe(rs: &[Live]) -> String {
-    const SHOWN: usize = 5;
-    let mut s = rs
-        .iter()
-        .take(SHOWN)
-        .map(|l| {
-            let r = &l.resource;
-            let id = if r.id.is_empty() { &r.name } else { &r.id };
-            match &l.unverified {
-                Some(why) => format!("{} {id} (unverified: {why})", r.resource_type),
-                None => format!("{} {id}", r.resource_type),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    if rs.len() > SHOWN {
-        s.push_str(&format!(" and {} more", rs.len() - SHOWN));
-    }
-    s
 }

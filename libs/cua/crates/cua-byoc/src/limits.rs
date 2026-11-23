@@ -30,6 +30,20 @@ pub fn check_new_machine(
     usd_per_hour: f64,
     spent: f64,
 ) -> Result<()> {
+    check_new_machine_with_disk(conn, title, vcpus, memory_mb, None, usd_per_hour, spent)
+}
+
+/// [`check_new_machine`] plus optional boot disk size (`disk_gb`) checked
+/// against `conn.max_size.disk_gib` when set.
+pub fn check_new_machine_with_disk(
+    conn: &Connection,
+    title: &str,
+    vcpus: Option<u32>,
+    memory_mb: Option<u64>,
+    disk_gb: Option<u32>,
+    usd_per_hour: f64,
+    spent: f64,
+) -> Result<()> {
     if let Some(max) = conn.max_size {
         let too_big_cpu = vcpus.is_some_and(|c| c > max.vcpu);
         let too_big_mem = memory_mb.is_some_and(|m| m > u64::from(max.mem_gib) * 1024);
@@ -37,12 +51,23 @@ pub fn check_new_machine(
             return Err(Error::InvalidArgument(format!(
                 "refused: {title} allows machines up to {} vCPU and {} GB, and this one needs \
                  {} vCPU and {} GB. Ask for a smaller machine, or raise the limit with \
-                 `cua cloud connect {} --max-size <vcpu>x<gb>`.",
+                 `cua cloud connect {} --max-size <vcpu>x<gb>[x<disk_gb>]`.",
                 max.vcpu,
                 max.mem_gib,
                 vcpus.map_or("?".into(), |c| c.to_string()),
                 memory_mb.map_or("?".into(), |m| format!("{}", m.div_ceil(1024))),
                 conn.provider,
+            )));
+        }
+        if let Some(d) = disk_gb
+            && !max.fits_disk(d)
+            && let Some(max_d) = max.disk_gib
+        {
+            return Err(Error::InvalidArgument(format!(
+                "refused: {title} allows disks up to {max_d} GB, and this one needs {d} GB. \
+                 Ask for a smaller disk, or raise the limit with \
+                 `cua cloud connect {} --max-size {}x{}x<disk_gb>`.",
+                conn.provider, max.vcpu, max.mem_gib,
             )));
         }
     }
@@ -152,11 +177,15 @@ mod tests {
     fn conn() -> Connection {
         Connection {
             provider: "aws".into(),
-            budget_usd_month: Some(10.0),
-            max_size: Some(MaxSize {
-                vcpu: 4,
-                mem_gib: 16,
-            }),
+            extras: crate::model::ConnectionExtras {
+                budget_usd_month: Some(10.0),
+                max_size: Some(MaxSize {
+                    vcpu: 4,
+                    mem_gib: 16,
+                    disk_gib: None,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -232,5 +261,59 @@ mod tests {
         assert!((cost_this_month(&r, start + 7200) - 2.0).abs() < 1e-9);
         r.resource_type = "security_group".into();
         assert_eq!(cost_this_month(&r, start + 7200), 0.0);
+    }
+
+    #[test]
+    fn max_size_supports_optional_disk_cap_and_check_enforces_it() {
+        assert_eq!(
+            MaxSize::parse("4x16").unwrap(),
+            MaxSize {
+                vcpu: 4,
+                mem_gib: 16,
+                disk_gib: None,
+            }
+        );
+        let with_disk = MaxSize::parse("4x16gbx100gib").unwrap();
+        assert_eq!(
+            with_disk,
+            MaxSize {
+                vcpu: 4,
+                mem_gib: 16,
+                disk_gib: Some(100),
+            }
+        );
+        assert_eq!(with_disk.to_string(), "4x16x100");
+        assert!(MaxSize::parse("4x16x0").is_none());
+        assert!(MaxSize::parse("4x16x100x2").is_none());
+
+        let mut c = conn();
+        c.max_size = Some(with_disk);
+        assert!(
+            check_new_machine_with_disk(
+                &c,
+                "Alibaba Cloud ECS",
+                Some(4),
+                Some(16 * 1024),
+                Some(100),
+                0.1,
+                0.0
+            )
+            .is_ok()
+        );
+        let err = check_new_machine_with_disk(
+            &c,
+            "Alibaba Cloud ECS",
+            Some(4),
+            Some(16 * 1024),
+            Some(120),
+            0.1,
+            0.0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("allows disks up to 100 GB"),
+            "{err}"
+        );
     }
 }

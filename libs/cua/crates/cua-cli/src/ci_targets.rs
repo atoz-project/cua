@@ -204,6 +204,16 @@ fn cloud_target(kind: Kind, region: &Option<String>) -> cua_sdk::CloudTarget {
         project: None,
         environment: None,
         token: None,
+        relay_url: None,
+        relay_mode: None,
+        relay_token: None,
+        spacesd_download_url: None,
+        vpc_id: None,
+        vswitch_id: None,
+        no_public_ip: false,
+        windows_image_id: None,
+        linux_image_id: None,
+        instance_type: None,
     }
 }
 
