@@ -73,6 +73,12 @@ impl cua_driver_core::server::ToolProvider for FakeTools {
 pub struct Driver {
     /// `http://127.0.0.1:<port>`.
     pub url: String,
+    /// Loopback socket address of the in-process server.
+    pub addr: std::net::SocketAddr,
+    /// Live server context (e.g. for mesh host wiring or live token rotation).
+    pub ctx: ServerContext,
+    /// Env token passed to [`Driver::confine_env`] and [`Driver::confine_direct`].
+    pub token: String,
     /// Guest `$HOME` (set through Init by [`Driver::confine`]).
     pub home: PathBuf,
     /// The driver's Downloads (send_file lands here).
@@ -91,6 +97,11 @@ pub async fn driver() -> Driver {
 
 /// [`driver`], with `configure` applied to its server config last.
 pub async fn driver_with(configure: impl FnOnce(&mut ServerConfig)) -> Driver {
+    driver_with_token(TOKEN, configure).await
+}
+
+/// Starts a driver on loopback with `token`, applying `configure` to its server config last.
+pub async fn driver_with_token(token: &str, configure: impl FnOnce(&mut ServerConfig)) -> Driver {
     let dirs: Vec<tempfile::TempDir> = (0..5).map(|_| tempfile::tempdir().unwrap()).collect();
     let canon = |d: &tempfile::TempDir| d.path().canonicalize().unwrap();
     let (data, downloads, teleport_home, home, bin) = (
@@ -108,7 +119,7 @@ pub async fn driver_with(configure: impl FnOnce(&mut ServerConfig)) -> Driver {
         ..ServerConfig::default()
     };
     configure(&mut config);
-    let ctx = ServerContext::new(config, Some(TOKEN.into()));
+    let ctx = ServerContext::new(config, Some(token.into()));
     // The *receiver* is the spacesd under test (import side); its FakeHost
     // comes with the server crate.
     let receiver_host =
@@ -117,13 +128,16 @@ pub async fn driver_with(configure: impl FnOnce(&mut ServerConfig)) -> Driver {
         teleport_home.clone(),
         receiver_host,
     ));
-    let server = ServerBuilder::new(ctx)
+    let server = ServerBuilder::new(ctx.clone())
         .tools(Arc::new(FakeTools))
         .teleport_receiver(teleport)
         .build();
     let addr = cua_spacesd_server::spawn_local(server).await.unwrap();
     Driver {
         url: format!("http://{addr}"),
+        addr,
+        ctx,
+        token: token.into(),
         home,
         downloads,
         teleport_home,
@@ -162,7 +176,7 @@ impl Driver {
             ]
         };
         env.init(cua_spacesd_client::pb::InitRequest {
-            token: TOKEN.into(),
+            token: self.token.clone(),
             env: vars.into_iter().collect(),
             ..Default::default()
         })
@@ -184,7 +198,7 @@ impl Driver {
     /// Connects and confines without a Space (fixtures).
     pub async fn confine_direct(&self) {
         let mut o = cua_spacesd_client::ConnectOptions::parse(&self.url).unwrap();
-        o.token = Some(TOKEN.into());
+        o.token = Some(self.token.clone());
         let env = cua_spacesd_client::SpacesdClient::connect(o).await.unwrap();
         self.confine_env(&env).await;
     }
