@@ -724,7 +724,7 @@ pub(crate) struct Inner {
     pub(crate) operator_display: Arc<dyn OperatorDisplay>,
     probe_timeout: Duration,
     pub(crate) download_dir: PathBuf,
-    connections: tokio::sync::Mutex<HashMap<String, Space>>,
+    pub(crate) connections: tokio::sync::Mutex<HashMap<String, Space>>,
     /// The relay session (online, connected at) of the computer behind each
     /// cached connection when it was made: a computer that reconnected since
     /// (its cua-spacesd restarted) is dialed again ([`session_changed`]).
@@ -873,6 +873,9 @@ impl Spaces {
                 let mut info = SpaceInfo::from_record(r)?;
                 (info.power, info.power_state) = self.power_of(&info.id);
                 self.apply_cloud_metadata(&mut info);
+                if let Some(machine_id) = info.id.strip_prefix("relay:") {
+                    info.sharing = self.persisted_relay_sharing(machine_id);
+                }
                 info.stop_reason = self.stop_reason_of(&info.id);
                 Ok(info)
             })
@@ -955,7 +958,7 @@ impl Spaces {
                 };
             }
             if let Some(existing) = out.iter_mut().find(|i| i.id == info.id) {
-                if !self.is_static_relay_machine(&m.id) {
+                if matches!(self.relay_backing(&m.id), RelayBacking::Account { .. }) {
                     existing.sharing = info.sharing;
                 }
             } else {
@@ -1136,6 +1139,11 @@ impl Spaces {
 
     const RELAY_MAX_AGE: Duration = Duration::from_secs(10);
 
+    pub(crate) fn relay_backing(&self, machine_id: &str) -> RelayBacking {
+        let key = format!("relay:{machine_id}");
+        RelayBacking::from_credential(self.inner.registry.credential(&key).ok().flatten().as_ref())
+    }
+
     /// Custom Account-mode relay origin recorded for `machine_id`, when a
     /// registry credential stores a relay URL without a static env token and
     /// its origin differs from `default_url`.
@@ -1144,28 +1152,18 @@ impl Spaces {
         machine_id: &str,
         default_url: &str,
     ) -> Option<String> {
-        let key = format!("relay:{machine_id}");
-        let cred = self.inner.registry.credential(&key).ok().flatten()?;
-        if cred.token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-            return None;
+        match self.relay_backing(machine_id) {
+            RelayBacking::Account {
+                custom_origin: Some(url),
+            } => crate::cloud::custom_relay_origin(&url, default_url),
+            _ => None,
         }
-        let url = cred.url.as_deref()?;
-        crate::cloud::custom_relay_origin(url, default_url)
     }
 
     /// Whether `machine_id` is a Static Relay Space (registry credential stores
     /// both a non-empty relay URL and a static env token).
     pub(crate) fn is_static_relay_machine(&self, machine_id: &str) -> bool {
-        let key = format!("relay:{machine_id}");
-        self.inner
-            .registry
-            .credential(&key)
-            .ok()
-            .flatten()
-            .is_some_and(|cred| {
-                cred.url.as_deref().is_some_and(|u| !u.is_empty())
-                    && cred.token.as_deref().is_some_and(|t| !t.trim().is_empty())
-            })
+        matches!(self.relay_backing(machine_id), RelayBacking::Static { .. })
     }
 
     /// Whether `id` is a locally registered Static Relay Mode Space.
@@ -1176,10 +1174,18 @@ impl Spaces {
         )
     }
 
+    /// Whether canonical or parseable Space id `id` names a Static Relay Mode Space.
+    pub fn is_static_relay_space_id(&self, id: &str) -> bool {
+        SpaceId::parse(id).is_ok_and(|sid| self.is_static_relay_space(&sid))
+    }
+
     pub(crate) async fn relay_directory(
         &self,
         want: Option<&str>,
     ) -> Result<Vec<crate::relay::RelayMachine>> {
+        if want.is_some_and(|id| self.is_static_relay_machine(id)) {
+            return Ok(Vec::new());
+        }
         let mut relay = self.relay()?;
         if let Some(origin) = want.and_then(|id| self.custom_account_relay_origin(id, &relay.url)) {
             relay = relay.rebind(&origin)?;
@@ -1213,7 +1219,7 @@ impl Spaces {
                 None => client.machines(&token).await?,
             })
         };
-        let machines = match read.await {
+        let default_machines = match read.await {
             Ok(m) => m,
             Err(_) if listed => return Ok(cached),
             // The relay briefly unreachable (a deploy, a moment with no
@@ -1242,6 +1248,11 @@ impl Spaces {
                 }));
             }
         };
+        let mut machines = default_machines.clone();
+        if want.is_none() {
+            self.merge_custom_relay_origins(&relay, &cached, &mut machines)
+                .await;
+        }
         *read_at = Some(std::time::Instant::now());
         let changed = {
             let mut cache = self.inner.relay_cache.lock().expect("relay cache");
@@ -1256,7 +1267,7 @@ impl Spaces {
         // Kept for the next process: it lists these at once, before the
         // relay answers it (`Spaces::list_known`).
         if changed || first {
-            crate::listing::save_directory(self.home_dir(), &relay.url, &machines);
+            crate::listing::save_directory(self.home_dir(), &relay.url, &default_machines);
         }
         Ok(machines)
     }
@@ -1339,6 +1350,9 @@ impl Spaces {
     /// Resolves any accepted spelling (canonical id, legacy id, URL, display
     /// name, short name) to a canonical id.
     pub fn resolve(&self, space: &str) -> Result<SpaceId> {
+        if let Some(id) = self.direct_space_for_url(space) {
+            return Ok(id);
+        }
         if let Ok(id) = SpaceId::parse(space) {
             return Ok(id);
         }
@@ -1391,24 +1405,6 @@ impl Spaces {
         }
     }
 
-    /// Adds a Space by URL and stores it.
-    ///
-    /// `url` is `http(s)://host:port` (direct), bare `host:port`, or a
-    /// Space id (`cloud:<name>`, `local:<name>`, `direct:<host:port>`, or a
-    /// legacy `space://…` spelling). A URL that answers the
-    /// spacesd `GetCapabilities` handshake is a spacesd Space; any
-    /// other URL that answers MCP `initialize` (for example
-    /// `http://host:8765/mcp`) becomes a Space with one service, `mcp`, and
-    /// an empty capability set. Re-adding updates the entry.
-    pub async fn add(
-        &self,
-        url: &str,
-        token: Option<String>,
-        name: Option<String>,
-    ) -> Result<SpaceInfo> {
-        self.add_with_service(url, token, name, None).await
-    }
-
     /// Forks `source` (a local sandbox, running or stopped, or a
     /// checkpoint) as the local Space `name` and registers it: a QEMU fork
     /// of a memory checkpoint maps its RAM copy-on-write, so many forks of
@@ -1417,317 +1413,7 @@ impl Spaces {
         self.fork_local(source, Some(name.to_string())).await
     }
 
-    /// [`Spaces::add`], naming the service a plain MCP URL is registered
-    /// under (default `mcp`).
-    pub async fn add_with_service(
-        &self,
-        url: &str,
-        token: Option<String>,
-        name: Option<String>,
-        service: Option<String>,
-    ) -> Result<SpaceInfo> {
-        let url = url.trim();
-        let token = token.filter(|t| !t.trim().is_empty());
-        let name = name.filter(|n| !n.trim().is_empty());
-        let explicit_service = service.filter(|s| !s.trim().is_empty());
-
-        let (id, space, credential) = match classify_add_target(url)? {
-            AddTarget::Id { id, endpoint_url } => {
-                let credential = Credential {
-                    url: endpoint_url,
-                    token,
-                    ..Default::default()
-                };
-                let record = self.inner.registry.get(&id.to_string())?;
-                let space = self
-                    .connect(&id, &credential, name.as_deref(), record.as_ref())
-                    .await?;
-                (id, space, credential)
-            }
-            AddTarget::DirectUrl { id, raw_url } => {
-                let credential = Credential {
-                    url: Some(raw_url.clone()),
-                    token: token.clone(),
-                    ..Default::default()
-                };
-                let record = self.inner.registry.get(&id.to_string())?;
-                match self
-                    .connect(&id, &credential, name.as_deref(), record.as_ref())
-                    .await
-                {
-                    Ok(space) => (id, space, credential),
-                    Err(e) if not_an_spacesd(&e) => {
-                        let (space, mcp_cred) = self
-                            .try_add_plain_mcp(
-                                &id,
-                                &raw_url,
-                                token,
-                                name.as_deref(),
-                                explicit_service.as_deref(),
-                                Some(e),
-                            )
-                            .await?;
-                        (id, space, mcp_cred)
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            AddTarget::RelayPathUrl {
-                endpoint,
-                machine_id,
-                has_extra_segments,
-                raw_url,
-                direct_id,
-            } => {
-                if explicit_service.is_some() {
-                    let (space, mcp_cred) = self
-                        .try_add_plain_mcp(
-                            &direct_id,
-                            &raw_url,
-                            token,
-                            name.as_deref(),
-                            explicit_service.as_deref(),
-                            None,
-                        )
-                        .await?;
-                    (direct_id, space, mcp_cred)
-                } else {
-                    let valid_id = cua_sandbox_core::refs::valid_machine_id(&machine_id);
-                    match (valid_id && !has_extra_segments, token) {
-                        (true, None) => {
-                            return Err(Error::invalid(format!(
-                                "Static Relay URL {endpoint} requires a non-empty token; \
-                                 pass --token <token> or set CUA_ENV_TOKEN"
-                            )));
-                        }
-                        (false, Some(_)) if !valid_id => {
-                            return Err(Error::invalid(format!(
-                                "invalid Static Relay machine id {machine_id:?}: must match \
-                                 [a-z0-9-]{{8,64}} (lowercase letters, digits, and hyphens, \
-                                 without leading or trailing '-')"
-                            )));
-                        }
-                        (false, Some(_)) => {
-                            return Err(Error::invalid(format!(
-                                "invalid Static Relay URL {raw_url:?}: expected \
-                                 <origin>/m/<machine-id> without extra path segments"
-                            )));
-                        }
-                        (false, None) => {
-                            let (space, mcp_cred) = self
-                                .try_add_plain_mcp(
-                                    &direct_id,
-                                    &raw_url,
-                                    None,
-                                    name.as_deref(),
-                                    None,
-                                    None,
-                                )
-                                .await?;
-                            (direct_id, space, mcp_cred)
-                        }
-                        (true, Some(tok)) => {
-                            let relay_id = SpaceId::Relay {
-                                machine_id: machine_id.clone(),
-                            };
-                            let credential = Credential {
-                                url: Some(endpoint.to_string()),
-                                token: Some(tok.clone()),
-                                ..Default::default()
-                            };
-                            let record = self.inner.registry.get(&relay_id.to_string())?;
-                            if record.is_some() {
-                                // Evict cached client, dial backoff, and mesh forward before
-                                // dialing the rotated URL/token so revoked credentials never
-                                // continue on a stale connection or forward.
-                                self.drop_connection(&relay_id).await;
-                            }
-                            let effective_name = name.as_deref().or_else(|| {
-                                record
-                                    .as_ref()
-                                    .map(|r| r.name.as_str())
-                                    .filter(|n| !n.is_empty())
-                            });
-                            match self
-                                .connect(&relay_id, &credential, effective_name, record.as_ref())
-                                .await
-                            {
-                                Ok(space) => (relay_id, space, credential),
-                                Err(e) if not_an_spacesd(&e) => {
-                                    let (space, mcp_cred) = self
-                                        .try_add_plain_mcp(
-                                            &direct_id,
-                                            &raw_url,
-                                            Some(tok),
-                                            name.as_deref(),
-                                            None,
-                                            Some(e),
-                                        )
-                                        .await?;
-                                    (direct_id, space, mcp_cred)
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        let key = id.to_string();
-        self.store(&space, credential)?;
-        if name.is_some()
-            && self
-                .inner
-                .registry
-                .meta(&key)
-                .is_some_and(|m| !m.display_name.is_empty())
-        {
-            self.inner
-                .registry
-                .update_meta(&key, |m| m.display_name.clear())?;
-        }
-        let forget_mesh = space.route().map(|r| r.transport()) != Some(crate::Transport::Mesh);
-        self.clear_dial_state(&key, &id, forget_mesh).await;
-        self.inner.connections.lock().await.insert(key, space);
-        self.info(&id)
-    }
-
-    async fn try_add_plain_mcp(
-        &self,
-        direct_id: &SpaceId,
-        mcp_url: &str,
-        token: Option<String>,
-        name: Option<&str>,
-        service: Option<&str>,
-        spacesd_err: Option<Error>,
-    ) -> Result<(Space, Credential)> {
-        let service = service
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("mcp")
-            .to_string();
-        let mut credential = Credential {
-            url: Some(mcp_url.to_string()),
-            token,
-            ..Default::default()
-        };
-        credential
-            .service_urls
-            .insert(service.clone(), mcp_url.to_string());
-        let record = self.inner.registry.get(&direct_id.to_string())?;
-        let space = self
-            .connect(direct_id, &credential, name, record.as_ref())
-            .await?;
-        if let Err(mcp) = space.mcp(&service).await {
-            return Err(match spacesd_err {
-                Some(Error::SpacesdNotAvailable { reason, .. }) => Error::SpacesdNotAvailable {
-                    space: direct_id.to_string(),
-                    reason: format!("{reason}; no MCP server answered either ({mcp})"),
-                },
-                Some(other) => other,
-                None => mcp,
-            });
-        }
-        Ok((space, credential))
-    }
-
-    /// Forgets a Space (registry entry and stored token). The sandbox is not
-    /// touched.
-    pub async fn remove(&self, space: &str) -> Result<SpaceInfo> {
-        #[cfg(feature = "spaces-stream")]
-        self.drop_stream_entries(space);
-        let id = self.resolve(space)?;
-        let info = self.info(&id).ok();
-        let _ = crate::lifetimes::forget(self.home_dir(), &id.to_string());
-        self.drop_connection(&id).await;
-        // A Space that registered itself on the relay and is gone (its
-        // machine is not connected) leaves the relay directory: otherwise
-        // its stale record would list again on the next refresh. Only its
-        // owner can remove it; anything else is only dropped here.
-        let mut relay_known = info.is_some();
-        if let SpaceId::Relay { machine_id } = &id
-            && !self.is_static_relay_machine(machine_id)
-            && self.relay_account().is_some()
-            && let Some(m) = self
-                .relay_machines()
-                .await
-                .ok()
-                .and_then(|all| all.into_iter().find(|m| &m.id == machine_id))
-        {
-            relay_known = true;
-            if m.role == "owner" && !m.online && crate::relay::is_registered_space(&m) {
-                self.forget_relay_machine(machine_id, false).await?;
-            }
-        }
-        // A Space this device attached to the relay as a machine of its own
-        // takes that machine with it (as `delete` does): `rm` must not leave
-        // a stale record the owner has to remove by hand (CUA-2841).
-        #[cfg(feature = "spaces-agents")]
-        if !matches!(id, SpaceId::Relay { .. }) {
-            let _ = self.release_attached(&id.to_string()).await;
-        }
-        // A direct host leaves the direct-host list with the Spaces it
-        // created here (nothing reaches them without it; a host that is
-        // gone leaves no rows behind), and a Space one created leaves its
-        // host's list.
-        if matches!(id, SpaceId::Direct { .. }) {
-            let is_host = self
-                .inner
-                .registry
-                .direct_hosts()
-                .is_ok_and(|hosts| hosts.iter().any(|h| h.space == id.to_string()));
-            if is_host {
-                self.forget_host_spaces(&id.to_string()).await;
-            }
-            let _ = self.inner.registry.forget_direct(&id.to_string());
-        }
-        if !self.inner.registry.remove(&id.to_string())? && !relay_known {
-            return Err(Error::NotFound(id.to_string()));
-        }
-        self.inner.thumbnails.remove(&id.to_string());
-        Ok(info.unwrap_or_else(|| SpaceInfo {
-            id: id.to_string(),
-            name: id.short_name().into(),
-            display_name: String::new(),
-            provider: id.provider(),
-            spacesd_version: String::new(),
-            features: vec![],
-            os: String::new(),
-            os_name: String::new(),
-            os_pretty_name: String::new(),
-            image: String::new(),
-            image_digest: String::new(),
-            kind: String::new(),
-            arch: String::new(),
-            services: vec![],
-            added_at: None,
-            host: String::new(),
-            host_name: String::new(),
-            power: String::new(),
-            power_state: String::new(),
-            cloud: String::new(),
-            cloud_place: String::new(),
-            cloud_delete: String::new(),
-            status: String::new(),
-            durable: String::new(),
-            stop_reason: String::new(),
-            volumes: Vec::new(),
-            labels: BTreeMap::new(),
-            hidden: false,
-            expires_at_unix: 0,
-            on_expire: String::new(),
-            created_at_unix: 0,
-            egress: Default::default(),
-            egress_enforced: None,
-            network: None,
-            tree: None,
-            clipboard: Default::default(),
-            volume_setting: Default::default(),
-            sharing: None,
-        }))
-    }
-
-    async fn clear_dial_state(&self, key: &str, id: &SpaceId, forget_mesh: bool) {
+    pub(crate) async fn clear_dial_state(&self, key: &str, id: &SpaceId, forget_mesh: bool) {
         self.inner.dial_backoff.clear(key);
         self.inner
             .connected_sessions
@@ -1866,6 +1552,31 @@ impl Spaces {
                 r.expires_at_unix = i64::try_from(l.expires_at_unix).unwrap_or(0);
                 r.on_expire = l.on_expire.clone();
             }
+            if let Some(machine_id) = r.id.strip_prefix("relay:") {
+                r.sharing = self
+                    .persisted_relay_sharing(machine_id)
+                    .as_ref()
+                    .map(Into::into);
+            }
+        }
+    }
+
+    pub(crate) fn persisted_relay_sharing(&self, machine_id: &str) -> Option<crate::SpaceSharing> {
+        match self.relay_backing(machine_id) {
+            RelayBacking::Static { .. } => None,
+            RelayBacking::Account { .. } => Some(
+                self.inner
+                    .relay_cache
+                    .lock()
+                    .expect("relay cache")
+                    .iter()
+                    .find(|m| m.id == machine_id)
+                    .map(|m| crate::sharing::sharing_of(m, &self.team_facts()))
+                    .unwrap_or_else(|| crate::SpaceSharing {
+                        role: "owner".into(),
+                        ..Default::default()
+                    }),
+            ),
         }
     }
 
@@ -1893,6 +1604,9 @@ impl Spaces {
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         let mut info = SpaceInfo::from_record(&record)?;
         self.apply_cloud_metadata(&mut info);
+        if let SpaceId::Relay { machine_id } = id {
+            info.sharing = self.persisted_relay_sharing(machine_id);
+        }
         Ok(info)
     }
 
@@ -2010,7 +1724,7 @@ impl Spaces {
         }
     }
 
-    fn store(&self, space: &Space, credential: Credential) -> Result<()> {
+    pub(crate) fn store(&self, space: &Space, credential: Credential) -> Result<()> {
         let caps = space.capabilities();
         let existing = self.inner.registry.get(&space.id().to_string())?;
         let (os_name, os_pretty_name) = os_names(space);
@@ -2105,9 +1819,7 @@ impl Spaces {
             // What the relay says about the computer now: one that came
             // back (online again, or a new session) is dialed afresh.
             let presence = match &id {
-                SpaceId::Relay { machine_id } if !me.is_static_relay_machine(machine_id) => {
-                    me.relay_presence(machine_id)
-                }
+                SpaceId::Relay { machine_id } => me.relay_presence(machine_id),
                 _ => None,
             };
             if let Some(f) = gate.failed.lock().expect("gate").clone()
@@ -2252,7 +1964,7 @@ impl Spaces {
         // (`crate::dial_backoff`). An online one is always dialed: its
         // cua-spacesd may be a moment from connecting (`cua spaces start`).
         let presence = match &id {
-            SpaceId::Relay { machine_id } if !self.is_static_relay_machine(machine_id) => {
+            SpaceId::Relay { machine_id } => {
                 Some(self.relay_presence(machine_id)).filter(|p| matches!(p, Some((false, _))))
             }
             _ => None,
@@ -2312,6 +2024,9 @@ impl Spaces {
     /// What the relay's directory last said about `machine_id`: online,
     /// and when it last connected ([`crate::dial_backoff::Presence`]).
     fn relay_presence(&self, machine_id: &str) -> crate::dial_backoff::Presence {
+        if self.is_static_relay_machine(machine_id) {
+            return None;
+        }
         self.inner
             .relay_cache
             .lock()
@@ -2326,9 +2041,7 @@ impl Spaces {
     /// for a Space no relay computer carries.
     fn session_of(&self, key: &str) -> crate::dial_backoff::Presence {
         match SpaceId::parse(key).ok()? {
-            SpaceId::Relay { machine_id } if !self.is_static_relay_machine(&machine_id) => {
-                self.relay_presence(&machine_id)
-            }
+            SpaceId::Relay { machine_id } => self.relay_presence(&machine_id),
             SpaceId::Direct { authority } => {
                 let (machine, _) = crate::id::routed_host(&authority)?;
                 self.relay_presence(machine)
@@ -2397,9 +2110,7 @@ impl Spaces {
     /// listed it.
     pub(crate) fn carrier_listed_offline(&self, key: &str) -> bool {
         let machine = match SpaceId::parse(key) {
-            Ok(SpaceId::Relay { machine_id }) if !self.is_static_relay_machine(&machine_id) => {
-                machine_id
-            }
+            Ok(SpaceId::Relay { machine_id }) => machine_id,
             Ok(SpaceId::Direct { authority }) => match crate::id::routed_host(&authority) {
                 Some((machine, _)) => machine.to_string(),
                 None => return false,
@@ -2435,7 +2146,7 @@ impl Spaces {
         Ok(())
     }
 
-    async fn connect(
+    pub(crate) async fn connect(
         &self,
         id: &SpaceId,
         credential: &Credential,
@@ -2550,98 +2261,100 @@ impl Spaces {
                         image = Some((i.reference.clone(), i.digest.clone()));
                     }
                 }
-                if let (Some(url), Some(token)) = (
-                    credential.url.as_deref().filter(|u| !u.is_empty()),
-                    credential.token.as_deref().filter(|t| !t.trim().is_empty()),
-                ) {
-                    let mut o = ConnectOptions::parse(url)?;
-                    o.token = Some(token.to_string());
-                    let relay_url = o.endpoint.origin();
-                    let mut route = Some(crate::ChannelRoute::Relay(relay_url.clone()));
-                    let via = crate::mesh::Via::Static {
-                        relay: &relay_url,
-                        token,
-                    };
-                    match crate::mesh::connect_options(
-                        &self.inner.mesh,
-                        crate::mesh::Via::Static {
+                match RelayBacking::from_credential(Some(credential)) {
+                    RelayBacking::Static { url, token } => {
+                        let mut o = ConnectOptions::parse(&url)?;
+                        o.token = Some(token.clone());
+                        let relay_url = o.endpoint.origin();
+                        let mut route = Some(crate::ChannelRoute::Relay(relay_url.clone()));
+                        let via = crate::mesh::Via::Static {
                             relay: &relay_url,
-                            token,
-                        },
-                        machine_id,
-                        crate::mesh::policy(),
-                    )
-                    .await?
-                    {
-                        crate::mesh::Route::Mesh(m, via_mesh) => {
-                            tracing::info!(machine = %machine_id, "relay Space over the mesh");
-                            self.inner.mesh.note_routed(&id.to_string(), &via, false);
-                            o = *m;
-                            route = Some(via_mesh);
+                            token: &token,
+                        };
+                        match crate::mesh::connect_options(
+                            &self.inner.mesh,
+                            crate::mesh::Via::Static {
+                                relay: &relay_url,
+                                token: &token,
+                            },
+                            machine_id,
+                            crate::mesh::policy(),
+                        )
+                        .await?
+                        {
+                            crate::mesh::Route::Mesh(m, via_mesh) => {
+                                tracing::info!(machine = %machine_id, "relay Space over the mesh");
+                                self.inner.mesh.note_routed(&id.to_string(), &via, false);
+                                o = *m;
+                                route = Some(via_mesh);
+                            }
+                            crate::mesh::Route::Relay { fallback: why } => fallback = why,
                         }
-                        crate::mesh::Route::Relay { fallback: why } => fallback = why,
+                        (Some(o), None, route)
                     }
-                    (Some(o), None, route)
-                } else {
-                    let mut relay = self.relay()?;
-                    if let Some(url) = credential.url.as_deref().filter(|u| !u.is_empty()) {
-                        let _ = ConnectOptions::parse(url)?;
-                        if let Some(origin) = crate::cloud::custom_relay_origin(url, &relay.url) {
-                            relay = relay.rebind(&origin)?;
+                    RelayBacking::Account { custom_origin } => {
+                        let mut relay = self.relay()?;
+                        if let Some(url) = custom_origin {
+                            let _ = ConnectOptions::parse(&url)?;
+                            if let Some(origin) =
+                                crate::cloud::custom_relay_origin(&url, &relay.url)
+                            {
+                                relay = relay.rebind(&origin)?;
+                            }
                         }
-                    }
-                    // A Space one of your own machines provides prefers the mesh
-                    // (often a LAN neighbour); others follow `CUA_MESH`.
-                    // ... and so does a host whose routed Spaces ride its channel.
-                    let provided = self.provided_by_a_host(machine_id, record).await
-                        || self.routes_through(machine_id);
-                    let policy = if provided {
-                        crate::mesh::policy_for_provided()
-                    } else {
-                        crate::mesh::policy()
-                    };
-                    // The WireGuard®-based mesh first (end to end, direct when
-                    // possible); the relay's HTTPS path when the relay or the
-                    // machine does not speak it yet (see `crate::mesh`).
-                    match crate::mesh::connect_options(
-                        &self.inner.mesh,
-                        crate::mesh::Via::Account(&relay),
-                        machine_id,
-                        policy,
-                    )
-                    .await?
-                    {
-                        crate::mesh::Route::Mesh(o, route) => {
-                            tracing::info!(machine = %machine_id, route = %route.describe(), "relay Space over the mesh");
-                            self.inner.mesh.note_routed(
-                                &id.to_string(),
-                                &crate::mesh::Via::Account(&relay),
-                                provided,
-                            );
-                            (Some(*o), None, Some(route))
-                        }
-                        crate::mesh::Route::Relay { fallback: why } => {
-                            fallback = why;
-                            if policy.uses_mesh() {
-                                // Its driver may join the mesh a moment later:
-                                // move there once it has (`Spaces::space`).
-                                self.inner.mesh.note_fallback(
+                        // A Space one of your own machines provides prefers the mesh
+                        // (often a LAN neighbour); others follow `CUA_MESH`.
+                        // ... and so does a host whose routed Spaces ride its channel.
+                        let provided = self.provided_by_a_host(machine_id, record).await
+                            || self.routes_through(machine_id);
+                        let policy = if provided {
+                            crate::mesh::policy_for_provided()
+                        } else {
+                            crate::mesh::policy()
+                        };
+                        // The WireGuard®-based mesh first (end to end, direct when
+                        // possible); the relay's HTTPS path when the relay or the
+                        // machine does not speak it yet (see `crate::mesh`).
+                        match crate::mesh::connect_options(
+                            &self.inner.mesh,
+                            crate::mesh::Via::Account(&relay),
+                            machine_id,
+                            policy,
+                        )
+                        .await?
+                        {
+                            crate::mesh::Route::Mesh(o, route) => {
+                                tracing::info!(machine = %machine_id, route = %route.describe(), "relay Space over the mesh");
+                                self.inner.mesh.note_routed(
                                     &id.to_string(),
                                     &crate::mesh::Via::Account(&relay),
-                                    machine_id,
+                                    provided,
                                 );
+                                (Some(*o), None, Some(route))
                             }
-                            let url =
-                                cua_host::RelayClient::new(&relay.url)?.machine_url(machine_id);
-                            // The account token rides in `authorization` and
-                            // this device's session next to it, fetched (and
-                            // refreshed) per call; the relay checks both and
-                            // swaps them for its signed identity assertion.
-                            let route = crate::ChannelRoute::Relay(relay.url.clone());
-                            let bearer = crate::relay::RelayBearer { account: relay };
-                            let mut o = ConnectOptions::parse(&url)?.gateway(Arc::new(bearer));
-                            o.token = credential.token.clone();
-                            (Some(o), None, Some(route))
+                            crate::mesh::Route::Relay { fallback: why } => {
+                                fallback = why;
+                                if policy.uses_mesh() {
+                                    // Its driver may join the mesh a moment later:
+                                    // move there once it has (`Spaces::space`).
+                                    self.inner.mesh.note_fallback(
+                                        &id.to_string(),
+                                        &crate::mesh::Via::Account(&relay),
+                                        machine_id,
+                                    );
+                                }
+                                let url =
+                                    cua_host::RelayClient::new(&relay.url)?.machine_url(machine_id);
+                                // The account token rides in `authorization` and
+                                // this device's session next to it, fetched (and
+                                // refreshed) per call; the relay checks both and
+                                // swaps them for its signed identity assertion.
+                                let route = crate::ChannelRoute::Relay(relay.url.clone());
+                                let bearer = crate::relay::RelayBearer { account: relay };
+                                let mut o = ConnectOptions::parse(&url)?.gateway(Arc::new(bearer));
+                                o.token = credential.token.clone();
+                                (Some(o), None, Some(route))
+                            }
                         }
                     }
                 }
@@ -4183,6 +3896,9 @@ impl Spaces {
 
     /// The relay directory row of `machine_id`, or `None` when it is not listed.
     pub(crate) async fn relay_row(&self, machine_id: &str) -> Option<crate::relay::RelayMachine> {
+        if self.is_static_relay_machine(machine_id) {
+            return None;
+        }
         self.relay_directory(Some(machine_id))
             .await
             .ok()?
@@ -4597,9 +4313,6 @@ impl Spaces {
                 };
                 Ok(SpacePower::new(&id.to_string(), control, state))
             }
-            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id) => Err(
-                refuse("relay (only a Space one of your computers provides)"),
-            ),
             SpaceId::Relay { machine_id } => {
                 let row = self.relay_row(machine_id).await;
                 match row.and_then(|m| {
@@ -4636,83 +4349,37 @@ impl Spaces {
     }
 }
 
-/// Classified target of [`Spaces::add_with_service`] and [`Spaces::add_direct_host`].
-pub(crate) enum AddTarget {
-    /// Explicit Space id (`local:`, `cloud:`, `direct:`, `relay:`, `space://`).
-    Id {
-        id: SpaceId,
-        endpoint_url: Option<String>,
-    },
-    /// Non-relay HTTP(S) or `host[:port]` URL.
-    DirectUrl { id: SpaceId, raw_url: String },
-    /// URL with a `/m/<segment>` path prefix (either a Static Relay `cua-spacesd`
-    /// endpoint or a plain HTTP MCP endpoint mounted under `/m/...`).
-    RelayPathUrl {
-        endpoint: cua_spacesd_client::Endpoint,
-        machine_id: String,
-        has_extra_segments: bool,
-        raw_url: String,
-        direct_id: SpaceId,
-    },
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RelayBacking {
+    /// Static Token Mode Space (`spaces-credentials.json` has both non-empty `url` and `token`).
+    Static { url: String, token: String },
+    /// Account Relay Mode computer or Space (optional custom OIDC relay origin, no static token).
+    Account { custom_origin: Option<String> },
 }
 
-pub(crate) fn classify_add_target(url: &str) -> Result<AddTarget> {
-    let url = url.trim();
-    let is_id = url.starts_with("space://")
-        || ["local:", "cloud:", "direct:", "relay:"]
-            .iter()
-            .any(|p| url.starts_with(p));
-    if is_id {
-        let id = SpaceId::parse(url)?;
-        let endpoint_url = match &id {
-            SpaceId::Direct { authority } => Some(format!("http://{authority}")),
-            _ => None,
-        };
-        return Ok(AddTarget::Id { id, endpoint_url });
-    }
-    let raw_url = if url.contains("://") {
-        url.to_string()
-    } else {
-        format!("http://{url}")
-    };
-    let endpoint = cua_spacesd_client::Endpoint::parse(&raw_url)?;
-    let direct_id = SpaceId::Direct {
-        authority: authority(endpoint.host(), endpoint.port()),
-    };
-    let segments: Vec<&str> = endpoint
-        .base_url()
-        .path_segments()
-        .map(|s| s.filter(|p| !p.is_empty()).collect())
-        .unwrap_or_default();
-    match segments.as_slice() {
-        ["m", machine_id, rest @ ..] => {
-            let machine_id = (*machine_id).to_string();
-            let has_extra_segments = !rest.is_empty();
-            Ok(AddTarget::RelayPathUrl {
-                endpoint,
-                machine_id,
-                has_extra_segments,
-                raw_url,
-                direct_id,
-            })
+impl RelayBacking {
+    pub(crate) fn from_credential(cred: Option<&Credential>) -> Self {
+        let url = cred
+            .and_then(|c| c.url.as_deref())
+            .map(str::trim)
+            .filter(|u| !u.is_empty());
+        let token = cred
+            .and_then(|c| c.token.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        match (url, token) {
+            (Some(u), Some(t)) => Self::Static {
+                url: u.to_string(),
+                token: t.to_string(),
+            },
+            (Some(u), None) => Self::Account {
+                custom_origin: Some(u.to_string()),
+            },
+            _ => Self::Account {
+                custom_origin: None,
+            },
         }
-        _ => Ok(AddTarget::DirectUrl {
-            id: direct_id,
-            raw_url,
-        }),
     }
-}
-
-/// Errors from the spacesd handshake that mean "this URL is not an
-/// spacesd" (so it may be another service), as opposed to failures to
-/// report as they are.
-fn not_an_spacesd(e: &Error) -> bool {
-    matches!(
-        e,
-        Error::SpacesdNotAvailable { .. }
-            | Error::Env(cua_spacesd_client::Error::Unauthenticated(_))
-            | Error::Env(cua_spacesd_client::Error::Transport(_))
-    )
 }
 
 /// `container:ghcr.io/x:1` -> `ghcr.io/x:1` (the local runtime prefixes).
@@ -5404,5 +5071,89 @@ mod tests {
                 "disk_gb=Some(0) for on={on:?}: {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn list_all_merges_custom_origin_account_relay_and_keeps_static_unshared() {
+        use crate::relay::{RelayAccount, StaticToken};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn start_dir_relay(id: &'static str, role: &'static str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let body = serde_json::json!({
+                        "machines": [{"id": id, "name": id, "online": true, "role": role,
+                            "owner": {"id": "u-owner"}, "allow": ["ed@example.com"]}]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                }
+            });
+            url
+        }
+
+        let default_url = start_dir_relay("0123abcd4567ef89", "owner").await;
+        let custom_url = start_dir_relay("abcdef0123456789", "owner").await;
+        let home = tempfile::tempdir().unwrap();
+        let spaces = Spaces::builder()
+            .home(home.path())
+            .relay(RelayAccount::new(
+                &default_url,
+                Arc::new(StaticToken("tok".into())),
+            ))
+            .build();
+        spaces
+            .registry()
+            .upsert(
+                dpb::Space {
+                    id: "relay:abcdef0123456789".into(),
+                    name: "custom-byoc".into(),
+                    ..Default::default()
+                },
+                Credential {
+                    url: Some(format!("{custom_url}/m/abcdef0123456789")),
+                    token: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        spaces
+            .registry()
+            .upsert(
+                dpb::Space {
+                    id: "relay:fedcba9876543210".into(),
+                    name: "static-space".into(),
+                    ..Default::default()
+                },
+                Credential {
+                    url: Some("https://static.example/m/fedcba9876543210".into()),
+                    token: Some("sec".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let all = spaces.list_all().await.unwrap();
+        let custom = all
+            .iter()
+            .find(|s| s.id == "relay:abcdef0123456789")
+            .unwrap();
+        assert_eq!(
+            custom.sharing.as_ref().map(|s| s.owner_id.as_str()),
+            Some("u-owner")
+        );
+        let stat = all
+            .iter()
+            .find(|s| s.id == "relay:fedcba9876543210")
+            .unwrap();
+        assert!(stat.sharing.is_none());
     }
 }

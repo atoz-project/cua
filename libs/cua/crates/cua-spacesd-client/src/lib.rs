@@ -57,7 +57,9 @@ pub use computer::{
     ScreenshotOptions,
 };
 pub use egress::EgressPolicy;
-pub use endpoint::{Endpoint, EndpointKind};
+pub use endpoint::{
+    Endpoint, EndpointKind, relay_machine_of_url, relay_path_segments, valid_machine_id,
+};
 pub use error::{Error, ErrorDetails, Result};
 pub use fs::{
     DownloadOptions, DownloadResult, DownloadSink, FileAccess, RUN_AS_FEATURE, UploadOptions,

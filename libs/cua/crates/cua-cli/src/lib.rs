@@ -1783,7 +1783,7 @@ async fn run(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
         _ => None,
     };
     if let Some((space, delete_spaces, yes)) = rm
-        && owns_computer(&space).await
+        && owns_computer(&cli, &space).await?
     {
         return remove_computer(cli, &space, delete_spaces, yes, json, out).await;
     }
@@ -1923,11 +1923,16 @@ async fn run(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
                 host::attach_relay_account(&cua, || host::daemon_relay_account(&util::cua_home()));
                 let yes = matches!(cmd, host::SpacesCmd::Share { yes: true, .. });
                 let is_share = matches!(cmd, host::SpacesCmd::Share { .. });
-                let is_static_share = matches!(
-                    &cmd,
-                    host::SpacesCmd::Share { space, .. }
-                        if host::local_static_relay(space).is_some()
-                );
+                let is_static_share = match &cmd {
+                    host::SpacesCmd::Share { space, .. } => {
+                        match cua.spaces().is_static_relay_space(space).await {
+                            Ok(v) => v,
+                            Err(e @ CuaError::AmbiguousSandbox { .. }) => return Err(e),
+                            Err(_) => false,
+                        }
+                    }
+                    _ => false,
+                };
                 let mut presence_asks = is_share && !is_static_share;
                 if let Some(rt) = cua.embedded_runtime()
                     && !rt.spaces().has_share_consent()
@@ -2430,11 +2435,16 @@ async fn run_sdk(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
 
 /// Whether `target` is one of your computers on the relay (signed in, one
 /// match, you own it): see [`host::owned_computer`].
-async fn owns_computer(target: &str) -> bool {
-    // Static Relay Mode Spaces live only in the local registry and must never
-    // trigger Account Relay directory lookups on `cua spaces rm`.
-    if host::local_static_relay(target).is_some() {
-        return false;
+async fn owns_computer(cli: &Cli, target: &str) -> Result<bool, CuaError> {
+    // Static Relay Mode Spaces live in the Spaces registry and must never
+    // trigger Account Relay directory lookups on `cua spaces rm`, while still
+    // propagating `AmbiguousSandbox` on name collisions.
+    let cua = open(cli, false).await?;
+    host::attach_relay_account(&cua, || host::daemon_relay_account(&util::cua_home()));
+    match cua.spaces().is_static_relay_space(target).await {
+        Ok(true) => return Ok(false),
+        Err(e @ CuaError::AmbiguousSandbox { .. }) => return Err(e),
+        Ok(false) | Err(_) => {}
     }
     let home = util::cua_home();
     if auth::session_token(&auth::Store::from_env())
@@ -2443,12 +2453,14 @@ async fn owns_computer(target: &str) -> bool {
         .flatten()
         .is_none()
     {
-        return false;
+        return Ok(false);
     }
-    match devices_cmd::device_auth(&host::relay_url(None, &home)) {
-        Ok(a) => host::owned_computer(&a, &host::SessionTokens, target).await,
-        Err(_) => false,
-    }
+    Ok(
+        match devices_cmd::device_auth(&host::relay_url(None, &home)) {
+            Ok(a) => host::owned_computer(&a, &host::SessionTokens, target).await,
+            Err(_) => false,
+        },
+    )
 }
 
 /// Takes one of your computers off the relay (`cua spaces rm <computer>`):

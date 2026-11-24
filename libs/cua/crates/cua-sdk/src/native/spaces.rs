@@ -8692,6 +8692,79 @@ impl Spaces {
     }
 }
 
+/// Rust-only non-dialing Space sharing and Static Relay inspection methods
+/// (kept outside `#[uniffi::export]` so foreign-binding API checksums do not change).
+impl Spaces {
+    /// Shares `space` with `who` (`viewer` by default, or `editor`) without
+    /// dialing `space`'s cua-spacesd up front unless relay attachment requires it.
+    pub async fn share_space(
+        &self,
+        space: String,
+        who: String,
+        role: Option<String>,
+    ) -> Result<SpaceShares> {
+        let host = self.host.clone();
+        run(async move {
+            parse(
+                host.tool_value(
+                    "share_space",
+                    json!({"space": space, "who": who, "role": role.unwrap_or_else(|| "viewer".into())}),
+                )
+                .await?,
+            )
+        })
+        .await
+    }
+
+    /// Stops sharing `space` with `who` (or everyone when `None`) without
+    /// dialing `space`'s cua-spacesd.
+    pub async fn unshare_space(&self, space: String, who: Option<String>) -> Result<SpaceShares> {
+        let host = self.host.clone();
+        run(async move {
+            parse(
+                host.tool_value("unshare_space", json!({"space": space, "who": who}))
+                    .await?,
+            )
+        })
+        .await
+    }
+
+    /// Lists who `space` is shared with without dialing `space`'s cua-spacesd.
+    pub async fn space_shares(&self, space: String) -> Result<SpaceShares> {
+        let host = self.host.clone();
+        run(async move {
+            parse(
+                host.tool_value("space_shares", json!({"space": space}))
+                    .await?,
+            )
+        })
+        .await
+    }
+
+    /// Whether `space` resolves to a Static Relay Mode Space on this runtime.
+    /// Propagates `AmbiguousSandbox` and `NotFound` from resolution.
+    pub async fn is_static_relay_space(&self, space: &str) -> Result<bool> {
+        let host = self.host.clone();
+        let space = space.to_string();
+        run(async move {
+            match &host {
+                Host::Embedded(s) => {
+                    let id = s.resolve(&space)?;
+                    Ok(s.is_static_relay_space(&id))
+                }
+                Host::Daemon(_) => {
+                    let info = host.record(&space).await?;
+                    Ok(info.id.starts_with("relay:")
+                        && info.sharing.is_none()
+                        && info.cloud_delete != cua_spaces::cloud::DELETE_ELSEWHERE
+                        && !info.cloud_delete.starts_with("host:"))
+                }
+            }
+        })
+        .await
+    }
+}
+
 /// The thumbnail cache's format word (`jpeg`, `png`, `webp`).
 fn thumbnail_format(word: &str) -> crate::types::ImageFormat {
     match word {

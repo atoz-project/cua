@@ -3114,37 +3114,49 @@ fn image_defaults(name: &str, line: String) -> String {
     } else {
         format!("local:{name}")
     };
-    let config = cua_spaces::registry::Registry::new(util::cua_home())
+    cua_spaces::registry::Registry::new(util::cua_home())
         .get(&id)
         .ok()
         .flatten()
         .filter(|r| !r.image_config.is_empty())
-        .and_then(|r| serde_json::from_str::<cua_spaces::build::ImageConfig>(&r.image_config).ok());
-    match config {
-        Some(c) => c.wrap_shell(&line),
-        None => line,
+        .and_then(|r| serde_json::from_str::<cua_spaces::build::ImageConfig>(&r.image_config).ok())
+        .map_or(line.clone(), |c| c.wrap_shell(&line))
+}
+
+fn attach_cli_relay(cua: &Cua) {
+    crate::host::attach_relay_account(cua, || crate::host::daemon_relay_account(&util::cua_home()));
+}
+
+async fn relay_target(cua: &Cua, name: &str) -> Option<String> {
+    let id = relay_space_id(name)?;
+    let http = name.starts_with("http://") || name.starts_with("https://");
+    let direct = http
+        && cua
+            .sandboxes()
+            .get(name.into())
+            .await
+            .is_ok_and(|i| i.location == "direct");
+    (!direct).then(|| if http { name.into() } else { id })
+}
+
+async fn resolve_local_then_refresh(spaces: &cua_sdk::Spaces, name: &str) -> Option<String> {
+    if let Ok(i) = spaces.resolve(name.to_string()).await {
+        return Some(i.id);
     }
+    let _ = spaces.list().await;
+    spaces.resolve(name.to_string()).await.ok().map(|i| i.id)
 }
 
 pub async fn env_of(cua: &Cua, name: &str) -> Result<Arc<cua_sdk::SpacesdClient>, CuaError> {
-    if let Some(id) = relay_space_id(name) {
-        // The SDK attaches the signed-in relay account only when its `host`
-        // feature is on. This binary reaches those Spaces the way `cua mcp` does.
-        crate::host::attach_relay_account(cua, || {
-            crate::host::daemon_relay_account(&crate::util::cua_home())
-        });
+    if let Some(target) = relay_target(cua, name).await {
+        attach_cli_relay(cua);
         let spaces = cua.spaces();
-        return within_lookup_deadline(&id, SPACE_LOOKUP_DEADLINE, async {
-            // NotFound before dial, and the snapshot has the name space() dials with.
-            spaces.resolve(id.clone()).await?;
-            // Right after `cua spaces start` the machine is listed but its
-            // spacesd is not connected yet: wait for it (bounded), then say so.
-            wait_while_starting(
-                &id,
-                RELAY_START_WAIT,
-                std::time::Duration::from_millis(500),
-                || async { spaces.space(id.clone()).await?.spacesd() },
-            )
+        return within_lookup_deadline(&target, SPACE_LOOKUP_DEADLINE, async {
+            let id = spaces.resolve(target.clone()).await?.id;
+            let step = std::time::Duration::from_millis(500);
+            wait_while_starting(&id, RELAY_START_WAIT, step, || async {
+                spaces.space(id.clone()).await?.spacesd()
+            })
             .await
         })
         .await;
@@ -3178,46 +3190,23 @@ fn routed_direct(name: &str) -> bool {
 /// (a Space on a pool host) the daemon has no sandbox of. `None` means use
 /// the sandboxes API (its error stands when nothing matches).
 async fn space_for(cua: &Cua, name: &str) -> Result<Option<Arc<cua_sdk::Space>>, CuaError> {
-    let id = if let Some(id) = relay_space_id(name) {
-        Some(id)
-    } else if routed_direct(name) {
-        Some(name.to_string())
-    } else {
-        match cua.sandboxes().get(name.to_string()).await {
+    let target = match relay_target(cua, name).await {
+        Some(t) => Some(t),
+        None if routed_direct(name) => Some(name.to_string()),
+        None => match cua.sandboxes().get(name.to_string()).await {
             Err(CuaError::NotFound(_)) => None,
-            // Inside a Space, the spawn channel serves Spaces and not the
-            // sandbox API: a child is found among the Space's own children.
             Err(CuaError::Unsupported(_)) if cua_daemon::client::spawn_channel().is_some() => None,
             _ => return Ok(None),
-        }
+        },
     };
-    // The SDK attaches the signed-in relay account only when its `host`
-    // feature is on. This binary reaches those Spaces the way `cua mcp` does.
-    crate::host::attach_relay_account(cua, || {
-        crate::host::daemon_relay_account(&crate::util::cua_home())
-    });
+    attach_cli_relay(cua);
     let spaces = cua.spaces();
-    let id = match id {
-        Some(id) => {
-            // NotFound before dial, and the snapshot has the name space() dials with.
-            spaces.resolve(id.clone()).await?;
-            id
-        }
-        None => {
-            // Try resolving locally first (registry + space-meta) so Static
-            // Relay Spaces matched by bare machine id or display name do not
-            // query the Account Relay directory. Only refresh on a miss.
-            match spaces.resolve(name.to_string()).await {
-                Ok(i) => i.id,
-                Err(_) => {
-                    let _ = spaces.list().await;
-                    match spaces.resolve(name.to_string()).await {
-                        Ok(i) => i.id,
-                        Err(_) => return Ok(None),
-                    }
-                }
-            }
-        }
+    let id = match target {
+        Some(t) => spaces.resolve(t).await?.id,
+        None => match resolve_local_then_refresh(&spaces, name).await {
+            Some(id) => id,
+            None => return Ok(None),
+        },
     };
     Ok(Some(spaces.space(id).await?))
 }
