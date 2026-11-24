@@ -15,13 +15,17 @@ use cua_spacesd_client::testing::{MockAuth, MockServer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const MACHINE_A: &str = "cli-alpha-000001";
 const MACHINE_B: &str = "cli-beta-0000002";
 const TOKEN_A: &str = "cli-static-token-alpha-secret";
+const TOKEN_A_ROTATED: &str = "cli-static-token-alpha-rotated";
+const TOKEN_A_V3: &str = "cli-static-token-alpha-v3";
 const TOKEN_B: &str = "cli-static-token-beta-secret";
 
 #[derive(Default)]
@@ -78,14 +82,16 @@ fn pem(der: &[u8]) -> String {
     )
 }
 
-fn write_tls_fixture(dir: &Path, host: &str) {
+fn write_tls_fixture(dir: &Path, hosts: &[&str]) {
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let key = rcgen::KeyPair::generate().unwrap();
     let root = ca.self_signed(&key).unwrap();
     let issuer = rcgen::Issuer::new(ca, key);
-    let leaf = rcgen::CertificateParams::new(vec![host.into()]).unwrap();
+    let leaf =
+        rcgen::CertificateParams::new(hosts.iter().map(|h| (*h).to_string()).collect::<Vec<_>>())
+            .unwrap();
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let leaf = leaf.signed_by(&leaf_key, &issuer).unwrap();
     std::fs::write(dir.join("leaf.der"), leaf.der()).unwrap();
@@ -236,7 +242,7 @@ async fn cli_static_relay_add_ls_sb_exec_and_rejections_zero_leaks() {
     let router_addr = start_static_router(routes).await;
 
     let tls_dir = tempfile::tempdir().unwrap();
-    write_tls_fixture(tls_dir.path(), "relay.invalid");
+    write_tls_fixture(tls_dir.path(), &["relay.invalid"]);
     let mut tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -509,4 +515,455 @@ async fn cli_static_relay_add_ls_sb_exec_and_rejections_zero_leaks() {
         "Port-443 plaintext spy caught plaintext HTTP leaks: {:?}",
         plaintext_leaks.lock().unwrap()
     );
+}
+
+#[tokio::test]
+async fn cli_static_relay_rotation_rm_isolation_share_refusal_and_relay_register_non_regression() {
+    let srv_a_v1 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let srv_a_v2 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A_ROTATED.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let srv_a_v3 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A_V3.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let srv_b = MockServer::start(MockAuth {
+        token: Some(TOKEN_B.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_B}")),
+    })
+    .await;
+
+    let mut routes_1 = HashMap::new();
+    routes_1.insert(MACHINE_A.to_string(), srv_a_v1.addr);
+    routes_1.insert(MACHINE_B.to_string(), srv_b.addr);
+    let router_1 = start_static_router(routes_1).await;
+
+    let mut routes_2_v2 = HashMap::new();
+    routes_2_v2.insert(MACHINE_A.to_string(), srv_a_v2.addr);
+    let router_2_v2 = start_static_router(routes_2_v2).await;
+
+    let mut routes_2_v3 = HashMap::new();
+    routes_2_v3.insert(MACHINE_A.to_string(), srv_a_v3.addr);
+    let router_2_v3 = start_static_router(routes_2_v3).await;
+
+    let active_v3 = Arc::new(AtomicBool::new(false));
+
+    let tls_dir = tempfile::tempdir().unwrap();
+    write_tls_fixture(tls_dir.path(), &["relay.invalid", "relay2.invalid"]);
+    let mut tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![
+            std::fs::read(tls_dir.path().join("leaf.der"))
+                .unwrap()
+                .into(),
+        ],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(
+            std::fs::read(tls_dir.path().join("key.der")).unwrap(),
+        )
+        .into(),
+    )
+    .unwrap();
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_cfg = Arc::new(tls_cfg);
+
+    let plaintext_leaks = Arc::new(Mutex::new(Vec::<String>::new()));
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let leaks_bg = plaintext_leaks.clone();
+    let active_v3_bg = active_v3.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = proxy.accept().await else {
+                break;
+            };
+            let tls_cfg = tls_cfg.clone();
+            let leaks = leaks_bg.clone();
+            let active_v3_bg = active_v3_bg.clone();
+            tokio::spawn(async move {
+                let Some(head) = read_http_head(&mut socket).await else {
+                    return;
+                };
+                let is_relay1 = head.starts_with("CONNECT relay.invalid:443 ");
+                let is_relay2 = head.starts_with("CONNECT relay2.invalid:443 ");
+                if !is_relay1 && !is_relay2 {
+                    leaks.lock().unwrap().push(head);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.is_err() {
+                    return;
+                }
+                let Ok(hello) = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    socket,
+                )
+                .await
+                else {
+                    leaks
+                        .lock()
+                        .unwrap()
+                        .push("non-TLS bytes on port-443 tunnel".into());
+                    return;
+                };
+                let Ok(mut tls_stream) = hello.into_stream(tls_cfg).await else {
+                    return;
+                };
+                let target = if is_relay1 {
+                    router_1
+                } else if active_v3_bg.load(Ordering::SeqCst) {
+                    router_2_v3
+                } else {
+                    router_2_v2
+                };
+                if let Ok(mut upstream) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream).await;
+                }
+            });
+        }
+    });
+
+    let (account_spy_url, account_spy) = AccountRelaySpy::start().await;
+
+    let mut home = Home::new();
+    home.set(
+        "SSL_CERT_FILE",
+        tls_dir.path().join("roots.pem").display().to_string(),
+    );
+    home.set("HTTPS_PROXY", format!("http://{proxy_addr}"));
+    home.set("HTTP_PROXY", format!("http://{proxy_addr}"));
+    home.set("NO_PROXY", "127.0.0.1,localhost");
+    home.set("CUA_RELAY_URL", &account_spy_url);
+
+    // Seed valid account auth so any accidental Account Relay call hits `account_spy`.
+    std::fs::create_dir_all(home.cua_home()).unwrap();
+    std::fs::write(
+        home.cua_home().join("credentials.json"),
+        r#"{"access_token":"spy-account-jwt","refresh_token":null,"expires_at":"2099-01-01T00:00:00Z","token_type":"Bearer"}"#,
+    )
+    .unwrap();
+
+    home.run(&[
+        "--embedded",
+        "--json",
+        "spaces",
+        "add",
+        &format!("https://relay.invalid/m/{MACHINE_A}"),
+        "--token",
+        TOKEN_A,
+        "--name",
+        "alpha-cli",
+    ])
+    .await
+    .ok();
+    home.run(&[
+        "--embedded",
+        "--json",
+        "spaces",
+        "add",
+        &format!("https://relay.invalid/m/{MACHINE_B}"),
+        "--token",
+        TOKEN_B,
+        "--name",
+        "beta-cli",
+    ])
+    .await
+    .ok();
+
+    // Rename alpha-cli -> alpha-renamed.
+    home.run(&[
+        "--embedded",
+        "spaces",
+        "rename",
+        &format!("relay:{MACHINE_A}"),
+        "alpha-renamed",
+    ])
+    .await
+    .ok();
+
+    // Rotate URL (`relay2.invalid`) and token WITHOUT `--name`: preserves stored name + display_name.
+    let rot_no_name = home
+        .run(&[
+            "--embedded",
+            "--json",
+            "spaces",
+            "add",
+            &format!("https://relay2.invalid/m/{MACHINE_A}"),
+            "--token",
+            TOKEN_A_ROTATED,
+        ])
+        .await
+        .ok()
+        .json();
+    assert_eq!(rot_no_name["id"], format!("relay:{MACHINE_A}"));
+    assert_eq!(rot_no_name["name"], "alpha-cli");
+    assert_eq!(rot_no_name["display_name"], "alpha-renamed");
+
+    let exec_rot = home
+        .run(&[
+            "--embedded",
+            "sb",
+            "exec",
+            "alpha-renamed",
+            "echo",
+            "rotated-url-ok",
+        ])
+        .await;
+    exec_rot.ok();
+    assert!(exec_rot.stdout.contains("rotated-url-ok"), "{exec_rot:?}");
+
+    // Re-add WITH explicit `--name`: updates name and clears stale `display_name`.
+    let rot_named = home
+        .run(&[
+            "--embedded",
+            "--json",
+            "spaces",
+            "add",
+            &format!("https://relay2.invalid/m/{MACHINE_A}"),
+            "--token",
+            TOKEN_A_ROTATED,
+            "--name",
+            "alpha-final",
+        ])
+        .await
+        .ok()
+        .json();
+    assert_eq!(rot_named["name"], "alpha-final");
+    assert_eq!(rot_named["display_name"], "");
+
+    // Revoke TOKEN_A_ROTATED on relay2.invalid -> old token fails on `cua sb exec` and `cua spaces add`.
+    active_v3.store(true, Ordering::SeqCst);
+    let revoked_exec = home
+        .run(&["--embedded", "sb", "exec", "alpha-final", "echo", "revoked"])
+        .await;
+    assert_ne!(
+        revoked_exec.code, 0,
+        "revoked token must fail on cua sb exec: {revoked_exec:?}"
+    );
+    let revoked_add = home
+        .run(&[
+            "--embedded",
+            "spaces",
+            "add",
+            &format!("https://relay2.invalid/m/{MACHINE_A}"),
+            "--token",
+            TOKEN_A_ROTATED,
+        ])
+        .await;
+    assert_ne!(
+        revoked_add.code, 0,
+        "re-add with revoked token must fail: {revoked_add:?}"
+    );
+
+    // Rotate to TOKEN_A_V3 -> very next `cua sb exec` immediately succeeds.
+    home.run(&[
+        "--embedded",
+        "--json",
+        "spaces",
+        "add",
+        &format!("https://relay2.invalid/m/{MACHINE_A}"),
+        "--token",
+        TOKEN_A_V3,
+    ])
+    .await
+    .ok();
+    let exec_v3 = home
+        .run(&[
+            "--embedded",
+            "sb",
+            "exec",
+            "alpha-final",
+            "echo",
+            "v3-cli-ok",
+        ])
+        .await;
+    exec_v3.ok();
+    assert!(exec_v3.stdout.contains("v3-cli-ok"), "{exec_v3:?}");
+
+    for args in [
+        vec![
+            "--embedded",
+            "spaces",
+            "share",
+            "alpha-final",
+            "bob@example.com",
+            "--yes",
+        ],
+        vec![
+            "--embedded",
+            "spaces",
+            "share",
+            "alpha-final",
+            "team:Design Team",
+            "--yes",
+        ],
+        vec![
+            "--embedded",
+            "spaces",
+            "unshare",
+            "alpha-final",
+            "bob@example.com",
+        ],
+        vec!["--embedded", "spaces", "unshare", "alpha-final", "--all"],
+        vec!["--embedded", "spaces", "shares", "alpha-final"],
+    ] {
+        let out = home.run(&args).await;
+        assert_ne!(out.code, 0, "sharing op {args:?} must fail: {out:?}");
+        assert!(
+            out.stderr.contains("Static Relay") && out.stderr.contains("Account Relay"),
+            "sharing op {args:?} must explain Static Relay vs Account Relay Mode: {out:?}"
+        );
+    }
+
+    let rm_a = home
+        .run(&[
+            "--embedded",
+            "--json",
+            "spaces",
+            "rm",
+            &format!("relay:{MACHINE_A}"),
+        ])
+        .await;
+    let rm_json = rm_a.ok().json();
+    assert_eq!(rm_json["removed"]["id"], format!("relay:{MACHINE_A}"));
+
+    // Sibling MACHINE_B remains completely untouched.
+    let exec_b = home
+        .run(&[
+            "--embedded",
+            "sb",
+            "exec",
+            "beta-cli",
+            "echo",
+            "sibling-alive",
+        ])
+        .await;
+    exec_b.ok();
+    assert!(exec_b.stdout.contains("sibling-alive"), "{exec_b:?}");
+
+    // Removing MACHINE_A a second time fails (NotFound) and does not touch MACHINE_B.
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "Account Relay must receive 0 hits across add/rotate/rename/share/unshare/shares/rm: {:?}",
+        account_spy.snapshot()
+    );
+    assert!(
+        plaintext_leaks.lock().unwrap().is_empty(),
+        "Port-443 plaintext spy caught plaintext HTTP leaks: {:?}",
+        plaintext_leaks.lock().unwrap()
+    );
+
+    // Verify no duplicates remained, stale `alpha-renamed` does not resolve, and only MACHINE_B is listed.
+    std::fs::remove_file(home.cua_home().join("credentials.json")).unwrap();
+    let stale_exec = home
+        .run(&["--embedded", "sb", "exec", "alpha-renamed", "echo", "stale"])
+        .await;
+    assert_ne!(
+        stale_exec.code, 0,
+        "stale display_name must not resolve after --name update: {stale_exec:?}"
+    );
+    let rm_again = home
+        .run(&["--embedded", "spaces", "rm", &format!("relay:{MACHINE_A}")])
+        .await;
+    assert_ne!(
+        rm_again.code, 0,
+        "second rm of already-removed relay space must fail: {rm_again:?}"
+    );
+    let ls = home.run(&["--json", "spaces", "ls", "--no-size"]).await;
+    let ls_json = ls.ok().json();
+    let ids: Vec<&str> = ls_json["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![format!("relay:{MACHINE_B}")]);
+
+    let fake_relay = cua_host::testing::FakeRelay::start().await;
+    fake_relay.add_account("ada-token", "ada", Some("ada@example.com"));
+    let direct_srv = MockServer::start(MockAuth::default()).await;
+    direct_srv.state.advertise(&["relay_attach"]);
+    let state = direct_srv.state.clone();
+    let relay_bg = fake_relay.clone();
+    tokio::spawn(async move {
+        for _ in 0..400 {
+            if let Some(a) = state.relay_attached.lock().unwrap().clone() {
+                relay_bg.set_online(&a.machine_id, true, "0.1.0");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let mut acct_home = Home::new();
+    acct_home.set("CUA_RELAY_URL", &fake_relay.url);
+    std::fs::create_dir_all(acct_home.cua_home()).unwrap();
+    std::fs::write(
+        acct_home.cua_home().join("credentials.json"),
+        r#"{"access_token":"ada-token","refresh_token":null,"expires_at":"2099-01-01T00:00:00Z","token_type":"Bearer"}"#,
+    )
+    .unwrap();
+
+    let added_direct = acct_home
+        .run(&[
+            "--embedded",
+            "--json",
+            "spaces",
+            "add",
+            &direct_srv.url(),
+            "--name",
+            "direct-cli",
+        ])
+        .await
+        .ok()
+        .json();
+    assert_eq!(added_direct["provider"], "direct");
+
+    let reg = acct_home
+        .run(&[
+            "--embedded",
+            "--json",
+            "spaces",
+            "relay-register",
+            "direct-cli",
+        ])
+        .await
+        .ok()
+        .json();
+    assert_eq!(reg["online"], true, "{reg}");
+    assert!(
+        reg["relay_space"].as_str().unwrap().starts_with("relay:"),
+        "{reg}"
+    );
+
+    let unreg = acct_home
+        .run(&[
+            "--embedded",
+            "--json",
+            "spaces",
+            "relay-unregister",
+            "direct-cli",
+        ])
+        .await
+        .ok()
+        .json();
+    assert_eq!(unreg["unregistered"], true, "{unreg}");
 }

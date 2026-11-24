@@ -1360,6 +1360,15 @@ pub async fn run_spaces_sdk(
         SpacesCmd::Share {
             space, who, role, ..
         } => {
+            if let Some(rt) = cua.embedded_runtime()
+                && let Ok(id) = rt.spaces().resolve(&space)
+                && rt.spaces().is_static_relay_space(&id)
+            {
+                let parsed_role = cua_spaces::share::ShareRole::parse(&role)?;
+                rt.spaces()
+                    .share_space(&id.to_string(), &who, parsed_role)
+                    .await?;
+            }
             let who = team_who(&who).await?;
             if who.starts_with("team:") && !json {
                 eprintln!(
@@ -1370,6 +1379,15 @@ pub async fn run_spaces_sdk(
             print_shares(&s.share(who, Some(role)).await?, json, out);
         }
         SpacesCmd::Unshare { space, who, all } => {
+            if let Some(rt) = cua.embedded_runtime()
+                && let Ok(id) = rt.spaces().resolve(&space)
+                && rt.spaces().is_static_relay_space(&id)
+            {
+                let target_who = who.as_deref().filter(|_| !all);
+                rt.spaces()
+                    .unshare_space(&id.to_string(), target_who)
+                    .await?;
+            }
             let s = spaces.space(space).await?;
             let who = match who {
                 Some(w) if !all => Some(team_who(&w).await?),
@@ -1378,6 +1396,12 @@ pub async fn run_spaces_sdk(
             print_shares(&s.unshare(who).await?, json, out);
         }
         SpacesCmd::Shares { space } => {
+            if let Some(rt) = cua.embedded_runtime()
+                && let Ok(id) = rt.spaces().resolve(&space)
+                && rt.spaces().is_static_relay_space(&id)
+            {
+                rt.spaces().space_shares(&id.to_string()).await?;
+            }
             let s = spaces.space(space).await?;
             print_shares(&s.shares().await?, json, out);
         }

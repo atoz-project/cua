@@ -2426,6 +2426,15 @@ async fn run_sdk(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
 /// Whether `target` is one of your computers on the relay (signed in, one
 /// match, you own it): see [`host::owned_computer`].
 async fn owns_computer(target: &str) -> bool {
+    let home = util::cua_home();
+    // Static Relay Mode Spaces live only in the local registry and must never
+    // trigger Account Relay directory lookups on `cua spaces rm`.
+    let local_spaces = cua_spaces::Spaces::builder().home(&home).build();
+    if let Ok(id) = local_spaces.resolve(target)
+        && local_spaces.is_static_relay_space(&id)
+    {
+        return false;
+    }
     if auth::session_token(&auth::Store::from_env())
         .await
         .ok()
@@ -2434,7 +2443,6 @@ async fn owns_computer(target: &str) -> bool {
     {
         return false;
     }
-    let home = util::cua_home();
     match devices_cmd::device_auth(&host::relay_url(None, &home)) {
         Ok(a) => host::owned_computer(&a, &host::SessionTokens, target).await,
         Err(_) => false,
