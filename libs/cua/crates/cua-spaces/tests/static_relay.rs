@@ -908,6 +908,818 @@ async fn static_relay_mesh_enabled_pairs_and_dials_two_machines_without_account_
 }
 
 #[tokio::test]
+async fn static_relay_rotation_updates_url_token_name_and_evicts_cached_connections() {
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+
+    // Two distinct static relay servers (simulating URL rotation) and a rotated-token
+    // replacement on server 2 (simulating live token revocation + rotation).
+    let srv_v1 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let srv_v2 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A_ROTATED.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let srv_v3 = MockServer::start(MockAuth {
+        token: Some("static-relay-token-alpha-v3".into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+
+    // Switchable backend behind relay_2 so we can revoke TOKEN_A_ROTATED on the same URL.
+    let active_v3 = Arc::new(AtomicBool::new(false));
+    let seen_paths = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let relay_2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_2_addr = relay_2_listener.local_addr().unwrap();
+    let active_v3_bg = active_v3.clone();
+    let seen_bg = seen_paths.clone();
+    let v2_addr = srv_v2.addr;
+    let v3_addr = srv_v3.addr;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client_tcp, _)) = relay_2_listener.accept().await else {
+                break;
+            };
+            let target = if active_v3_bg.load(Ordering::SeqCst) {
+                v3_addr
+            } else {
+                v2_addr
+            };
+            let seen_bg = seen_bg.clone();
+            tokio::spawn(async move {
+                let mut peek = vec![0u8; 512];
+                if let Ok(n) = client_tcp.peek(&mut peek).await {
+                    let head = String::from_utf8_lossy(&peek[..n]);
+                    seen_bg.lock().unwrap().push((
+                        format!("relay2->{target}"),
+                        head.lines().next().map(str::to_string),
+                    ));
+                }
+                if let Ok(mut upstream) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client_tcp, &mut upstream).await;
+                }
+            });
+        }
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .build();
+
+    let url_1 = format!("{}/m/{MACHINE_A}", srv_v1.url());
+    let url_2 = format!("http://{relay_2_addr}/m/{MACHINE_A}");
+
+    // Initial registration with explicit name + warm connection cache.
+    let initial = spaces
+        .add(&url_1, Some(TOKEN_A.into()), Some("alpha-initial".into()))
+        .await
+        .unwrap();
+    assert_eq!(initial.id, format!("relay:{MACHINE_A}"));
+    assert_eq!(initial.name, "alpha-initial");
+
+    let s1 = spaces.space("alpha-initial").await.unwrap();
+    assert!(
+        s1.bash("echo v1", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("v1")
+    );
+
+    // Rename sets `meta.display_name`.
+    let renamed = spaces
+        .rename(&format!("relay:{MACHINE_A}"), "alpha-renamed")
+        .await
+        .unwrap();
+    assert_eq!(renamed.shown_name(), "alpha-renamed");
+    assert_eq!(renamed.display_name, "alpha-renamed");
+
+    // Rotate URL + token WITHOUT passing `--name`: existing name + display_name must stay intact,
+    // no duplicate record created, and cached connection to url_1 must be replaced immediately.
+    let rotated_no_name = spaces
+        .add(&url_2, Some(TOKEN_A_ROTATED.into()), None)
+        .await
+        .unwrap();
+    assert_eq!(rotated_no_name.id, format!("relay:{MACHINE_A}"));
+    assert_eq!(
+        rotated_no_name.name, "alpha-initial",
+        "re-add without --name must preserve existing stored name instead of clobbering it"
+    );
+    assert_eq!(
+        rotated_no_name.display_name, "alpha-renamed",
+        "re-add without --name must preserve existing display_name"
+    );
+    assert_eq!(spaces.list().unwrap().len(), 1);
+    let cred2 = spaces
+        .registry()
+        .credential(&format!("relay:{MACHINE_A}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cred2.url.as_deref(), Some(url_2.as_str()));
+    assert_eq!(cred2.token.as_deref(), Some(TOKEN_A_ROTATED));
+
+    // Very next SDK call must hit relay_2 (not cached srv_v1).
+    let s2 = spaces.space("alpha-renamed").await.unwrap();
+    assert!(
+        s2.bash("echo v2", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("v2")
+    );
+    assert!(
+        !seen_paths.lock().unwrap().is_empty(),
+        "next SDK call must route to rotated relay_2 URL"
+    );
+
+    // Now re-add WITH explicit `--name`: must update stored name AND clear stale display_name.
+    let rotated_named = spaces
+        .add(
+            &url_2,
+            Some(TOKEN_A_ROTATED.into()),
+            Some("alpha-final".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated_named.name, "alpha-final");
+    assert_eq!(rotated_named.display_name, "");
+    assert_eq!(rotated_named.shown_name(), "alpha-final");
+    assert_eq!(spaces.list().unwrap().len(), 1);
+    assert!(
+        spaces.resolve("alpha-renamed").is_err(),
+        "stale display_name must no longer resolve after explicit --name update"
+    );
+    assert_eq!(
+        spaces.resolve("alpha-final").unwrap(),
+        SpaceId::Relay {
+            machine_id: MACHINE_A.into()
+        }
+    );
+
+    // Revoke TOKEN_A_ROTATED on relay_2 (only v3 token is accepted now).
+    // Attempting to re-add with the revoked token must fail AND evict the stale cached connection
+    // so a subsequent `spaces.space(...)` fails instead of reusing the pre-revocation connection.
+    active_v3.store(true, Ordering::SeqCst);
+    let revoked_err = spaces
+        .add(&url_2, Some(TOKEN_A_ROTATED.into()), None)
+        .await
+        .unwrap_err();
+    assert_ne!(revoked_err.tag(), "", "{revoked_err}");
+    assert!(
+        spaces.space("alpha-final").await.is_err(),
+        "revoked token must fail on next spaces.space() instead of continuing on cached connection"
+    );
+
+    // Now rotate to the valid v3 token: must succeed immediately on next SDK call.
+    let rotated_v3 = spaces
+        .add(&url_2, Some("static-relay-token-alpha-v3".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(rotated_v3.shown_name(), "alpha-final");
+    let s3 = spaces.space("alpha-final").await.unwrap();
+    assert!(
+        s3.bash("echo v3-ok", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("v3-ok")
+    );
+    assert_eq!(account_spy.count(), 0, "{:?}", account_spy.snapshot());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_relay_mesh_token_rotation_evicts_forward_without_affecting_sibling() {
+    let coord = FakeCoordinator::start(Mode::Static).await;
+    let mesh_dir = tempfile::tempdir().unwrap();
+
+    let srv_a_v1 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: None,
+    })
+    .await;
+    let srv_a_v2 = MockServer::start(MockAuth {
+        token: Some(TOKEN_A_ROTATED.into()),
+        gateway: None,
+        prefix: None,
+    })
+    .await;
+    let srv_b = MockServer::start(MockAuth {
+        token: Some(TOKEN_B.into()),
+        gateway: None,
+        prefix: None,
+    })
+    .await;
+
+    let rotated = Arc::new(AtomicBool::new(false));
+    let start_mesh_machine = |machine_id: &'static str,
+                              token_v1: &'static str,
+                              token_v2: Option<&'static str>,
+                              up_v1: SocketAddr,
+                              up_v2: Option<SocketAddr>,
+                              rotated: Arc<AtomicBool>| {
+        let coord_url = coord.url.clone();
+        let stun = coord.stun.to_string();
+        let dir = mesh_dir.path().to_path_buf();
+        async move {
+            let mut cfg = MeshConfig::new(
+                coord_url,
+                NodeKind::Machine,
+                Some(dir.join(format!("{machine_id}.json"))),
+                static_auth(vec![("x-cua-machine-id".into(), machine_id.into())]),
+            );
+            cfg.stun = vec![stun];
+            cfg.approved_path = Some(dir.join(format!("{machine_id}-approved.json")));
+            let rot_v = rotated.clone();
+            cfg.pair_verifier = Some(Arc::new(move |client, ts, proof| {
+                let tok = if rot_v.load(Ordering::SeqCst) {
+                    token_v2.unwrap_or(token_v1)
+                } else {
+                    token_v1
+                };
+                cua_mesh::proto::verify_pair_proof(
+                    tok,
+                    machine_id,
+                    client,
+                    ts,
+                    proof,
+                    cua_mesh::proto::now_secs(),
+                )
+            }));
+            let mesh = Mesh::start(cfg).await.unwrap();
+            mesh.wait_ready(Duration::from_secs(10)).await.unwrap();
+            let m = mesh.clone();
+            tokio::spawn(async move {
+                while let Some(mut incoming) = m.accept().await {
+                    if incoming.header.service == "spacesd" {
+                        let upstream = if rotated.load(Ordering::SeqCst) {
+                            up_v2.unwrap_or(up_v1)
+                        } else {
+                            up_v1
+                        };
+                        tokio::spawn(async move {
+                            if let Ok(mut tcp) = TcpStream::connect(upstream).await {
+                                let _ =
+                                    tokio::io::copy_bidirectional(&mut incoming.stream, &mut tcp)
+                                        .await;
+                            }
+                        });
+                    }
+                }
+            });
+            mesh
+        }
+    };
+
+    let _machine_a = start_mesh_machine(
+        MACHINE_A,
+        TOKEN_A,
+        Some(TOKEN_A_ROTATED),
+        srv_a_v1.addr,
+        Some(srv_a_v2.addr),
+        rotated.clone(),
+    )
+    .await;
+    let _machine_b = start_mesh_machine(
+        MACHINE_B,
+        TOKEN_B,
+        None,
+        srv_b.addr,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let coord_addr: SocketAddr = coord.url.strip_prefix("http://").unwrap().parse().unwrap();
+    let stun_str = coord.stun.to_string();
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+    let relay_url = format!("http://{relay_addr}");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client_tcp, _)) = relay_listener.accept().await else {
+                break;
+            };
+            let stun_str = stun_str.clone();
+            tokio::spawn(async move {
+                let mut peek = vec![0u8; 4096];
+                let Ok(n) = client_tcp.peek(&mut peek).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                let head = String::from_utf8_lossy(&peek[..n]);
+                let first_line = head.lines().next().unwrap_or_default();
+                if first_line.starts_with("GET /v1/info ") {
+                    let mut sink = vec![0u8; n];
+                    let _ = client_tcp.read(&mut sink).await;
+                    let body = serde_json::json!({
+                        "account_auth": false,
+                        "issuer": serde_json::Value::Null,
+                        "mesh": { "stun": [stun_str], "version": 1 },
+                        "public_url": format!("http://{relay_addr}"),
+                        "state_writable": false,
+                        "static_tokens": true,
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client_tcp.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                if first_line.contains("/v1/mesh/") {
+                    if let Ok(mut upstream) = TcpStream::connect(coord_addr).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client_tcp, &mut upstream).await;
+                    }
+                    return;
+                }
+                let _ = client_tcp
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(8))
+        .build();
+
+    spaces
+        .add(
+            &format!("{relay_url}/m/{MACHINE_A}"),
+            Some(TOKEN_A.into()),
+            Some("mesh-a".into()),
+        )
+        .await
+        .unwrap();
+    spaces
+        .add(
+            &format!("{relay_url}/m/{MACHINE_B}"),
+            Some(TOKEN_B.into()),
+            Some("mesh-b".into()),
+        )
+        .await
+        .unwrap();
+
+    let sa = spaces.space("mesh-a").await.unwrap();
+    assert_eq!(sa.route().map(|r| r.transport()), Some(Transport::Mesh));
+    assert!(
+        sa.bash("echo a-v1", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("a-v1")
+    );
+
+    // Rotate MACHINE_A's token on the server; old token now fails on re-add AND evicts cache/forward.
+    rotated.store(true, Ordering::SeqCst);
+    assert!(
+        spaces
+            .add(
+                &format!("{relay_url}/m/{MACHINE_A}"),
+                Some(TOKEN_A.into()),
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        spaces.space("mesh-a").await.is_err(),
+        "old cached mesh forward/connection must be evicted after revocation"
+    );
+
+    // Re-add with rotated token: must evict old forward and succeed immediately over mesh.
+    spaces
+        .add(
+            &format!("{relay_url}/m/{MACHINE_A}"),
+            Some(TOKEN_A_ROTATED.into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let sa2 = spaces.space("mesh-a").await.unwrap();
+    assert_eq!(sa2.route().map(|r| r.transport()), Some(Transport::Mesh));
+    assert!(
+        sa2.bash("echo a-v2", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("a-v2")
+    );
+
+    // Sibling MACHINE_B on the same static relay mesh must remain unaffected.
+    let sb = spaces.space("mesh-b").await.unwrap();
+    assert_eq!(sb.route().map(|r| r.transport()), Some(Transport::Mesh));
+    assert!(
+        sb.bash("echo b-still-ok", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("b-still-ok")
+    );
+}
+
+#[tokio::test]
+async fn static_relay_remove_isolates_siblings_skips_account_relay_and_returns_not_found() {
+    let srv_a = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let srv_b = MockServer::start(MockAuth {
+        token: Some(TOKEN_B.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_B}")),
+    })
+    .await;
+
+    let seen_paths = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let mut routes = HashMap::new();
+    routes.insert(MACHINE_A.to_string(), srv_a.addr);
+    routes.insert(MACHINE_B.to_string(), srv_b.addr);
+    let router_addr = start_static_path_router(routes, None, seen_paths).await;
+    let relay_origin = format!("http://{router_addr}");
+
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .build();
+
+    spaces
+        .add(
+            &format!("{relay_origin}/m/{MACHINE_A}"),
+            Some(TOKEN_A.into()),
+            Some("rm-alpha".into()),
+        )
+        .await
+        .unwrap();
+    spaces
+        .add(
+            &format!("{relay_origin}/m/{MACHINE_B}"),
+            Some(TOKEN_B.into()),
+            Some("rm-beta".into()),
+        )
+        .await
+        .unwrap();
+
+    // Warm both connections in the cache.
+    assert!(
+        spaces
+            .space("rm-alpha")
+            .await
+            .unwrap()
+            .bash("echo a-before", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("a-before")
+    );
+    assert!(
+        spaces
+            .space("rm-beta")
+            .await
+            .unwrap()
+            .bash("echo b-before", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("b-before")
+    );
+
+    // Removing MACHINE_A must delete only MACHINE_A's record, credential, and cached connection,
+    // making 0 Account Relay calls while leaving sibling MACHINE_B untouched.
+    let removed = spaces.remove(&format!("relay:{MACHINE_A}")).await.unwrap();
+    assert_eq!(removed.id, format!("relay:{MACHINE_A}"));
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "removing a Static Relay Space must never hit Account Relay: {:?}",
+        account_spy.snapshot()
+    );
+    assert!(
+        spaces
+            .registry()
+            .get(&format!("relay:{MACHINE_A}"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        spaces
+            .registry()
+            .credential(&format!("relay:{MACHINE_A}"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(spaces.resolve("rm-alpha").is_err());
+
+    // Sibling MACHINE_B on the same relay host stays intact and operational.
+    let listed = spaces.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, format!("relay:{MACHINE_B}"));
+    let cred_b = spaces
+        .registry()
+        .credential(&format!("relay:{MACHINE_B}"))
+        .unwrap()
+        .expect("sibling credential must remain intact");
+    assert_eq!(cred_b.token.as_deref(), Some(TOKEN_B));
+    assert!(
+        spaces
+            .space("rm-beta")
+            .await
+            .unwrap()
+            .bash("echo b-after", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("b-after")
+    );
+    assert_eq!(account_spy.count(), 0, "{:?}", account_spy.snapshot());
+
+    // Removing a non-existent / already-removed `relay:<id>` must return NotFound.
+    let no_account_spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .build();
+    let err_again = no_account_spaces
+        .remove(&format!("relay:{MACHINE_A}"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_again.tag(),
+        "not_found",
+        "removing already-deleted relay id must return NotFound: {err_again}"
+    );
+    let err_unknown = no_account_spaces
+        .remove("relay:unregistered-0001")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err_unknown.tag(),
+        "not_found",
+        "removing unknown relay id must return NotFound: {err_unknown}"
+    );
+    let err_with_account = spaces.remove("relay:unregistered-0002").await.unwrap_err();
+    assert_eq!(
+        err_with_account.tag(),
+        "not_found",
+        "removing unknown relay id with account configured must return NotFound: {err_with_account}"
+    );
+}
+
+#[tokio::test]
+async fn static_relay_refuses_account_sharing_with_zero_account_relay_hits_while_direct_relay_register_works()
+ {
+    struct AlwaysAllow;
+    impl cua_spaces::share::ShareConsent for AlwaysAllow {
+        fn confirm(&self, _reason: &str) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let srv_a = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .share_consent(Arc::new(AlwaysAllow))
+        .build();
+
+    spaces
+        .add(
+            &format!("{}/m/{MACHINE_A}", srv_a.url()),
+            Some(TOKEN_A.into()),
+            Some("share-alpha".into()),
+        )
+        .await
+        .unwrap();
+
+    let assert_refused = |label: &str, err: cua_spaces::Error| {
+        assert_eq!(
+            err.tag(),
+            "invalid_argument",
+            "{label} must fail with invalid_argument, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Static Relay") && msg.contains("Account Relay"),
+            "{label} error must explain Static Relay vs Account Relay Mode: {msg}"
+        );
+    };
+
+    assert_refused(
+        "share_space(email)",
+        spaces
+            .share_space(
+                "share-alpha",
+                "bob@example.com",
+                cua_spaces::share::ShareRole::Viewer,
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "share_space(team)",
+        spaces
+            .share_space(
+                &format!("relay:{MACHINE_A}"),
+                "team:design",
+                cua_spaces::share::ShareRole::Editor,
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "share_with_team",
+        spaces
+            .share_with_team("share-alpha", "design")
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "unshare_space(email)",
+        spaces
+            .unshare_space("share-alpha", Some("bob@example.com"))
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "unshare_space(team)",
+        spaces
+            .unshare_space("share-alpha", Some("team:design"))
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "unshare_space(all)",
+        spaces.unshare_space("share-alpha", None).await.unwrap_err(),
+    );
+    assert_refused(
+        "unshare_from_team",
+        spaces
+            .unshare_from_team("share-alpha", "design")
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "space_shares",
+        spaces.space_shares("share-alpha").await.unwrap_err(),
+    );
+    assert_refused(
+        "relay_register",
+        spaces.relay_register("share-alpha").await.unwrap_err(),
+    );
+    assert_refused(
+        "relay_unregister",
+        spaces.relay_unregister("share-alpha").await.unwrap_err(),
+    );
+    let leave_results = spaces
+        .leave_many(&[format!("relay:{MACHINE_A}"), "share-alpha".into()])
+        .await;
+    assert_eq!(leave_results.len(), 2);
+    for r in &leave_results {
+        assert!(!r.ok, "leave_many must refuse Static Relay Space: {r:?}");
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("it's yours; delete it instead")),
+            "unexpected leave_many error: {r:?}"
+        );
+    }
+    assert!(
+        spaces
+            .registry()
+            .get(&format!("relay:{MACHINE_A}"))
+            .unwrap()
+            .is_some(),
+        "leave_many must never delete a Static Relay Space record"
+    );
+    assert!(
+        spaces
+            .registry()
+            .credential(&format!("relay:{MACHINE_A}"))
+            .unwrap()
+            .is_some(),
+        "leave_many must never delete a Static Relay Space credential"
+    );
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "Account Relay must receive 0 hits for share/unshare/shares/leave on Static Relay Space: {:?}",
+        account_spy.snapshot()
+    );
+
+    // Even when signed out (no RelayAccount), refusal happens BEFORE `self.relay()`.
+    let signed_out = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .build();
+    assert_refused(
+        "signed-out share_space",
+        signed_out
+            .share_space(
+                "share-alpha",
+                "bob@example.com",
+                cua_spaces::share::ShareRole::Viewer,
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "signed-out unshare_space",
+        signed_out
+            .unshare_space("share-alpha", None)
+            .await
+            .unwrap_err(),
+    );
+    assert_refused(
+        "signed-out space_shares",
+        signed_out.space_shares("share-alpha").await.unwrap_err(),
+    );
+    let signed_out_leave = signed_out.leave_many(&[format!("relay:{MACHINE_A}")]).await;
+    assert_eq!(signed_out_leave.len(), 1);
+    assert!(!signed_out_leave[0].ok, "{signed_out_leave:?}");
+    assert!(
+        signed_out_leave[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("it's yours; delete it instead")),
+        "{signed_out_leave:?}"
+    );
+
+    // Non-regression: Account Relay Mode `relay_register` on a direct Space still works.
+    let fake_relay = cua_host::testing::FakeRelay::start().await;
+    fake_relay.add_account("ada-token", "ada", Some("ada@example.com"));
+    let direct_srv = MockServer::start(MockAuth::default()).await;
+    direct_srv.state.advertise(&["relay_attach"]);
+    let acct_home = tempfile::tempdir().unwrap();
+    let acct_spaces = Spaces::builder()
+        .home(acct_home.path())
+        .relay(RelayAccount::new(
+            &fake_relay.url,
+            Arc::new(StaticToken("ada-token".into())),
+        ))
+        .build();
+    let direct_info = acct_spaces
+        .add(&direct_srv.url(), None, Some("direct-box".into()))
+        .await
+        .unwrap();
+    let state = direct_srv.state.clone();
+    let relay_bg = fake_relay.clone();
+    tokio::spawn(async move {
+        for _ in 0..400 {
+            if let Some(a) = state.relay_attached.lock().unwrap().clone() {
+                relay_bg.set_online(&a.machine_id, true, "0.1.0");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let reg = acct_spaces.relay_register(&direct_info.id).await.unwrap();
+    assert!(reg.online);
+    assert_eq!(reg.relay_space, format!("relay:{}", reg.machine));
+    let listed_shares = acct_spaces.space_shares(&direct_info.id).await.unwrap();
+    assert_eq!(listed_shares.machine, reg.machine);
+    assert!(acct_spaces.relay_unregister(&direct_info.id).await.unwrap());
+}
+
+#[tokio::test]
 async fn plain_http_mcp_under_m_path_registers_as_direct_without_token() {
     let (account_spy_url, account_spy) = HttpSpy::start().await;
     let home = tempfile::tempdir().unwrap();

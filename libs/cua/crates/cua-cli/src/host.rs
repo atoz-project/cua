@@ -1360,6 +1360,12 @@ pub async fn run_spaces_sdk(
         SpacesCmd::Share {
             space, who, role, ..
         } => {
+            if let Some((local, id)) = local_static_relay(&space) {
+                let parsed_role = cua_spaces::share::ShareRole::parse(&role)?;
+                local
+                    .share_space(&id.to_string(), &who, parsed_role)
+                    .await?;
+            }
             let who = team_who(&who).await?;
             if who.starts_with("team:") && !json {
                 eprintln!(
@@ -1370,6 +1376,10 @@ pub async fn run_spaces_sdk(
             print_shares(&s.share(who, Some(role)).await?, json, out);
         }
         SpacesCmd::Unshare { space, who, all } => {
+            if let Some((local, id)) = local_static_relay(&space) {
+                let target_who = who.as_deref().filter(|_| !all);
+                local.unshare_space(&id.to_string(), target_who).await?;
+            }
             let s = spaces.space(space).await?;
             let who = match who {
                 Some(w) if !all => Some(team_who(&w).await?),
@@ -1378,6 +1388,9 @@ pub async fn run_spaces_sdk(
             print_shares(&s.unshare(who).await?, json, out);
         }
         SpacesCmd::Shares { space } => {
+            if let Some((local, id)) = local_static_relay(&space) {
+                local.space_shares(&id.to_string()).await?;
+            }
             let s = spaces.space(space).await?;
             print_shares(&s.shares().await?, json, out);
         }
@@ -3569,6 +3582,17 @@ fn print_allow(allow: &[String], json: bool, out: &mut dyn Write) {
     } else {
         line(out, format!("Shared with: {}", allow.join(", ")));
     }
+}
+
+/// Returns the local `Spaces` registry handle and canonical `relay:<machine-id>`
+/// when `space` resolves to a Static Relay Mode Space in `$CUA_HOME` (works in
+/// both embedded and daemon CLI modes without Account Relay calls or dialing).
+pub(crate) fn local_static_relay(space: &str) -> Option<(cua_spaces::Spaces, cua_spaces::SpaceId)> {
+    let local = cua_spaces::Spaces::builder()
+        .home(crate::util::cua_home())
+        .build();
+    let id = local.resolve(space).ok()?;
+    local.is_static_relay_space(&id).then_some((local, id))
 }
 
 /// `who` as it is shared with: a `team:<name>` becomes `team:<organization

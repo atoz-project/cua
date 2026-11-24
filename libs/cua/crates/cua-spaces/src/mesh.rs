@@ -263,10 +263,48 @@ impl MeshClients {
         );
     }
 
-    /// Drops any recorded mesh route or fallback entry for `space`.
-    pub(crate) fn clear_space(&self, space: &str) {
-        self.routed.lock().expect("routed").remove(space);
-        self.fallbacks.lock().expect("fallbacks").remove(space);
+    /// Drops any recorded mesh route, fallback entry, and active loopback
+    /// forward for `space` / `machine_id` without tearing down sibling
+    /// machines sharing the same relay node.
+    pub(crate) async fn forget_space(&self, space: &str, machine_id: Option<&str>) {
+        let prev_key = self
+            .routed
+            .lock()
+            .expect("routed")
+            .remove(space)
+            .map(|(k, _, _)| k);
+        let fallback_key = self
+            .fallbacks
+            .lock()
+            .expect("fallbacks")
+            .remove(space)
+            .map(|(k, _, _)| k);
+        let Some(machine_id) = machine_id else {
+            return;
+        };
+        let dialers: Vec<Arc<Dialer>> = {
+            let nodes = self.nodes.lock().await;
+            let mut out = Vec::new();
+            for key in [prev_key, fallback_key].into_iter().flatten() {
+                if let Some(Slot::Ready { dialer, .. }) = nodes.get(&key)
+                    && !out.iter().any(|d| Arc::ptr_eq(d, dialer))
+                {
+                    out.push(dialer.clone());
+                }
+            }
+            for (key, slot) in nodes.iter() {
+                if matches!(key, Key::Static(_))
+                    && let Slot::Ready { dialer, .. } = slot
+                    && !out.iter().any(|d| Arc::ptr_eq(d, dialer))
+                {
+                    out.push(dialer.clone());
+                }
+            }
+            out
+        };
+        for dialer in dialers {
+            dialer.forget(machine_id).await;
+        }
     }
 
     /// Why a Space on the relay's HTTPS path should reconnect now: its

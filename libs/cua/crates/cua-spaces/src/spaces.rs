@@ -1164,6 +1164,14 @@ impl Spaces {
             })
     }
 
+    /// Whether `id` is a locally registered Static Relay Mode Space.
+    pub fn is_static_relay_space(&self, id: &SpaceId) -> bool {
+        matches!(
+            id,
+            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id)
+        )
+    }
+
     pub(crate) async fn relay_directory(
         &self,
         want: Option<&str>,
@@ -1511,8 +1519,20 @@ impl Spaces {
                         ..Default::default()
                     };
                     let record = self.inner.registry.get(&relay_id.to_string())?;
+                    if record.is_some() {
+                        // Evict cached client, dial backoff, and mesh forward before
+                        // dialing the rotated URL/token so revoked credentials never
+                        // continue on a stale connection or forward.
+                        self.drop_connection(&relay_id).await;
+                    }
+                    let effective_name = name.as_deref().or_else(|| {
+                        record
+                            .as_ref()
+                            .map(|r| r.name.as_str())
+                            .filter(|n| !n.is_empty())
+                    });
                     match self
-                        .connect(&relay_id, &credential, name.as_deref(), record.as_ref())
+                        .connect(&relay_id, &credential, effective_name, record.as_ref())
                         .await
                     {
                         Ok(space) => (relay_id, space, credential),
@@ -1567,8 +1587,17 @@ impl Spaces {
             .lock()
             .expect("sessions")
             .remove(&key);
+        self.inner
+            .connecting
+            .lock()
+            .expect("connecting")
+            .remove(&key);
         if space.route().map(|r| r.transport()) != Some(crate::Transport::Mesh) {
-            self.inner.mesh.clear_space(&key);
+            let machine_id = match &id {
+                SpaceId::Relay { machine_id } => Some(machine_id.as_str()),
+                _ => None,
+            };
+            self.inner.mesh.forget_space(&key, machine_id).await;
         }
         self.inner.connections.lock().await.insert(key, space);
         self.info(&id)
@@ -1625,6 +1654,7 @@ impl Spaces {
         // machine is not connected) leaves the relay directory: otherwise
         // its stale record would list again on the next refresh. Only its
         // owner can remove it; anything else is only dropped here.
+        let mut relay_known = info.is_some();
         if let SpaceId::Relay { machine_id } = &id
             && !self.is_static_relay_machine(machine_id)
             && self.relay_account().is_some()
@@ -1633,11 +1663,11 @@ impl Spaces {
                 .await
                 .ok()
                 .and_then(|all| all.into_iter().find(|m| &m.id == machine_id))
-            && m.role == "owner"
-            && !m.online
-            && crate::relay::is_registered_space(&m)
         {
-            self.forget_relay_machine(machine_id, false).await?;
+            relay_known = true;
+            if m.role == "owner" && !m.online && crate::relay::is_registered_space(&m) {
+                self.forget_relay_machine(machine_id, false).await?;
+            }
         }
         // A Space this device attached to the relay as a machine of its own
         // takes that machine with it (as `delete` does): `rm` must not leave
@@ -1661,7 +1691,7 @@ impl Spaces {
             }
             let _ = self.inner.registry.forget_direct(&id.to_string());
         }
-        if !self.inner.registry.remove(&id.to_string())? && !matches!(id, SpaceId::Relay { .. }) {
+        if !self.inner.registry.remove(&id.to_string())? && !relay_known {
             return Err(Error::NotFound(id.to_string()));
         }
         self.inner.thumbnails.remove(&id.to_string());
@@ -1708,21 +1738,35 @@ impl Spaces {
     }
 
     pub(crate) async fn drop_connection(&self, id: &SpaceId) {
+        let key = id.to_string();
         #[cfg(feature = "spaces-hotspot")]
-        if let Some(h) = self.inner.hotspots.lock().await.remove(&id.to_string()) {
+        if let Some(h) = self.inner.hotspots.lock().await.remove(&key) {
             let _ = h.stop().await;
         }
         // What an extension holds for the Space (a mounted volume) ends
         // while the Space still answers.
         #[cfg(feature = "mcp")]
         for e in &self.inner.extensions {
-            e.space_dropped(self, &id.to_string()).await;
+            e.space_dropped(self, &key).await;
         }
-        self.inner.connections.lock().await.remove(&id.to_string());
-        let _ = self
-            .inner
-            .registry
-            .set_overlay_volumes(&id.to_string(), vec![]);
+        self.inner.connections.lock().await.remove(&key);
+        self.inner
+            .connected_sessions
+            .lock()
+            .expect("sessions")
+            .remove(&key);
+        self.inner.dial_backoff.clear(&key);
+        self.inner
+            .connecting
+            .lock()
+            .expect("connecting")
+            .remove(&key);
+        let machine_id = match id {
+            SpaceId::Relay { machine_id } => Some(machine_id.as_str()),
+            _ => None,
+        };
+        self.inner.mesh.forget_space(&key, machine_id).await;
+        let _ = self.inner.registry.set_overlay_volumes(&key, vec![]);
     }
 
     pub(crate) fn info(&self, id: &SpaceId) -> Result<SpaceInfo> {
