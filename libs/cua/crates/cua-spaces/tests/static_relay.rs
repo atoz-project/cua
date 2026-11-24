@@ -1609,10 +1609,39 @@ async fn static_relay_refuses_account_sharing_with_zero_account_relay_hits_while
         "relay_unregister",
         spaces.relay_unregister("share-alpha").await.unwrap_err(),
     );
+    let leave_results = spaces
+        .leave_many(&[format!("relay:{MACHINE_A}"), "share-alpha".into()])
+        .await;
+    assert_eq!(leave_results.len(), 2);
+    for r in &leave_results {
+        assert!(!r.ok, "leave_many must refuse Static Relay Space: {r:?}");
+        assert!(
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("it's yours; delete it instead")),
+            "unexpected leave_many error: {r:?}"
+        );
+    }
+    assert!(
+        spaces
+            .registry()
+            .get(&format!("relay:{MACHINE_A}"))
+            .unwrap()
+            .is_some(),
+        "leave_many must never delete a Static Relay Space record"
+    );
+    assert!(
+        spaces
+            .registry()
+            .credential(&format!("relay:{MACHINE_A}"))
+            .unwrap()
+            .is_some(),
+        "leave_many must never delete a Static Relay Space credential"
+    );
     assert_eq!(
         account_spy.count(),
         0,
-        "Account Relay must receive 0 hits for share/unshare/shares on Static Relay Space: {:?}",
+        "Account Relay must receive 0 hits for share/unshare/shares/leave on Static Relay Space: {:?}",
         account_spy.snapshot()
     );
 
@@ -1642,6 +1671,16 @@ async fn static_relay_refuses_account_sharing_with_zero_account_relay_hits_while
     assert_refused(
         "signed-out space_shares",
         signed_out.space_shares("share-alpha").await.unwrap_err(),
+    );
+    let signed_out_leave = signed_out.leave_many(&[format!("relay:{MACHINE_A}")]).await;
+    assert_eq!(signed_out_leave.len(), 1);
+    assert!(!signed_out_leave[0].ok, "{signed_out_leave:?}");
+    assert!(
+        signed_out_leave[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("it's yours; delete it instead")),
+        "{signed_out_leave:?}"
     );
 
     // Non-regression: Account Relay Mode `relay_register` on a direct Space still works.

@@ -967,3 +967,96 @@ async fn cli_static_relay_rotation_rm_isolation_share_refusal_and_relay_register
         .json();
     assert_eq!(unreg["unregistered"], true, "{unreg}");
 }
+
+#[tokio::test]
+async fn cli_static_relay_daemon_mode_and_offline_share_refusal_zero_account_hits() {
+    const LOOPBACK: &str = if cfg!(unix) { "off" } else { "127.0.0.1:0" };
+
+    let (account_spy_url, account_spy) = AccountRelaySpy::start().await;
+    let srv = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let url = format!("{}/m/{MACHINE_A}", srv.url());
+
+    let mut home = Home::new();
+    home.set("CUA_RELAY_URL", &account_spy_url);
+    home.set("CUA_DAEMON_NO_RELAY", "1");
+    std::fs::create_dir_all(home.cua_home()).unwrap();
+    std::fs::write(
+        home.cua_home().join("credentials.json"),
+        r#"{"access_token":"spy-account-jwt","refresh_token":null,"expires_at":"2099-01-01T00:00:00Z","token_type":"Bearer"}"#,
+    )
+    .unwrap();
+
+    home.run(&[
+        "--embedded",
+        "--json",
+        "spaces",
+        "add",
+        &url,
+        "--token",
+        TOKEN_A,
+        "--name",
+        "offline-alpha",
+    ])
+    .await
+    .ok();
+
+    // Stop the mock server so the Static Relay Space is genuinely offline.
+    drop(srv);
+
+    home.run(&["daemon", "start", "--loopback", LOOPBACK])
+        .await
+        .ok();
+
+    let cases: &[&[&str]] = &[
+        &["spaces", "share", "offline-alpha", "bob@example.com"],
+        &[
+            "spaces",
+            "share",
+            "offline-alpha",
+            "bob@example.com",
+            "--yes",
+        ],
+        &[
+            "spaces",
+            "share",
+            "offline-alpha",
+            "team:Design Team",
+            "--yes",
+        ],
+        &["spaces", "unshare", "offline-alpha", "bob@example.com"],
+        &["spaces", "unshare", "offline-alpha", "team:Design Team"],
+        &["spaces", "unshare", "offline-alpha", "--all"],
+        &["spaces", "shares", "offline-alpha"],
+    ];
+
+    let mut failures = Vec::new();
+    for args in cases {
+        let out = home.run(args).await;
+        if out.code == 0
+            || !out.stderr.contains("Static Relay")
+            || !out.stderr.contains("Account Relay")
+            || out.stderr.contains("stdin is not a terminal")
+        {
+            failures.push(format!("{args:?} -> {out:?}"));
+        }
+    }
+
+    home.run(&["daemon", "stop"]).await.ok();
+
+    assert!(
+        failures.is_empty(),
+        "daemon-mode offline share refusals failed:\n{}",
+        failures.join("\n")
+    );
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "Account Relay must receive 0 hits in daemon mode for offline Static Relay share/unshare/shares: {:?}",
+        account_spy.snapshot()
+    );
+}

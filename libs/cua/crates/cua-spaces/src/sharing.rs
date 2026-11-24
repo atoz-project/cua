@@ -392,6 +392,9 @@ impl Spaces {
         let SpaceId::Relay { machine_id } = &id else {
             return Err(leave_error(&name_of(self), "it's yours; delete it instead"));
         };
+        if self.is_static_relay_machine(machine_id) {
+            return Err(leave_error(&name_of(self), "it's yours; delete it instead"));
+        }
         let name = name_of(self);
         let relay = self
             .relay()
