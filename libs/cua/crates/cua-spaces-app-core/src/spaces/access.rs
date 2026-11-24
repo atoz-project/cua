@@ -64,7 +64,12 @@ pub fn access_of(row: &SpaceRow, power: bool) -> SpaceAccess {
     };
     let owner = role == SpaceAccessRole::Owner;
     let editor = role != SpaceAccessRole::Viewer;
-    let static_relay_unattached = super::is_persisted_relay_row(row) && row.sharing.is_none();
+    let is_account_cloud_delete = row
+        .cloud_delete
+        .as_deref()
+        .is_some_and(|d| d == "elsewhere" || d.starts_with("host:"));
+    let static_relay_unattached =
+        super::is_persisted_relay_row(row) && row.sharing.is_none() && !is_account_cloud_delete;
     SpaceAccess {
         kind,
         role,
@@ -343,6 +348,16 @@ mod tests {
         // An account-attached cloud Space with sharing facts stays shareable.
         byoc.sharing = Some(facts("owner"));
         assert!(access_of(&byoc, false).can_share);
+
+        // Account-Relay cloud Spaces created on another device (`elsewhere` / `host:*`)
+        // are Account-Relay indicators even without inline sharing facts.
+        let mut elsewhere = row("relay:cloud-elsewhere0001", "relay");
+        elsewhere.added_at = Some("2026-11-24T10:05:00Z".into());
+        elsewhere.cloud = Some("gcp".into());
+        elsewhere.cloud_delete = Some("elsewhere".into());
+        assert!(access_of(&elsewhere, false).can_share);
+        elsewhere.cloud_delete = Some("host:studio-01".into());
+        assert!(access_of(&elsewhere, false).can_share);
 
         // Online and offline Account Relay Computers keep account place & sharing.
         let mut online_computer = row("relay:studio-online", "relay");

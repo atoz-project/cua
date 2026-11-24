@@ -398,26 +398,40 @@ pub fn count_active(spaces: &[Space]) -> u32 {
         .count() as u32
 }
 
-/// Whether a registry row is a persisted Static Relay Mode Space (`relay:<id>`
-/// with no `host` above it, carrying `added_at` or `cloud` metadata) rather
-/// than an Account Relay Mode Computer from the account directory.
+/// Whether a registry row is a relay-reached Space (`relay:<id>` with no
+/// `host` above it, carrying `added_at` or `cloud` metadata) rather than an
+/// Account Relay Mode Computer from the account directory.
 pub(crate) fn is_persisted_relay_row(row: &SpaceRow) -> bool {
     row.id.starts_with("relay:")
         && normalize_provider(&row.provider) == SpaceProvider::Relay
         && row.host.as_deref().is_none_or(|h| h.trim().is_empty())
-        && (row.added_at.as_deref().and_then(parse_rfc3339_ms).is_some()
+        && (row
+            .added_at
+            .as_deref()
+            .and_then(parse_rfc3339_ms)
+            .is_some_and(|t| t > 0)
             || row.cloud.as_deref().is_some_and(|c| !c.trim().is_empty()))
 }
 
-/// Whether `space` is a persisted Static Relay Mode Space (`relay:<id>` with
-/// no `host` above it, carrying `started_at` or `cloud` metadata) rather than
-/// an Account Relay Mode Computer.
-pub fn is_static_relay_space(space: &Space) -> bool {
+/// Whether `space` is a relay-reached Space (`relay:<id>` with no `host`
+/// above it, carrying `started_at` or `cloud` metadata), classifying it as a
+/// Space rather than an Account Relay Mode Computer's own desktop.
+pub fn is_relay_space(space: &Space) -> bool {
     space.id.starts_with("relay:")
         && (space.provider == Some(SpaceProvider::Relay) || space.provider.is_none())
         && space.host.as_deref().is_none_or(|h| h.trim().is_empty())
-        && (space.started_at.is_some()
+        && (space.started_at.is_some_and(|t| t > 0)
             || space.cloud.as_deref().is_some_and(|c| !c.trim().is_empty()))
+}
+
+/// Whether `space` is an unattached Static Relay Mode Space (a relay Space
+/// without Account Relay sharing attachment).
+pub fn is_static_relay_space(space: &Space) -> bool {
+    is_relay_space(space)
+        && space
+            .access
+            .as_ref()
+            .is_none_or(|a| a.kind == crate::model::SpaceAccessKind::Mine && !a.can_share)
 }
 
 /// A machine's own desktop, not a Space: This machine (`this-mac`, and any
@@ -433,8 +447,7 @@ pub fn is_machine_desktop(space: &Space) -> bool {
     }
     if space.provider != Some(SpaceProvider::Relay)
         || space.host.as_deref().is_some_and(|h| !h.trim().is_empty())
-        || space.started_at.is_some()
-        || space.cloud.as_deref().is_some_and(|c| !c.trim().is_empty())
+        || is_relay_space(space)
     {
         return false;
     }

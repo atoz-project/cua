@@ -19,7 +19,7 @@ import type { DataAdapter } from "@/bridge/adapter";
 import { threadOpAvailable } from "@/bridge/ops/thread";
 import { t } from "@/i18n";
 
-import { isMachineDesktop, orderSpaces, spaceState } from "./spaces";
+import { isMachineDesktop, isStaticRelaySpace, orderSpaces, spaceState } from "./spaces";
 import { thisComputerLabel, thisComputerText } from "./host-labels";
 
 export type TaskEnding = "kept" | "thrown";
@@ -420,10 +420,16 @@ export function thisMacConfirmText(agent: string): { title: string; description:
  * can go away between being picked and the job starting, and its thread lives on the relay, so a job posted to it
  * would still "succeed" and wait there for a computer that is gone. A start asks it first (`spaces.reach`).
  */
-export function onAnotherComputer(spaceId: string, spaces: readonly Pick<Space, "id" | "provider" | "host">[] | null | undefined): boolean {
-  if (spaceId.startsWith("relay:")) return true;
+export function onAnotherComputer(
+  spaceId: string,
+  spaces: readonly Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">[] | null | undefined,
+): boolean {
   const row = spaces?.find((s) => s.id === spaceId);
-  return Boolean(row && (row.provider === "relay" || row.host));
+  if (row) {
+    if (isStaticRelaySpace(row)) return false;
+    return row.provider === "relay" || Boolean(row.host);
+  }
+  return spaceId.startsWith("relay:");
 }
 
 /** Why a start stops before it hands the job over (`spaces.reach` said no): words `isUnreachableError` reads. */

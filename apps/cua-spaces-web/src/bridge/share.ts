@@ -30,7 +30,7 @@ export const shareView = (core: CoreClient, input: ShareInput, state: ShareSheet
  * (Static Relay Mode Spaces without account sharing are never shareable). */
 export const shareable = (space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "access" | "sdk">): boolean => {
   if (space.access?.canShare === false) return false;
-  if (isStaticRelaySpace(space) && !space.access?.canShare) return false;
+  if (isStaticRelaySpace(space)) return false;
   return space.id.startsWith("relay:") || Boolean(space.sdk?.features.includes("relay_attach"));
 };
 

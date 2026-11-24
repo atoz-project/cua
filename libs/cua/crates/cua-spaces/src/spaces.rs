@@ -954,7 +954,11 @@ impl Spaces {
                     _ => crate::cloud::DELETE_ELSEWHERE.into(),
                 };
             }
-            if !out.iter().any(|i| i.id == info.id) {
+            if let Some(existing) = out.iter_mut().find(|i| i.id == info.id) {
+                if !self.is_static_relay_machine(&m.id) {
+                    existing.sharing = info.sharing;
+                }
+            } else {
                 out.push(info);
             }
         }
@@ -1487,81 +1491,83 @@ impl Spaces {
                         )
                         .await?;
                     (direct_id, space, mcp_cred)
-                } else if !cua_sandbox_core::refs::valid_machine_id(&machine_id)
-                    || has_extra_segments
-                {
-                    match self
-                        .try_add_plain_mcp(&direct_id, &raw_url, token, name.as_deref(), None, None)
-                        .await
-                    {
-                        Ok((space, mcp_cred)) => (direct_id, space, mcp_cred),
-                        Err(_) if !cua_sandbox_core::refs::valid_machine_id(&machine_id) => {
+                } else {
+                    let valid_id = cua_sandbox_core::refs::valid_machine_id(&machine_id);
+                    match (valid_id && !has_extra_segments, token) {
+                        (true, None) => {
+                            return Err(Error::invalid(format!(
+                                "Static Relay URL {endpoint} requires a non-empty token; \
+                                 pass --token <token> or set CUA_ENV_TOKEN"
+                            )));
+                        }
+                        (false, Some(_)) if !valid_id => {
                             return Err(Error::invalid(format!(
                                 "invalid Static Relay machine id {machine_id:?}: must match \
                                  [a-z0-9-]{{8,64}} (lowercase letters, digits, and hyphens, \
                                  without leading or trailing '-')"
                             )));
                         }
-                        Err(_) => {
+                        (false, Some(_)) => {
                             return Err(Error::invalid(format!(
                                 "invalid Static Relay URL {raw_url:?}: expected \
                                  <origin>/m/<machine-id> without extra path segments"
                             )));
                         }
-                    }
-                } else if let Some(tok) = token {
-                    let relay_id = SpaceId::Relay {
-                        machine_id: machine_id.clone(),
-                    };
-                    let credential = Credential {
-                        url: Some(endpoint.to_string()),
-                        token: Some(tok.clone()),
-                        ..Default::default()
-                    };
-                    let record = self.inner.registry.get(&relay_id.to_string())?;
-                    if record.is_some() {
-                        // Evict cached client, dial backoff, and mesh forward before
-                        // dialing the rotated URL/token so revoked credentials never
-                        // continue on a stale connection or forward.
-                        self.drop_connection(&relay_id).await;
-                    }
-                    let effective_name = name.as_deref().or_else(|| {
-                        record
-                            .as_ref()
-                            .map(|r| r.name.as_str())
-                            .filter(|n| !n.is_empty())
-                    });
-                    match self
-                        .connect(&relay_id, &credential, effective_name, record.as_ref())
-                        .await
-                    {
-                        Ok(space) => (relay_id, space, credential),
-                        Err(e) if not_an_spacesd(&e) => {
+                        (false, None) => {
                             let (space, mcp_cred) = self
                                 .try_add_plain_mcp(
                                     &direct_id,
                                     &raw_url,
-                                    Some(tok),
+                                    None,
                                     name.as_deref(),
                                     None,
-                                    Some(e),
+                                    None,
                                 )
                                 .await?;
                             (direct_id, space, mcp_cred)
                         }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    match self
-                        .try_add_plain_mcp(&direct_id, &raw_url, None, name.as_deref(), None, None)
-                        .await
-                    {
-                        Ok((space, mcp_cred)) => (direct_id, space, mcp_cred),
-                        Err(_) => {
-                            return Err(Error::invalid(format!(
-                                "Static Relay URL {endpoint} requires a non-empty token; \
-                                 pass --token <token> or set CUA_ENV_TOKEN"
-                            )));
+                        (true, Some(tok)) => {
+                            let relay_id = SpaceId::Relay {
+                                machine_id: machine_id.clone(),
+                            };
+                            let credential = Credential {
+                                url: Some(endpoint.to_string()),
+                                token: Some(tok.clone()),
+                                ..Default::default()
+                            };
+                            let record = self.inner.registry.get(&relay_id.to_string())?;
+                            if record.is_some() {
+                                // Evict cached client, dial backoff, and mesh forward before
+                                // dialing the rotated URL/token so revoked credentials never
+                                // continue on a stale connection or forward.
+                                self.drop_connection(&relay_id).await;
+                            }
+                            let effective_name = name.as_deref().or_else(|| {
+                                record
+                                    .as_ref()
+                                    .map(|r| r.name.as_str())
+                                    .filter(|n| !n.is_empty())
+                            });
+                            match self
+                                .connect(&relay_id, &credential, effective_name, record.as_ref())
+                                .await
+                            {
+                                Ok(space) => (relay_id, space, credential),
+                                Err(e) if not_an_spacesd(&e) => {
+                                    let (space, mcp_cred) = self
+                                        .try_add_plain_mcp(
+                                            &direct_id,
+                                            &raw_url,
+                                            Some(tok),
+                                            name.as_deref(),
+                                            None,
+                                            Some(e),
+                                        )
+                                        .await?;
+                                    (direct_id, space, mcp_cred)
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                 }
@@ -1581,24 +1587,8 @@ impl Spaces {
                 .registry
                 .update_meta(&key, |m| m.display_name.clear())?;
         }
-        self.inner.dial_backoff.clear(&key);
-        self.inner
-            .connected_sessions
-            .lock()
-            .expect("sessions")
-            .remove(&key);
-        self.inner
-            .connecting
-            .lock()
-            .expect("connecting")
-            .remove(&key);
-        if space.route().map(|r| r.transport()) != Some(crate::Transport::Mesh) {
-            let machine_id = match &id {
-                SpaceId::Relay { machine_id } => Some(machine_id.as_str()),
-                _ => None,
-            };
-            self.inner.mesh.forget_space(&key, machine_id).await;
-        }
+        let forget_mesh = space.route().map(|r| r.transport()) != Some(crate::Transport::Mesh);
+        self.clear_dial_state(&key, &id, forget_mesh).await;
         self.inner.connections.lock().await.insert(key, space);
         self.info(&id)
     }
@@ -1737,6 +1727,27 @@ impl Spaces {
         }))
     }
 
+    async fn clear_dial_state(&self, key: &str, id: &SpaceId, forget_mesh: bool) {
+        self.inner.dial_backoff.clear(key);
+        self.inner
+            .connected_sessions
+            .lock()
+            .expect("sessions")
+            .remove(key);
+        self.inner
+            .connecting
+            .lock()
+            .expect("connecting")
+            .remove(key);
+        if forget_mesh {
+            let machine_id = match id {
+                SpaceId::Relay { machine_id } => Some(machine_id.as_str()),
+                _ => None,
+            };
+            self.inner.mesh.forget_space(key, machine_id).await;
+        }
+    }
+
     pub(crate) async fn drop_connection(&self, id: &SpaceId) {
         let key = id.to_string();
         #[cfg(feature = "spaces-hotspot")]
@@ -1750,22 +1761,7 @@ impl Spaces {
             e.space_dropped(self, &key).await;
         }
         self.inner.connections.lock().await.remove(&key);
-        self.inner
-            .connected_sessions
-            .lock()
-            .expect("sessions")
-            .remove(&key);
-        self.inner.dial_backoff.clear(&key);
-        self.inner
-            .connecting
-            .lock()
-            .expect("connecting")
-            .remove(&key);
-        let machine_id = match id {
-            SpaceId::Relay { machine_id } => Some(machine_id.as_str()),
-            _ => None,
-        };
-        self.inner.mesh.forget_space(&key, machine_id).await;
+        self.clear_dial_state(&key, id, true).await;
         let _ = self.inner.registry.set_overlay_volumes(&key, vec![]);
     }
 
@@ -4683,22 +4679,24 @@ pub(crate) fn classify_add_target(url: &str) -> Result<AddTarget> {
     let direct_id = SpaceId::Direct {
         authority: authority(endpoint.host(), endpoint.port()),
     };
-    match endpoint.kind().clone() {
-        cua_spacesd_client::EndpointKind::Relay { machine_id } => {
-            let segment_count = endpoint
-                .base_url()
-                .path_segments()
-                .map(|s| s.filter(|p| !p.is_empty()).count())
-                .unwrap_or(0);
+    let segments: Vec<&str> = endpoint
+        .base_url()
+        .path_segments()
+        .map(|s| s.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    match segments.as_slice() {
+        ["m", machine_id, rest @ ..] => {
+            let machine_id = (*machine_id).to_string();
+            let has_extra_segments = !rest.is_empty();
             Ok(AddTarget::RelayPathUrl {
                 endpoint,
                 machine_id,
-                has_extra_segments: segment_count > 2,
+                has_extra_segments,
                 raw_url,
                 direct_id,
             })
         }
-        cua_spacesd_client::EndpointKind::Direct => Ok(AddTarget::DirectUrl {
+        _ => Ok(AddTarget::DirectUrl {
             id: direct_id,
             raw_url,
         }),

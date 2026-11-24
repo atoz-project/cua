@@ -44,16 +44,34 @@ export function spaceState(space: Pick<Space, "status" | "power"> & { progress?:
   }
 }
 
+/** Structural fields shared by `Space` and wire `WkSpace` for relay classification. */
+export interface RelaySpaceFields {
+  id: string;
+  provider?: Space["provider"] | null;
+  host?: string | null;
+  startedAt?: number | null;
+  cloud?: string | null;
+}
+
 /**
- * Whether `space` is a persisted Static Relay Mode Space (`relay:<id>` with no
- * host above it, carrying `startedAt` or `cloud` metadata) rather than an
- * Account Relay Mode Computer.
+ * Whether `space` is a relay-reached Space (`relay:<id>` with no host above it,
+ * carrying `startedAt > 0` or `cloud` metadata), classifying it as a Space
+ * rather than an Account Relay Mode Computer's own desktop.
  */
-export function isStaticRelaySpace(space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud">): boolean {
+export function isRelaySpace(space: RelaySpaceFields): boolean {
   if (!space.id.startsWith("relay:")) return false;
-  if (space.provider !== undefined && space.provider !== "relay") return false;
+  if (space.provider != null && space.provider !== "relay") return false;
   if (space.host?.trim()) return false;
-  return space.startedAt != null || Boolean(space.cloud?.trim());
+  return (space.startedAt != null && space.startedAt > 0) || Boolean(space.cloud?.trim());
+}
+
+/**
+ * Whether `space` is an unattached Static Relay Mode Space (a relay Space
+ * without Account Relay sharing attachment).
+ */
+export function isStaticRelaySpace(space: RelaySpaceFields & { access?: Space["access"] | null }): boolean {
+  if (!isRelaySpace(space)) return false;
+  return !space.access || (space.access.kind === "mine" && !space.access.canShare);
 }
 
 /**
@@ -63,10 +81,10 @@ export function isStaticRelaySpace(space: Pick<Space, "id" | "provider" | "host"
  * belong on Computers; the Spaces grid, its count and the command palette
  * leave them out.
  */
-export function isMachineDesktop(space: Pick<Space, "id" | "status" | "provider" | "host" | "startedAt" | "cloud">): boolean {
+export function isMachineDesktop(space: RelaySpaceFields & Pick<Space, "status">): boolean {
   if (space.status === "local" || space.id === "this-mac") return true;
   if (space.provider !== "relay" || space.host?.trim() || !space.id.startsWith("relay:")) return false;
-  if (space.startedAt != null || Boolean(space.cloud?.trim())) return false;
+  if (isRelaySpace(space)) return false;
   const own = space.id.slice("relay:".length);
   return own.length > 0 && !own.includes("/") && !own.startsWith("space-");
 }
@@ -159,7 +177,7 @@ export function machineName(
   if (space.hostName?.trim()) return space.hostName.trim();
   if (space.cloudPlace?.trim()) return space.cloudPlace.trim();
   if (space.cloud?.trim()) return space.cloud.trim();
-  if (isStaticRelaySpace(space)) return t("computers.status.remote_relay");
+  if (isRelaySpace(space)) return t("computers.status.remote_relay");
   if (space.provider === "direct" || space.provider === undefined) return t("computers.status.added_by_address");
   return t("computers.status.unknown_computer");
 }
@@ -289,7 +307,7 @@ const PROVIDER = (provider: "relay" | "direct"): string =>
 export function locationLabel(space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "cloudPlace">): string {
   if (space.cloudPlace?.trim()) return space.cloudPlace.trim();
   if (space.cloud?.trim()) return space.cloud.trim();
-  if (isStaticRelaySpace(space)) return t("computers.status.remote_relay");
+  if (isRelaySpace(space)) return t("computers.status.remote_relay");
   const provider = space.provider ?? "direct";
   return provider === "local" ? thisComputerLabel() : PROVIDER(provider);
 }

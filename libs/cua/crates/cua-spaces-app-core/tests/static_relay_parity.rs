@@ -12,7 +12,9 @@ use cua_spaces_app_core::model::{SpaceOs, SpaceRow};
 use cua_spaces_app_core::spaces::sidebar::{
     DetailActionId, detail_for, is_your_machine, requires_account_relay_access, sidebar,
 };
-use cua_spaces_app_core::spaces::{is_machine_desktop, is_static_relay_space, row_to_space};
+use cua_spaces_app_core::spaces::{
+    is_machine_desktop, is_relay_space, is_static_relay_space, row_to_space,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -31,12 +33,15 @@ struct Fixture {
 #[serde(rename_all = "camelCase")]
 struct Expect {
     is_machine_desktop: bool,
+    is_relay_space: bool,
     is_static_relay_space: bool,
     in_machines_page: bool,
     in_real_spaces: bool,
     sidebar_section: String,
     can_share: bool,
     requires_account_relay_access: bool,
+    remove_only: bool,
+    delete_label: String,
     detail: String,
     place: String,
 }
@@ -71,6 +76,11 @@ fn static_relay_classification_matches_shared_cross_surface_matrix() {
             is_machine_desktop(space),
             e.is_machine_desktop,
             "{case}: is_machine_desktop"
+        );
+        assert_eq!(
+            is_relay_space(space),
+            e.is_relay_space,
+            "{case}: is_relay_space"
         );
         assert_eq!(
             is_static_relay_space(space),
@@ -120,6 +130,11 @@ fn static_relay_classification_matches_shared_cross_surface_matrix() {
             d.actions.iter().any(|a| a.id == DetailActionId::Share),
             e.can_share,
             "{case}: detail_for Share action"
+        );
+        assert_eq!(d.remove_only, e.remove_only, "{case}: detail.remove_only");
+        assert_eq!(
+            d.delete_label, e.delete_label,
+            "{case}: detail.delete_label"
         );
     }
 }

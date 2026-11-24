@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { isMachineDesktop, isStaticRelaySpace, menuItems, realSpaces } from "./host-start";
+import { isMachineDesktop, isRelaySpace, isStaticRelaySpace, menuItems, realSpaces } from "./host-start";
 import type { BridgeContext } from "./context";
 import type { AppSpace } from "../native/generated/index";
 
@@ -74,6 +74,12 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
   });
 
   it("classifies manual and BYOC Static Relay entries as Spaces and keeps online/offline Account Computers as desktops", () => {
+    expect(isRelaySpace(manualStatic)).toBe(true);
+    expect(isRelaySpace(byocStatic)).toBe(true);
+    expect(isRelaySpace(onlineComputer)).toBe(false);
+    expect(isRelaySpace(offlineComputer)).toBe(false);
+    expect(isRelaySpace(hostedSpace)).toBe(false);
+
     expect(isStaticRelaySpace(manualStatic)).toBe(true);
     expect(isStaticRelaySpace(byocStatic)).toBe(true);
     expect(isStaticRelaySpace(onlineComputer)).toBe(false);
@@ -92,6 +98,8 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
     // Electron JSON serialization turns absent `startedAt` into `null`; Account Computers must still classify as desktops.
     const wireNullOnline = { ...onlineComputer, startedAt: null } as unknown as AppSpace;
     const wireNullOffline = { ...offlineComputer, startedAt: null } as unknown as AppSpace;
+    expect(isRelaySpace(wireNullOnline)).toBe(false);
+    expect(isRelaySpace(wireNullOffline)).toBe(false);
     expect(isStaticRelaySpace(wireNullOnline)).toBe(false);
     expect(isStaticRelaySpace(wireNullOffline)).toBe(false);
     expect(isMachineDesktop(wireNullOnline)).toBe(true);
@@ -144,11 +152,14 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
           host?: string;
           cloud?: string;
           cloudPlace?: string;
+          sharing?: { role: string };
         };
         expect: {
           isMachineDesktop: boolean;
+          isRelaySpace: boolean;
           isStaticRelaySpace: boolean;
           inRealSpaces: boolean;
+          canShare: boolean;
         };
       }[];
     };
@@ -164,12 +175,25 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
         host: f.row.host,
         cloud: f.row.cloud,
         cloudPlace: f.row.cloudPlace,
+        access: {
+          kind: "mine" as NonNullable<AppSpace["access"]>["kind"],
+          role: (f.row.sharing?.role ?? "owner") as NonNullable<AppSpace["access"]>["role"],
+          place: f.row.cloudPlace ?? "",
+          people: [],
+          canPower: false,
+          canTeleport: true,
+          canShare: f.expect.canShare,
+          canRename: true,
+          canDelete: true,
+          canLeave: false,
+        },
       }),
     );
 
     matrix.fixtures.forEach((f, i) => {
       const s = spaces[i]!;
       expect(isMachineDesktop(s), `${f.case}: isMachineDesktop`).toBe(f.expect.isMachineDesktop);
+      expect(isRelaySpace(s), `${f.case}: isRelaySpace`).toBe(f.expect.isRelaySpace);
       expect(isStaticRelaySpace(s), `${f.case}: isStaticRelaySpace`).toBe(f.expect.isStaticRelaySpace);
     });
     expect(realSpaces(spaces).map((s) => s.id)).toEqual(matrix.fixtures.filter((f) => f.expect.inRealSpaces).map((f) => f.row.id));

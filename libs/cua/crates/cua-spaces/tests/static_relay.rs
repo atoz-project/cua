@@ -1767,9 +1767,9 @@ async fn plain_http_mcp_under_m_path_registers_as_direct_without_token() {
     assert_eq!(info_valid.provider, Provider::Direct);
     assert!(info_valid.id.starts_with("direct:"), "{}", info_valid.id);
 
-    // Case 3: `/m/<valid-machine-id>` exact two-segment path serving plain MCP without token.
-    // McpTestServer mounts at `<prefix>/mcp`; mount at `/m` gives `/m/mcp`, and mount at `/m/mcp-service-001` gives `/m/mcp-service-001/mcp`.
-    // Also verify a plain MCP server directly at `/m/mcp-service-001` (exact 2 segments, valid machine id) without token!
+    // Case 3: exact `/m/<valid-machine-id>` without token and without `--service` MUST fail
+    // immediately upfront (never probing MCP first), while passing `--service mcp` or a token
+    // still registers a plain MCP server as `direct:`.
     let mcp_exact_origin = McpTestServer::start("").await.unwrap();
     let rewrite_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rewrite_addr = rewrite_listener.local_addr().unwrap();
@@ -1807,17 +1807,41 @@ async fn plain_http_mcp_under_m_path_registers_as_direct_without_token() {
             });
         }
     });
-    let info_exact = spaces
-        .add(
-            &format!("http://{rewrite_addr}/m/mcp-service-001"),
+    let exact_url = format!("http://{rewrite_addr}/m/mcp-service-001");
+    let err_no_tok = spaces.add(&exact_url, None, None).await.unwrap_err();
+    assert_eq!(err_no_tok.tag(), "invalid_argument", "{err_no_tok}");
+    assert!(
+        err_no_tok.to_string().contains("--token")
+            && err_no_tok.to_string().contains("CUA_ENV_TOKEN"),
+        "{err_no_tok}"
+    );
+
+    let info_exact_service = spaces
+        .add_with_service(
+            &exact_url,
             None,
+            Some("mcp-exact-svc".into()),
+            Some("mcp".into()),
+        )
+        .await
+        .expect(
+            "plain MCP at exact /m/<valid-machine-id> with explicit --service registers as direct",
+        );
+    assert_eq!(info_exact_service.provider, Provider::Direct);
+    assert_eq!(info_exact_service.id, format!("direct:{rewrite_addr}"));
+    assert_eq!(info_exact_service.services, ["mcp"]);
+
+    let info_exact_tok = spaces
+        .add(
+            &exact_url,
+            Some("mcp-bearer-token".into()),
             Some("mcp-exact".into()),
         )
         .await
-        .expect("plain MCP at exact /m/<valid-machine-id> must register as direct without token");
-    assert_eq!(info_exact.provider, Provider::Direct);
-    assert_eq!(info_exact.id, format!("direct:{rewrite_addr}"));
-    assert_eq!(info_exact.services, ["mcp"]);
+        .expect("plain MCP at exact /m/<valid-machine-id> with token falls back to direct");
+    assert_eq!(info_exact_tok.provider, Provider::Direct);
+    assert_eq!(info_exact_tok.id, format!("direct:{rewrite_addr}"));
+    assert_eq!(info_exact_tok.services, ["mcp"]);
     let (tools, _) = spaces
         .space("mcp-exact")
         .await
@@ -1827,24 +1851,43 @@ async fn plain_http_mcp_under_m_path_registers_as_direct_without_token() {
         .unwrap();
     assert!(!tools.is_empty());
 
+    // Case 4: unreachable plain-MCP `/m/tools` without token MUST propagate the real
+    // MCP/transport error, never misreporting it as "invalid Static Relay machine id".
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let err_dead_mcp = spaces
+        .add(&format!("http://{dead_addr}/m/tools"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        !err_dead_mcp
+            .to_string()
+            .contains("invalid Static Relay machine id"),
+        "unreachable /m/tools must propagate real MCP/transport error, got: {err_dead_mcp}"
+    );
+    assert_ne!(
+        err_dead_mcp.tag(),
+        "invalid_argument",
+        "unreachable /m/tools must not fail with invalid_argument: {err_dead_mcp}"
+    );
+
     assert_eq!(account_spy.count(), 0);
 }
 
 #[tokio::test]
 async fn upfront_rejections_missing_token_host_flag_and_malformed_machine_id_never_mutate_stores() {
-    let srv_auth = MockServer::start(MockAuth {
-        token: Some(TOKEN_A.into()),
-        gateway: None,
-        prefix: Some(format!("/m/{MACHINE_A}")),
-    })
-    .await;
-    // Even an unauthenticated spacesd behind `/m/<machine-id>` MUST be rejected when token is missing!
-    let srv_open = MockServer::start(MockAuth {
-        token: None,
-        gateway: None,
-        prefix: Some(format!("/m/{MACHINE_B}")),
-    })
-    .await;
+    // TCP spy listener: upfront validation MUST fail with ZERO network I/O.
+    let net_spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let net_spy_addr = net_spy.local_addr().unwrap();
+    let net_hits = Arc::new(AtomicUsize::new(0));
+    let net_hits_bg = net_hits.clone();
+    tokio::spawn(async move {
+        while let Ok((_sock, _)) = net_spy.accept().await {
+            net_hits_bg.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let spy_origin = format!("http://{net_spy_addr}");
 
     let home = tempfile::tempdir().unwrap();
     let spaces = Spaces::builder()
@@ -1853,16 +1896,10 @@ async fn upfront_rejections_missing_token_host_flag_and_malformed_machine_id_nev
         .build();
 
     for (url, tok) in [
-        (format!("{}/m/{MACHINE_A}", srv_auth.url()), None),
-        (
-            format!("{}/m/{MACHINE_A}", srv_auth.url()),
-            Some(String::new()),
-        ),
-        (
-            format!("{}/m/{MACHINE_A}", srv_auth.url()),
-            Some("   ".into()),
-        ),
-        (format!("{}/m/{MACHINE_B}", srv_open.url()), None),
+        (format!("{spy_origin}/m/{MACHINE_A}"), None),
+        (format!("{spy_origin}/m/{MACHINE_A}"), Some(String::new())),
+        (format!("{spy_origin}/m/{MACHINE_A}"), Some("   ".into())),
+        (format!("{spy_origin}/m/{MACHINE_B}/"), None),
     ] {
         let err = spaces.add(&url, tok, None).await.unwrap_err();
         assert_eq!(err.tag(), "invalid_argument", "{url}: {err}");
@@ -1875,7 +1912,7 @@ async fn upfront_rejections_missing_token_host_flag_and_malformed_machine_id_nev
 
     let err = spaces
         .add_direct_host(
-            &format!("{}/m/{MACHINE_A}", srv_auth.url()),
+            &format!("{spy_origin}/m/{MACHINE_A}"),
             Some(TOKEN_A.into()),
             Some("bad-host".into()),
         )
@@ -1908,7 +1945,7 @@ async fn upfront_rejections_missing_token_host_flag_and_malformed_machine_id_nev
         "bad_under_score",
         too_long.as_str(),
     ] {
-        let url = format!("{}/m/{bad_id}", srv_auth.url());
+        let url = format!("{spy_origin}/m/{bad_id}");
         let err = spaces
             .add(&url, Some(TOKEN_A.into()), None)
             .await
@@ -1920,6 +1957,27 @@ async fn upfront_rejections_missing_token_host_flag_and_malformed_machine_id_nev
         );
     }
 
+    let extra_err = spaces
+        .add(
+            &format!("{spy_origin}/m/{MACHINE_A}/mcp"),
+            Some(TOKEN_A.into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(extra_err.tag(), "invalid_argument", "{extra_err}");
+    assert!(
+        extra_err
+            .to_string()
+            .contains("without extra path segments"),
+        "extra path segments error: {extra_err}"
+    );
+
+    assert_eq!(
+        net_hits.load(Ordering::SeqCst),
+        0,
+        "upfront Static Relay validation must make ZERO network connections"
+    );
     assert!(spaces.list().unwrap().is_empty());
     assert!(!spaces.registry().spaces_path().exists());
     assert!(!spaces.registry().credentials_path().exists());
@@ -1966,5 +2024,379 @@ async fn direct_space_has_no_legacy_static_relay_branch() {
         space.route().map(|r| r.transport()),
         Some(Transport::Direct),
         "SpaceId::Direct must not route through legacy Via::Static relay/mesh"
+    );
+}
+
+#[tokio::test]
+async fn static_relay_bypasses_account_relay_in_reach_thread_home_and_checkpoints() {
+    let srv = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .build();
+
+    let space_id = format!("relay:{MACHINE_A}");
+    spaces
+        .add(
+            &format!("{}/m/{MACHINE_A}", srv.url()),
+            Some(TOKEN_A.into()),
+            Some("bypass-box".into()),
+        )
+        .await
+        .unwrap();
+
+    // 1. Spaces::reach must skip relay_directory while still probing the Static Relay Space.
+    let reach = spaces.reach(&space_id).await;
+    assert!(reach.reachable, "{reach:?}");
+    assert!(!reach.listed_offline, "{reach:?}");
+    assert_eq!(reach.reason, None);
+
+    // 2. Spaces::thread_home must return ThreadHome::Here(None) without calling relay_row.
+    let home_route = spaces.thread_home(&space_id).await.unwrap();
+    assert!(
+        matches!(home_route, cua_spaces::thread_route::ThreadHome::Here(None)),
+        "expected ThreadHome::Here(None), got {home_route:?}"
+    );
+    let home_by_name = spaces.thread_home("bypass-box").await.unwrap();
+    assert!(
+        matches!(
+            home_by_name,
+            cua_spaces::thread_route::ThreadHome::Here(None)
+        ),
+        "expected ThreadHome::Here(None) by name, got {home_by_name:?}"
+    );
+
+    // 3. Spaces::checkpoint_space calls provider_of, which must return None without relay_row.
+    let ckpt_err = spaces
+        .checkpoint_space(&space_id, "snap-1", false)
+        .await
+        .unwrap_err();
+    assert_eq!(ckpt_err.tag(), "wrong_provider", "{ckpt_err}");
+
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "Account Relay must receive 0 hits during reach/thread_home/checkpoint_space: {:?}",
+        account_spy.snapshot()
+    );
+}
+
+#[tokio::test]
+async fn byoc_static_relay_create_in_cloud_matches_manual_spaces_add_persistence() {
+    struct StaticCloudManager;
+
+    #[async_trait::async_trait]
+    impl cua_sandbox_core::byoc::CloudManager for StaticCloudManager {
+        async fn status(
+            &self,
+            _provider: Option<&str>,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::byoc::CloudStatusReport> {
+            Ok(cua_sandbox_core::byoc::CloudStatusReport::default())
+        }
+
+        fn relay_mode(&self, provider: &str) -> Option<cua_sandbox_core::byoc::RelayMode> {
+            (provider == "aws").then_some(cua_sandbox_core::byoc::RelayMode::Static)
+        }
+
+        async fn test(
+            &self,
+            _target: &cua_sandbox_core::byoc::CloudTarget,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::byoc::CloudTestReport> {
+            unimplemented!()
+        }
+
+        async fn connect(
+            &self,
+            _target: &cua_sandbox_core::byoc::CloudTarget,
+            _make_default: bool,
+            _ttl_hours: Option<u32>,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::byoc::CloudConnected> {
+            unimplemented!()
+        }
+
+        async fn disconnect(
+            &self,
+            _provider: &str,
+            _delete: bool,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::byoc::CloudDisconnected> {
+            unimplemented!()
+        }
+
+        async fn sweep(
+            &self,
+            _provider: Option<&str>,
+            _dry_run: bool,
+            _all: bool,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::byoc::CloudSweepReport> {
+            unimplemented!()
+        }
+
+        async fn auto_sweep(
+            &self,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::byoc::CloudSweepReport> {
+            unimplemented!()
+        }
+
+        async fn audit(
+            &self,
+            _limit: usize,
+        ) -> cua_sandbox_core::Result<Vec<cua_sandbox_core::byoc::CloudAuditEntry>> {
+            unimplemented!()
+        }
+    }
+
+    struct FakeStaticByocProvider {
+        relay_origin: String,
+        machine_id: String,
+        env_token: String,
+    }
+
+    impl FakeStaticByocProvider {
+        fn instance(&self, name: &str) -> cua_sandbox_core::ProviderInstance {
+            let mut inst = cua_sandbox_core::ProviderInstance::new(
+                "inst-static-1",
+                name,
+                cua_sandbox_core::Status::Running,
+            );
+            inst.details.insert(
+                cua_sandbox_core::byoc::DETAIL_RELAY_MACHINE.into(),
+                self.machine_id.clone(),
+            );
+            inst.details.insert(
+                cua_sandbox_core::byoc::DETAIL_PLACE.into(),
+                "AWS \u{b7} us-west-2".into(),
+            );
+            inst.endpoints.insert(
+                cua_sandbox_core::ENV_PORT,
+                cua_sandbox_core::ServiceEndpoint {
+                    url: format!("{}/m/{}", self.relay_origin, self.machine_id),
+                    headers: vec![],
+                },
+            );
+            inst
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cua_sandbox_core::Provider for FakeStaticByocProvider {
+        fn name(&self) -> &'static str {
+            "aws"
+        }
+
+        fn capabilities(&self) -> cua_sandbox_core::ProviderCapabilities {
+            cua_sandbox_core::ProviderCapabilities {
+                kinds: vec![cua_sandbox_core::RunKind::Container],
+                runtime: "fake",
+                arches: vec!["amd64"],
+                image_mode: cua_sandbox_core::ImageMode::Direct,
+                ports: cua_sandbox_core::PortExposure::Https,
+                command: false,
+                env_to_entrypoint: true,
+                private_registry: false,
+                suspend: false,
+                max_cpus: None,
+                max_memory_mb: None,
+                credential_env: &[],
+                gpus: vec![],
+                oses: vec!["linux"],
+                custom_disk_gb: false,
+                custom_cloud_image: false,
+            }
+        }
+
+        fn check_configured(&self) -> cua_sandbox_core::Result<()> {
+            Ok(())
+        }
+
+        async fn create(
+            &self,
+            spec: &cua_sandbox_core::ProviderCreate,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::ProviderInstance> {
+            Ok(self.instance(&spec.name))
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::ProviderInstance> {
+            Ok(self.instance("byoc-static-box"))
+        }
+
+        async fn list(&self) -> cua_sandbox_core::Result<Vec<cua_sandbox_core::ProviderInstance>> {
+            Ok(vec![])
+        }
+
+        async fn delete(&self, _id: &str) -> cua_sandbox_core::Result<()> {
+            Ok(())
+        }
+
+        fn endpoint(
+            &self,
+            instance: &cua_sandbox_core::ProviderInstance,
+            port: u16,
+        ) -> cua_sandbox_core::Result<cua_sandbox_core::ServiceEndpoint> {
+            instance
+                .endpoints
+                .get(&port)
+                .cloned()
+                .ok_or_else(|| cua_sandbox_core::Error::NotFound(format!("port {port}")))
+        }
+
+        fn connect_options(
+            &self,
+            instance: &cua_sandbox_core::ProviderInstance,
+            port: u16,
+        ) -> Option<cua_sandbox_core::Result<cua_spacesd_client::ConnectOptions>> {
+            let ep = instance.endpoints.get(&port)?;
+            Some(
+                cua_spacesd_client::ConnectOptions::parse(&ep.url)
+                    .map(|o| o.token(&self.env_token))
+                    .map_err(|e| cua_sandbox_core::Error::InvalidArgument(e.to_string())),
+            )
+        }
+
+        fn joins_relay(&self) -> bool {
+            true
+        }
+
+        fn keeps_internet_only(&self) -> bool {
+            true
+        }
+    }
+
+    const BYOC_MACHINE: &str = "cloud-0123456789abcdef";
+    let srv_byoc = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{BYOC_MACHINE}")),
+    })
+    .await;
+    let srv_manual = MockServer::start(MockAuth {
+        token: Some(TOKEN_B.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_B}")),
+    })
+    .await;
+
+    let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let mut routes = HashMap::new();
+    routes.insert(BYOC_MACHINE.to_string(), srv_byoc.addr);
+    routes.insert(MACHINE_B.to_string(), srv_manual.addr);
+    let router_addr = start_static_path_router(routes, None, seen).await;
+    let relay_origin = format!("http://{router_addr}");
+
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let sandboxes = cua_sandbox_core::Sandboxes::builder()
+        .state_dir(home.path().join("sandboxes"))
+        .clouds(Arc::new(StaticCloudManager))
+        .provider(Arc::new(FakeStaticByocProvider {
+            relay_origin: relay_origin.clone(),
+            machine_id: BYOC_MACHINE.into(),
+            env_token: TOKEN_A.into(),
+        }))
+        .build();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .sandboxes(sandboxes)
+        .probe_timeout(Duration::from_secs(5))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .build();
+
+    let created = spaces
+        .create(cua_spaces::SpaceCreate {
+            name: Some("byoc-static-box".into()),
+            image: Some("linux".into()),
+            on: Some(cua_sandbox_core::placement::On::Provider("aws".into())),
+            env: [("CUA_ENV_TOKEN".to_string(), TOKEN_A.to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let byoc_info = match created {
+        cua_spaces::SpaceCreated::Ready { info, .. } => info,
+        other => panic!("expected Ready, got {other:?}"),
+    };
+
+    let manual_info = spaces
+        .add(
+            &format!("{relay_origin}/m/{MACHINE_B}"),
+            Some(TOKEN_B.into()),
+            Some("manual-static-box".into()),
+        )
+        .await
+        .unwrap();
+
+    // Both `create_in_cloud` (BYOC Static Relay) and `Spaces::add` persist identical
+    // canonical `relay:<machine-id>` records in `spaces.json` and `Credential { url, token }`
+    // in `spaces-credentials.json`.
+    assert_eq!(byoc_info.id, format!("relay:{BYOC_MACHINE}"));
+    assert_eq!(byoc_info.provider, Provider::Relay);
+    assert_eq!(manual_info.id, format!("relay:{MACHINE_B}"));
+    assert_eq!(manual_info.provider, Provider::Relay);
+
+    let rec_byoc = spaces
+        .registry()
+        .get(&byoc_info.id)
+        .unwrap()
+        .expect("BYOC record in spaces.json");
+    let rec_manual = spaces
+        .registry()
+        .get(&manual_info.id)
+        .unwrap()
+        .expect("manual record in spaces.json");
+    assert_eq!(rec_byoc.id, format!("relay:{BYOC_MACHINE}"));
+    assert_eq!(rec_manual.id, format!("relay:{MACHINE_B}"));
+    assert!(rec_byoc.added_at.is_some());
+    assert!(rec_manual.added_at.is_some());
+
+    let cred_byoc = spaces
+        .registry()
+        .credential(&byoc_info.id)
+        .unwrap()
+        .expect("BYOC credential in spaces-credentials.json");
+    let cred_manual = spaces
+        .registry()
+        .credential(&manual_info.id)
+        .unwrap()
+        .expect("manual credential in spaces-credentials.json");
+    assert_eq!(
+        cred_byoc.url.as_deref(),
+        Some(format!("{relay_origin}/m/{BYOC_MACHINE}").as_str())
+    );
+    assert_eq!(
+        cred_manual.url.as_deref(),
+        Some(format!("{relay_origin}/m/{MACHINE_B}").as_str())
+    );
+    assert_eq!(cred_byoc.token.as_deref(), Some(TOKEN_A));
+    assert_eq!(cred_manual.token.as_deref(), Some(TOKEN_B));
+    assert!(spaces.is_static_relay_space(&SpaceId::Relay {
+        machine_id: BYOC_MACHINE.into(),
+    }));
+    assert!(spaces.is_static_relay_space(&SpaceId::Relay {
+        machine_id: MACHINE_B.into(),
+    }));
+
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "BYOC Static Relay create + manual add must make 0 Account Relay calls: {:?}",
+        account_spy.snapshot()
     );
 }

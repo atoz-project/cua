@@ -133,7 +133,7 @@ function ghostMachineIds(spaces: readonly Space[], machines: readonly Machine[])
 /** A Space id the account relay knows (`relay:<machine>` or `relay:<machine>/<name>`): one that can be the default. */
 const relayId = (space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">): string | null => {
   if (!space.id.startsWith("relay:")) return null;
-  if (isStaticRelaySpace(space) && space.access?.canShare !== true) return null;
+  if (isStaticRelaySpace(space)) return null;
   return space.id;
 };
 

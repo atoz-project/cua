@@ -12,7 +12,7 @@ import { shareable } from "@/bridge/share";
 import { requiresAccountRelayAccess, spaceDetail } from "@/bridge/space-detail";
 import { accessOf } from "@/lib/space-access";
 import { buildSpacesTree } from "@/lib/spaces-tree";
-import { isMachineDesktop, isStaticRelaySpace, listedSpaces, locationLabel, machineName, realSpaces, spacePlace } from "@/lib/spaces";
+import { isMachineDesktop, isRelaySpace, isStaticRelaySpace, listedSpaces, locationLabel, machineName, realSpaces, spacePlace } from "@/lib/spaces";
 
 function makeSpace(overrides: Partial<Space> & Pick<Space, "id">): Space {
   return {
@@ -77,6 +77,12 @@ const hostedSpace = makeSpace({
 
 describe("Web Static Relay Space vs Account Computer classification", () => {
   it("classifies manual and BYOC Static Relay entries as Spaces and keeps online/offline Account Computers as desktops", () => {
+    expect(isRelaySpace(manualStatic)).toBe(true);
+    expect(isRelaySpace(byocStatic)).toBe(true);
+    expect(isRelaySpace(onlineComputer)).toBe(false);
+    expect(isRelaySpace(offlineComputer)).toBe(false);
+    expect(isRelaySpace(hostedSpace)).toBe(false);
+
     expect(isStaticRelaySpace(manualStatic)).toBe(true);
     expect(isStaticRelaySpace(byocStatic)).toBe(true);
     expect(isStaticRelaySpace(onlineComputer)).toBe(false);
@@ -232,11 +238,14 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
         };
         expect: {
           isMachineDesktop: boolean;
+          isRelaySpace: boolean;
           isStaticRelaySpace: boolean;
           inMachinesPage: boolean;
           inRealSpaces: boolean;
           canShare: boolean;
           requiresAccountRelayAccess: boolean;
+          removeOnly: boolean;
+          deleteLabel: string;
           webHeaderSubtitle: string;
         };
       }[];
@@ -299,6 +308,7 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
       const s = spaces[i]!;
       const e = f.expect;
       expect(isMachineDesktop(s), `${f.case}: isMachineDesktop`).toBe(e.isMachineDesktop);
+      expect(isRelaySpace(s), `${f.case}: isRelaySpace`).toBe(e.isRelaySpace);
       expect(isStaticRelaySpace(s), `${f.case}: isStaticRelaySpace`).toBe(e.isStaticRelaySpace);
       const rawId = s.id.startsWith("relay:") ? s.id.slice("relay:".length) : s.id;
       expect(
@@ -317,6 +327,8 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
         d.actions.some((a) => a.id === "share"),
         `${f.case}: detail share action`,
       ).toBe(e.canShare);
+      expect(d.removeOnly, `${f.case}: detail.removeOnly`).toBe(e.removeOnly);
+      expect(d.deleteLabel, `${f.case}: detail.deleteLabel`).toBe(e.deleteLabel);
     });
 
     expect(realSpaces(spaces).map((s) => s.id)).toEqual(matrix.fixtures.filter((f) => f.expect.inRealSpaces).map((f) => f.row.id));
