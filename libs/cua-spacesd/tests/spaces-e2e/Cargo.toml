@@ -50,6 +50,7 @@ tokio = { version = "1", features = ["full"] }
 [dev-dependencies]
 cua-sdk = { path = "../../../cua/crates/cua-sdk" }
 cua-host = { path = "../../../cua/crates/cua-host", features = ["testing"] }
+cua-sandbox-core = { path = "../../../cua/crates/cua-sandbox-core", features = ["testing"] }
 # The real relay, for the device-enrollment conformance of cua-host's client.
 cua-relay = { path = "../../crates/cua-relay" }
 # Stops the live host the relay re-register case joins.

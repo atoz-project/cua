@@ -130,9 +130,3 @@ tonic-web.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls.workspace = true
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
