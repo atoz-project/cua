@@ -128,14 +128,13 @@ export function spaceToRow(s: WkSpace): SpaceRow {
   const here = running || s.id === "this-mac";
   const off = s.power ? s.power.off : s.status === "suspended";
   const powerState = s.power ? (off ? (s.power.control === "stop" ? "stopped" : "suspended") : "running") : off ? "suspended" : undefined;
-  const added = s.startedAt ?? s.lastUsedAt;
   return {
     id: s.id,
     name: s.name,
     provider: s.provider ?? (here ? "local" : "direct"),
     spacesdVersion: s.sdk?.spacesdVersion ?? "",
     features: s.sdk?.features ?? [],
-    addedAt: added ? new Date(added).toISOString() : undefined,
+    addedAt: s.startedAt != null && s.startedAt > 0 ? new Date(s.startedAt).toISOString() : undefined,
     os: s.os,
     osName: opt(s.osName),
     osPrettyName: opt(s.osPrettyName),
@@ -154,15 +153,22 @@ export function spaceToRow(s: WkSpace): SpaceRow {
     cloud: opt(s.cloud),
     cloudPlace: opt(s.cloudPlace),
     cloudDelete: opt(s.cloudDelete),
-    sharing: s.access ? sharingOf(s.access) : undefined,
+    sharing: s.access ? sharingOf(s.access, isPersistedRelayWireSpace(s)) : undefined,
     hostProgress: s.id.startsWith("pending:") ? (s.progress ?? undefined) : undefined,
   };
 }
 
+function isPersistedRelayWireSpace(s: Pick<WkSpace, "id" | "provider" | "host" | "startedAt" | "cloud">): boolean {
+  if (!s.id.startsWith("relay:")) return false;
+  if (s.provider !== undefined && s.provider !== "relay") return false;
+  if (s.host?.trim()) return false;
+  return (s.startedAt != null && s.startedAt > 0) || Boolean(s.cloud?.trim());
+}
+
 /** The sharing facts back from the core's `SpaceAccess` on an `AppSpace`,
  * so the core draws the same access again from the row. */
-export function sharingOf(a: SpaceAccess): SpaceSharingFacts | undefined {
-  if (a.kind === "mine" && a.people.length === 0) return undefined;
+export function sharingOf(a: SpaceAccess, preserveOwnerShare = false): SpaceSharingFacts | undefined {
+  if (a.kind === "mine" && a.people.length === 0 && !(preserveOwnerShare && a.canShare)) return undefined;
   const people = (role: "editor" | "viewer") => a.people.filter((p) => !p.team && p.role === role).map((p) => p.who);
   const teams = a.people.filter((p) => p.team).map((p) => ({ key: p.who.replace(/^team:/, ""), name: p.name ?? p.who.replace(/^team:/, ""), role: p.role }));
   const owner = a.role === "owner";
@@ -204,8 +210,11 @@ export function toMachineRows(spaces: WkSpaces, machines: WkMachines | null, os:
     rows.push(row);
   };
   for (const { space } of spaces.spaces) {
-    // A machine's own desktop: `relay:<machine>` with no host above it.
-    const own = space.provider === "relay" && !space.host && space.id.startsWith("relay:") ? space.id.slice(6) : undefined;
+    // A machine's own desktop: `relay:<machine>` with no host, no persisted `startedAt`, and no `cloud` metadata.
+    const own =
+      space.provider === "relay" && !space.host?.trim() && space.startedAt == null && !space.cloud?.trim() && space.id.startsWith("relay:")
+        ? space.id.slice(6)
+        : undefined;
     // A Space registered on the relay (`space-…`) is a Space, not a machine.
     if (own?.startsWith("space-")) continue;
     if (own && !own.includes("/")) {

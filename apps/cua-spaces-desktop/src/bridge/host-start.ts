@@ -18,22 +18,36 @@ import type { BridgeContext } from "./context";
 import { hostParts } from "./host-parts";
 
 /**
- * A machine's own desktop, not a Space: This machine, or one of your
- * machines sharing its desktop over the relay (`relay:<machine>` with no
- * host above it). The page lists them on Machines, not with the Spaces
- * (`isMachineDesktop` in the web UI), so the menu's count leaves them out
- * too (it said "4 Spaces" with 2 Spaces).
+ * Whether `space` is a persisted Static Relay Mode Space (`relay:<id>` with no
+ * host above it, carrying `startedAt` or `cloud` metadata) rather than an
+ * Account Relay Mode Computer.
  */
-export function isMachineDesktop(space: Pick<AppSpace, "id" | "status" | "provider" | "host">): boolean {
+export function isStaticRelaySpace(space: Pick<AppSpace, "id" | "provider" | "host" | "startedAt" | "cloud">): boolean {
+  if (!space.id.startsWith("relay:")) return false;
+  if (space.provider !== undefined && space.provider !== "relay") return false;
+  if (space.host?.trim()) return false;
+  return space.startedAt != null || Boolean(space.cloud?.trim());
+}
+
+/**
+ * A machine's own desktop, not a Space: This machine, or one of your Account
+ * Relay computers sharing its desktop over the relay (`relay:<machine>` with
+ * no host, no persisted `startedAt`, and no `cloud` metadata). The page lists
+ * them on Computers, not with the Spaces (`isMachineDesktop` in the web UI),
+ * so the menu's count leaves them out too.
+ */
+export function isMachineDesktop(space: Pick<AppSpace, "id" | "status" | "provider" | "host" | "startedAt" | "cloud">): boolean {
   if (space.status === "local" || space.id === "this-mac") return true;
-  if (space.provider !== "relay" || space.host || !space.id.startsWith("relay:")) return false;
+  if (space.provider !== "relay" || space.host?.trim() || !space.id.startsWith("relay:")) return false;
+  if (space.startedAt != null || Boolean(space.cloud?.trim())) return false;
   const own = space.id.slice("relay:".length);
   return own.length > 0 && !own.includes("/") && !own.startsWith("space-");
 }
 
 /** The Spaces the user created (what the menu and the tray count and list), never the home warming for Home's prompt box (`hidden`). */
-export const realSpaces = <T extends Pick<AppSpace, "id" | "status" | "provider" | "host"> & { hidden?: boolean }>(spaces: readonly T[]): T[] =>
-  spaces.filter((s) => !isMachineDesktop(s) && !s.hidden);
+export const realSpaces = <T extends Pick<AppSpace, "id" | "status" | "provider" | "host" | "startedAt" | "cloud"> & { hidden?: boolean }>(
+  spaces: readonly T[],
+): T[] => spaces.filter((s) => !isMachineDesktop(s) && !s.hidden);
 
 /** The menu bar item's menu (the core's `appMenu`): the count, the Volume's sync line and conflicts, then Open, New Space, Settings and Quit. */
 export function menuItems(ctx: BridgeContext): AppMenuItem[] {

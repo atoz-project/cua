@@ -9,7 +9,7 @@
 
 import type { Space, SpaceAccess } from "@/bridge";
 import { thisComputerLabel } from "@/lib/host-labels";
-import { canDelete, canPower } from "@/lib/spaces";
+import { canDelete, canPower, isStaticRelaySpace } from "@/lib/spaces";
 
 /** `space.access`, or yours alone when the host did not say. */
 export function accessOf(space: Space, machine: string): SpaceAccess {
@@ -21,7 +21,7 @@ export function accessOf(space: Space, machine: string): SpaceAccess {
     people: [],
     canPower: canPower(space),
     canTeleport: true,
-    canShare: true,
+    canShare: !isStaticRelaySpace(space),
     canRename: true,
     canDelete: canDelete(space),
     canLeave: false,

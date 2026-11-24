@@ -104,18 +104,26 @@ fn is_container_hostname(name: &str) -> bool {
 
 /// The name to show. A container's spacesd reports its hostname (12 hex
 /// digits), so the id's name (`local:<name>`, `cloud:<name>`) wins then.
+/// Empty or whitespace names fall back to the bare identifier without
+/// internal prefixes (`relay:`, `direct:`, `space://direct/`).
 pub fn name_of(id: &str, name: &str) -> String {
+    let trimmed = name.trim();
     let from_id = id
         .strip_prefix("local:")
         .or_else(|| id.strip_prefix("cloud:"))
         .filter(|rest| !rest.is_empty());
     if let Some(from_id) = from_id
-        && (name.is_empty() || is_container_hostname(name))
+        && (trimmed.is_empty() || is_container_hostname(trimmed))
     {
         return from_id.to_string();
     }
-    if name.is_empty() {
-        id.to_string()
+    if trimmed.is_empty() {
+        id.strip_prefix("space://direct/")
+            .or_else(|| id.strip_prefix("direct:"))
+            .or_else(|| id.strip_prefix("relay:"))
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(id)
+            .to_string()
     } else {
         name.to_string()
     }
@@ -164,6 +172,13 @@ fn detail_for(row: &SpaceRow, status: SpaceStatus) -> String {
                     .filter(|n| !n.is_empty())
                     .unwrap_or(host)
             ),
+            None if is_persisted_relay_row(row) => row
+                .host_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or("Remote relay")
+                .to_string(),
             None => "My machines".into(),
         },
         p => provider_label(p).into(),
@@ -383,17 +398,44 @@ pub fn count_active(spaces: &[Space]) -> u32 {
         .count() as u32
 }
 
+/// Whether a registry row is a persisted Static Relay Mode Space (`relay:<id>`
+/// with no `host` above it, carrying `added_at` or `cloud` metadata) rather
+/// than an Account Relay Mode Computer from the account directory.
+pub(crate) fn is_persisted_relay_row(row: &SpaceRow) -> bool {
+    row.id.starts_with("relay:")
+        && normalize_provider(&row.provider) == SpaceProvider::Relay
+        && row.host.as_deref().is_none_or(|h| h.trim().is_empty())
+        && (row.added_at.as_deref().and_then(parse_rfc3339_ms).is_some()
+            || row.cloud.as_deref().is_some_and(|c| !c.trim().is_empty()))
+}
+
+/// Whether `space` is a persisted Static Relay Mode Space (`relay:<id>` with
+/// no `host` above it, carrying `started_at` or `cloud` metadata) rather than
+/// an Account Relay Mode Computer.
+pub fn is_static_relay_space(space: &Space) -> bool {
+    space.id.starts_with("relay:")
+        && (space.provider == Some(SpaceProvider::Relay) || space.provider.is_none())
+        && space.host.as_deref().is_none_or(|h| h.trim().is_empty())
+        && (space.started_at.is_some()
+            || space.cloud.as_deref().is_some_and(|c| !c.trim().is_empty()))
+}
+
 /// A machine's own desktop, not a Space: This machine (`this-mac`, and any
-/// row reported as `Local`), or one of your machines sharing its own desktop
-/// over the relay (`relay:<machine>` with no host above it). They belong
-/// with the machines (the sidebar's This Mac and My machines, the web UI's
-/// Machines page), not in the count of Spaces; the web UI's
-/// `isMachineDesktop` is the same rule.
+/// row reported as `Local`), or one of your Account Relay computers sharing
+/// its own desktop over the relay (`relay:<machine>` with no host, no
+/// persisted `started_at`, and no `cloud` metadata). They belong with the
+/// machines (the sidebar's This Mac and My computers, the web UI's Computers
+/// page), not in the count of Spaces; the desktop and web `isMachineDesktop`
+/// checks follow the same rule.
 pub fn is_machine_desktop(space: &Space) -> bool {
     if space.id == crate::host::THIS_MACHINE_ID || space.status == SpaceStatus::Local {
         return true;
     }
-    if space.provider != Some(SpaceProvider::Relay) || space.host.is_some() {
+    if space.provider != Some(SpaceProvider::Relay)
+        || space.host.as_deref().is_some_and(|h| !h.trim().is_empty())
+        || space.started_at.is_some()
+        || space.cloud.as_deref().is_some_and(|c| !c.trim().is_empty())
+    {
         return false;
     }
     space
@@ -969,6 +1011,7 @@ mod tests {
         machine.id = "relay:96fedb7e1be65c3d31fa18587febde2c".into();
         machine.name = "Studio".into();
         machine.provider = "relay".into();
+        machine.added_at = None;
         machine.reachable = false;
         let mut provided = row();
         provided.id = "relay:space-ca12d6d23907f387".into();
@@ -1014,6 +1057,7 @@ mod tests {
             let mut r = row();
             r.id = format!("relay:{id}");
             r.provider = "relay".into();
+            r.added_at = None;
             r.features = features.iter().map(|f| f.to_string()).collect();
             r.reachable = reachable;
             row_to_space(&r, 0)
@@ -1105,5 +1149,125 @@ mod tests {
         out[2].power.as_mut().unwrap().turning_on = Some(false);
         assert_eq!(on_count(&out), 3);
         assert_eq!(on_status_line(3), "3 Spaces running");
+    }
+
+    #[test]
+    fn static_relay_spaces_classify_as_spaces_while_account_computers_stay_desktops() {
+        let manual_static = row_to_space(
+            &SpaceRow {
+                id: "relay:office-gpu".into(),
+                name: "Office GPU".into(),
+                provider: "relay".into(),
+                added_at: Some("2026-11-24T10:00:00Z".into()),
+                cloud: None,
+                cloud_place: None,
+                host: None,
+                sharing: None,
+                reachable: true,
+                features: vec!["desktop_stream".into()],
+                ..row()
+            },
+            0,
+        );
+        let byoc_static = row_to_space(
+            &SpaceRow {
+                id: "relay:cloud-0123456789abcdef".into(),
+                name: "Research Box".into(),
+                provider: "relay".into(),
+                added_at: Some("2026-11-24T10:05:00Z".into()),
+                cloud: Some("aws".into()),
+                cloud_place: Some("AWS \u{b7} us-west-2".into()),
+                host: None,
+                sharing: None,
+                reachable: true,
+                features: vec!["desktop_stream".into()],
+                ..row()
+            },
+            0,
+        );
+        let online_computer = row_to_space(
+            &SpaceRow {
+                id: "relay:studio-online".into(),
+                name: "Studio".into(),
+                provider: "relay".into(),
+                added_at: None,
+                cloud: None,
+                cloud_place: None,
+                host: None,
+                sharing: Some(crate::model::SpaceSharingFacts {
+                    owner_id: "u1".into(),
+                    owner_email: Some("ada@example.com".into()),
+                    owner_name: Some("Ada".into()),
+                    role: "owner".into(),
+                    team: None,
+                    team_name: None,
+                    editors: vec![],
+                    viewers: vec![],
+                    teams: vec![],
+                }),
+                reachable: true,
+                features: vec!["desktop_stream".into(), "host_spaces".into()],
+                ..row()
+            },
+            0,
+        );
+        let offline_computer = row_to_space(
+            &SpaceRow {
+                id: "relay:studio-offline".into(),
+                name: "Spare Mini".into(),
+                provider: "relay".into(),
+                added_at: None,
+                cloud: None,
+                cloud_place: None,
+                host: None,
+                sharing: None,
+                reachable: false,
+                features: vec![],
+                ..row()
+            },
+            0,
+        );
+
+        assert!(!is_machine_desktop(&manual_static));
+        assert!(!is_remote_desktop(&manual_static));
+        assert!(!is_machine_desktop(&byoc_static));
+        assert!(!is_remote_desktop(&byoc_static));
+
+        assert!(is_machine_desktop(&online_computer));
+        assert!(is_remote_desktop(&online_computer));
+        assert!(is_machine_desktop(&offline_computer));
+        assert!(is_remote_desktop(&offline_computer));
+
+        let roster = vec![
+            manual_static,
+            byoc_static,
+            online_computer,
+            offline_computer,
+        ];
+        let openable_ids: Vec<String> =
+            openable_spaces(&roster).into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            openable_ids,
+            [
+                "relay:office-gpu",
+                "relay:cloud-0123456789abcdef",
+                "relay:studio-online"
+            ]
+        );
+
+        for raw_name in ["", "   "] {
+            let unnamed = row_to_space(
+                &SpaceRow {
+                    id: "relay:office-gpu".into(),
+                    name: raw_name.into(),
+                    provider: "relay".into(),
+                    added_at: Some("2026-11-24T10:00:00Z".into()),
+                    ..row()
+                },
+                0,
+            );
+            assert_eq!(unnamed.name, "office-gpu");
+            assert!(!unnamed.name.contains("relay:"));
+        }
     }
 }

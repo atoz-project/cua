@@ -15,6 +15,7 @@ import { useContext, useEffect, useSyncExternalStore } from "react";
 import { isUnsupported, type DataAdapter } from "./adapter";
 import { BridgeContext } from "./BridgeProvider";
 import type { CoreClient } from "./core";
+import { isStaticRelaySpace } from "@/lib/spaces";
 import { sharesDesktop } from "./derive";
 import type { MachineAccessNotice } from "./contracts/devices";
 import type { SpaceAgentRun } from "./contracts/agents";
@@ -49,6 +50,15 @@ export const RUNS_REFRESH_MS = 4_000;
 
 /* ---- The core's decisions ------------------------------------------------------ */
 
+/** Whether `space` is reached through the signed-in account's relay directory
+ * and therefore gated by this device's enrollment notice (`sidebar::requires_account_relay_access`).
+ * Unattached Static Relay Mode Spaces are exempt; Account-Relay BYOC Spaces remain gated. */
+export function requiresAccountRelayAccess(space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">): boolean {
+  if (!space.id.startsWith("relay:")) return false;
+  if (!isStaticRelaySpace(space)) return true;
+  return Boolean(space.access && (space.access.canShare || space.access.kind !== "mine"));
+}
+
 /** The Space's detail (`sidebar.detail`): facts, sections, preview text and
  * Delete's question, as this device sees it (`sidebar::detail_for`, the
  * SwiftUI app's `AppModel.detail`). */
@@ -57,11 +67,11 @@ export function spaceDetail(
   space: Space,
   usage?: SpaceUsage | null,
   hostArch?: string | null,
-  /** This device is signed in but not enrolled: a machine on the relay
-   * shows why, with its connection actions off. */
+  /** This device is signed in but not enrolled: a machine on the account relay
+   * shows why, with its connection actions off. Static Relay Mode Spaces are exempt. */
   access?: MachineAccessNotice | null,
 ): SpaceDetailView {
-  return core.tryCall<SpaceDetailView>("sidebar.detail", { space, usage, hostArch, access: access ?? undefined }) ?? fallbackDetail(space);
+  return core.tryCall<SpaceDetailView>("sidebar.detail", { space, usage, hostArch, access: access ?? undefined }) ?? fallbackDetail(space, access);
 }
 
 /** What the preview shows over (or instead of) the live desktop
@@ -111,26 +121,30 @@ function fallbackCover(input: DesktopCoverInput): DesktopCover {
   return { ...cover("connecting", input.stream === "reconnecting" ? "Reconnecting…" : "Connecting…"), openStream: input.stream === "nosession" };
 }
 
-function fallbackDetail(space: Space): SpaceDetailView {
+function fallbackDetail(space: Space, access?: MachineAccessNotice | null): SpaceDetailView {
   const running = space.status === "running" && !space.power?.off;
+  const blocked = access && requiresAccountRelayAccess(space) ? access : undefined;
+  const canStream = running && !blocked;
+  const canShare = space.access ? space.access.canShare : !isStaticRelaySpace(space);
   return {
     id: space.id,
     title: space.name,
     facts: [
-      { label: "Status", value: space.detail || space.status },
+      { label: "Status", value: blocked ? blocked.status : space.detail || space.status },
       ...(space.image ? [{ label: "Image", value: space.image }] : []),
       { label: "Identifier", value: space.id },
       { label: "System", value: space.osPrettyName ?? space.osName ?? space.os },
     ],
     isHost: false,
-    showSections: running,
-    canStream: running,
-    previewText: running ? "Loading the desktop…" : "Not reachable",
+    showSections: canStream,
+    canStream,
+    previewText: blocked ? blocked.text : running ? "Loading the desktop…" : "Not reachable",
     deleteLabel: "Delete Space",
     removeOnly: false,
+    ...(blocked ? { access: blocked } : {}),
     actions: [
-      { id: "teleport", label: "Teleport an app", help: "Teleport an app into this Space", enabled: running, destructive: false, primary: false },
-      { id: "share", label: "Share", help: "Share this Space", enabled: running, destructive: false, primary: false },
+      { id: "teleport", label: "Teleport an app", help: "Teleport an app into this Space", enabled: canStream, destructive: false, primary: false },
+      ...(canShare ? [{ id: "share" as const, label: "Share", help: "Share this Space", enabled: canStream, destructive: false, primary: false }] : []),
     ],
     confirm: {
       title: `Delete ${space.name}?`,
@@ -139,7 +153,7 @@ function fallbackDetail(space: Space): SpaceDetailView {
       confirmEnabled: true,
       cancelLabel: "Keep",
     },
-    sections: running ? ["Stream"] : [],
+    sections: canStream ? ["Stream"] : [],
   };
 }
 
@@ -440,7 +454,7 @@ export function useSpaceDetail(space: Space | undefined, hostArch: string | null
   // Nor is this machine's own screen: it is not a Space, and nothing here
   // streams it (the core's detail says so in its note).
   const noDesktop = space
-    ? space.id === THIS_MACHINE_ID || sharesDesktop(ctx.core, space) === false || Boolean(seen.access && space.id.startsWith("relay:"))
+    ? space.id === THIS_MACHINE_ID || sharesDesktop(ctx.core, space) === false || Boolean(seen.access && requiresAccountRelayAccess(space))
     : false;
   useEffect(() => {
     if (!details || !id || id.startsWith("pending:") || noDesktop) return;
