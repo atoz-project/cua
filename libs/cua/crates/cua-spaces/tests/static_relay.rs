@@ -1,0 +1,1158 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
+//! Seam 1 integration tests for Static Relay Mode Spaces on `relay:<machine-id>`.
+//!
+//! Exercises:
+//! - Two `cua-spacesd` instances on `/m/<id-1>` and `/m/<id-2>` behind one HTTPS origin
+//!   (real TLS + ALPN h2 via `SSL_CERT_FILE` and a port-443 proxy/plaintext spy).
+//! - Static Token Mode WireGuard mesh (`cua_mesh::Mode::Static`) pairing and dialing
+//!   both machines behind one relay origin.
+//! - Plain HTTP MCP servers mounted at `/m/...` registering as `direct:` without a token.
+//! - Account Relay HTTP spy asserting 0 requests across Static Relay add/resolve/list/connect/rename/remove.
+//! - Port-443 plaintext TCP/HTTP spy asserting 0 plaintext HTTP requests or bearer token leaks.
+//! - Upfront rejections for missing/empty token, `--host` combination before store mutation,
+//!   and malformed `<machine-id>` segments.
+
+use base64::Engine;
+use cua_mesh::testing::FakeCoordinator;
+use cua_mesh::{Mesh, MeshConfig, Mode, NodeKind, static_auth};
+use cua_sandbox_core::testing::McpTestServer;
+use cua_spaces::presence::{Identity as PresenceIdentity, PresenceDatagrams};
+use cua_spaces::relay::StaticToken;
+use cua_spaces::{Provider, RelayAccount, SpaceId, Spaces, Transport};
+use cua_spacesd_client::testing::{MockAuth, MockServer};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+const MACHINE_A: &str = "machine-alpha-01";
+const MACHINE_B: &str = "machine-beta-002";
+const TOKEN_A: &str = "static-relay-token-alpha-secret";
+const TOKEN_A_ROTATED: &str = "static-relay-token-alpha-rotated";
+const TOKEN_B: &str = "static-relay-token-beta-secret";
+
+const HTTPS_SUBPROCESS_ENV: &str = "CUA_TEST_STATIC_RELAY_HTTPS";
+const HTTPS_FIXTURE_ENV: &str = "CUA_TEST_STATIC_RELAY_FIXTURE";
+const HTTPS_PROXY_ADDR_ENV: &str = "CUA_TEST_STATIC_RELAY_PROXY";
+
+#[derive(Default)]
+struct HttpSpy {
+    requests: Mutex<Vec<String>>,
+}
+
+impl HttpSpy {
+    async fn start() -> (String, Arc<Self>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let spy = Arc::new(Self::default());
+        let bg = spy.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let bg = bg.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let line = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    bg.requests.lock().unwrap().push(line);
+                    let body = r#"{"error":"account relay must not be called"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), spy)
+    }
+
+    fn count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn pem(der: &[u8]) -> String {
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        base64::engine::general_purpose::STANDARD.encode(der)
+    )
+}
+
+fn write_tls_fixture(dir: &Path, host: &str) {
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let key = rcgen::KeyPair::generate().unwrap();
+    let root = ca.self_signed(&key).unwrap();
+    let issuer = rcgen::Issuer::new(ca, key);
+    let leaf = rcgen::CertificateParams::new(vec![host.into()]).unwrap();
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = leaf.signed_by(&leaf_key, &issuer).unwrap();
+    std::fs::write(dir.join("leaf.der"), leaf.der()).unwrap();
+    std::fs::write(dir.join("key.der"), leaf_key.serialize_der()).unwrap();
+    std::fs::write(dir.join("roots.pem"), pem(root.der())).unwrap();
+}
+
+async fn read_http_head(socket: &mut (impl AsyncRead + Unpin)) -> Option<String> {
+    let mut data = Vec::new();
+    while !data.ends_with(b"\r\n\r\n") {
+        if data.len() > 8192 {
+            return None;
+        }
+        let mut b = [0u8; 1];
+        if socket.read_exact(&mut b).await.is_err() {
+            return None;
+        }
+        data.push(b[0]);
+    }
+    String::from_utf8(data).ok()
+}
+
+type SeenPaths = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// Starts an in-process HTTP/2 + HTTP/1.1 router that dispatches `/m/<id>/...`
+/// to the matching upstream `MockServer` while rejecting `/v1/machines` (Static
+/// Token Mode relay has no Account Relay directory).
+async fn start_static_path_router(
+    routes: HashMap<String, SocketAddr>,
+    mesh_info_coord: Option<String>,
+    seen_paths: SeenPaths,
+) -> SocketAddr {
+    use http_body_util::BodyExt as _;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoServer;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let routes = Arc::new(routes);
+    tokio::spawn(async move {
+        let client: hyper_util::client::legacy::Client<
+            hyper_util::client::legacy::connect::HttpConnector,
+            tonic::body::Body,
+        > = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http();
+        let client_h1: hyper_util::client::legacy::Client<
+            hyper_util::client::legacy::connect::HttpConnector,
+            tonic::body::Body,
+        > = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let routes = routes.clone();
+            let mesh_info_coord = mesh_info_coord.clone();
+            let seen_paths = seen_paths.clone();
+            let client = client.clone();
+            let client_h1 = client_h1.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                    let routes = routes.clone();
+                    let mesh_info_coord = mesh_info_coord.clone();
+                    let seen_paths = seen_paths.clone();
+                    let client = client.clone();
+                    let client_h1 = client_h1.clone();
+                    async move {
+                        let path = req.uri().path().to_string();
+                        let auth = req
+                            .headers()
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        seen_paths.lock().unwrap().push((path.clone(), auth));
+
+                        if path == "/v1/info" {
+                            let body = if mesh_info_coord.is_some() {
+                                r#"{"account_auth":false,"issuer":null,"mesh":{"stun":[],"version":1},"public_url":"http://relay","state_writable":false,"static_tokens":true}"#
+                            } else {
+                                r#"{"account_auth":false,"issuer":null,"mesh":null,"public_url":"https://relay.invalid","state_writable":false,"static_tokens":true}"#
+                            };
+                            return Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(tonic::body::Body::new(
+                                        http_body_util::Full::new(bytes::Bytes::from(body))
+                                            .map_err(|never| match never {}),
+                                    ))
+                                    .unwrap(),
+                            );
+                        }
+
+                        if let Some(rest) = path.strip_prefix("/m/") {
+                            let (machine_id, _) = rest.split_once('/').unwrap_or((rest, ""));
+                            if let Some(&upstream) = routes.get(machine_id) {
+                                let pq = req
+                                    .uri()
+                                    .path_and_query()
+                                    .map(|pq| pq.as_str())
+                                    .unwrap_or(&path);
+                                let uri: http::Uri =
+                                    format!("http://{upstream}{pq}").parse().unwrap();
+                                let is_h2 = req.version() == http::Version::HTTP_2;
+                                let (parts, incoming_body) = req.into_parts();
+                                let body = tonic::body::Body::new(
+                                    incoming_body
+                                        .map_err(|e| tonic::Status::internal(e.to_string())),
+                                );
+                                let mut fwd =
+                                    http::Request::builder().method(parts.method).uri(uri);
+                                if is_h2 {
+                                    fwd = fwd.version(http::Version::HTTP_2);
+                                }
+                                for (k, v) in &parts.headers {
+                                    if k != http::header::HOST {
+                                        fwd = fwd.header(k, v);
+                                    }
+                                }
+                                let fwd = fwd.body(body).unwrap();
+                                let resp = if is_h2 {
+                                    client.request(fwd).await
+                                } else {
+                                    client_h1.request(fwd).await
+                                };
+                                match resp {
+                                    Ok(r) => {
+                                        let (parts, b) = r.into_parts();
+                                        let mapped =
+                                            tonic::body::Body::new(b.map_err(|e| {
+                                                tonic::Status::internal(e.to_string())
+                                            }));
+                                        return Ok(http::Response::from_parts(parts, mapped));
+                                    }
+                                    Err(e) => {
+                                        return Ok(http::Response::builder()
+                                            .status(502)
+                                            .body(tonic::body::Body::new(
+                                                http_body_util::Full::new(bytes::Bytes::from(
+                                                    e.to_string(),
+                                                ))
+                                                .map_err(|never| match never {}),
+                                            ))
+                                            .unwrap());
+                                    }
+                                }
+                            }
+                        }
+
+                        Ok(http::Response::builder()
+                            .status(404)
+                            .body(tonic::body::Body::new(
+                                http_body_util::Full::new(bytes::Bytes::from("not found"))
+                                    .map_err(|never| match never {}),
+                            ))
+                            .unwrap())
+                    }
+                });
+                let _ = AutoServer::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tcp), svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+struct SpyPresenceDatagrams {
+    connect_calls: Arc<AtomicUsize>,
+}
+
+impl PresenceDatagrams for SpyPresenceDatagrams {
+    fn connect<'a>(
+        &'a self,
+        _space: &'a cua_spaces::Space,
+        _info: &'a cua_spacesd_client::pb::PresenceDatagrams,
+        _timeout: Duration,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        cua_spaces::Result<cua_spaces::presence::DatagramChannel>,
+    > {
+        self.connect_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(cua_spaces::Error::Stream(
+                "UDP presence datagrams must not be dialed for Static Relay Spaces".into(),
+            ))
+        })
+    }
+}
+
+/// Full HTTPS Seam 1 test in an isolated child process with `SSL_CERT_FILE`
+/// and `HTTPS_PROXY` + `HTTP_PROXY` pointing at our in-process TLS relay and
+/// port-443 plaintext spy.
+#[test]
+fn static_relay_https_two_machines_coexist_with_zero_account_or_plaintext_leaks() {
+    if std::env::var_os(HTTPS_SUBPROCESS_ENV).is_some() {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_https_seam1_suite());
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    write_tls_fixture(dir.path(), "relay.invalid");
+
+    let mut attempt = 0;
+    let output = loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            "static_relay_https_two_machines_coexist_with_zero_account_or_plaintext_leaks",
+            "--nocapture",
+        ]);
+        for k in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "SSL_CERT_DIR",
+            "CUA_ENV_TOKEN",
+            "CUA_RELAY_URL",
+        ] {
+            child.env_remove(k);
+        }
+        let out = child
+            .env(HTTPS_SUBPROCESS_ENV, "1")
+            .env(HTTPS_FIXTURE_ENV, dir.path())
+            .env(HTTPS_PROXY_ADDR_ENV, addr.to_string())
+            .env("SSL_CERT_FILE", dir.path().join("roots.pem"))
+            .env("HTTPS_PROXY", format!("http://{addr}"))
+            .env("HTTP_PROXY", format!("http://{addr}"))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .output()
+            .unwrap();
+        attempt += 1;
+        if out.status.success()
+            || attempt >= 5
+            || !String::from_utf8_lossy(&out.stderr).contains("AddrInUse")
+        {
+            break out;
+        }
+    };
+    assert!(
+        output.status.success(),
+        "HTTPS Seam 1 subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn run_https_seam1_suite() {
+    let fixture_dir = std::path::PathBuf::from(std::env::var_os(HTTPS_FIXTURE_ENV).unwrap());
+    let proxy_addr = std::env::var(HTTPS_PROXY_ADDR_ENV).unwrap();
+
+    // Two distinct cua-spacesd servers behind one HTTPS origin (`https://relay.invalid`).
+    let srv_a = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    srv_a.state.advertise(&["presence"]);
+    srv_a
+        .state
+        .offer_presence_datagrams(cua_spacesd_client::pb::PresenceDatagrams {
+            endpoint: Some(cua_spacesd_client::pb::QuicEndpoint {
+                port: 49999,
+                certificate_sha256: "00".repeat(32),
+                alpn: String::new(),
+            }),
+            ticket: "udp-ticket".into(),
+            ..Default::default()
+        });
+
+    let srv_b = MockServer::start(MockAuth {
+        token: Some(TOKEN_B.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_B}")),
+    })
+    .await;
+
+    let srv_a_rotated = MockServer::start(MockAuth {
+        token: Some(TOKEN_A_ROTATED.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+
+    let active_a = Arc::new(AtomicBool::new(false));
+    let seen_relay_paths = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+
+    // Route table: switchable upstream for MACHINE_A to test token rotation on re-add.
+    let router_addr = {
+        let mut routes = HashMap::new();
+        routes.insert(MACHINE_A.to_string(), srv_a.addr);
+        routes.insert(MACHINE_B.to_string(), srv_b.addr);
+        start_static_path_router(routes, None, seen_relay_paths.clone()).await
+    };
+    let router_rotated_addr = {
+        let mut routes = HashMap::new();
+        routes.insert(MACHINE_A.to_string(), srv_a_rotated.addr);
+        routes.insert(MACHINE_B.to_string(), srv_b.addr);
+        start_static_path_router(routes, None, seen_relay_paths.clone()).await
+    };
+
+    // TLS config for `relay.invalid` with ALPN h2 + http/1.1.
+    let mut tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![std::fs::read(fixture_dir.join("leaf.der")).unwrap().into()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(
+            std::fs::read(fixture_dir.join("key.der")).unwrap(),
+        )
+        .into(),
+    )
+    .unwrap();
+    tls_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_cfg = Arc::new(tls_cfg);
+
+    // Port-443 plaintext TCP/HTTP spy + HTTPS CONNECT proxy.
+    let plaintext_leaks = Arc::new(Mutex::new(Vec::<String>::new()));
+    let proxy = TcpListener::bind(&proxy_addr).await.unwrap();
+    let leaks_bg = plaintext_leaks.clone();
+    let active_a_bg = active_a.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = proxy.accept().await else {
+                break;
+            };
+            let tls_cfg = tls_cfg.clone();
+            let leaks = leaks_bg.clone();
+            let active_a_bg = active_a_bg.clone();
+            tokio::spawn(async move {
+                let Some(head) = read_http_head(&mut socket).await else {
+                    return;
+                };
+                if !head.starts_with("CONNECT relay.invalid:443 ") {
+                    // Any plaintext HTTP request to port 443 or non-CONNECT traffic is a leak!
+                    leaks.lock().unwrap().push(head);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.is_err() {
+                    return;
+                }
+                let Ok(hello) = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    socket,
+                )
+                .await
+                else {
+                    leaks
+                        .lock()
+                        .unwrap()
+                        .push("non-TLS bytes sent on port-443 tunnel".into());
+                    return;
+                };
+                assert_eq!(hello.client_hello().server_name(), Some("relay.invalid"));
+                let Ok(mut tls_stream) = hello.into_stream(tls_cfg).await else {
+                    return;
+                };
+                let target = if active_a_bg.load(Ordering::SeqCst) {
+                    router_rotated_addr
+                } else {
+                    router_addr
+                };
+                if let Ok(mut upstream) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream).await;
+                }
+            });
+        }
+    });
+
+    // Account Relay HTTP spy: MUST receive 0 requests across all Static Relay operations.
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+
+    // Spy PresenceDatagrams: MUST never be dialed for Static Relay Spaces (Provider::Relay).
+    let udp_dial_calls = Arc::new(AtomicUsize::new(0));
+    cua_spaces::presence::register_presence_datagrams(Arc::new(SpyPresenceDatagrams {
+        connect_calls: udp_dial_calls.clone(),
+    }));
+
+    let home = tempfile::tempdir().unwrap();
+    let build_spaces = || {
+        Spaces::builder()
+            .home(home.path())
+            .probe_timeout(Duration::from_secs(5))
+            .relay(RelayAccount::new(
+                &account_spy_url,
+                Arc::new(StaticToken("account-spy-bearer".into())),
+            ))
+            .build()
+    };
+    let spaces = build_spaces();
+
+    let info_a = spaces
+        .add(
+            &format!("https://relay.invalid/m/{MACHINE_A}"),
+            Some(TOKEN_A.into()),
+            Some("alpha-box".into()),
+        )
+        .await
+        .expect("machine A static relay add must succeed");
+    assert_eq!(info_a.id, format!("relay:{MACHINE_A}"));
+    assert_eq!(info_a.provider, Provider::Relay);
+    assert_eq!(info_a.name, "alpha-box");
+    assert!(info_a.added_at.is_some());
+
+    let info_b = spaces
+        .add(
+            &format!("https://relay.invalid/m/{MACHINE_B}/"),
+            Some(TOKEN_B.into()),
+            None,
+        )
+        .await
+        .expect("machine B static relay add must succeed");
+    assert_eq!(info_b.id, format!("relay:{MACHINE_B}"));
+    assert_eq!(info_b.provider, Provider::Relay);
+    assert!(
+        !info_b.name.contains("relay.invalid:443"),
+        "{}",
+        info_b.name
+    );
+    assert!(info_b.added_at.is_some());
+
+    // Stored credentials match BYOC Static Relay format (`url` normalized, `token: Some`).
+    let cred_a = spaces
+        .registry()
+        .credential(&format!("relay:{MACHINE_A}"))
+        .unwrap()
+        .expect("cred A persisted");
+    assert_eq!(
+        cred_a.url.as_deref(),
+        Some(format!("https://relay.invalid/m/{MACHINE_A}").as_str())
+    );
+    assert_eq!(cred_a.token.as_deref(), Some(TOKEN_A));
+
+    let cred_b = spaces
+        .registry()
+        .credential(&format!("relay:{MACHINE_B}"))
+        .unwrap()
+        .expect("cred B persisted");
+    assert_eq!(
+        cred_b.url.as_deref(),
+        Some(format!("https://relay.invalid/m/{MACHINE_B}").as_str())
+    );
+    assert_eq!(cred_b.token.as_deref(), Some(TOKEN_B));
+
+    let reloaded = build_spaces();
+    let listed = reloaded.list().unwrap();
+    assert_eq!(listed.len(), 2, "both machines must coexist: {listed:?}");
+    assert_eq!(
+        reloaded.resolve(&format!("relay:{MACHINE_A}")).unwrap(),
+        SpaceId::Relay {
+            machine_id: MACHINE_A.into()
+        }
+    );
+    assert_eq!(
+        reloaded.resolve(MACHINE_A).unwrap(),
+        SpaceId::Relay {
+            machine_id: MACHINE_A.into()
+        }
+    );
+    assert_eq!(
+        reloaded.resolve("alpha-box").unwrap(),
+        SpaceId::Relay {
+            machine_id: MACHINE_A.into()
+        }
+    );
+    assert_eq!(
+        reloaded
+            .resolve(&format!("https://relay.invalid/m/{MACHINE_B}"))
+            .unwrap(),
+        SpaceId::Relay {
+            machine_id: MACHINE_B.into()
+        }
+    );
+    assert_eq!(
+        reloaded.find("alpha-box").await.unwrap().id,
+        format!("relay:{MACHINE_A}")
+    );
+    assert_eq!(
+        reloaded.find(MACHINE_B).await.unwrap().id,
+        format!("relay:{MACHINE_B}")
+    );
+
+    let space_a = reloaded.space("alpha-box").await.unwrap();
+    let space_b = reloaded.space(&format!("relay:{MACHINE_B}")).await.unwrap();
+    assert_eq!(space_a.provider(), Provider::Relay);
+    assert_eq!(space_b.provider(), Provider::Relay);
+    assert_eq!(
+        space_a.route().map(|r| r.transport()),
+        Some(Transport::RelayHttps)
+    );
+    let out_a = space_a
+        .bash("echo hello-alpha", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(out_a.render().contains("hello-alpha"), "{}", out_a.render());
+    let out_b = space_b
+        .bash("echo hello-beta", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(out_b.render().contains("hello-beta"), "{}", out_b.render());
+
+    // Verify presence skips LAN UDP datagrams for Static Relay Space (`Provider::Relay`).
+    let presence = space_a
+        .join_presence_with(
+            PresenceIdentity {
+                id: "user-1".into(),
+                display_name: "Tester".into(),
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(!presence.uses_datagrams());
+    assert_eq!(
+        udp_dial_calls.load(Ordering::SeqCst),
+        0,
+        "Static Relay Space must skip LAN UDP presence datagrams"
+    );
+    presence.leave().await.unwrap();
+
+    active_a.store(true, Ordering::SeqCst);
+    let updated = reloaded
+        .add(
+            &format!("https://relay.invalid/m/{MACHINE_A}"),
+            Some(TOKEN_A_ROTATED.into()),
+            Some("alpha-rotated".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.id, format!("relay:{MACHINE_A}"));
+    assert_eq!(updated.name, "alpha-rotated");
+    let cred_a2 = reloaded
+        .registry()
+        .credential(&format!("relay:{MACHINE_A}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cred_a2.token.as_deref(), Some(TOKEN_A_ROTATED));
+    let space_a2 = reloaded.space("alpha-rotated").await.unwrap();
+    let out_a2 = space_a2
+        .bash("echo rotated-ok", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        out_a2.render().contains("rotated-ok"),
+        "{}",
+        out_a2.render()
+    );
+
+    let renamed = reloaded
+        .rename(&format!("relay:{MACHINE_B}"), "beta-renamed")
+        .await
+        .unwrap();
+    assert_eq!(renamed.shown_name(), "beta-renamed");
+    reloaded
+        .remove(&format!("relay:{MACHINE_B}"))
+        .await
+        .unwrap();
+    assert_eq!(reloaded.list().unwrap().len(), 1);
+
+    let paths = seen_relay_paths.lock().unwrap().clone();
+    assert!(
+        paths.iter().any(|(p, a)| {
+            p.starts_with(&format!("/m/{MACHINE_A}/"))
+                && a.as_deref() == Some(&format!("Bearer {TOKEN_A}"))
+        }),
+        "expected Bearer TOKEN_A on /m/{MACHINE_A}: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|(p, a)| {
+            p.starts_with(&format!("/m/{MACHINE_B}/"))
+                && a.as_deref() == Some(&format!("Bearer {TOKEN_B}"))
+        }),
+        "expected Bearer TOKEN_B on /m/{MACHINE_B}: {paths:?}"
+    );
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "Account Relay must receive 0 requests during Static Relay ops, got: {:?}",
+        account_spy.snapshot()
+    );
+    assert!(
+        plaintext_leaks.lock().unwrap().is_empty(),
+        "Port-443 plaintext spy detected leaks: {:?}",
+        plaintext_leaks.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_relay_mesh_enabled_pairs_and_dials_two_machines_without_account_relay() {
+    let coord = FakeCoordinator::start(Mode::Static).await;
+    let mesh_dir = tempfile::tempdir().unwrap();
+
+    // Two mock spacesd servers bridged onto the Static Token Mode mesh coordinator.
+    let srv_a = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: None,
+    })
+    .await;
+    let srv_b = MockServer::start(MockAuth {
+        token: Some(TOKEN_B.into()),
+        gateway: None,
+        prefix: None,
+    })
+    .await;
+
+    async fn start_mesh_machine(
+        coord: &FakeCoordinator,
+        dir: &Path,
+        machine_id: &'static str,
+        token: &'static str,
+        upstream: SocketAddr,
+    ) -> Mesh {
+        let mut cfg = MeshConfig::new(
+            coord.url.clone(),
+            NodeKind::Machine,
+            Some(dir.join(format!("{machine_id}.json"))),
+            static_auth(vec![("x-cua-machine-id".into(), machine_id.into())]),
+        );
+        cfg.stun = vec![coord.stun.to_string()];
+        cfg.approved_path = Some(dir.join(format!("{machine_id}-approved.json")));
+        cfg.pair_verifier = Some(Arc::new(move |client, ts, proof| {
+            cua_mesh::proto::verify_pair_proof(
+                token,
+                machine_id,
+                client,
+                ts,
+                proof,
+                cua_mesh::proto::now_secs(),
+            )
+        }));
+        let mesh = Mesh::start(cfg).await.unwrap();
+        mesh.wait_ready(Duration::from_secs(10)).await.unwrap();
+        let m = mesh.clone();
+        tokio::spawn(async move {
+            while let Some(mut incoming) = m.accept().await {
+                if incoming.header.service == "spacesd" {
+                    tokio::spawn(async move {
+                        if let Ok(mut tcp) = TcpStream::connect(upstream).await {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut incoming.stream, &mut tcp).await;
+                        }
+                    });
+                }
+            }
+        });
+        mesh
+    }
+
+    let _machine_a =
+        start_mesh_machine(&coord, mesh_dir.path(), MACHINE_A, TOKEN_A, srv_a.addr).await;
+    let _machine_b =
+        start_mesh_machine(&coord, mesh_dir.path(), MACHINE_B, TOKEN_B, srv_b.addr).await;
+
+    // Front `/v1/info` (advertising mesh v1) + `/v1/mesh/connect` (spliced to FakeCoordinator)
+    // behind one Static Token Mode relay origin.
+    let coord_addr: SocketAddr = coord.url.strip_prefix("http://").unwrap().parse().unwrap();
+    let stun_str = coord.stun.to_string();
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+    let relay_url = format!("http://{relay_addr}");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client_tcp, _)) = relay_listener.accept().await else {
+                break;
+            };
+            let stun_str = stun_str.clone();
+            tokio::spawn(async move {
+                let mut peek = vec![0u8; 4096];
+                let Ok(n) = client_tcp.peek(&mut peek).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                let head = String::from_utf8_lossy(&peek[..n]);
+                let first_line = head.lines().next().unwrap_or_default();
+                if first_line.starts_with("GET /v1/info ") {
+                    let mut sink = vec![0u8; n];
+                    let _ = client_tcp.read(&mut sink).await;
+                    let body = serde_json::json!({
+                        "account_auth": false,
+                        "issuer": serde_json::Value::Null,
+                        "mesh": { "stun": [stun_str], "version": 1 },
+                        "public_url": format!("http://{relay_addr}"),
+                        "state_writable": false,
+                        "static_tokens": true,
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client_tcp.write_all(resp.as_bytes()).await;
+                    return;
+                }
+                if first_line.contains("/v1/mesh/") {
+                    if let Ok(mut upstream) = TcpStream::connect(coord_addr).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client_tcp, &mut upstream).await;
+                    }
+                    return;
+                }
+                let _ = client_tcp
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(8))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .build();
+
+    let info_a = spaces
+        .add(
+            &format!("{relay_url}/m/{MACHINE_A}"),
+            Some(TOKEN_A.into()),
+            Some("mesh-alpha".into()),
+        )
+        .await
+        .expect("machine A over static mesh must add");
+    let info_b = spaces
+        .add(
+            &format!("{relay_url}/m/{MACHINE_B}"),
+            Some(TOKEN_B.into()),
+            Some("mesh-beta".into()),
+        )
+        .await
+        .expect("machine B over static mesh must add");
+    assert_eq!(info_a.id, format!("relay:{MACHINE_A}"));
+    assert_eq!(info_b.id, format!("relay:{MACHINE_B}"));
+
+    let space_a = spaces.space("mesh-alpha").await.unwrap();
+    let space_b = spaces.space("mesh-beta").await.unwrap();
+    assert_eq!(
+        space_a.route().map(|r| r.transport()),
+        Some(Transport::Mesh),
+        "expected mesh transport for A, got {:?}",
+        space_a.route()
+    );
+    assert_eq!(
+        space_b.route().map(|r| r.transport()),
+        Some(Transport::Mesh),
+        "expected mesh transport for B, got {:?}",
+        space_b.route()
+    );
+    assert!(
+        space_a
+            .bash("echo mesh-a", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("mesh-a")
+    );
+    assert!(
+        space_b
+            .bash("echo mesh-b", Duration::from_secs(5))
+            .await
+            .unwrap()
+            .render()
+            .contains("mesh-b")
+    );
+    assert_eq!(
+        account_spy.count(),
+        0,
+        "Account Relay must receive 0 requests during Static Relay mesh ops: {:?}",
+        account_spy.snapshot()
+    );
+}
+
+#[tokio::test]
+async fn plain_http_mcp_under_m_path_registers_as_direct_without_token() {
+    let (account_spy_url, account_spy) = HttpSpy::start().await;
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(5))
+        .relay(RelayAccount::new(
+            &account_spy_url,
+            Arc::new(StaticToken("account-spy-bearer".into())),
+        ))
+        .build();
+
+    // Case 1: `/m/tools` (segment shorter than valid_machine_id) without token.
+    let mcp_short = McpTestServer::start("/m/tools").await.unwrap();
+    let info_short = spaces
+        .add(
+            &format!("{}/m/tools/mcp", mcp_short.url),
+            None,
+            Some("mcp-short".into()),
+        )
+        .await
+        .expect("plain MCP at /m/tools/mcp must succeed without token");
+    assert_eq!(info_short.provider, Provider::Direct);
+    assert!(info_short.id.starts_with("direct:"), "{}", info_short.id);
+    assert_eq!(info_short.services, ["mcp"]);
+    let (tools, _) = spaces
+        .space("mcp-short")
+        .await
+        .unwrap()
+        .list_tools(Some("mcp"))
+        .await
+        .unwrap();
+    assert!(!tools.is_empty());
+
+    // Case 2: `/m/<valid-machine-id>` where the server is a plain HTTP MCP server without token.
+    let mcp_valid_seg = McpTestServer::start("/m").await.unwrap();
+    let info_valid = spaces
+        .add(
+            &format!("{}/m/mcp", mcp_valid_seg.url),
+            None,
+            Some("mcp-m".into()),
+        )
+        .await
+        .expect("plain MCP at /m/mcp must succeed without token");
+    assert_eq!(info_valid.provider, Provider::Direct);
+    assert!(info_valid.id.starts_with("direct:"), "{}", info_valid.id);
+
+    // Case 3: `/m/<valid-machine-id>` exact two-segment path serving plain MCP without token.
+    // McpTestServer mounts at `<prefix>/mcp`; mount at `/m` gives `/m/mcp`, and mount at `/m/mcp-service-001` gives `/m/mcp-service-001/mcp`.
+    // Also verify a plain MCP server directly at `/m/mcp-service-001` (exact 2 segments, valid machine id) without token!
+    let mcp_exact_origin = McpTestServer::start("").await.unwrap();
+    let rewrite_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rewrite_addr = rewrite_listener.local_addr().unwrap();
+    let upstream_port = mcp_exact_origin.port();
+    tokio::spawn(async move {
+        let client: hyper_util::client::legacy::Client<
+            hyper_util::client::legacy::connect::HttpConnector,
+            hyper::body::Incoming,
+        > = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+        loop {
+            let Ok((tcp, _)) = rewrite_listener.accept().await else {
+                break;
+            };
+            let client = client.clone();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(
+                    move |mut req: http::Request<hyper::body::Incoming>| {
+                        let client = client.clone();
+                        async move {
+                            let uri: http::Uri = format!("http://127.0.0.1:{upstream_port}/mcp")
+                                .parse()
+                                .unwrap();
+                            *req.uri_mut() = uri;
+                            req.headers_mut().remove(http::header::HOST);
+                            client.request(req).await
+                        }
+                    },
+                );
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(hyper_util::rt::TokioIo::new(tcp), svc)
+                .await;
+            });
+        }
+    });
+    let info_exact = spaces
+        .add(
+            &format!("http://{rewrite_addr}/m/mcp-service-001"),
+            None,
+            Some("mcp-exact".into()),
+        )
+        .await
+        .expect("plain MCP at exact /m/<valid-machine-id> must register as direct without token");
+    assert_eq!(info_exact.provider, Provider::Direct);
+    assert_eq!(info_exact.id, format!("direct:{rewrite_addr}"));
+    assert_eq!(info_exact.services, ["mcp"]);
+    let (tools, _) = spaces
+        .space("mcp-exact")
+        .await
+        .unwrap()
+        .list_tools(Some("mcp"))
+        .await
+        .unwrap();
+    assert!(!tools.is_empty());
+
+    assert_eq!(account_spy.count(), 0);
+}
+
+#[tokio::test]
+async fn upfront_rejections_missing_token_host_flag_and_malformed_machine_id_never_mutate_stores() {
+    let srv_auth = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    // Even an unauthenticated spacesd behind `/m/<machine-id>` MUST be rejected when token is missing!
+    let srv_open = MockServer::start(MockAuth {
+        token: None,
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_B}")),
+    })
+    .await;
+
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(3))
+        .build();
+
+    for (url, tok) in [
+        (format!("{}/m/{MACHINE_A}", srv_auth.url()), None),
+        (
+            format!("{}/m/{MACHINE_A}", srv_auth.url()),
+            Some(String::new()),
+        ),
+        (
+            format!("{}/m/{MACHINE_A}", srv_auth.url()),
+            Some("   ".into()),
+        ),
+        (format!("{}/m/{MACHINE_B}", srv_open.url()), None),
+    ] {
+        let err = spaces.add(&url, tok, None).await.unwrap_err();
+        assert_eq!(err.tag(), "invalid_argument", "{url}: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--token") && msg.contains("CUA_ENV_TOKEN"),
+            "missing-token error must be actionable: {msg}"
+        );
+    }
+
+    let err = spaces
+        .add_direct_host(
+            &format!("{}/m/{MACHINE_A}", srv_auth.url()),
+            Some(TOKEN_A.into()),
+            Some("bad-host".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.tag(), "invalid_argument", "{err}");
+    assert!(
+        err.to_string().contains("--host") && err.to_string().contains("Direct Host"),
+        "unexpected --host error: {err}"
+    );
+    assert!(
+        !spaces.registry().spaces_path().exists(),
+        "spaces.json must not be created on --host rejection"
+    );
+    assert!(
+        !spaces.registry().credentials_path().exists(),
+        "spaces-credentials.json must not be created on --host rejection"
+    );
+    assert!(
+        !spaces.registry().direct_hosts_path().exists(),
+        "direct-hosts.json must not be created on --host rejection"
+    );
+
+    let too_long = "a".repeat(65);
+    for bad_id in [
+        "short",
+        "UPPERCASE123",
+        "-leading-dash",
+        "trailing-dash-",
+        "bad_under_score",
+        too_long.as_str(),
+    ] {
+        let url = format!("{}/m/{bad_id}", srv_auth.url());
+        let err = spaces
+            .add(&url, Some(TOKEN_A.into()), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.tag(), "invalid_argument", "{bad_id}: {err}");
+        assert!(
+            err.to_string().contains("[a-z0-9-]{8,64}"),
+            "malformed id error must cite grammar for {bad_id}: {err}"
+        );
+    }
+
+    assert!(spaces.list().unwrap().is_empty());
+    assert!(!spaces.registry().spaces_path().exists());
+    assert!(!spaces.registry().credentials_path().exists());
+    assert!(!spaces.registry().direct_hosts_path().exists());
+}
+
+#[tokio::test]
+async fn direct_space_has_no_legacy_static_relay_branch() {
+    let srv = MockServer::start(MockAuth {
+        token: Some(TOKEN_A.into()),
+        gateway: None,
+        prefix: Some(format!("/m/{MACHINE_A}")),
+    })
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    let spaces = Spaces::builder()
+        .home(home.path())
+        .probe_timeout(Duration::from_secs(3))
+        .build();
+
+    // Manually seed a pre-release `direct:<host>:<port>` record with a `/m/<id>` credential URL:
+    // with the legacy `Via::Static` branch deleted from `SpaceId::Direct`, connecting uses
+    // `Transport::Direct` only and never routes via `ChannelRoute::Relay` or mesh.
+    let direct_id = format!("direct:{}", srv.addr);
+    spaces
+        .registry()
+        .upsert(
+            cua_proto::daemon::v1::Space {
+                id: direct_id.clone(),
+                name: "legacy-direct".into(),
+                ..Default::default()
+            },
+            cua_spaces::registry::Credential {
+                url: Some(format!("{}/m/{MACHINE_A}", srv.url())),
+                token: Some(TOKEN_A.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let space = spaces.space(&direct_id).await.unwrap();
+    assert_eq!(space.provider(), Provider::Direct);
+    assert_eq!(
+        space.route().map(|r| r.transport()),
+        Some(Transport::Direct),
+        "SpaceId::Direct must not route through legacy Via::Static relay/mesh"
+    );
+}

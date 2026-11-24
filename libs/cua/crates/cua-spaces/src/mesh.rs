@@ -263,6 +263,12 @@ impl MeshClients {
         );
     }
 
+    /// Drops any recorded mesh route or fallback entry for `space`.
+    pub(crate) fn clear_space(&self, space: &str) {
+        self.routed.lock().expect("routed").remove(space);
+        self.fallbacks.lock().expect("fallbacks").remove(space);
+    }
+
     /// Why a Space on the relay's HTTPS path should reconnect now: its
     /// machine joined the mesh since (checked at most every `every`).
     /// Reported once; the reconnect picks the route again.

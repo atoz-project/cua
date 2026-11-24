@@ -1263,7 +1263,7 @@ pub async fn run_spaces_sdk(
             host: _,
         } => {
             let info = spaces
-                .add_with_service(url, token.filter(|t| !t.is_empty()), name, service)
+                .add_with_service(url, token.filter(|t| !t.trim().is_empty()), name, service)
                 .await?;
             if json {
                 line(out, space_json(&info).to_string());
@@ -4241,7 +4241,7 @@ pub async fn run_add_host(
     };
     let spaces = cua_spaces::Spaces::builder().home(home).build();
     let info = spaces
-        .add_direct_host(&url, token.filter(|t| !t.is_empty()), name)
+        .add_direct_host(&url, token.filter(|t| !t.trim().is_empty()), name)
         .await
         .map_err(CuaError::from)?;
     let host = spaces

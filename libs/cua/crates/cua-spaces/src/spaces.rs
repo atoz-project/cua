@@ -1142,7 +1142,7 @@ impl Spaces {
     ) -> Option<String> {
         let key = format!("relay:{machine_id}");
         let cred = self.inner.registry.credential(&key).ok().flatten()?;
-        if cred.token.is_some() {
+        if cred.token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
             return None;
         }
         let url = cred.url.as_deref()?;
@@ -1159,7 +1159,8 @@ impl Spaces {
             .ok()
             .flatten()
             .is_some_and(|cred| {
-                cred.url.as_deref().is_some_and(|u| !u.is_empty()) && cred.token.is_some()
+                cred.url.as_deref().is_some_and(|u| !u.is_empty())
+                    && cred.token.as_deref().is_some_and(|t| !t.trim().is_empty())
             })
     }
 
@@ -1414,72 +1415,201 @@ impl Spaces {
         service: Option<String>,
     ) -> Result<SpaceInfo> {
         let url = url.trim();
-        let is_id = url.starts_with("space://")
-            || ["local:", "cloud:", "direct:", "relay:"]
-                .iter()
-                .any(|p| url.starts_with(p));
-        let (id, endpoint_url) = if is_id {
-            let id = SpaceId::parse(url)?;
-            let endpoint = match &id {
-                SpaceId::Direct { authority } => Some(format!("http://{authority}")),
-                _ => None,
-            };
-            (id, endpoint)
-        } else {
-            let with_scheme = if url.contains("://") {
-                url.to_string()
-            } else {
-                format!("http://{url}")
-            };
-            let endpoint = cua_spacesd_client::Endpoint::parse(&with_scheme)?;
-            let id = SpaceId::Direct {
-                authority: authority(endpoint.host(), endpoint.port()),
-            };
-            (id, Some(with_scheme))
-        };
-        let mut credential = Credential {
-            url: endpoint_url.clone(),
-            token,
-            ..Default::default()
-        };
-        let record = self.inner.registry.get(&id.to_string())?;
-        let space = match self
-            .connect(&id, &credential, name.as_deref(), record.as_ref())
-            .await
-        {
-            Ok(s) => s,
-            Err(e) if not_an_spacesd(&e) => {
-                // Not a spacesd: maybe an MCP endpoint.
-                let (Some(mcp_url), SpaceId::Direct { .. }) = (endpoint_url, &id) else {
-                    return Err(e);
+        let token = token.filter(|t| !t.trim().is_empty());
+        let name = name.filter(|n| !n.trim().is_empty());
+        let explicit_service = service.filter(|s| !s.trim().is_empty());
+
+        let (id, space, credential) = match classify_add_target(url)? {
+            AddTarget::Id { id, endpoint_url } => {
+                let credential = Credential {
+                    url: endpoint_url,
+                    token,
+                    ..Default::default()
                 };
-                let service = service
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| "mcp".into());
-                credential.service_urls.insert(service.clone(), mcp_url);
+                let record = self.inner.registry.get(&id.to_string())?;
                 let space = self
                     .connect(&id, &credential, name.as_deref(), record.as_ref())
                     .await?;
-                if let Err(mcp) = space.mcp(&service).await {
-                    return Err(match e {
-                        Error::SpacesdNotAvailable { reason, .. } => Error::SpacesdNotAvailable {
-                            space: id.to_string(),
-                            reason: format!("{reason}; no MCP server answered either ({mcp})"),
-                        },
-                        other => other,
-                    });
-                }
-                space
+                (id, space, credential)
             }
-            Err(e) => return Err(e),
+            AddTarget::DirectUrl { id, raw_url } => {
+                let credential = Credential {
+                    url: Some(raw_url.clone()),
+                    token: token.clone(),
+                    ..Default::default()
+                };
+                let record = self.inner.registry.get(&id.to_string())?;
+                match self
+                    .connect(&id, &credential, name.as_deref(), record.as_ref())
+                    .await
+                {
+                    Ok(space) => (id, space, credential),
+                    Err(e) if not_an_spacesd(&e) => {
+                        let (space, mcp_cred) = self
+                            .try_add_plain_mcp(
+                                &id,
+                                &raw_url,
+                                token,
+                                name.as_deref(),
+                                explicit_service.as_deref(),
+                                Some(e),
+                            )
+                            .await?;
+                        (id, space, mcp_cred)
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            AddTarget::RelayPathUrl {
+                endpoint,
+                machine_id,
+                has_extra_segments,
+                raw_url,
+                direct_id,
+            } => {
+                if explicit_service.is_some() {
+                    let (space, mcp_cred) = self
+                        .try_add_plain_mcp(
+                            &direct_id,
+                            &raw_url,
+                            token,
+                            name.as_deref(),
+                            explicit_service.as_deref(),
+                            None,
+                        )
+                        .await?;
+                    (direct_id, space, mcp_cred)
+                } else if !cua_sandbox_core::refs::valid_machine_id(&machine_id)
+                    || has_extra_segments
+                {
+                    match self
+                        .try_add_plain_mcp(&direct_id, &raw_url, token, name.as_deref(), None, None)
+                        .await
+                    {
+                        Ok((space, mcp_cred)) => (direct_id, space, mcp_cred),
+                        Err(_) if !cua_sandbox_core::refs::valid_machine_id(&machine_id) => {
+                            return Err(Error::invalid(format!(
+                                "invalid Static Relay machine id {machine_id:?}: must match \
+                                 [a-z0-9-]{{8,64}} (lowercase letters, digits, and hyphens, \
+                                 without leading or trailing '-')"
+                            )));
+                        }
+                        Err(_) => {
+                            return Err(Error::invalid(format!(
+                                "invalid Static Relay URL {raw_url:?}: expected \
+                                 <origin>/m/<machine-id> without extra path segments"
+                            )));
+                        }
+                    }
+                } else if let Some(tok) = token {
+                    let relay_id = SpaceId::Relay {
+                        machine_id: machine_id.clone(),
+                    };
+                    let credential = Credential {
+                        url: Some(endpoint.to_string()),
+                        token: Some(tok.clone()),
+                        ..Default::default()
+                    };
+                    let record = self.inner.registry.get(&relay_id.to_string())?;
+                    match self
+                        .connect(&relay_id, &credential, name.as_deref(), record.as_ref())
+                        .await
+                    {
+                        Ok(space) => (relay_id, space, credential),
+                        Err(e) if not_an_spacesd(&e) => {
+                            let (space, mcp_cred) = self
+                                .try_add_plain_mcp(
+                                    &direct_id,
+                                    &raw_url,
+                                    Some(tok),
+                                    name.as_deref(),
+                                    None,
+                                    Some(e),
+                                )
+                                .await?;
+                            (direct_id, space, mcp_cred)
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    match self
+                        .try_add_plain_mcp(&direct_id, &raw_url, None, name.as_deref(), None, None)
+                        .await
+                    {
+                        Ok((space, mcp_cred)) => (direct_id, space, mcp_cred),
+                        Err(_) => {
+                            return Err(Error::invalid(format!(
+                                "Static Relay URL {endpoint} requires a non-empty token; \
+                                 pass --token <token> or set CUA_ENV_TOKEN"
+                            )));
+                        }
+                    }
+                }
+            }
         };
+
+        let key = id.to_string();
         self.store(&space, credential)?;
+        if name.is_some()
+            && self
+                .inner
+                .registry
+                .meta(&key)
+                .is_some_and(|m| !m.display_name.is_empty())
+        {
+            self.inner
+                .registry
+                .update_meta(&key, |m| m.display_name.clear())?;
+        }
+        self.inner.dial_backoff.clear(&key);
         self.inner
-            .connections
+            .connected_sessions
             .lock()
-            .await
-            .insert(id.to_string(), space.clone());
+            .expect("sessions")
+            .remove(&key);
+        if space.route().map(|r| r.transport()) != Some(crate::Transport::Mesh) {
+            self.inner.mesh.clear_space(&key);
+        }
+        self.inner.connections.lock().await.insert(key, space);
         self.info(&id)
+    }
+
+    async fn try_add_plain_mcp(
+        &self,
+        direct_id: &SpaceId,
+        mcp_url: &str,
+        token: Option<String>,
+        name: Option<&str>,
+        service: Option<&str>,
+        spacesd_err: Option<Error>,
+    ) -> Result<(Space, Credential)> {
+        let service = service
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("mcp")
+            .to_string();
+        let mut credential = Credential {
+            url: Some(mcp_url.to_string()),
+            token,
+            ..Default::default()
+        };
+        credential
+            .service_urls
+            .insert(service.clone(), mcp_url.to_string());
+        let record = self.inner.registry.get(&direct_id.to_string())?;
+        let space = self
+            .connect(direct_id, &credential, name, record.as_ref())
+            .await?;
+        if let Err(mcp) = space.mcp(&service).await {
+            return Err(match spacesd_err {
+                Some(Error::SpacesdNotAvailable { reason, .. }) => Error::SpacesdNotAvailable {
+                    space: direct_id.to_string(),
+                    reason: format!("{reason}; no MCP server answered either ({mcp})"),
+                },
+                Some(other) => other,
+                None => mcp,
+            });
+        }
+        Ok((space, credential))
     }
 
     /// Forgets a Space (registry entry and stored token). The sandbox is not
@@ -1496,6 +1626,7 @@ impl Spaces {
         // its stale record would list again on the next refresh. Only its
         // owner can remove it; anything else is only dropped here.
         if let SpaceId::Relay { machine_id } = &id
+            && !self.is_static_relay_machine(machine_id)
             && self.relay_account().is_some()
             && let Some(m) = self
                 .relay_machines()
@@ -1934,7 +2065,9 @@ impl Spaces {
             // What the relay says about the computer now: one that came
             // back (online again, or a new session) is dialed afresh.
             let presence = match &id {
-                SpaceId::Relay { machine_id } => me.relay_presence(machine_id),
+                SpaceId::Relay { machine_id } if !me.is_static_relay_machine(machine_id) => {
+                    me.relay_presence(machine_id)
+                }
                 _ => None,
             };
             if let Some(f) = gate.failed.lock().expect("gate").clone()
@@ -2079,7 +2212,7 @@ impl Spaces {
         // (`crate::dial_backoff`). An online one is always dialed: its
         // cua-spacesd may be a moment from connecting (`cua spaces start`).
         let presence = match &id {
-            SpaceId::Relay { machine_id } => {
+            SpaceId::Relay { machine_id } if !self.is_static_relay_machine(machine_id) => {
                 Some(self.relay_presence(machine_id)).filter(|p| matches!(p, Some((false, _))))
             }
             _ => None,
@@ -2153,7 +2286,9 @@ impl Spaces {
     /// for a Space no relay computer carries.
     fn session_of(&self, key: &str) -> crate::dial_backoff::Presence {
         match SpaceId::parse(key).ok()? {
-            SpaceId::Relay { machine_id } => self.relay_presence(&machine_id),
+            SpaceId::Relay { machine_id } if !self.is_static_relay_machine(&machine_id) => {
+                self.relay_presence(&machine_id)
+            }
             SpaceId::Direct { authority } => {
                 let (machine, _) = crate::id::routed_host(&authority)?;
                 self.relay_presence(machine)
@@ -2222,7 +2357,9 @@ impl Spaces {
     /// listed it.
     pub(crate) fn carrier_listed_offline(&self, key: &str) -> bool {
         let machine = match SpaceId::parse(key) {
-            Ok(SpaceId::Relay { machine_id }) => machine_id,
+            Ok(SpaceId::Relay { machine_id }) if !self.is_static_relay_machine(&machine_id) => {
+                machine_id
+            }
             Ok(SpaceId::Direct { authority }) => match crate::id::routed_host(&authority) {
                 Some((machine, _)) => machine.to_string(),
                 None => return false,
@@ -2343,39 +2480,7 @@ impl Spaces {
                         .unwrap_or_else(|| format!("http://{authority}"));
                     let mut o = ConnectOptions::parse(&url)?;
                     o.token = credential.token.clone();
-                    // A machine on a self-hosted (static-token) relay: the
-                    // mesh when the relay coordinates one (pairing with the
-                    // env token), the relay's HTTPS path otherwise.
-                    let mut route = Some(crate::ChannelRoute::Direct(o.endpoint.origin()));
-                    if let (cua_spacesd_client::EndpointKind::Relay { machine_id }, Some(token)) =
-                        (o.endpoint.kind().clone(), credential.token.as_deref())
-                    {
-                        let relay_url = o.endpoint.origin();
-                        let via = crate::mesh::Via::Static {
-                            relay: &relay_url,
-                            token,
-                        };
-                        route = Some(crate::ChannelRoute::Relay(relay_url.clone()));
-                        match crate::mesh::connect_options(
-                            &self.inner.mesh,
-                            crate::mesh::Via::Static {
-                                relay: &relay_url,
-                                token,
-                            },
-                            &machine_id,
-                            crate::mesh::policy(),
-                        )
-                        .await?
-                        {
-                            crate::mesh::Route::Mesh(m, via_mesh) => {
-                                tracing::info!(machine = %machine_id, "relay Space over the mesh");
-                                self.inner.mesh.note_routed(&id.to_string(), &via, false);
-                                o = *m;
-                                route = Some(via_mesh);
-                            }
-                            crate::mesh::Route::Relay { fallback: why } => fallback = why,
-                        }
-                    }
+                    let route = Some(crate::ChannelRoute::Direct(o.endpoint.origin()));
                     (Some(o), None, route)
                 } else {
                     // Added by an MCP URL: the token belongs to that server.
@@ -2407,7 +2512,7 @@ impl Spaces {
                 }
                 if let (Some(url), Some(token)) = (
                     credential.url.as_deref().filter(|u| !u.is_empty()),
-                    credential.token.as_deref(),
+                    credential.token.as_deref().filter(|t| !t.trim().is_empty()),
                 ) {
                     let mut o = ConnectOptions::parse(url)?;
                     o.token = Some(token.to_string());
@@ -3987,6 +4092,11 @@ impl Spaces {
                     "Removed {id} (added by address, so only forgotten; the computer is untouched)."
                 )
             }
+            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id) => {
+                format!(
+                    "Removed {id} (added by address, so only forgotten; the computer is untouched)."
+                )
+            }
             SpaceId::Relay { machine_id } => {
                 // A Space one of your machines provides is deleted there.
                 let row = self.relay_row(machine_id).await;
@@ -4447,6 +4557,9 @@ impl Spaces {
                 };
                 Ok(SpacePower::new(&id.to_string(), control, state))
             }
+            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id) => Err(
+                refuse("relay (only a Space one of your computers provides)"),
+            ),
             SpaceId::Relay { machine_id } => {
                 let row = self.relay_row(machine_id).await;
                 match row.and_then(|m| {
@@ -4480,6 +4593,71 @@ impl Spaces {
     /// Where `download` lands by default.
     pub fn download_dir(&self) -> &Path {
         &self.inner.download_dir
+    }
+}
+
+/// Classified target of [`Spaces::add_with_service`] and [`Spaces::add_direct_host`].
+pub(crate) enum AddTarget {
+    /// Explicit Space id (`local:`, `cloud:`, `direct:`, `relay:`, `space://`).
+    Id {
+        id: SpaceId,
+        endpoint_url: Option<String>,
+    },
+    /// Non-relay HTTP(S) or `host[:port]` URL.
+    DirectUrl { id: SpaceId, raw_url: String },
+    /// URL with a `/m/<segment>` path prefix (either a Static Relay `cua-spacesd`
+    /// endpoint or a plain HTTP MCP endpoint mounted under `/m/...`).
+    RelayPathUrl {
+        endpoint: cua_spacesd_client::Endpoint,
+        machine_id: String,
+        has_extra_segments: bool,
+        raw_url: String,
+        direct_id: SpaceId,
+    },
+}
+
+pub(crate) fn classify_add_target(url: &str) -> Result<AddTarget> {
+    let url = url.trim();
+    let is_id = url.starts_with("space://")
+        || ["local:", "cloud:", "direct:", "relay:"]
+            .iter()
+            .any(|p| url.starts_with(p));
+    if is_id {
+        let id = SpaceId::parse(url)?;
+        let endpoint_url = match &id {
+            SpaceId::Direct { authority } => Some(format!("http://{authority}")),
+            _ => None,
+        };
+        return Ok(AddTarget::Id { id, endpoint_url });
+    }
+    let raw_url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    };
+    let endpoint = cua_spacesd_client::Endpoint::parse(&raw_url)?;
+    let direct_id = SpaceId::Direct {
+        authority: authority(endpoint.host(), endpoint.port()),
+    };
+    match endpoint.kind().clone() {
+        cua_spacesd_client::EndpointKind::Relay { machine_id } => {
+            let segment_count = endpoint
+                .base_url()
+                .path_segments()
+                .map(|s| s.filter(|p| !p.is_empty()).count())
+                .unwrap_or(0);
+            Ok(AddTarget::RelayPathUrl {
+                endpoint,
+                machine_id,
+                has_extra_segments: segment_count > 2,
+                raw_url,
+                direct_id,
+            })
+        }
+        cua_spacesd_client::EndpointKind::Direct => Ok(AddTarget::DirectUrl {
+            id: direct_id,
+            raw_url,
+        }),
     }
 }
 
