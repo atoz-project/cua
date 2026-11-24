@@ -57,6 +57,7 @@
 // Send check needs more than the default recursion depth on newer rustc.
 #![recursion_limit = "256"]
 
+mod add;
 pub mod app_icon;
 /// A hash-chained audit log (the share audit).
 pub mod audit;

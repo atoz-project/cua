@@ -1360,35 +1360,27 @@ pub async fn run_spaces_sdk(
         SpacesCmd::Share {
             space, who, role, ..
         } => {
-            if let Some(id) = local_static_relay(&space) {
-                return Err(refuse_static_relay_sharing(&id, "share"));
-            }
             let who = team_who(&who).await?;
             if who.starts_with("team:") && !json {
                 eprintln!(
                     "Adding {space} to the team… (right after a Teams checkout this can take up to a minute while the plan is set up)"
                 );
             }
-            let s = spaces.space(space).await?;
-            print_shares(&s.share(who, Some(role)).await?, json, out);
+            print_shares(
+                &spaces.share_space(space, who, Some(role)).await?,
+                json,
+                out,
+            );
         }
         SpacesCmd::Unshare { space, who, all } => {
-            if let Some(id) = local_static_relay(&space) {
-                return Err(refuse_static_relay_sharing(&id, "unshare"));
-            }
-            let s = spaces.space(space).await?;
             let who = match who {
                 Some(w) if !all => Some(team_who(&w).await?),
                 _ => None,
             };
-            print_shares(&s.unshare(who).await?, json, out);
+            print_shares(&spaces.unshare_space(space, who).await?, json, out);
         }
         SpacesCmd::Shares { space } => {
-            if let Some(id) = local_static_relay(&space) {
-                return Err(refuse_static_relay_sharing(&id, "list shares for"));
-            }
-            let s = spaces.space(space).await?;
-            print_shares(&s.shares().await?, json, out);
+            print_shares(&spaces.space_shares(space).await?, json, out);
         }
         SpacesCmd::RelayRegister { space } => {
             let r = spaces.relay_register(space).await?;
@@ -3578,23 +3570,6 @@ fn print_allow(allow: &[String], json: bool, out: &mut dyn Write) {
     } else {
         line(out, format!("Shared with: {}", allow.join(", ")));
     }
-}
-
-/// Returns the canonical `relay:<machine-id>` when `space` resolves to a
-/// Static Relay Mode Space in `$CUA_HOME` (works in both embedded and daemon
-/// CLI modes without Account Relay calls or dialing).
-pub(crate) fn local_static_relay(space: &str) -> Option<cua_spaces::SpaceId> {
-    let local = cua_spaces::Spaces::builder()
-        .home(crate::util::cua_home())
-        .build();
-    let id = local.resolve(space).ok()?;
-    local.is_static_relay_space(&id).then_some(id)
-}
-
-fn refuse_static_relay_sharing(id: &cua_spaces::SpaceId, action: &str) -> CuaError {
-    CuaError::InvalidArgument(format!(
-        "cannot {action} Static Relay Space {id}: account sharing requires Account Relay Mode (`cua host setup` or `cua spaces relay-register`)"
-    ))
 }
 
 /// `who` as it is shared with: a `team:<name>` becomes `team:<organization

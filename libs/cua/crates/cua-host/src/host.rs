@@ -1079,7 +1079,9 @@ fn random_hex(bytes: usize) -> String {
     hex::encode(v)
 }
 
-/// Machine ids are `[a-z0-9-]{8,64}` (the relay's rule).
+/// Machine ids are `[a-z0-9-]{8,64}` (same grammar as
+/// `cua_spacesd_client::valid_machine_id`; kept local because `cua-host` does
+/// not depend on `cua-proto`/`tonic`).
 fn valid_machine_id(id: &str) -> bool {
     (8..=64).contains(&id.len())
         && id

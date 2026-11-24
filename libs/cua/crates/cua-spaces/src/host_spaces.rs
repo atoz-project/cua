@@ -3480,21 +3480,7 @@ impl Spaces {
         token: Option<String>,
         name: Option<String>,
     ) -> Result<SpaceInfo> {
-        match crate::spaces::classify_add_target(url)? {
-            crate::spaces::AddTarget::RelayPathUrl { endpoint, .. } => {
-                return Err(Error::invalid(format!(
-                    "{endpoint} is a Static Relay URL and cannot be added with --host; \
-                     a Direct Host to add with --host is `<tailscale or LAN address>:<port>`"
-                )));
-            }
-            crate::spaces::AddTarget::Id { id, .. } if !matches!(id, SpaceId::Direct { .. }) => {
-                return Err(Error::invalid(format!(
-                    "{id} is not reached by a direct address; a host to add with --host is \
-                     `<tailscale or LAN address>:<port>`"
-                )));
-            }
-            _ => {}
-        }
+        crate::add::ensure_direct_host_add_allowed(url)?;
         let info = self.add(url, token, name.clone()).await?;
         if !matches!(SpaceId::parse(&info.id)?, SpaceId::Direct { .. }) {
             return Err(Error::invalid(format!(

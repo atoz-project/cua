@@ -85,12 +85,37 @@ pub(crate) mod imp {
         Ok(())
     }
 
-    async fn record(spaces: &cua_spaces::Spaces, id: &str) -> Result<pb::Space, Error> {
+    pub(crate) fn merge_info_into_record(
+        spaces: &cua_spaces::Spaces,
+        s: &mut pb::Space,
+        info: &cua_spaces::SpaceInfo,
+    ) {
+        s.display_name = info.display_name.clone();
+        s.cloud = info.cloud.clone();
+        s.cloud_place = info.cloud_place.clone();
+        s.cloud_delete = info.cloud_delete.clone();
+        s.host = info.host.clone();
+        s.host_name = info.host_name.clone();
+        s.power = info.power.clone();
+        s.power_state = info.power_state.clone();
+        if spaces.is_static_relay_space_id(&s.id) {
+            s.sharing = None;
+        } else if let Some(sh) = info.sharing.as_ref() {
+            s.sharing = Some(sh.into());
+        }
+    }
+
+    pub(crate) async fn record(spaces: &cua_spaces::Spaces, id: &str) -> Result<pb::Space, Error> {
         if let Some(r) = spaces.registry().get(id).map_err(Error::from)? {
             let mut r = [r];
             spaces.fill_records(&mut r);
             let [mut r] = r;
+            (r.power, r.power_state) = spaces.power_of(&r.id);
+            r.stop_reason = spaces.stop_reason_of(&r.id);
             r.children = spaces.children_on(&r.id);
+            if let Ok(info) = spaces.find(&r.id).await {
+                merge_info_into_record(spaces, &mut r, &info);
+            }
             return Ok(r);
         }
         Ok(info_record(&spaces.find(id).await.map_err(Error::from)?))
@@ -449,9 +474,9 @@ pub(crate) mod imp {
             };
             for info in others {
                 if let Some(s) = spaces.iter_mut().find(|s| s.id == info.id) {
-                    // A Space this computer provides shows its name on the
-                    // relay (renamed from another device).
-                    s.display_name = info.display_name;
+                    // Enrich persisted records with live relay/cloud/host/power
+                    // and Account Relay sharing facts (never for Static Relay).
+                    merge_info_into_record(self.spaces(), s, &info);
                 } else if info.provider == cua_spaces::Provider::Relay {
                     spaces.push(info_record(&info));
                 }
@@ -1824,5 +1849,100 @@ mod imp {
         ) -> R<Self::WatchSpacesStream> {
             off()
         }
+    }
+}
+
+#[cfg(all(test, feature = "spaces"))]
+mod tests {
+    use super::*;
+    use cua_spaces::registry::Credential;
+
+    #[tokio::test]
+    async fn persisted_account_relay_record_keeps_sharing_and_cloud_while_static_stays_unshared() {
+        let home = tempfile::tempdir().unwrap();
+        let spaces = cua_spaces::Spaces::builder().home(home.path()).build();
+        let acct_id = "relay:0123abcd4567ef89";
+        let static_id = "relay:fedcba9876543210";
+
+        spaces
+            .registry()
+            .upsert(
+                pb::Space {
+                    id: acct_id.into(),
+                    name: "acct-byoc".into(),
+                    ..Default::default()
+                },
+                Credential {
+                    url: Some("https://custom-relay.example".into()),
+                    token: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        spaces
+            .registry()
+            .upsert(
+                pb::Space {
+                    id: static_id.into(),
+                    name: "static-box".into(),
+                    ..Default::default()
+                },
+                Credential {
+                    url: Some("https://static-relay.example/m/fedcba9876543210".into()),
+                    token: Some("static-secret".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let acct_rec = imp::record(&spaces, acct_id).await.unwrap();
+        assert_eq!(
+            acct_rec.sharing.as_ref().map(|s| s.role.as_str()),
+            Some("owner")
+        );
+
+        let static_rec = imp::record(&spaces, static_id).await.unwrap();
+        assert!(static_rec.sharing.is_none());
+
+        let mut merged_acct = pb::Space {
+            id: acct_id.into(),
+            name: "acct-byoc".into(),
+            ..Default::default()
+        };
+        let mut acct_info = spaces.find(acct_id).await.unwrap();
+        acct_info.display_name = "renamed-byoc".into();
+        acct_info.cloud = "aws".into();
+        acct_info.cloud_place = "us-west-2".into();
+        acct_info.cloud_delete = "here".into();
+        acct_info.host = "host-1".into();
+        acct_info.host_name = "aws-usw2".into();
+        acct_info.power = "stop".into();
+        acct_info.power_state = "running".into();
+        acct_info.sharing = Some(cua_spaces::SpaceSharing {
+            owner_id: "u1".into(),
+            role: "owner".into(),
+            ..Default::default()
+        });
+        imp::merge_info_into_record(&spaces, &mut merged_acct, &acct_info);
+        assert_eq!(merged_acct.display_name, "renamed-byoc");
+        assert_eq!(merged_acct.cloud, "aws");
+        assert_eq!(merged_acct.cloud_place, "us-west-2");
+        assert_eq!(merged_acct.cloud_delete, "here");
+        assert_eq!(merged_acct.host, "host-1");
+        assert_eq!(merged_acct.host_name, "aws-usw2");
+        assert_eq!(merged_acct.power, "stop");
+        assert_eq!(merged_acct.power_state, "running");
+        assert_eq!(
+            merged_acct.sharing.as_ref().map(|s| s.owner_id.as_str()),
+            Some("u1")
+        );
+
+        let mut merged_static = pb::Space {
+            id: static_id.into(),
+            name: "static-box".into(),
+            ..Default::default()
+        };
+        imp::merge_info_into_record(&spaces, &mut merged_static, &acct_info);
+        assert!(merged_static.sharing.is_none());
     }
 }
