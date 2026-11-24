@@ -447,8 +447,8 @@ pub fn location(space: &Space, spaces: &[Space]) -> String {
                 .to_string()
         }),
         SpaceProvider::Relay => {
-            if let Some(place) =
-                text(&space.cloud_place).filter(|_| crate::spaces::sidebar::in_your_cloud(space))
+            if crate::spaces::sidebar::in_your_cloud(space)
+                && let Some(place) = text(&space.cloud_place).or_else(|| text(&space.cloud))
             {
                 return place;
             }
@@ -464,6 +464,9 @@ pub fn location(space: &Space, spaces: &[Space]) -> String {
                             .map(|m| m.name.clone())
                     })
                     .unwrap_or(host),
+                None if crate::spaces::is_static_relay_space(space) => {
+                    text(&space.host_name).unwrap_or_else(|| "Remote relay".into())
+                }
                 // The machine itself.
                 None => text(&space.host_name).unwrap_or_else(|| space.name.clone()),
             }
@@ -2634,5 +2637,48 @@ mod tests {
         assert_eq!(view(&open, std::slice::from_ref(&wsl)).label, "1 desktop");
         assert_eq!(view(&open, &[a, wsl]).label, "1 Space and 1 desktop");
         assert_eq!(view(&open, &[]).label, "0 Spaces");
+    }
+
+    #[test]
+    fn static_relay_spaces_use_remote_relay_and_cloud_location_in_notch() {
+        let mut manual = space(
+            "relay:office-gpu",
+            "Office GPU",
+            SpaceOs::Linux,
+            SpaceStatus::Running,
+        );
+        manual.provider = Some(crate::model::SpaceProvider::Relay);
+        manual.started_at = Some(1_763_978_400_000);
+
+        let mut byoc_with_place = space(
+            "relay:cloud-01",
+            "Research Box",
+            SpaceOs::Linux,
+            SpaceStatus::Running,
+        );
+        byoc_with_place.provider = Some(crate::model::SpaceProvider::Relay);
+        byoc_with_place.started_at = Some(1_763_978_400_000);
+        byoc_with_place.cloud = Some("aws".into());
+        byoc_with_place.cloud_place = Some("AWS \u{b7} us-west-2".into());
+
+        let mut byoc_cloud_only = byoc_with_place.clone();
+        byoc_cloud_only.id = "relay:cloud-02".into();
+        byoc_cloud_only.name = "Worker".into();
+        byoc_cloud_only.cloud_place = None;
+
+        let all = [
+            manual.clone(),
+            byoc_with_place.clone(),
+            byoc_cloud_only.clone(),
+        ];
+        assert_eq!(location(&manual, &all), "Remote relay");
+        assert_eq!(location(&byoc_with_place, &all), "AWS \u{b7} us-west-2");
+        assert_eq!(location(&byoc_cloud_only, &all), "aws");
+
+        let rendered = tiles(&all, None);
+        assert_eq!(rendered[0].location, "Remote relay");
+        assert_ne!(rendered[0].location, rendered[0].name);
+        assert_eq!(rendered[1].location, "AWS \u{b7} us-west-2");
+        assert_eq!(rendered[2].location, "aws");
     }
 }

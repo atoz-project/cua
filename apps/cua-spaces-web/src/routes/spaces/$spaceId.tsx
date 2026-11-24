@@ -66,6 +66,7 @@ import {
   canDelete,
   canPower,
   createError,
+  isStaticRelaySpace,
   isUnsharedDesktop,
   createProgress,
   machineName,
@@ -239,7 +240,7 @@ function SpaceDetailPage() {
   // A teammate who may only watch is not offered Share or control (the host refuses both anyway).
   const viewOnly = space.access?.role === "viewer";
   const sharedOwner = space.access && space.access.kind === "withMe" ? { name: ownerLabel(space.access) ?? "", email: space.access.ownerEmail } : null;
-  const mayShare = space.access?.canShare !== false && !viewOnly;
+  const mayShare = (space.access ? space.access.canShare : !isStaticRelaySpace(space)) && !viewOnly;
   const shareAction = mayShare ? action("share") : undefined;
   // Signed in, not enrolled: the access line's action opens this computer's page with the enroll sheet.
   const enroll = () => {

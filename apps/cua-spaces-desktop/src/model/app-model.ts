@@ -42,6 +42,7 @@ import type { BulkResult, CreatingElsewhereRow, ListRead, LocalRuntimes, SpacesB
 
 /** How many Spaces a bulk delete or leave works on at the same time. */
 const BULK_CONCURRENCY = 3;
+import { isMachineDesktop } from "../bridge/host-start";
 import { AgentsModel, type AgentSetupRunning, type ToolRunner } from "./agents";
 import { ChecklistModel } from "./checklist";
 import type { CloudModel } from "./cloud";
@@ -309,7 +310,7 @@ export class AppModel {
   get relayHostnames(): Record<string, string> {
     const out: Record<string, string> = {};
     for (const space of this.spaces) {
-      if (!space.id.startsWith("relay:") || space.host) continue;
+      if (!isMachineDesktop(space) || !space.id.startsWith("relay:")) continue;
       const name = this.backend.reportedHostname(space.id);
       if (name) out[space.id.slice(6)] = name;
     }
@@ -834,7 +835,7 @@ export class AppModel {
 
   /** The name of one of your machines, from the Spaces it provides (or its own entry on the relay). */
   private machineName(id: string): string | undefined {
-    return this.spaces.find((s) => s.id === `relay:${id}`)?.name ?? this.spaces.find((s) => s.host === id && s.hostName)?.hostName;
+    return this.spaces.find((s) => isMachineDesktop(s) && s.id === `relay:${id}`)?.name ?? this.spaces.find((s) => s.host === id && s.hostName)?.hostName;
   }
 
   private async followCreate(args: AppCreateSpaceArgs, pendingId: string, progress?: (p: SpaceCreateProgress) => void): Promise<string> {

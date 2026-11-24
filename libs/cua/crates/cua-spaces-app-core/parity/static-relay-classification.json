@@ -1,0 +1,198 @@
+{
+  "about": "Cross-surface Seam 2 parity matrix for Static Relay Mode Spaces vs Account Relay Mode Computers across cua-spaces-app-core (Rust), cua-spaces-desktop (Electron), and cua-spaces-web (React).",
+  "fixtures": [
+    {
+      "case": "manual-static-relay-space-signed-out",
+      "row": {
+        "id": "relay:office-gpu",
+        "name": "Office GPU",
+        "provider": "relay",
+        "spacesdVersion": "0.8.0",
+        "features": ["desktop_stream", "window_stream"],
+        "addedAt": "2026-11-24T10:00:00Z",
+        "os": "linux",
+        "osPrettyName": "Ubuntu 24.04",
+        "reachable": true
+      },
+      "expect": {
+        "isMachineDesktop": false,
+        "isStaticRelaySpace": true,
+        "inMachinesPage": false,
+        "inRealSpaces": true,
+        "sidebarSection": "spaces.sidebar.section.connected",
+        "canShare": false,
+        "requiresAccountRelayAccess": false,
+        "detail": "Remote relay",
+        "place": "Remote relay",
+        "webHeaderSubtitle": "Ubuntu 24.04 · Remote relay"
+      }
+    },
+    {
+      "case": "byoc-static-relay-space",
+      "row": {
+        "id": "relay:cloud-0123456789abcdef",
+        "name": "Research Box",
+        "provider": "relay",
+        "spacesdVersion": "0.8.0",
+        "features": ["desktop_stream"],
+        "addedAt": "2026-11-24T10:05:00Z",
+        "os": "linux",
+        "reachable": true,
+        "cloud": "aws",
+        "cloudPlace": "AWS · us-west-2",
+        "cloudDelete": "here"
+      },
+      "expect": {
+        "isMachineDesktop": false,
+        "isStaticRelaySpace": true,
+        "inMachinesPage": false,
+        "inRealSpaces": true,
+        "sidebarSection": "spaces.sidebar.section.connected",
+        "canShare": false,
+        "requiresAccountRelayAccess": false,
+        "detail": "AWS · us-west-2",
+        "place": "AWS · us-west-2",
+        "webHeaderSubtitle": "Linux on AWS · us-west-2"
+      }
+    },
+    {
+      "case": "account-relay-byoc-space",
+      "row": {
+        "id": "relay:cloud-account00000001",
+        "name": "Team Cloud Box",
+        "provider": "relay",
+        "spacesdVersion": "0.8.0",
+        "features": ["desktop_stream"],
+        "addedAt": "2026-11-24T10:06:00Z",
+        "os": "linux",
+        "reachable": true,
+        "cloud": "aws",
+        "cloudPlace": "AWS · us-east-1",
+        "cloudDelete": "here",
+        "sharing": {
+          "ownerId": "u1",
+          "ownerEmail": "ada@example.com",
+          "ownerName": "Ada",
+          "role": "owner"
+        }
+      },
+      "expect": {
+        "isMachineDesktop": false,
+        "isStaticRelaySpace": true,
+        "inMachinesPage": false,
+        "inRealSpaces": true,
+        "sidebarSection": "spaces.sidebar.section.connected",
+        "canShare": true,
+        "requiresAccountRelayAccess": true,
+        "detail": "AWS · us-east-1",
+        "place": "AWS · us-east-1",
+        "webHeaderSubtitle": "Linux on AWS · us-east-1"
+      }
+    },
+    {
+      "case": "account-relay-computer-online",
+      "row": {
+        "id": "relay:studio-online",
+        "name": "Studio",
+        "provider": "relay",
+        "spacesdVersion": "0.8.0",
+        "features": ["desktop_stream", "host_spaces"],
+        "os": "macos",
+        "reachable": true,
+        "sharing": {
+          "ownerId": "u1",
+          "ownerEmail": "ada@example.com",
+          "ownerName": "Ada",
+          "role": "owner"
+        }
+      },
+      "expect": {
+        "isMachineDesktop": true,
+        "isStaticRelaySpace": false,
+        "inMachinesPage": true,
+        "inRealSpaces": false,
+        "sidebarSection": "spaces.sidebar.section.my_computers",
+        "canShare": true,
+        "requiresAccountRelayAccess": true,
+        "detail": "My machines",
+        "place": "My machines",
+        "webHeaderSubtitle": "macOS on Studio"
+      }
+    },
+    {
+      "case": "account-relay-computer-offline-no-sharing",
+      "row": {
+        "id": "relay:studio-offline",
+        "name": "Spare Mini",
+        "provider": "relay",
+        "spacesdVersion": "0.8.0",
+        "features": [],
+        "os": "macos",
+        "reachable": false
+      },
+      "expect": {
+        "isMachineDesktop": true,
+        "isStaticRelaySpace": false,
+        "inMachinesPage": true,
+        "inRealSpaces": false,
+        "sidebarSection": "spaces.sidebar.section.my_computers",
+        "canShare": true,
+        "requiresAccountRelayAccess": true,
+        "detail": "Unreachable",
+        "place": "My machines",
+        "webHeaderSubtitle": "macOS on Spare Mini"
+      }
+    },
+    {
+      "case": "account-relay-hosted-space",
+      "row": {
+        "id": "relay:studio-online/dev",
+        "name": "dev",
+        "provider": "relay",
+        "spacesdVersion": "0.8.0",
+        "features": ["desktop_stream"],
+        "os": "linux",
+        "reachable": true,
+        "host": "studio-online",
+        "hostName": "Studio"
+      },
+      "expect": {
+        "isMachineDesktop": false,
+        "isStaticRelaySpace": false,
+        "inMachinesPage": false,
+        "inRealSpaces": true,
+        "sidebarSection": "spaces.sidebar.section.my_computers",
+        "canShare": true,
+        "requiresAccountRelayAccess": true,
+        "detail": "On Studio",
+        "place": "Studio",
+        "webHeaderSubtitle": "Linux on Studio"
+      }
+    },
+    {
+      "case": "local-space",
+      "row": {
+        "id": "local:ubuntu",
+        "name": "ubuntu",
+        "provider": "local",
+        "spacesdVersion": "0.8.0",
+        "features": ["desktop_stream"],
+        "addedAt": "2026-11-24T09:00:00Z",
+        "os": "linux",
+        "reachable": true
+      },
+      "expect": {
+        "isMachineDesktop": false,
+        "isStaticRelaySpace": false,
+        "inMachinesPage": false,
+        "inRealSpaces": true,
+        "sidebarSection": "spaces.sidebar.section.this_mac",
+        "canShare": true,
+        "requiresAccountRelayAccess": false,
+        "detail": "This Mac",
+        "place": "This Mac",
+        "webHeaderSubtitle": "Linux on This Mac"
+      }
+    }
+  ]
+}

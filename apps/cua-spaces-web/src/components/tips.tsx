@@ -38,7 +38,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useChildren } from "@/components/children/use-children";
 import { useHiddenSpaceIds } from "@/lib/prepare/store";
-import { realSpaces, spaceState } from "@/lib/spaces";
+import { isStaticRelaySpace, realSpaces, spaceState } from "@/lib/spaces";
 import { cn } from "@/lib/utils";
 
 /** Whether a page shows a tip now (the sidebar's waits until none does). */
@@ -51,7 +51,7 @@ const usePageTip = create<{ shown: number; add(): () => void }>((set) => ({
 }));
 
 /** The sharing facts a Space carries once the host reports them (`Space.access`). */
-type Access = { kind?: string; people?: unknown[]; canDelete?: boolean; canPower?: boolean };
+type Access = { kind?: string; people?: unknown[]; canDelete?: boolean; canPower?: boolean; canShare?: boolean };
 const accessOf = (s: Space): Access | undefined => (s as Space & { access?: Access }).access;
 const mine = (s: Space) => (accessOf(s)?.kind ?? "mine") === "mine";
 
@@ -127,7 +127,9 @@ export function useTipFacts(space?: Space): TipFacts | null {
       deletableStopped: 0,
       diskNearlyFull: disk === "low" || disk === "critical",
       secondComputerOnline: machines.filter((m) => m.online).length >= 2,
-      sharedAny: spaces.some((s) => mine(s) && (accessOf(s)?.people?.length ?? 0) > 0),
+      sharedAny:
+        spaces.some((s) => mine(s) && (accessOf(s)?.people?.length ?? 0) > 0) ||
+        Boolean(space && (accessOf(space)?.canShare === false || (!accessOf(space) && isStaticRelaySpace(space)))),
       pageTipShown,
     };
   }, [all, machines, resources, agents, space, pageTipShown]);
@@ -177,7 +179,8 @@ const Bulb = ({ className }: { className?: string }) => (
  * Copy (and Open in Cursor where the core gives it).
  */
 export function PageTip({ place, space, onShare, className }: { place: "spaces" | "space"; space?: Space; onShare?: () => void; className?: string }) {
-  const tip = useTip(place, space);
+  const rawTip = useTip(place, space);
+  const tip = rawTip && rawTip.action.kind === "share" && !onShare ? null : rawTip;
   const { send } = useTips();
   const { openExternal } = useSession();
   const add = usePageTip((s) => s.add);

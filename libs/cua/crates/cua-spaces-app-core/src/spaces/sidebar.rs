@@ -19,8 +19,11 @@ pub const SECTION_ORDER: [&str; 3] = [
     "spaces.sidebar.section.my_computers",
 ];
 
-fn section_of(p: Option<SpaceProvider>) -> &'static str {
-    match p.unwrap_or(SpaceProvider::Direct) {
+fn section_of(space: &Space) -> &'static str {
+    if super::is_static_relay_space(space) {
+        return SECTION_ORDER[1];
+    }
+    match space.provider.unwrap_or(SpaceProvider::Direct) {
         SpaceProvider::Local => SECTION_ORDER[0],
         SpaceProvider::Direct => SECTION_ORDER[1],
         SpaceProvider::Relay => SECTION_ORDER[2],
@@ -312,7 +315,7 @@ fn nest_under_hosts(spaces: Vec<&Space>, selected: Option<&str>) -> Vec<SidebarR
     let listed = |h: &str| {
         spaces
             .iter()
-            .any(|m| m.id.strip_prefix("relay:") == Some(h) && host_of(m).is_none())
+            .any(|m| is_your_machine(m) && m.id.strip_prefix("relay:") == Some(h))
     };
     let mut out = Vec::with_capacity(spaces.len());
     for s in spaces
@@ -320,7 +323,7 @@ fn nest_under_hosts(spaces: Vec<&Space>, selected: Option<&str>) -> Vec<SidebarR
         .filter(|s| host_of(s).is_none_or(|h| !listed(&h)))
     {
         out.push(row(s, selected));
-        if let Some(machine) = s.id.strip_prefix("relay:").filter(|_| host_of(s).is_none()) {
+        if let Some(machine) = s.id.strip_prefix("relay:").filter(|_| is_your_machine(s)) {
             for child in spaces
                 .iter()
                 .filter(|c| host_of(c).as_deref() == Some(machine))
@@ -376,7 +379,7 @@ pub fn sidebar(spaces: &[Space], query: &str, selected_id: &str) -> SidebarView 
                 visible
                     .iter()
                     .copied()
-                    .filter(|s| s.id != THIS_MACHINE_ID && section_of(s.provider) == *title)
+                    .filter(|s| s.id != THIS_MACHINE_ID && section_of(s) == *title)
                     .collect(),
                 sel,
             );
@@ -530,12 +533,16 @@ pub struct NewSpaceOn {
 /// spacesd's feature for a machine that provides Spaces.
 pub const HOST_SPACES_FEATURE: &str = "host_spaces";
 
-/// One of your machines itself, reached through the relay: not a Space it
-/// provides and not a Space in your cloud.
+/// One of your Account Relay computers itself, reached through the relay: not
+/// a Space it provides and not a persisted Static Relay or cloud Space.
 pub fn is_your_machine(space: &Space) -> bool {
-    space.id.starts_with("relay:")
-        && space.host.as_deref().is_none_or(str::is_empty)
+    space.host.as_deref().is_none_or(|h| h.trim().is_empty())
+        && space.started_at.is_none()
         && !in_your_cloud(space)
+        && space
+            .id
+            .strip_prefix("relay:")
+            .is_some_and(|own| !own.is_empty() && !own.contains('/') && !own.starts_with("space-"))
 }
 
 /// Whether one of your machines shares its own desktop, when it said so:
@@ -1051,13 +1058,19 @@ pub fn detail_live(
             "Picture in picture",
             can_stream,
         ));
-        actions.push(action(
-            DetailActionId::Share,
-            "Share",
-            Some("person.badge.plus"),
-            "Share this Space",
-            can_stream,
-        ));
+        let can_share = space
+            .access
+            .as_ref()
+            .map_or(!super::is_static_relay_space(space), |a| a.can_share);
+        if can_share {
+            actions.push(action(
+                DetailActionId::Share,
+                "Share",
+                Some("person.badge.plus"),
+                "Share this Space",
+                can_stream,
+            ));
+        }
         // One still being created can be cancelled (it stops, and what it
         // made is removed).
         if let Some(p) = creating.filter(|p| p.error.is_none()) {
@@ -1147,14 +1160,33 @@ pub fn detail_live(
     }
 }
 
+/// Whether `space` is reached through the signed-in account's relay directory
+/// and therefore gated by this device's enrollment notice.
+///
+/// Unattached Static Relay Mode Spaces (`is_static_relay_space` without
+/// account-relay sharing/attachment) are exempt; Account-Relay BYOC Spaces
+/// (`access.can_share` or `access.kind != Mine`) continue honoring enrollment.
+pub fn requires_account_relay_access(space: &Space) -> bool {
+    if !space.id.starts_with("relay:") {
+        return false;
+    }
+    if !super::is_static_relay_space(space) {
+        return true;
+    }
+    space
+        .access
+        .as_ref()
+        .is_some_and(|a| a.can_share || a.kind != crate::model::SpaceAccessKind::Mine)
+}
+
 /// [`detail_live`] as this device sees it. `access` is why this device
 /// cannot open the account's machines (signed in, not enrolled;
 /// [`crate::devices::machine_access_notice`]): every Space reached through
-/// the relay then shows its Connect greyed out under that line, says why
-/// in its Status, and nothing that needs a connection is offered. One of
-/// your machines that does not share its desktop shows [`desktop_note`] in
-/// place of its desktop, Stream, Agents and Teleport, and New Space on it
-/// when it provides Spaces.
+/// the account relay then shows its Connect greyed out under that line, says
+/// why in its Status, and nothing that needs a connection is offered. Static
+/// Relay Mode Spaces are exempt. One of your machines that does not share its
+/// desktop shows [`desktop_note`] in place of its desktop, Stream, Agents and
+/// Teleport, and New Space on it when it provides Spaces.
 pub fn detail_for(
     space: &Space,
     usage: Option<&SpaceUsage>,
@@ -1168,7 +1200,7 @@ pub fn detail_for(
         DetailActionId::Share,
         DetailActionId::Open,
     ];
-    if let Some(access) = access.filter(|_| space.id.starts_with("relay:")) {
+    if let Some(access) = access.filter(|_| requires_account_relay_access(space)) {
         d.can_stream = false;
         d.show_sections = false;
         d.sections.clear();
@@ -2178,5 +2210,159 @@ mod tests {
         assert!(settle(&done, &off).powering.is_empty());
         // Gone from the registry: forgotten.
         assert!(settle(&done, &[]).powering.is_empty());
+    }
+
+    #[test]
+    fn sidebar_groups_static_relay_spaces_under_connected_and_keeps_computers_under_my_computers() {
+        let mk = |json: serde_json::Value| {
+            super::super::row_to_space(&serde_json::from_value(json).unwrap(), 0)
+        };
+        let manual = mk(serde_json::json!({
+            "id": "relay:office-gpu",
+            "name": "Office GPU",
+            "provider": "relay",
+            "addedAt": "2026-11-24T10:00:00Z",
+            "os": "linux",
+            "reachable": true,
+            "features": ["desktop_stream"],
+        }));
+        let byoc = mk(serde_json::json!({
+            "id": "relay:cloud-0123456789abcdef",
+            "name": "Research Box",
+            "provider": "relay",
+            "addedAt": "2026-11-24T10:05:00Z",
+            "cloud": "aws",
+            "cloudPlace": "AWS \u{b7} us-west-2",
+            "os": "linux",
+            "reachable": true,
+            "features": ["desktop_stream"],
+        }));
+        let online_computer = mk(serde_json::json!({
+            "id": "relay:studio-online",
+            "name": "Studio",
+            "provider": "relay",
+            "os": "macos",
+            "reachable": true,
+            "features": ["desktop_stream", "host_spaces"],
+            "sharing": { "ownerId": "u1", "role": "owner" },
+        }));
+        let offline_computer = mk(serde_json::json!({
+            "id": "relay:studio-offline",
+            "name": "Spare Mini",
+            "provider": "relay",
+            "os": "macos",
+            "reachable": false,
+        }));
+
+        assert!(!is_your_machine(&manual));
+        assert!(!is_your_machine(&byoc));
+        assert!(is_your_machine(&online_computer));
+        assert!(is_your_machine(&offline_computer));
+
+        let view = sidebar(&[manual, byoc, online_computer, offline_computer], "", "");
+        let section_ids = |code: &str| -> Vec<&str> {
+            view.sections
+                .iter()
+                .find(|s| s.title.code == code)
+                .map(|s| s.rows.iter().map(|r| r.id.as_str()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            section_ids("spaces.sidebar.section.connected"),
+            ["relay:office-gpu", "relay:cloud-0123456789abcdef"]
+        );
+        assert_eq!(
+            section_ids("spaces.sidebar.section.my_computers"),
+            ["relay:studio-online", "relay:studio-offline"]
+        );
+    }
+
+    #[test]
+    fn static_relay_spaces_skip_machine_access_notice_and_hide_share_action() {
+        use crate::devices::{EnrollmentKind, machine_access_notice};
+        let mk = |json: serde_json::Value| {
+            super::super::row_to_space(&serde_json::from_value(json).unwrap(), 0)
+        };
+        let notice = machine_access_notice(EnrollmentKind::NeedsEnrollment, None).unwrap();
+
+        let manual = mk(serde_json::json!({
+            "id": "relay:office-gpu",
+            "name": "Office GPU",
+            "provider": "relay",
+            "addedAt": "2026-11-24T10:00:00Z",
+            "os": "linux",
+            "reachable": true,
+            "features": ["desktop_stream"],
+        }));
+        let byoc = mk(serde_json::json!({
+            "id": "relay:cloud-0123456789abcdef",
+            "name": "Research Box",
+            "provider": "relay",
+            "addedAt": "2026-11-24T10:05:00Z",
+            "cloud": "aws",
+            "cloudPlace": "AWS \u{b7} us-west-2",
+            "os": "linux",
+            "reachable": true,
+            "features": ["desktop_stream"],
+        }));
+
+        for space in [&manual, &byoc] {
+            let d = detail_for(space, None, None, Some(&notice));
+            assert!(
+                d.access.is_none(),
+                "static relay Space must not lock out: {}",
+                space.id
+            );
+            assert!(d.can_stream, "static relay Space must stream: {}", space.id);
+            assert!(d.show_sections);
+            assert!(d.desktop_note.is_none());
+            assert!(
+                !d.actions.iter().any(|a| a.id == DetailActionId::Share),
+                "Share button must be hidden on Static Relay Space {}",
+                space.id
+            );
+        }
+        assert_eq!(manual.detail, "Remote relay");
+        assert!(!manual.detail.contains("My machines"));
+        assert!(!manual.detail.contains("relay:"));
+        assert_eq!(byoc.detail, "AWS \u{b7} us-west-2");
+
+        // Account Relay Computer and hosted Space still honor MachineAccessNotice.
+        let computer = mk(serde_json::json!({
+            "id": "relay:studio-online",
+            "name": "Studio",
+            "provider": "relay",
+            "os": "macos",
+            "reachable": true,
+            "features": ["desktop_stream", "host_spaces"],
+        }));
+        let hosted = mk(serde_json::json!({
+            "id": "relay:studio-online/dev",
+            "name": "dev",
+            "provider": "relay",
+            "host": "studio-online",
+            "hostName": "Studio",
+            "os": "linux",
+            "reachable": true,
+            "features": ["desktop_stream"],
+        }));
+        let account_byoc = mk(serde_json::json!({
+            "id": "relay:cloud-account00000001",
+            "name": "Team Cloud Box",
+            "provider": "relay",
+            "addedAt": "2026-11-24T10:06:00Z",
+            "cloud": "aws",
+            "cloudPlace": "AWS \u{b7} us-east-1",
+            "os": "linux",
+            "reachable": true,
+            "features": ["desktop_stream"],
+            "sharing": { "ownerId": "u1", "role": "owner" },
+        }));
+        for account_space in [&computer, &hosted, &account_byoc] {
+            let d = detail_for(account_space, None, None, Some(&notice));
+            assert_eq!(d.access.as_ref(), Some(&notice));
+            assert!(!d.can_stream);
+            assert!(d.actions.iter().any(|a| a.id == DetailActionId::Share));
+        }
     }
 }
