@@ -125,6 +125,9 @@ impl Spaces {
                 _ => return Ok(ThreadHome::Here(None)),
             },
         };
+        if self.is_static_relay_machine(&machine) {
+            return Ok(ThreadHome::Here(None));
+        }
         // A Space this machine provides: its thread is here, under its id
         // here.
         let host_dir = cua_host::Host::new(self.home_dir()).paths().dir.clone();

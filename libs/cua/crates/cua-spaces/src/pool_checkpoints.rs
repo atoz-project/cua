@@ -106,6 +106,7 @@ impl Spaces {
     /// Space no machine of yours provides.
     async fn provider_of(&self, id: &SpaceId) -> Result<Option<(String, String)>> {
         Ok(match id {
+            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id) => None,
             SpaceId::Relay { machine_id } => self
                 .relay_row(machine_id)
                 .await

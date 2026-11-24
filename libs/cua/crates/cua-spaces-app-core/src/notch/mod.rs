@@ -464,7 +464,7 @@ pub fn location(space: &Space, spaces: &[Space]) -> String {
                             .map(|m| m.name.clone())
                     })
                     .unwrap_or(host),
-                None if crate::spaces::is_static_relay_space(space) => {
+                None if crate::spaces::is_relay_space(space) => {
                     text(&space.host_name).unwrap_or_else(|| "Remote relay".into())
                 }
                 // The machine itself.

@@ -20,7 +20,7 @@ pub const SECTION_ORDER: [&str; 3] = [
 ];
 
 fn section_of(space: &Space) -> &'static str {
-    if super::is_static_relay_space(space) {
+    if super::is_relay_space(space) {
         return SECTION_ORDER[1];
     }
     match space.provider.unwrap_or(SpaceProvider::Direct) {
@@ -534,11 +534,10 @@ pub struct NewSpaceOn {
 pub const HOST_SPACES_FEATURE: &str = "host_spaces";
 
 /// One of your Account Relay computers itself, reached through the relay: not
-/// a Space it provides and not a persisted Static Relay or cloud Space.
+/// a Space it provides and not a relay Space.
 pub fn is_your_machine(space: &Space) -> bool {
     space.host.as_deref().is_none_or(|h| h.trim().is_empty())
-        && space.started_at.is_none()
-        && !in_your_cloud(space)
+        && !super::is_relay_space(space)
         && space
             .id
             .strip_prefix("relay:")
@@ -1163,20 +1162,10 @@ pub fn detail_live(
 /// Whether `space` is reached through the signed-in account's relay directory
 /// and therefore gated by this device's enrollment notice.
 ///
-/// Unattached Static Relay Mode Spaces (`is_static_relay_space` without
-/// account-relay sharing/attachment) are exempt; Account-Relay BYOC Spaces
-/// (`access.can_share` or `access.kind != Mine`) continue honoring enrollment.
+/// Unattached Static Relay Mode Spaces (`is_static_relay_space`) are exempt;
+/// Account-Relay BYOC Spaces and Account Computers continue honoring enrollment.
 pub fn requires_account_relay_access(space: &Space) -> bool {
-    if !space.id.starts_with("relay:") {
-        return false;
-    }
-    if !super::is_static_relay_space(space) {
-        return true;
-    }
-    space
-        .access
-        .as_ref()
-        .is_some_and(|a| a.can_share || a.kind != crate::model::SpaceAccessKind::Mine)
+    space.id.starts_with("relay:") && !super::is_static_relay_space(space)
 }
 
 /// [`detail_live`] as this device sees it. `access` is why this device

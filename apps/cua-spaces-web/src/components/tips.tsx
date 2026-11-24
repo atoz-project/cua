@@ -127,9 +127,7 @@ export function useTipFacts(space?: Space): TipFacts | null {
       deletableStopped: 0,
       diskNearlyFull: disk === "low" || disk === "critical",
       secondComputerOnline: machines.filter((m) => m.online).length >= 2,
-      sharedAny:
-        spaces.some((s) => mine(s) && (accessOf(s)?.people?.length ?? 0) > 0) ||
-        Boolean(space && (accessOf(space)?.canShare === false || (!accessOf(space) && isStaticRelaySpace(space)))),
+      sharedAny: spaces.some((s) => mine(s) && (accessOf(s)?.people?.length ?? 0) > 0),
       pageTipShown,
     };
   }, [all, machines, resources, agents, space, pageTipShown]);
@@ -180,7 +178,8 @@ const Bulb = ({ className }: { className?: string }) => (
  */
 export function PageTip({ place, space, onShare, className }: { place: "spaces" | "space"; space?: Space; onShare?: () => void; className?: string }) {
   const rawTip = useTip(place, space);
-  const tip = rawTip && rawTip.action.kind === "share" && !onShare ? null : rawTip;
+  const canShare = Boolean(onShare) && space?.access?.canShare !== false && (!space || space.access != null || !isStaticRelaySpace(space));
+  const tip = rawTip && rawTip.action.kind === "share" && !canShare ? null : rawTip;
   const { send } = useTips();
   const { openExternal } = useSession();
   const add = usePageTip((s) => s.add);

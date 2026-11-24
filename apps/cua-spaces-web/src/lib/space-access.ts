@@ -14,6 +14,7 @@ import { canDelete, canPower, isStaticRelaySpace } from "@/lib/spaces";
 /** `space.access`, or yours alone when the host did not say. */
 export function accessOf(space: Space, machine: string): SpaceAccess {
   if (space.access) return space.access;
+  const accountCloudDelete = space.cloudDelete === "elsewhere" || Boolean(space.cloudDelete?.startsWith("host:"));
   return {
     kind: "mine",
     role: "owner",
@@ -21,7 +22,7 @@ export function accessOf(space: Space, machine: string): SpaceAccess {
     people: [],
     canPower: canPower(space),
     canTeleport: true,
-    canShare: !isStaticRelaySpace(space),
+    canShare: accountCloudDelete || !isStaticRelaySpace(space),
     canRename: true,
     canDelete: canDelete(space),
     canLeave: false,

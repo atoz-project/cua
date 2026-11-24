@@ -163,7 +163,7 @@ describe("Static Relay Mode Space detail page (rendered DOM)", () => {
 
     render(
       <BridgeProvider adapter={createDemoAdapter()} core={shareTipCore}>
-        <PageTip place="space" space={staticSpace} onShare={undefined} />
+        <PageTip place="space" space={staticSpace} onShare={() => {}} />
       </BridgeProvider>,
     );
 

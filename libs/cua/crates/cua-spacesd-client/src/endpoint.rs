@@ -162,13 +162,24 @@ impl Endpoint {
     }
 }
 
+/// Relay machine ids are DNS-label safe: `[a-z0-9-]{8,64}` without leading
+/// or trailing hyphens.
+fn valid_machine_id(id: &str) -> bool {
+    (8..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+}
+
 fn classify(url: &Url) -> EndpointKind {
     let segments: Vec<&str> = url
         .path_segments()
         .map(|s| s.filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
     match segments.as_slice() {
-        ["m", machine_id, ..] => EndpointKind::Relay {
+        ["m", machine_id] if valid_machine_id(machine_id) => EndpointKind::Relay {
             machine_id: (*machine_id).to_string(),
         },
         _ => EndpointKind::Direct,
@@ -207,14 +218,35 @@ mod tests {
 
     #[test]
     fn relay_url_is_classified() {
-        let e = Endpoint::parse("https://relay.example/m/abc123").unwrap();
+        let e = Endpoint::parse("https://relay.example/m/abc12345").unwrap();
         assert_eq!(
             e.kind(),
             &EndpointKind::Relay {
-                machine_id: "abc123".into()
+                machine_id: "abc12345".into()
             }
         );
-        assert_eq!(e.ws_url("/media"), "wss://relay.example/m/abc123/media");
+        assert_eq!(e.ws_url("/media"), "wss://relay.example/m/abc12345/media");
+
+        // Trailing slash still round-trips to Relay.
+        let trailing = Endpoint::parse("https://relay.example/m/abc12345/").unwrap();
+        assert_eq!(
+            trailing.kind(),
+            &EndpointKind::Relay {
+                machine_id: "abc12345".into()
+            }
+        );
+
+        // Extra path segments or non-machine-id segments classify as Direct.
+        for direct_url in [
+            "https://relay.example/m/abc12345/mcp",
+            "https://relay.example/m/tools",
+            "https://relay.example/m/BAD_ID_01",
+            "https://relay.example/m/-leading1",
+            "https://relay.example/m/trailing-",
+        ] {
+            let parsed = Endpoint::parse(direct_url).unwrap();
+            assert_eq!(parsed.kind(), &EndpointKind::Direct, "{direct_url}");
+        }
     }
 
     #[test]

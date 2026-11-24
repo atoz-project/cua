@@ -69,7 +69,12 @@ impl Spaces {
     /// then starts with [`cua_spaces_contract::presence::LISTED_OFFLINE`].
     pub async fn reach(&self, space: &str) -> Reach {
         let machine = carrier(space);
-        if let Some(machine) = &machine {
+        let is_static = machine
+            .as_deref()
+            .is_some_and(|m| self.is_static_relay_machine(m));
+        if let Some(machine) = &machine
+            && !is_static
+        {
             // A stale directory falls back to the last answer inside; an
             // error here leaves the connect below to say what is wrong.
             let _ = self.relay_directory(Some(machine.as_str())).await;
@@ -86,7 +91,7 @@ impl Spaces {
                 REACH_WITHIN.as_secs()
             )),
         };
-        let listed_offline = self.carrier_listed_offline(space);
+        let listed_offline = !is_static && self.carrier_listed_offline(space);
         let reason = match (reason, listed_offline) {
             (Some(r), true) => Some(crate::spaces::listed_offline_reason(&r)),
             (r, _) => r,

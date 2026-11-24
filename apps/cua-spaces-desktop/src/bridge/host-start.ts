@@ -18,15 +18,24 @@ import type { BridgeContext } from "./context";
 import { hostParts } from "./host-parts";
 
 /**
- * Whether `space` is a persisted Static Relay Mode Space (`relay:<id>` with no
- * host above it, carrying `startedAt` or `cloud` metadata) rather than an
- * Account Relay Mode Computer.
+ * Whether `space` is a relay-reached Space (`relay:<id>` with no host above it,
+ * carrying `startedAt > 0` or `cloud` metadata), classifying it as a Space
+ * rather than an Account Relay Mode Computer's own desktop.
  */
-export function isStaticRelaySpace(space: Pick<AppSpace, "id" | "provider" | "host" | "startedAt" | "cloud">): boolean {
+export function isRelaySpace(space: Pick<AppSpace, "id" | "provider" | "host" | "startedAt" | "cloud">): boolean {
   if (!space.id.startsWith("relay:")) return false;
   if (space.provider !== undefined && space.provider !== "relay") return false;
   if (space.host?.trim()) return false;
-  return space.startedAt != null || Boolean(space.cloud?.trim());
+  return (space.startedAt != null && Number(space.startedAt) > 0) || Boolean(space.cloud?.trim());
+}
+
+/**
+ * Whether `space` is an unattached Static Relay Mode Space (a relay Space
+ * without Account Relay sharing attachment).
+ */
+export function isStaticRelaySpace(space: Pick<AppSpace, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">): boolean {
+  if (!isRelaySpace(space)) return false;
+  return !space.access || (space.access.kind === "mine" && !space.access.canShare);
 }
 
 /**
@@ -39,7 +48,7 @@ export function isStaticRelaySpace(space: Pick<AppSpace, "id" | "provider" | "ho
 export function isMachineDesktop(space: Pick<AppSpace, "id" | "status" | "provider" | "host" | "startedAt" | "cloud">): boolean {
   if (space.status === "local" || space.id === "this-mac") return true;
   if (space.provider !== "relay" || space.host?.trim() || !space.id.startsWith("relay:")) return false;
-  if (space.startedAt != null || Boolean(space.cloud?.trim())) return false;
+  if (isRelaySpace(space)) return false;
   const own = space.id.slice("relay:".length);
   return own.length > 0 && !own.includes("/") && !own.startsWith("space-");
 }

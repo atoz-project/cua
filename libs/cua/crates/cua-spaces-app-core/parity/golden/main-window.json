@@ -190,6 +190,7 @@
         "actions": [
           "teleport: Teleport an app [arrow.down.circle] ?Teleport an app into this Space",
           "pip: Picture in picture [pip.enter] ?Picture in picture",
+          "share: Share [person.badge.plus] ?Share this Space",
           "delete: Delete Space [trash] ?Delete this Space or remove it from the list (destructive)",
           "open: Open [-] ?Open the desktop in its own window (primary)"
         ],
@@ -217,6 +218,7 @@
         "actions": [
           "teleport: Teleport an app [arrow.down.circle] ?Teleport an app into this Space (disabled)",
           "pip: Picture in picture [pip.enter] ?Picture in picture (disabled)",
+          "share: Share [person.badge.plus] ?Share this Space (disabled)",
           "delete: Delete Space [trash] ?Delete this Space or remove it from the list (destructive)",
           "open: Open [-] ?Open the desktop in its own window (disabled) (primary)"
         ],

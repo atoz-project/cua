@@ -214,12 +214,37 @@ describe("stale tasks", () => {
 });
 
 describe("asking a Space before a job is handed to it", () => {
-  it("asks the Spaces on your other computers, not this computer's own", () => {
+  it("asks the Spaces on your other computers, not this computer's own or Static Relay Spaces", () => {
     const spaces = [
       { id: "local:dev", provider: "local" },
       { id: "direct:studio.local:7400", provider: "direct", host: "studio01" },
+      { id: "relay:office-gpu", provider: "relay", startedAt: 1_763_978_400_000 },
+      { id: "relay:cloud-0123456789abcdef", provider: "relay", startedAt: 1_763_978_700_000, cloud: "aws" },
+      {
+        id: "relay:cloud-account00000001",
+        provider: "relay",
+        startedAt: 1_763_978_800_000,
+        cloud: "aws",
+        access: {
+          kind: "mine",
+          role: "owner",
+          place: "AWS",
+          people: [],
+          canPower: false,
+          canTeleport: true,
+          canShare: true,
+          canRename: true,
+          canDelete: true,
+          canLeave: false,
+        },
+      },
+      { id: "relay:studio-online", provider: "relay" },
     ] as Space[];
     expect(onAnotherComputer("relay:mac-mini", spaces)).toBe(true);
+    expect(onAnotherComputer("relay:studio-online", spaces)).toBe(true);
+    expect(onAnotherComputer("relay:cloud-account00000001", spaces)).toBe(true);
+    expect(onAnotherComputer("relay:office-gpu", spaces)).toBe(false);
+    expect(onAnotherComputer("relay:cloud-0123456789abcdef", spaces)).toBe(false);
     expect(onAnotherComputer("direct:studio.local:7400", spaces)).toBe(true);
     expect(onAnotherComputer("local:dev", spaces)).toBe(false);
     expect(onAnotherComputer("local:unknown", null)).toBe(false);

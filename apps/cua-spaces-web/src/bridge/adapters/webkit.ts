@@ -28,6 +28,7 @@
  */
 
 import { Emitter, HostError, type DataAdapter } from "../adapter";
+import { isMachineDesktop, isRelaySpace } from "@/lib/spaces";
 import { hostOs, THIS_MACHINE, type HostOs } from "../host-os";
 import { electronTransport, webkitTransport, type HostTransport } from "../transport";
 import type {
@@ -153,16 +154,9 @@ export function spaceToRow(s: WkSpace): SpaceRow {
     cloud: opt(s.cloud),
     cloudPlace: opt(s.cloudPlace),
     cloudDelete: opt(s.cloudDelete),
-    sharing: s.access ? sharingOf(s.access, isPersistedRelayWireSpace(s)) : undefined,
+    sharing: s.access ? sharingOf(s.access, isRelaySpace(s)) : undefined,
     hostProgress: s.id.startsWith("pending:") ? (s.progress ?? undefined) : undefined,
   };
-}
-
-function isPersistedRelayWireSpace(s: Pick<WkSpace, "id" | "provider" | "host" | "startedAt" | "cloud">): boolean {
-  if (!s.id.startsWith("relay:")) return false;
-  if (s.provider !== undefined && s.provider !== "relay") return false;
-  if (s.host?.trim()) return false;
-  return (s.startedAt != null && s.startedAt > 0) || Boolean(s.cloud?.trim());
 }
 
 /** The sharing facts back from the core's `SpaceAccess` on an `AppSpace`,
@@ -210,14 +204,9 @@ export function toMachineRows(spaces: WkSpaces, machines: WkMachines | null, os:
     rows.push(row);
   };
   for (const { space } of spaces.spaces) {
-    // A machine's own desktop: `relay:<machine>` with no host, no persisted `startedAt`, and no `cloud` metadata.
-    const own =
-      space.provider === "relay" && !space.host?.trim() && space.startedAt == null && !space.cloud?.trim() && space.id.startsWith("relay:")
-        ? space.id.slice(6)
-        : undefined;
-    // A Space registered on the relay (`space-…`) is a Space, not a machine.
-    if (own?.startsWith("space-")) continue;
-    if (own && !own.includes("/")) {
+    // A machine's own desktop: `relay:<machine>` classified by `isMachineDesktop`.
+    const own = isMachineDesktop(space) && space.id.startsWith("relay:") ? space.id.slice("relay:".length) : undefined;
+    if (own) {
       // The list's connect probe was refused by a machine that stopped
       // sharing: it is connected (that is how it refused), not offline.
       const stopped = STOPPED_SHARING_ERROR.test(space.sdk?.error ?? "");

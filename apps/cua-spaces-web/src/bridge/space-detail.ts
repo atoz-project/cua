@@ -54,9 +54,7 @@ export const RUNS_REFRESH_MS = 4_000;
  * and therefore gated by this device's enrollment notice (`sidebar::requires_account_relay_access`).
  * Unattached Static Relay Mode Spaces are exempt; Account-Relay BYOC Spaces remain gated. */
 export function requiresAccountRelayAccess(space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">): boolean {
-  if (!space.id.startsWith("relay:")) return false;
-  if (!isStaticRelaySpace(space)) return true;
-  return Boolean(space.access && (space.access.canShare || space.access.kind !== "mine"));
+  return space.id.startsWith("relay:") && !isStaticRelaySpace(space);
 }
 
 /** The Space's detail (`sidebar.detail`): facts, sections, preview text and
@@ -126,6 +124,9 @@ function fallbackDetail(space: Space, access?: MachineAccessNotice | null): Spac
   const blocked = access && requiresAccountRelayAccess(space) ? access : undefined;
   const canStream = running && !blocked;
   const canShare = space.access ? space.access.canShare : !isStaticRelaySpace(space);
+  const removeOnly =
+    space.provider === "direct" || (space.provider === "relay" && !space.host?.trim() && !space.cloud?.trim()) || space.id.startsWith("pending:");
+  const deleteLabel = removeOnly ? "Remove" : "Delete Space";
   return {
     id: space.id,
     title: space.name,
@@ -139,17 +140,17 @@ function fallbackDetail(space: Space, access?: MachineAccessNotice | null): Spac
     showSections: canStream,
     canStream,
     previewText: blocked ? blocked.text : running ? "Loading the desktop…" : "Not reachable",
-    deleteLabel: "Delete Space",
-    removeOnly: false,
+    deleteLabel,
+    removeOnly,
     ...(blocked ? { access: blocked } : {}),
     actions: [
       { id: "teleport", label: "Teleport an app", help: "Teleport an app into this Space", enabled: canStream, destructive: false, primary: false },
       ...(canShare ? [{ id: "share" as const, label: "Share", help: "Share this Space", enabled: canStream, destructive: false, primary: false }] : []),
     ],
     confirm: {
-      title: `Delete ${space.name}?`,
-      message: "Everything inside it, including its files, is deleted and can't be recovered.",
-      confirmLabel: "Delete Space",
+      title: `${removeOnly ? "Remove" : "Delete"} ${space.name}?`,
+      message: removeOnly ? "It is only removed from the list." : "Everything inside it, including its files, is deleted and can't be recovered.",
+      confirmLabel: deleteLabel,
       confirmEnabled: true,
       cancelLabel: "Keep",
     },
