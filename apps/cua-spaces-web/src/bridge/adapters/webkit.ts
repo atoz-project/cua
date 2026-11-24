@@ -28,7 +28,7 @@
  */
 
 import { Emitter, HostError, type DataAdapter } from "../adapter";
-import { isMachineDesktop, isRelaySpace } from "@/lib/spaces";
+import { isMachineDesktop } from "@/lib/spaces";
 import { hostOs, THIS_MACHINE, type HostOs } from "../host-os";
 import { electronTransport, webkitTransport, type HostTransport } from "../transport";
 import type {
@@ -154,13 +154,14 @@ export function spaceToRow(s: WkSpace): SpaceRow {
     cloud: opt(s.cloud),
     cloudPlace: opt(s.cloudPlace),
     cloudDelete: opt(s.cloudDelete),
-    sharing: s.access ? sharingOf(s.access, isRelaySpace(s)) : undefined,
+    sharing: s.access ? sharingOf(s.access, s.provider === "relay") : undefined,
     hostProgress: s.id.startsWith("pending:") ? (s.progress ?? undefined) : undefined,
   };
 }
 
-/** The sharing facts back from the core's `SpaceAccess` on an `AppSpace`,
- * so the core draws the same access again from the row. */
+/** Reconstruct `SpaceSharingFacts` from `SpaceAccess` across `WkSpace -> SpaceRow -> rowsToSpaces`.
+ * On relay rows (`preserveOwnerShare`), keep an owner fact when `a.canShare` is true so Account-Relay
+ * Spaces remain distinguishable from unattached Static Relay Spaces (`canShare: false`) after re-derivation. */
 export function sharingOf(a: SpaceAccess, preserveOwnerShare = false): SpaceSharingFacts | undefined {
   if (a.kind === "mine" && a.people.length === 0 && !(preserveOwnerShare && a.canShare)) return undefined;
   const people = (role: "editor" | "viewer") => a.people.filter((p) => !p.team && p.role === role).map((p) => p.who);

@@ -30,15 +30,6 @@ export function isRelaySpace(space: Pick<AppSpace, "id" | "provider" | "host" | 
 }
 
 /**
- * Whether `space` is an unattached Static Relay Mode Space (a relay Space
- * without Account Relay sharing attachment).
- */
-export function isStaticRelaySpace(space: Pick<AppSpace, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">): boolean {
-  if (!isRelaySpace(space)) return false;
-  return !space.access || (space.access.kind === "mine" && !space.access.canShare);
-}
-
-/**
  * A machine's own desktop, not a Space: This machine, or one of your Account
  * Relay computers sharing its desktop over the relay (`relay:<machine>` with
  * no host, no persisted `startedAt`, and no `cloud` metadata). The page lists
@@ -47,7 +38,7 @@ export function isStaticRelaySpace(space: Pick<AppSpace, "id" | "provider" | "ho
  */
 export function isMachineDesktop(space: Pick<AppSpace, "id" | "status" | "provider" | "host" | "startedAt" | "cloud">): boolean {
   if (space.status === "local" || space.id === "this-mac") return true;
-  if (space.provider !== "relay" || space.host?.trim() || !space.id.startsWith("relay:")) return false;
+  if ((space.provider !== undefined && space.provider !== "relay") || space.host?.trim() || !space.id.startsWith("relay:")) return false;
   if (isRelaySpace(space)) return false;
   const own = space.id.slice("relay:".length);
   return own.length > 0 && !own.includes("/") && !own.startsWith("space-");

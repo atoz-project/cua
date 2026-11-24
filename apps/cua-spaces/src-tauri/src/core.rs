@@ -370,6 +370,34 @@ pub struct SpaceRow {
     /// Why a local Space stopped without being asked to ("out of memory").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Sharing ownership and role facts from the relay directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<cua_spaces_app_core::model::SpaceSharingFacts>,
+}
+
+fn sharing_facts(
+    s: cua_spaces::sharing::SpaceSharing,
+) -> cua_spaces_app_core::model::SpaceSharingFacts {
+    let opt = |v: String| (!v.is_empty()).then_some(v);
+    cua_spaces_app_core::model::SpaceSharingFacts {
+        owner_id: s.owner_id,
+        owner_email: opt(s.owner_email),
+        owner_name: opt(s.owner_name),
+        role: s.role,
+        team: opt(s.team),
+        team_name: opt(s.team_name),
+        editors: s.editors,
+        viewers: s.viewers,
+        teams: s
+            .teams
+            .into_iter()
+            .map(|t| cua_spaces_app_core::model::SpaceTeamFact {
+                key: t.key,
+                name: t.name,
+                role: t.role,
+            })
+            .collect(),
+    }
 }
 
 /// The name to show for a registered Space: the app core's rule (a
@@ -410,6 +438,7 @@ impl SpaceRow {
             cloud_place: (!info.cloud_place.is_empty()).then_some(info.cloud_place),
             cloud_delete: (!info.cloud_delete.is_empty()).then_some(info.cloud_delete),
             stop_reason: (!info.stop_reason.is_empty()).then_some(info.stop_reason),
+            sharing: info.sharing.map(sharing_facts),
         }
     }
 

@@ -30,6 +30,7 @@ import type { RelayAllowanceNotice, RelayUsage, RelayUsageView } from "./ops/rel
 import type { SessionSnapshot, SettingsSnapshot } from "./protocol";
 import { notSharingOf, realLimits } from "./sharing";
 import { hostOs, type HostOs } from "./host-os";
+import { isMachineDesktop } from "@/lib/spaces";
 
 /* ---- Spaces --------------------------------------------------------------- */
 
@@ -44,17 +45,8 @@ const SCENES: Record<SpaceOs, Space["scene"]> = {
   unknown: "blank",
 };
 
-/** A Space name as shown: as the user typed it, trimmed (the core's `display_name`). */
-function displayName(name: string): string {
-  return name.trim() || name;
-}
-
 /** A Space's fallback name when `name` is empty or whitespace (`spaces::name_of`). */
-function fallbackSpaceName(id: string, name: string): string {
-  const trimmed = name.trim();
-  if (trimmed) return trimmed;
-  return id.replace(/^(?:space:\/\/direct\/|direct:|relay:|local:|cloud:)/, "") || id;
-}
+const fallbackSpaceName = (id: string, name: string): string => name.trim() || id.replace(/^(?:space:\/\/direct\/|direct:|relay:|local:|cloud:)/, "") || id;
 
 function fallbackAccessOf(row: SpaceRow, hasPower: boolean): NonNullable<Space["access"]> {
   const f = row.sharing!;
@@ -62,10 +54,10 @@ function fallbackAccessOf(row: SpaceRow, hasPower: boolean): NonNullable<Space["
   const owner = role === "owner";
   const editor = role !== "viewer";
   const team = f.team?.trim() || undefined;
-  const madeForTeam = owner && Boolean(f.teams?.length);
-  const kind: NonNullable<Space["access"]>["kind"] = team || madeForTeam ? "team" : owner ? "mine" : "withMe";
-  const teamName = team ? f.teamName?.trim() || team : madeForTeam ? f.teams![0]!.name.trim() || f.teams![0]!.key : undefined;
-  const ownerName = !owner ? f.ownerName?.trim() || f.ownerEmail?.split("@")[0] || f.ownerId : undefined;
+  const firstTeam = owner ? f.teams?.[0] : undefined;
+  const kind: NonNullable<Space["access"]>["kind"] = team || firstTeam ? "team" : owner ? "mine" : "withMe";
+  const teamName = team ? f.teamName?.trim() || team : firstTeam ? firstTeam.name.trim() || firstTeam.key : undefined;
+  const ownerName = owner ? undefined : f.ownerName?.trim() || f.ownerEmail?.split("@")[0] || f.ownerId;
   const place =
     kind === "team"
       ? (teamName ?? "")
@@ -76,7 +68,7 @@ function fallbackAccessOf(row: SpaceRow, hasPower: boolean): NonNullable<Space["
     kind,
     role,
     ownerName,
-    ownerEmail: !owner ? (f.ownerEmail ?? undefined) : undefined,
+    ownerEmail: owner ? undefined : (f.ownerEmail ?? undefined),
     teamName,
     place,
     people: [],
@@ -238,7 +230,7 @@ function fallbackReduce(state: CreatesState, a: CreateAction): CreatesState {
     case "start":
       pending.push({
         id: a.id,
-        name: a.name.trim() ? displayName(a.name) : a.os === "macos" ? "macOS Space" : a.os === "windows" ? "Windows Space" : "New Space",
+        name: a.name.trim() || (a.os === "macos" ? "macOS Space" : a.os === "windows" ? "Windows Space" : "New Space"),
         os: a.os,
         provider: a.provider,
         startedAt: a.now,
@@ -416,7 +408,7 @@ export function machineSpacesLabel(desktop: boolean, n: number): string {
 /** One Machines row as the core lists it, from the page's own machine
  * (an older host's rows, merged here): the core draws the page from it. */
 function pageRowOf(m: Machine, spaces: readonly Space[], core?: CoreClient): MachinePageRow {
-  const own = m.current ? spaces.find((s) => s.id === "this-mac") : spaces.find((s) => s.id === `relay:${m.id}`);
+  const own = m.current ? spaces.find((s) => s.id === "this-mac") : spaces.find((s) => isMachineDesktop(s) && s.id === `relay:${m.id}`);
   // The Spaces on it, never its own desktop (`machines::page_rows`).
   const n = spaces.filter((s) => (m.current ? s.provider === "local" && s.id !== "this-mac" : s.host === m.id)).length;
   // Its own desktop is shared (`machines::page_rows`).
@@ -473,9 +465,9 @@ export function machinesView(
 
 /** Which machine a Space runs on: its relay host, the machine itself for
  * its own desktop (`relay:<machine>`), or this machine for a local Space;
- * undefined for cloud Spaces. */
+ * undefined for cloud or Static Relay Spaces. */
 export function machineIdOf(
-  space: Pick<Space, "id" | "host" | "provider" | "startedAt" | "cloud">,
+  space: Pick<Space, "id" | "host" | "provider" | "startedAt" | "cloud"> & Partial<Pick<Space, "status">>,
   machines: Pick<MachineRow, "id" | "current" | "host">[],
 ): string | undefined {
   const current = machines.find((m) => m.current);
@@ -483,7 +475,7 @@ export function machineIdOf(
   const here = (id: string) => (current?.host?.machineId && id === current.host.machineId ? current.id : id);
   if (space.host) return here(space.host);
   if (space.provider === "local") return current?.id;
-  if (space.provider === "relay" && space.startedAt == null && !space.cloud?.trim() && space.id.startsWith("relay:")) {
+  if (isMachineDesktop(space) && space.id.startsWith("relay:")) {
     const own = here(space.id.slice("relay:".length));
     if (machines.some((m) => m.id === own)) return own;
   }

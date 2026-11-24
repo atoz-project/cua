@@ -81,9 +81,9 @@ export function isStaticRelaySpace(space: RelaySpaceFields & { access?: Space["a
  * belong on Computers; the Spaces grid, its count and the command palette
  * leave them out.
  */
-export function isMachineDesktop(space: RelaySpaceFields & Pick<Space, "status">): boolean {
+export function isMachineDesktop(space: RelaySpaceFields & Partial<Pick<Space, "status">>): boolean {
   if (space.status === "local" || space.id === "this-mac") return true;
-  if (space.provider !== "relay" || space.host?.trim() || !space.id.startsWith("relay:")) return false;
+  if ((space.provider != null && space.provider !== "relay") || space.host?.trim() || !space.id.startsWith("relay:")) return false;
   if (isRelaySpace(space)) return false;
   const own = space.id.slice("relay:".length);
   return own.length > 0 && !own.includes("/") && !own.startsWith("space-");
@@ -159,12 +159,36 @@ export function osLabel(space: Pick<Space, "os" | "osPrettyName">): string {
   return space.osPrettyName?.trim() || (space.os === "unknown" ? "" : OS_NAME[space.os]);
 }
 
+/** Where a Space runs, with whether it is reached directly over a remote relay rather than a named machine or cloud. */
+export interface SpacePlacement {
+  label: string;
+  viaRemoteRelay: boolean;
+}
+
 /** "macOS on Studio", "Ubuntu 24.04 · Remote relay", or only the machine when the OS is not known. */
-export function spacePlace(space: Pick<Space, "os" | "osPrettyName">, machine: string): string {
+export function spacePlace(space: Pick<Space, "os" | "osPrettyName">, place: string | SpacePlacement): string {
+  const { label, viaRemoteRelay } = typeof place === "string" ? { label: place, viaRemoteRelay: false } : place;
   const os = osLabel(space);
-  if (!os) return machine;
-  if (machine === t("computers.status.remote_relay")) return t("computers.status.os_via_remote_relay", { os, machine });
-  return t("computers.status.os_on_machine", { os, machine });
+  if (!os) return label;
+  if (viaRemoteRelay) return t("computers.status.os_via_remote_relay", { os, machine: label });
+  return t("computers.status.os_on_machine", { os, machine: label });
+}
+
+/** The machine or remote place a Space runs on, with typed remote-relay provenance. */
+export function machinePlacement(
+  machines: readonly Machine[],
+  space: Pick<Space, "id" | "provider" | "host" | "hostName" | "startedAt" | "cloud" | "cloudPlace">,
+): SpacePlacement {
+  const machine = machines.find((m) => m.spaceIds.includes(space.id));
+  if (machine) return { label: machine.name, viaRemoteRelay: false };
+  if (space.hostName?.trim()) return { label: space.hostName.trim(), viaRemoteRelay: false };
+  if (space.cloudPlace?.trim()) return { label: space.cloudPlace.trim(), viaRemoteRelay: false };
+  if (space.cloud?.trim()) return { label: space.cloud.trim(), viaRemoteRelay: false };
+  if (isRelaySpace(space)) return { label: t("computers.status.remote_relay"), viaRemoteRelay: true };
+  if (space.provider === "direct" || space.provider === undefined) {
+    return { label: t("computers.status.added_by_address"), viaRemoteRelay: false };
+  }
+  return { label: t("computers.status.unknown_computer"), viaRemoteRelay: false };
 }
 
 /** The machine or remote place a Space runs on, by the machines' `spaceIds` or Static Relay metadata. */
@@ -172,14 +196,7 @@ export function machineName(
   machines: readonly Machine[],
   space: Pick<Space, "id" | "provider" | "host" | "hostName" | "startedAt" | "cloud" | "cloudPlace">,
 ): string {
-  const machine = machines.find((m) => m.spaceIds.includes(space.id));
-  if (machine) return machine.name;
-  if (space.hostName?.trim()) return space.hostName.trim();
-  if (space.cloudPlace?.trim()) return space.cloudPlace.trim();
-  if (space.cloud?.trim()) return space.cloud.trim();
-  if (isRelaySpace(space)) return t("computers.status.remote_relay");
-  if (space.provider === "direct" || space.provider === undefined) return t("computers.status.added_by_address");
-  return t("computers.status.unknown_computer");
+  return machinePlacement(machines, space).label;
 }
 
 /** What a Space's ⌘K entries also match: its OS, state, detail and the machine it runs on. */

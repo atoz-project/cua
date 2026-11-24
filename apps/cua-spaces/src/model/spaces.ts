@@ -57,6 +57,8 @@ export interface SpaceRow {
   cloud?: string;
   cloudPlace?: string;
   cloudDelete?: string;
+  /** Sharing ownership and role facts forwarded to `cua-spaces-app-core`. */
+  sharing?: unknown;
 }
 
 /** spacesd feature names the UI keys on. */
@@ -69,6 +71,12 @@ export const FEATURE = {
 
 export function hasFeature(space: Pick<Space, "sdk">, feature: string): boolean {
   return Boolean(space.sdk?.features.includes(feature));
+}
+
+/** Whether a Space may be shared (Static Relay Spaces carry `access.canShare === false`). */
+export function canShareSpace(space: Space & { access?: { canShare?: boolean } }): boolean {
+  if (space.access?.canShare === false) return false;
+  return space.id.startsWith("relay:") || hasFeature(space, "relay_attach");
 }
 
 /** The provider a Space id names (`space://<loc>/…`). */

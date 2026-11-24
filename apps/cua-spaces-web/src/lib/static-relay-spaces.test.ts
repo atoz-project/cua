@@ -10,9 +10,19 @@ import { machineIdOf, rowsToSpaces } from "@/bridge/derive";
 import type { WkSpace } from "@/bridge/webkit-protocol";
 import { shareable } from "@/bridge/share";
 import { requiresAccountRelayAccess, spaceDetail } from "@/bridge/space-detail";
-import { accessOf } from "@/lib/space-access";
+import { accessOf, canShareSpace, isAccountCloudDelete } from "@/lib/space-access";
 import { buildSpacesTree } from "@/lib/spaces-tree";
-import { isMachineDesktop, isRelaySpace, isStaticRelaySpace, listedSpaces, locationLabel, machineName, realSpaces, spacePlace } from "@/lib/spaces";
+import {
+  isMachineDesktop,
+  isRelaySpace,
+  isStaticRelaySpace,
+  listedSpaces,
+  locationLabel,
+  machineName,
+  machinePlacement,
+  realSpaces,
+  spacePlace,
+} from "@/lib/spaces";
 
 function makeSpace(overrides: Partial<Space> & Pick<Space, "id">): Space {
   return {
@@ -125,6 +135,8 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
     expect(machineIdOf(byocStatic, rows)).toBeUndefined();
     expect(machineIdOf(onlineComputer, rows)).toBe("studio-online");
     expect(machineIdOf(offlineComputer, rows)).toBe("studio-offline");
+    // `startedAt: 0` stays consistent between `isMachineDesktop` and `machineIdOf`.
+    expect(machineIdOf({ ...onlineComputer, startedAt: 0 }, rows)).toBe("studio-online");
 
     const machines: Machine[] = [
       { id: "studio-online", name: "Studio", os: "macos", via: "relay", connection: "relay", online: true, current: false, spaceIds: [], limits: [] },
@@ -144,6 +156,17 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
   });
 
   it("hides unavailable account sharing controls and exempts Static Relay Spaces from MachineAccessNotice", () => {
+    expect(isAccountCloudDelete("elsewhere")).toBe(true);
+    expect(isAccountCloudDelete("host:studio-01")).toBe(true);
+    expect(isAccountCloudDelete("here")).toBe(false);
+    expect(isAccountCloudDelete(undefined)).toBe(false);
+
+    expect(canShareSpace(manualStatic)).toBe(false);
+    expect(canShareSpace(byocStatic)).toBe(false);
+    expect(canShareSpace({ ...byocStatic, cloudDelete: "elsewhere" })).toBe(true);
+    expect(canShareSpace({ ...byocStatic, cloudDelete: "host:studio-01" })).toBe(true);
+    expect(canShareSpace(hostedSpace)).toBe(true);
+
     expect(accessOf(manualStatic, "Remote relay").canShare).toBe(false);
     expect(accessOf(byocStatic, "AWS · us-west-2").canShare).toBe(false);
     expect(shareable(manualStatic)).toBe(false);
@@ -182,25 +205,47 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
   });
 
   it("renders natural user-facing placement copy with zero My machines, Unknown computer, or raw relay prefixes", () => {
-    const manualMachine = machineName([], manualStatic);
-    expect(manualMachine).toBe("Remote relay");
-    expect(spacePlace(manualStatic, manualMachine)).toBe("Ubuntu 24.04 · Remote relay");
-    expect(spacePlace({ os: "unknown" }, manualMachine)).toBe("Remote relay");
+    const manualPlace = machinePlacement([], manualStatic);
+    expect(manualPlace).toEqual({ label: "Remote relay", viaRemoteRelay: true });
+    expect(machineName([], manualStatic)).toBe("Remote relay");
+    expect(spacePlace(manualStatic, manualPlace)).toBe("Ubuntu 24.04 · Remote relay");
+    expect(spacePlace({ os: "unknown" }, manualPlace)).toBe("Remote relay");
     expect(locationLabel(manualStatic)).toBe("Remote relay");
-    expect(accessOf(manualStatic, manualMachine).place).toBe("Remote relay");
+    expect(accessOf(manualStatic, manualPlace.label).place).toBe("Remote relay");
 
-    const byocMachine = machineName([], byocStatic);
-    expect(byocMachine).toBe("AWS · us-west-2");
-    expect(spacePlace(byocStatic, byocMachine)).toBe("Linux on AWS · us-west-2");
+    const byocPlace = machinePlacement([], byocStatic);
+    expect(byocPlace).toEqual({ label: "AWS · us-west-2", viaRemoteRelay: false });
+    expect(machineName([], byocStatic)).toBe("AWS · us-west-2");
+    expect(spacePlace(byocStatic, byocPlace)).toBe("Linux on AWS · us-west-2");
     expect(locationLabel(byocStatic)).toBe("AWS · us-west-2");
-    expect(accessOf(byocStatic, byocMachine).place).toBe("AWS · us-west-2");
+    expect(accessOf(byocStatic, byocPlace.label).place).toBe("AWS · us-west-2");
+
+    // A computer literally named "Remote relay" formats via `os_on_machine`, not `os_via_remote_relay`.
+    const literalMachines: Machine[] = [
+      {
+        id: "m-literal",
+        name: "Remote relay",
+        os: "linux",
+        via: "relay",
+        connection: "relay",
+        online: true,
+        current: false,
+        spaceIds: ["relay:m-literal/box"],
+        limits: [],
+      },
+    ];
+    const onLiteralMachine = makeSpace({ id: "relay:m-literal/box", name: "box", provider: "relay", host: "m-literal", os: "linux" });
+    const literalPlace = machinePlacement(literalMachines, onLiteralMachine);
+    expect(literalPlace).toEqual({ label: "Remote relay", viaRemoteRelay: false });
+    expect(spacePlace(onLiteralMachine, literalPlace)).toBe("Linux on Remote relay");
+    expect(spacePlace(onLiteralMachine, "Remote relay")).toBe("Linux on Remote relay");
 
     for (const copy of [
-      manualMachine,
-      spacePlace(manualStatic, manualMachine),
+      manualPlace.label,
+      spacePlace(manualStatic, manualPlace),
       locationLabel(manualStatic),
-      byocMachine,
-      spacePlace(byocStatic, byocMachine),
+      byocPlace.label,
+      spacePlace(byocStatic, byocPlace),
       locationLabel(byocStatic),
     ]) {
       expect(copy).not.toContain("My machines");
@@ -317,9 +362,9 @@ describe("Web Static Relay Space vs Account Computer classification", () => {
       ).toBe(e.inMachinesPage);
       expect(requiresAccountRelayAccess(s), `${f.case}: requiresAccountRelayAccess`).toBe(e.requiresAccountRelayAccess);
 
-      const m = machineName(machines, s);
-      expect(spacePlace(s, m), `${f.case}: webHeaderSubtitle`).toBe(e.webHeaderSubtitle);
-      expect(accessOf(s, m).canShare, `${f.case}: accessOf.canShare`).toBe(e.canShare);
+      const p = machinePlacement(machines, s);
+      expect(spacePlace(s, p), `${f.case}: webHeaderSubtitle`).toBe(e.webHeaderSubtitle);
+      expect(accessOf(s, p.label).canShare, `${f.case}: accessOf.canShare`).toBe(e.canShare);
 
       const d = spaceDetail(noCore, s, null, null, notice);
       expect(Boolean(d.access), `${f.case}: spaceDetail.access`).toBe(e.requiresAccountRelayAccess);

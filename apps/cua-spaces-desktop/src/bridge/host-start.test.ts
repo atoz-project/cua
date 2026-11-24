@@ -4,7 +4,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { isMachineDesktop, isRelaySpace, isStaticRelaySpace, menuItems, realSpaces } from "./host-start";
+import { isMachineDesktop, isRelaySpace, menuItems, realSpaces } from "./host-start";
 import type { BridgeContext } from "./context";
 import type { AppSpace } from "../native/generated/index";
 
@@ -80,12 +80,6 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
     expect(isRelaySpace(offlineComputer)).toBe(false);
     expect(isRelaySpace(hostedSpace)).toBe(false);
 
-    expect(isStaticRelaySpace(manualStatic)).toBe(true);
-    expect(isStaticRelaySpace(byocStatic)).toBe(true);
-    expect(isStaticRelaySpace(onlineComputer)).toBe(false);
-    expect(isStaticRelaySpace(offlineComputer)).toBe(false);
-    expect(isStaticRelaySpace(hostedSpace)).toBe(false);
-
     expect(isMachineDesktop(manualStatic)).toBe(false);
     expect(isMachineDesktop(byocStatic)).toBe(false);
     expect(isMachineDesktop(hostedSpace)).toBe(false);
@@ -100,8 +94,6 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
     const wireNullOffline = { ...offlineComputer, startedAt: null } as unknown as AppSpace;
     expect(isRelaySpace(wireNullOnline)).toBe(false);
     expect(isRelaySpace(wireNullOffline)).toBe(false);
-    expect(isStaticRelaySpace(wireNullOnline)).toBe(false);
-    expect(isStaticRelaySpace(wireNullOffline)).toBe(false);
     expect(isMachineDesktop(wireNullOnline)).toBe(true);
     expect(isMachineDesktop(wireNullOffline)).toBe(true);
   });
@@ -157,7 +149,6 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
         expect: {
           isMachineDesktop: boolean;
           isRelaySpace: boolean;
-          isStaticRelaySpace: boolean;
           inRealSpaces: boolean;
           canShare: boolean;
         };
@@ -194,7 +185,6 @@ describe("Desktop Static Relay Space vs Account Computer classification", () => 
       const s = spaces[i]!;
       expect(isMachineDesktop(s), `${f.case}: isMachineDesktop`).toBe(f.expect.isMachineDesktop);
       expect(isRelaySpace(s), `${f.case}: isRelaySpace`).toBe(f.expect.isRelaySpace);
-      expect(isStaticRelaySpace(s), `${f.case}: isStaticRelaySpace`).toBe(f.expect.isStaticRelaySpace);
     });
     expect(realSpaces(spaces).map((s) => s.id)).toEqual(matrix.fixtures.filter((f) => f.expect.inRealSpaces).map((f) => f.row.id));
   });

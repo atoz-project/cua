@@ -38,6 +38,8 @@ pub const METHODS: &[&str] = &[
     "spaces.normalizeProvider",
     "spaces.sceneForOs",
     "spaces.hasFeature",
+    "spaces.isMachineDesktop",
+    "spaces.isStaticRelaySpace",
     "spaces.sharesDesktop",
     "spaces.sortByMru",
     "spaces.touchSpace",
@@ -470,6 +472,8 @@ pub fn call_value(method: &str, args: Value) -> Result<Value, CoreError> {
             &a.get("space")?,
             &a.get::<String>("feature")?,
         )),
+        "spaces.isMachineDesktop" => out(spaces::is_machine_desktop(&a.get("space")?)),
+        "spaces.isStaticRelaySpace" => out(spaces::is_static_relay_space(&a.get("space")?)),
         // Whether one of your machines shares its desktop (null: not known
         // or not one of your machines): when it does not, nothing asks its
         // desktop or its processes.

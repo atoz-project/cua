@@ -38,7 +38,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { useChildren } from "@/components/children/use-children";
 import { useHiddenSpaceIds } from "@/lib/prepare/store";
-import { isStaticRelaySpace, realSpaces, spaceState } from "@/lib/spaces";
+import { canShareSpace } from "@/lib/space-access";
+import { realSpaces, spaceState } from "@/lib/spaces";
 import { cn } from "@/lib/utils";
 
 /** Whether a page shows a tip now (the sidebar's waits until none does). */
@@ -178,7 +179,7 @@ const Bulb = ({ className }: { className?: string }) => (
  */
 export function PageTip({ place, space, onShare, className }: { place: "spaces" | "space"; space?: Space; onShare?: () => void; className?: string }) {
   const rawTip = useTip(place, space);
-  const canShare = Boolean(onShare) && space?.access?.canShare !== false && (!space || space.access != null || !isStaticRelaySpace(space));
+  const canShare = Boolean(onShare) && (!space || canShareSpace(space));
   const tip = rawTip && rawTip.action.kind === "share" && !canShare ? null : rawTip;
   const { send } = useTips();
   const { openExternal } = useSession();

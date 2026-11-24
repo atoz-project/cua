@@ -15,6 +15,7 @@ import { useContext, useEffect, useSyncExternalStore } from "react";
 import { isUnsupported, type DataAdapter } from "./adapter";
 import { BridgeContext } from "./BridgeProvider";
 import type { CoreClient } from "./core";
+import { canShareSpace } from "@/lib/space-access";
 import { isStaticRelaySpace } from "@/lib/spaces";
 import { sharesDesktop } from "./derive";
 import type { MachineAccessNotice } from "./contracts/devices";
@@ -123,7 +124,7 @@ function fallbackDetail(space: Space, access?: MachineAccessNotice | null): Spac
   const running = space.status === "running" && !space.power?.off;
   const blocked = access && requiresAccountRelayAccess(space) ? access : undefined;
   const canStream = running && !blocked;
-  const canShare = space.access ? space.access.canShare : !isStaticRelaySpace(space);
+  const canShare = canShareSpace(space);
   const removeOnly =
     space.provider === "direct" || (space.provider === "relay" && !space.host?.trim() && !space.cloud?.trim()) || space.id.startsWith("pending:");
   const deleteLabel = removeOnly ? "Remove" : "Delete Space";
