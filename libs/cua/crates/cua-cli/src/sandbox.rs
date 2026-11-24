@@ -3204,12 +3204,18 @@ async fn space_for(cua: &Cua, name: &str) -> Result<Option<Arc<cua_sdk::Space>>,
             id
         }
         None => {
-            // A name: read the directory again, then resolve it. A miss
-            // leaves the sandboxes error as it was.
-            let _ = spaces.list().await;
+            // Try resolving locally first (registry + space-meta) so Static
+            // Relay Spaces matched by bare machine id or display name do not
+            // query the Account Relay directory. Only refresh on a miss.
             match spaces.resolve(name.to_string()).await {
                 Ok(i) => i.id,
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    let _ = spaces.list().await;
+                    match spaces.resolve(name.to_string()).await {
+                        Ok(i) => i.id,
+                        Err(_) => return Ok(None),
+                    }
+                }
             }
         }
     };

@@ -81,6 +81,12 @@ impl Spaces {
                      point cua controls",
                 ));
             }
+            SpaceId::Relay { machine_id } if self.is_static_relay_machine(machine_id) => {
+                return Err(refused(
+                    "relay",
+                    "only a Space one of your machines provides; that machine enforces it",
+                ));
+            }
             SpaceId::Relay { machine_id } => {
                 let host = self.relay_row(machine_id).await.and_then(|m| {
                     let host = m.host.clone().filter(|h| !h.is_empty())?;
