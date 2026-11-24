@@ -39,7 +39,7 @@ import { AgentsSection } from "@/components/space-detail/agents-section";
 import { DropWell } from "@/components/space-detail/drop-well";
 import { FactList } from "@/components/space-detail/facts";
 import { SpaceResourcesPanel } from "@/components/resources/space-resources-panel";
-import { ownerLabel } from "@/lib/space-access";
+import { canShareSpace, ownerLabel } from "@/lib/space-access";
 import { systemName } from "@/lib/resources";
 import { StreamSection } from "@/components/space-detail/stream-section";
 import { StreamSurface } from "@/components/space-detail/stream-surface";
@@ -66,10 +66,9 @@ import {
   canDelete,
   canPower,
   createError,
-  isStaticRelaySpace,
   isUnsharedDesktop,
   createProgress,
-  machineName,
+  machinePlacement,
   powerLabel,
   powerPending,
   spacePlace,
@@ -222,7 +221,7 @@ function SpaceDetailPage() {
   if (!space || !detail) return null;
 
   const state = spaceState(space);
-  const machine = machineName(machines, space);
+  const placement = machinePlacement(machines, space);
   const pending = powerPending(space);
   // "Turn on" / "Turn off" (or Resume / Suspend), the SwiftUI app's words.
   const turnOn = powerLabel(core, space, true);
@@ -240,8 +239,7 @@ function SpaceDetailPage() {
   // A teammate who may only watch is not offered Share or control (the host refuses both anyway).
   const viewOnly = space.access?.role === "viewer";
   const sharedOwner = space.access && space.access.kind === "withMe" ? { name: ownerLabel(space.access) ?? "", email: space.access.ownerEmail } : null;
-  const mayShare = (space.access ? space.access.canShare : !isStaticRelaySpace(space)) && !viewOnly;
-  const shareAction = mayShare ? action("share") : undefined;
+  const shareAction = canShareSpace(space) && !viewOnly ? action("share") : undefined;
   // Signed in, not enrolled: the access line's action opens this computer's page with the enroll sheet.
   const enroll = () => {
     devices.startEnroll();
@@ -386,7 +384,7 @@ function SpaceDetailPage() {
   );
   const place = (
     <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-muted-foreground">
-      <span>{spacePlace(space, machine)}</span>
+      <span>{spacePlace(space, placement)}</span>
       {pending ? (
         <span className="text-xs">{pending}</span>
       ) : space.id === "this-mac" ? (

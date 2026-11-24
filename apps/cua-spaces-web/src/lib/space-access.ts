@@ -11,10 +11,20 @@ import type { Space, SpaceAccess } from "@/bridge";
 import { thisComputerLabel } from "@/lib/host-labels";
 import { canDelete, canPower, isStaticRelaySpace } from "@/lib/spaces";
 
+/** Whether `cloudDelete` indicates an Account-Relay cloud Space created on another device (`elsewhere` or `host:<machine>`). */
+export function isAccountCloudDelete(cloudDelete: string | null | undefined): boolean {
+  return cloudDelete === "elsewhere" || Boolean(cloudDelete?.startsWith("host:"));
+}
+
+/** Whether the current user may share `space` (honoring `space.access` when present, else excluding unattached Static Relay Spaces). */
+export function canShareSpace(space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "cloudDelete" | "access">): boolean {
+  if (space.access) return space.access.canShare && space.access.role !== "viewer";
+  return isAccountCloudDelete(space.cloudDelete) || !isStaticRelaySpace(space);
+}
+
 /** `space.access`, or yours alone when the host did not say. */
 export function accessOf(space: Space, machine: string): SpaceAccess {
   if (space.access) return space.access;
-  const accountCloudDelete = space.cloudDelete === "elsewhere" || Boolean(space.cloudDelete?.startsWith("host:"));
   return {
     kind: "mine",
     role: "owner",
@@ -22,7 +32,7 @@ export function accessOf(space: Space, machine: string): SpaceAccess {
     people: [],
     canPower: canPower(space),
     canTeleport: true,
-    canShare: accountCloudDelete || !isStaticRelaySpace(space),
+    canShare: canShareSpace(space),
     canRename: true,
     canDelete: canDelete(space),
     canLeave: false,

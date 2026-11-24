@@ -64,12 +64,9 @@ pub fn access_of(row: &SpaceRow, power: bool) -> SpaceAccess {
     };
     let owner = role == SpaceAccessRole::Owner;
     let editor = role != SpaceAccessRole::Viewer;
-    let is_account_cloud_delete = row
-        .cloud_delete
-        .as_deref()
-        .is_some_and(|d| d == "elsewhere" || d.starts_with("host:"));
-    let static_relay_unattached =
-        super::is_persisted_relay_row(row) && row.sharing.is_none() && !is_account_cloud_delete;
+    let static_relay_unattached = super::is_persisted_relay_row(row)
+        && row.sharing.is_none()
+        && !super::is_account_cloud_delete(row.cloud_delete.as_deref());
     SpaceAccess {
         kind,
         role,
