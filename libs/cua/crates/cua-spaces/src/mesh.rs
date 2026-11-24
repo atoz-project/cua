@@ -307,6 +307,22 @@ impl MeshClients {
         }
     }
 
+    /// Drops only the loopback forward on `(relay, token)`'s static mesh
+    /// dialer for `machine_id` after rotating to a new credential.
+    pub(crate) async fn forget_static_machine(&self, relay: &str, token: &str, machine_id: &str) {
+        let key = key_of(&Via::Static { relay, token });
+        let dialer = {
+            let nodes = self.nodes.lock().await;
+            match nodes.get(&key) {
+                Some(Slot::Ready { dialer, .. }) => Some(dialer.clone()),
+                _ => None,
+            }
+        };
+        if let Some(dialer) = dialer {
+            dialer.forget(machine_id).await;
+        }
+    }
+
     /// Why a Space on the relay's HTTPS path should reconnect now: its
     /// machine joined the mesh since (checked at most every `every`).
     /// Reported once; the reconnect picks the route again.
