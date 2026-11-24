@@ -307,10 +307,10 @@ impl MeshClients {
         }
     }
 
-    /// Drops only the loopback forward on `(relay, token)`'s static mesh
-    /// dialer for `machine_id` after rotating to a new credential.
-    pub(crate) async fn forget_static_machine(&self, relay: &str, token: &str, machine_id: &str) {
-        let key = key_of(&Via::Static { relay, token });
+    /// Drops the loopback forward on `relay`'s static mesh dialer for
+    /// `machine_id` after rotating to a different relay origin.
+    pub(crate) async fn forget_static_machine(&self, relay: &str, machine_id: &str) {
+        let key = Key::Static(relay.to_owned());
         let dialer = {
             let nodes = self.nodes.lock().await;
             match nodes.get(&key) {

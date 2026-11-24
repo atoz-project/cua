@@ -286,7 +286,7 @@ impl Spaces {
     ) -> Result<SpaceInfo> {
         let name = name.filter(|n| !n.trim().is_empty());
 
-        let (id, space, credential, prev_static) = match plan_add(url, token, service)? {
+        let (id, space, credential, prev_origin) = match plan_add(url, token, service)? {
             AddPlan::ById { id, credential } => {
                 let record = self.inner.registry.get(&id.to_string())?;
                 let space = self
@@ -359,14 +359,16 @@ impl Spaces {
                     c.url.as_deref() == Some(endpoint_url.as_str())
                         && c.token.as_deref() == Some(token.as_str())
                 });
-                let prev_static = existing_cred
+                let new_origin = cua_spacesd_client::Endpoint::parse(&endpoint_url)
+                    .ok()
+                    .map(|e| e.origin());
+                let prev_origin = existing_cred
                     .as_ref()
-                    .and_then(|c| {
-                        let url = c.url.as_deref().filter(|u| !u.trim().is_empty())?;
-                        let tok = c.token.as_deref().filter(|t| !t.trim().is_empty())?;
-                        Some((url.to_string(), tok.to_string()))
-                    })
-                    .filter(|_| !same_cred);
+                    .and_then(|c| c.url.as_deref())
+                    .filter(|u| !u.trim().is_empty())
+                    .and_then(|u| cua_spacesd_client::Endpoint::parse(u).ok())
+                    .map(|e| e.origin())
+                    .filter(|prev| Some(prev) != new_origin.as_ref());
                 if record.is_some() && same_cred {
                     let machine_id = match &relay_id {
                         SpaceId::Relay { machine_id } => Some(machine_id.as_str()),
@@ -389,7 +391,7 @@ impl Spaces {
                     .connect(&relay_id, &credential, effective_name, record.as_ref())
                     .await
                 {
-                    Ok(space) => Ok((relay_id.clone(), space, credential, prev_static)),
+                    Ok(space) => Ok((relay_id.clone(), space, credential, prev_origin)),
                     Err(e) if not_an_spacesd(&e) => self
                         .try_add_plain_mcp(
                             &direct_id,
@@ -419,12 +421,11 @@ impl Spaces {
         let key = id.to_string();
         self.store(&space, credential)?;
         if let SpaceId::Relay { machine_id } = &id
-            && let Some((prev_url, prev_tok)) = prev_static
-            && let Ok(prev_ep) = cua_spacesd_client::Endpoint::parse(&prev_url)
+            && let Some(prev_orig) = prev_origin
         {
             self.inner
                 .mesh
-                .forget_static_machine(&prev_ep.origin(), &prev_tok, machine_id)
+                .forget_static_machine(&prev_orig, machine_id)
                 .await;
         }
         if name.is_some()

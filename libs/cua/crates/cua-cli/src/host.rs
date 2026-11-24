@@ -1360,8 +1360,8 @@ pub async fn run_spaces_sdk(
         SpacesCmd::Share {
             space, who, role, ..
         } => {
-            let who = team_who(&who).await?;
-            if who.starts_with("team:") && !json {
+            let (who, is_static) = resolve_share_who(&spaces, &space, &who).await?;
+            if !is_static && who.starts_with("team:") && !json {
                 eprintln!(
                     "Adding {space} to the team… (right after a Teams checkout this can take up to a minute while the plan is set up)"
                 );
@@ -1374,7 +1374,7 @@ pub async fn run_spaces_sdk(
         }
         SpacesCmd::Unshare { space, who, all } => {
             let who = match who {
-                Some(w) if !all => Some(team_who(&w).await?),
+                Some(w) if !all => Some(resolve_share_who(&spaces, &space, &w).await?.0),
                 _ => None,
             };
             print_shares(&spaces.unshare_space(space, who).await?, json, out);
@@ -3570,6 +3570,24 @@ fn print_allow(allow: &[String], json: bool, out: &mut dyn Write) {
     } else {
         line(out, format!("Shared with: {}", allow.join(", ")));
     }
+}
+
+/// Resolves `team:<name>` only when `space` is not already known on the host as
+/// a Static Relay Space, so offline `share`/`unshare` refusals never hit the
+/// remote Spaces API before `share_space`/`unshare_space` rejects them.
+async fn resolve_share_who(
+    spaces: &cua_sdk::Spaces,
+    space: &str,
+    who: &str,
+) -> Result<(String, bool), CuaError> {
+    if who.trim().starts_with("team:") {
+        match spaces.is_static_relay_space(space).await {
+            Ok(true) => return Ok((who.to_string(), true)),
+            Err(e @ CuaError::AmbiguousSandbox { .. }) => return Err(e),
+            Ok(false) | Err(_) => {}
+        }
+    }
+    Ok((team_who(who).await?, false))
 }
 
 /// `who` as it is shared with: a `team:<name>` becomes `team:<organization
