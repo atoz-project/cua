@@ -484,15 +484,12 @@ pub(crate) fn says_listed_offline(space: &Space) -> bool {
 }
 
 /// The machine whose own desktop `space` is (`relay:<machine>`, no host
-/// above it), if it is one.
+/// above it, and not a persisted Static Relay Space), if it is one.
 fn own_desktop(space: &Space) -> Option<&str> {
-    if space.provider != Some(SpaceProvider::Relay) || space.host.is_some() {
+    if !crate::spaces::is_remote_desktop(space) {
         return None;
     }
-    space
-        .id
-        .strip_prefix("relay:")
-        .filter(|own| !own.is_empty() && !own.contains('/') && !own.starts_with("space-"))
+    space.id.strip_prefix("relay:")
 }
 
 /// A Space's system as a machine's `os`: empty when unknown, so it never
@@ -1223,5 +1220,57 @@ mod tests {
             .filter_map(|o| o.id.strip_prefix("host:").map(str::to_string))
             .collect();
         assert_eq!(offered, machines);
+    }
+
+    #[test]
+    fn page_rows_excludes_static_relay_spaces_and_keeps_online_and_offline_account_computers() {
+        let mk = |json: serde_json::Value| {
+            crate::spaces::row_to_space(&serde_json::from_value(json).unwrap(), 0)
+        };
+        let spaces = vec![
+            mk(serde_json::json!({
+                "id": "relay:office-gpu",
+                "name": "Office GPU",
+                "provider": "relay",
+                "addedAt": "2026-11-24T10:00:00Z",
+                "os": "linux",
+                "reachable": true,
+            })),
+            mk(serde_json::json!({
+                "id": "relay:cloud-0123456789abcdef",
+                "name": "Research Box",
+                "provider": "relay",
+                "addedAt": "2026-11-24T10:05:00Z",
+                "cloud": "aws",
+                "cloudPlace": "AWS \u{b7} us-west-2",
+                "os": "linux",
+                "reachable": true,
+            })),
+            mk(serde_json::json!({
+                "id": "relay:studio-online",
+                "name": "Studio",
+                "provider": "relay",
+                "os": "macos",
+                "reachable": true,
+                "sharing": { "ownerId": "u1", "role": "owner" },
+            })),
+            mk(serde_json::json!({
+                "id": "relay:studio-offline",
+                "name": "Spare Mini",
+                "provider": "relay",
+                "os": "macos",
+                "reachable": false,
+            })),
+        ];
+        let rows = page_rows(&MachinesPageInput {
+            host_os: SpaceOs::Macos,
+            spaces,
+            devices: vec![],
+            hostnames: Default::default(),
+            presence: Default::default(),
+            now: NOW,
+        });
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["this-mac", "studio-online", "studio-offline"]);
     }
 }

@@ -56,6 +56,10 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, body::Body};
 
+#[path = "testing_relay.rs"]
+mod testing_relay;
+pub use testing_relay::*;
+
 type Stream<T> = Pin<Box<dyn futures_util::Stream<Item = Result<T, Status>> + Send>>;
 
 /// How the mock authenticates callers.

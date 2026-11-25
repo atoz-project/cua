@@ -64,6 +64,9 @@ pub fn access_of(row: &SpaceRow, power: bool) -> SpaceAccess {
     };
     let owner = role == SpaceAccessRole::Owner;
     let editor = role != SpaceAccessRole::Viewer;
+    let static_relay_unattached = super::is_persisted_relay_row(row)
+        && row.sharing.is_none()
+        && !super::is_account_cloud_delete(row.cloud_delete.as_deref());
     SpaceAccess {
         kind,
         role,
@@ -74,7 +77,7 @@ pub fn access_of(row: &SpaceRow, power: bool) -> SpaceAccess {
         people,
         can_power: power && editor,
         can_teleport: editor,
-        can_share: owner,
+        can_share: owner && !static_relay_unattached,
         can_rename: owner,
         can_delete: owner && row.cloud_delete.as_deref() != Some("elsewhere"),
         can_leave: !owner,
@@ -129,7 +132,13 @@ fn own_place(row: &SpaceRow) -> String {
         SpaceProvider::Relay => text(&row.cloud_place)
             .or_else(|| text(&row.host_name))
             .or_else(|| text(&row.cloud))
-            .unwrap_or_else(|| "My machines".into()),
+            .unwrap_or_else(|| {
+                if super::is_persisted_relay_row(row) {
+                    "Remote relay".into()
+                } else {
+                    "My machines".into()
+                }
+            }),
     }
 }
 
@@ -311,5 +320,52 @@ mod tests {
         assert_eq!(possessive("James", "Mac"), "James' Mac");
         assert_eq!(possessive("Sam", "Sam's Mac mini"), "Sam's Mac mini");
         assert_eq!(possessive("", "PC"), "PC");
+    }
+
+    #[test]
+    fn static_relay_spaces_hide_sharing_and_use_clean_place_copy() {
+        let mut manual = row("relay:office-gpu", "relay");
+        manual.added_at = Some("2026-11-24T10:00:00Z".into());
+        let a = access_of(&manual, false);
+        assert_eq!(a.kind, SpaceAccessKind::Mine);
+        assert_eq!(a.role, SpaceAccessRole::Owner);
+        assert!(!a.can_share);
+        assert_eq!(a.place, "Remote relay");
+        assert!(!a.place.contains("relay:"));
+        assert!(!a.place.contains("My machines"));
+
+        let mut byoc = row("relay:cloud-0123456789abcdef", "relay");
+        byoc.added_at = Some("2026-11-24T10:05:00Z".into());
+        byoc.cloud = Some("aws".into());
+        byoc.cloud_place = Some("AWS \u{b7} us-west-2".into());
+        let a = access_of(&byoc, false);
+        assert!(!a.can_share);
+        assert_eq!(a.place, "AWS \u{b7} us-west-2");
+
+        // An account-attached cloud Space with sharing facts stays shareable.
+        byoc.sharing = Some(facts("owner"));
+        assert!(access_of(&byoc, false).can_share);
+
+        // Account-Relay cloud Spaces created on another device (`elsewhere` / `host:*`)
+        // are Account-Relay indicators even without inline sharing facts.
+        let mut elsewhere = row("relay:cloud-elsewhere0001", "relay");
+        elsewhere.added_at = Some("2026-11-24T10:05:00Z".into());
+        elsewhere.cloud = Some("gcp".into());
+        elsewhere.cloud_delete = Some("elsewhere".into());
+        assert!(access_of(&elsewhere, false).can_share);
+        elsewhere.cloud_delete = Some("host:studio-01".into());
+        assert!(access_of(&elsewhere, false).can_share);
+
+        // Online and offline Account Relay Computers keep account place & sharing.
+        let mut online_computer = row("relay:studio-online", "relay");
+        online_computer.sharing = Some(facts("owner"));
+        let a = access_of(&online_computer, false);
+        assert!(a.can_share);
+        assert_eq!(a.place, "My machines");
+
+        let offline_computer = row("relay:studio-offline", "relay");
+        let a = access_of(&offline_computer, false);
+        assert!(a.can_share);
+        assert_eq!(a.place, "My machines");
     }
 }

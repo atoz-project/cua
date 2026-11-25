@@ -566,12 +566,25 @@ impl Spaces {
         self.ensure_shared_machine_with(space, true).await
     }
 
+    /// Refuses Account Relay Mode sharing or registration operations on a
+    /// Static Relay Mode Space before touching `self.relay()` or issuing any
+    /// Account Relay HTTP request.
+    fn reject_static_relay_sharing(&self, id: &SpaceId, action: &str) -> Result<()> {
+        if self.is_static_relay_space(id) {
+            return Err(Error::invalid(format!(
+                "cannot {action} Static Relay Space {id}: account sharing requires Account Relay Mode (`cua host setup` or `cua spaces relay-register`)"
+            )));
+        }
+        Ok(())
+    }
+
     /// [`Self::ensure_shared_machine`]; with `wait` false it asks the relay
     /// for nothing it does not need: no read of the machine first (the caller
     /// has the directory) and no polling until the driver is online (the
     /// next pass sees it), so one Space costs the relay one registration.
     async fn ensure_shared_machine_with(&self, space: &str, wait: bool) -> Result<String> {
         let id = self.resolve(space)?;
+        self.reject_static_relay_sharing(&id, "register or share")?;
         let canonical = id.to_string();
         let relay = self.relay()?;
         let token = relay.tokens.access_token().await?;
@@ -731,13 +744,15 @@ impl Spaces {
         who: &str,
         role: ShareRole,
     ) -> Result<SpaceShares> {
+        let id = self.resolve(space)?;
+        self.reject_static_relay_sharing(&id, "share")?;
         if let Some(team) = team_of(who) {
             return self
                 .share_with_team_as(space, &team?, role, &mut |_| {})
                 .await;
         }
         let who = normalize_who(who)?;
-        let canonical = self.resolve(space)?.to_string();
+        let canonical = id.to_string();
         self.require_team_to_share().await?;
         let consent = self
             .inner
@@ -791,10 +806,11 @@ impl Spaces {
     /// cut). With `who = None` the Space stops being shared with anyone,
     /// and a Space that is not a host leaves the relay.
     pub async fn unshare_space(&self, space: &str, who: Option<&str>) -> Result<SpaceShares> {
+        let id = self.resolve(space)?;
+        self.reject_static_relay_sharing(&id, "unshare")?;
         if let Some(team) = who.and_then(team_of) {
             return self.unshare_from_team(space, &team?).await;
         }
-        let id = self.resolve(space)?;
         let canonical = id.to_string();
         let Some(machine) = self.share_machine(&canonical, &id) else {
             self.info(&id)?;
@@ -919,6 +935,7 @@ impl Spaces {
         waiting: &mut (dyn FnMut(std::time::Duration) + Send),
     ) -> Result<SpaceShares> {
         let id = self.resolve(space)?;
+        self.reject_static_relay_sharing(&id, "share")?;
         let canonical = id.to_string();
         let relay = self.relay()?;
         let api = relay.spaces_api()?;
@@ -988,6 +1005,7 @@ impl Spaces {
     /// Takes `space` off `team`.
     pub async fn unshare_from_team(&self, space: &str, team: &str) -> Result<SpaceShares> {
         let id = self.resolve(space)?;
+        self.reject_static_relay_sharing(&id, "unshare")?;
         let canonical = id.to_string();
         let Some(machine) = self.share_machine(&canonical, &id) else {
             return Err(Error::NotFound(format!("{canonical} is not shared")));
@@ -1141,6 +1159,7 @@ impl Spaces {
             other => other?,
         };
         let canonical = id.to_string();
+        self.reject_static_relay_sharing(&id, "unregister")?;
         if let SpaceId::Relay { machine_id } = &id {
             let removed = self.forget_relay_machine(machine_id, delete_spaces).await?;
             if removed.is_some() {
@@ -1238,6 +1257,7 @@ impl Spaces {
     /// Who `space` is shared with, and who of them is connected now.
     pub async fn space_shares(&self, space: &str) -> Result<SpaceShares> {
         let id = self.resolve(space)?;
+        self.reject_static_relay_sharing(&id, "list shares for")?;
         let canonical = id.to_string();
         match self.share_machine(&canonical, &id) {
             Some(machine) => self.shares_of(&canonical, &machine).await,

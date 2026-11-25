@@ -19,8 +19,11 @@ pub const SECTION_ORDER: [&str; 3] = [
     "spaces.sidebar.section.my_computers",
 ];
 
-fn section_of(p: Option<SpaceProvider>) -> &'static str {
-    match p.unwrap_or(SpaceProvider::Direct) {
+fn section_of(space: &Space) -> &'static str {
+    if super::is_relay_space(space) {
+        return SECTION_ORDER[1];
+    }
+    match space.provider.unwrap_or(SpaceProvider::Direct) {
         SpaceProvider::Local => SECTION_ORDER[0],
         SpaceProvider::Direct => SECTION_ORDER[1],
         SpaceProvider::Relay => SECTION_ORDER[2],
@@ -312,7 +315,7 @@ fn nest_under_hosts(spaces: Vec<&Space>, selected: Option<&str>) -> Vec<SidebarR
     let listed = |h: &str| {
         spaces
             .iter()
-            .any(|m| m.id.strip_prefix("relay:") == Some(h) && host_of(m).is_none())
+            .any(|m| is_your_machine(m) && m.id.strip_prefix("relay:") == Some(h))
     };
     let mut out = Vec::with_capacity(spaces.len());
     for s in spaces
@@ -320,7 +323,7 @@ fn nest_under_hosts(spaces: Vec<&Space>, selected: Option<&str>) -> Vec<SidebarR
         .filter(|s| host_of(s).is_none_or(|h| !listed(&h)))
     {
         out.push(row(s, selected));
-        if let Some(machine) = s.id.strip_prefix("relay:").filter(|_| host_of(s).is_none()) {
+        if let Some(machine) = s.id.strip_prefix("relay:").filter(|_| is_your_machine(s)) {
             for child in spaces
                 .iter()
                 .filter(|c| host_of(c).as_deref() == Some(machine))
@@ -376,7 +379,7 @@ pub fn sidebar(spaces: &[Space], query: &str, selected_id: &str) -> SidebarView 
                 visible
                     .iter()
                     .copied()
-                    .filter(|s| s.id != THIS_MACHINE_ID && section_of(s.provider) == *title)
+                    .filter(|s| s.id != THIS_MACHINE_ID && section_of(s) == *title)
                     .collect(),
                 sel,
             );
@@ -530,12 +533,10 @@ pub struct NewSpaceOn {
 /// spacesd's feature for a machine that provides Spaces.
 pub const HOST_SPACES_FEATURE: &str = "host_spaces";
 
-/// One of your machines itself, reached through the relay: not a Space it
-/// provides and not a Space in your cloud.
+/// One of your Account Relay computers itself, reached through the relay: not
+/// a Space it provides and not a relay Space.
 pub fn is_your_machine(space: &Space) -> bool {
-    space.id.starts_with("relay:")
-        && space.host.as_deref().is_none_or(str::is_empty)
-        && !in_your_cloud(space)
+    super::is_remote_desktop(space)
 }
 
 /// Whether one of your machines shares its own desktop, when it said so:
@@ -1051,13 +1052,19 @@ pub fn detail_live(
             "Picture in picture",
             can_stream,
         ));
-        actions.push(action(
-            DetailActionId::Share,
-            "Share",
-            Some("person.badge.plus"),
-            "Share this Space",
-            can_stream,
-        ));
+        let can_share = space
+            .access
+            .as_ref()
+            .map_or(!super::is_static_relay_space(space), |a| a.can_share);
+        if can_share {
+            actions.push(action(
+                DetailActionId::Share,
+                "Share",
+                Some("person.badge.plus"),
+                "Share this Space",
+                can_stream,
+            ));
+        }
         // One still being created can be cancelled (it stops, and what it
         // made is removed).
         if let Some(p) = creating.filter(|p| p.error.is_none()) {
@@ -1147,14 +1154,32 @@ pub fn detail_live(
     }
 }
 
+/// Whether `space` is reached through the signed-in account's relay directory
+/// and therefore gated by this device's enrollment notice.
+///
+/// Unattached Static Relay Mode Spaces (`is_static_relay_space`) are exempt;
+/// Account-Relay BYOC Spaces and Account Computers continue honoring enrollment.
+pub fn requires_account_relay_access(space: &Space) -> bool {
+    matches!(
+        super::classify_relay_space(space),
+        Some(
+            super::RelayEntryKind::AccountComputer
+                | super::RelayEntryKind::HostedSpace
+                | super::RelayEntryKind::PersistedSpace {
+                    account_attached: true
+                }
+        )
+    )
+}
+
 /// [`detail_live`] as this device sees it. `access` is why this device
 /// cannot open the account's machines (signed in, not enrolled;
 /// [`crate::devices::machine_access_notice`]): every Space reached through
-/// the relay then shows its Connect greyed out under that line, says why
-/// in its Status, and nothing that needs a connection is offered. One of
-/// your machines that does not share its desktop shows [`desktop_note`] in
-/// place of its desktop, Stream, Agents and Teleport, and New Space on it
-/// when it provides Spaces.
+/// the account relay then shows its Connect greyed out under that line, says
+/// why in its Status, and nothing that needs a connection is offered. Static
+/// Relay Mode Spaces are exempt. One of your machines that does not share its
+/// desktop shows [`desktop_note`] in place of its desktop, Stream, Agents and
+/// Teleport, and New Space on it when it provides Spaces.
 pub fn detail_for(
     space: &Space,
     usage: Option<&SpaceUsage>,
@@ -1168,7 +1193,7 @@ pub fn detail_for(
         DetailActionId::Share,
         DetailActionId::Open,
     ];
-    if let Some(access) = access.filter(|_| space.id.starts_with("relay:")) {
+    if let Some(access) = access.filter(|_| requires_account_relay_access(space)) {
         d.can_stream = false;
         d.show_sections = false;
         d.sections.clear();

@@ -16,7 +16,19 @@ categories = ["api-bindings", "network-programming", "asynchronous"]
 [features]
 # In-process mock spacesd (`cua_spacesd_client::testing`) for this crate's tests and
 # downstream crates' integration tests. Never enabled in release builds.
-testing = ["tonic/server", "tonic/router", "tokio-stream/net"]
+testing = [
+    "tonic/server",
+    "tonic/router",
+    "tokio-stream/net",
+    "hyper/server",
+    "hyper/http1",
+    "hyper/http2",
+    "hyper-util/server",
+    "hyper-util/server-auto",
+    "hyper-util/service",
+    "dep:rcgen",
+    "dep:tokio-rustls",
+]
 
 [dependencies]
 cua-proto.workspace = true
@@ -51,6 +63,8 @@ tracing.workspace = true
 tokio-tungstenite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 
 # SHA-256 with the CPU's SHA instructions on arm64 (Apple silicon, Graviton):
 # every transferred byte is hashed, and the portable code is about 5x slower.
@@ -58,8 +72,6 @@ serde_json.workspace = true
 sha2 = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 cua-spacesd-client = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 # tests/emudhra_distrust.rs: prove the verifier refuses the compromised eMudhra

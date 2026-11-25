@@ -68,8 +68,7 @@ impl Spaces {
     /// connection still answers (the LAN mesh may carry it); its reason
     /// then starts with [`cua_spaces_contract::presence::LISTED_OFFLINE`].
     pub async fn reach(&self, space: &str) -> Reach {
-        let machine = carrier(space);
-        if let Some(machine) = &machine {
+        if let Some(machine) = carrier(space) {
             // A stale directory falls back to the last answer inside; an
             // error here leaves the connect below to say what is wrong.
             let _ = self.relay_directory(Some(machine.as_str())).await;

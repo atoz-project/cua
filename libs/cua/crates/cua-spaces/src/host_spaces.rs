@@ -3480,6 +3480,7 @@ impl Spaces {
         token: Option<String>,
         name: Option<String>,
     ) -> Result<SpaceInfo> {
+        crate::add::ensure_direct_host_add_allowed(url)?;
         let info = self.add(url, token, name.clone()).await?;
         if !matches!(SpaceId::parse(&info.id)?, SpaceId::Direct { .. }) {
             return Err(Error::invalid(format!(

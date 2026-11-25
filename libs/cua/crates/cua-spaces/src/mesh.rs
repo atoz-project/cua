@@ -263,6 +263,66 @@ impl MeshClients {
         );
     }
 
+    /// Drops any recorded mesh route, fallback entry, and active loopback
+    /// forward for `space` / `machine_id` without tearing down sibling
+    /// machines sharing the same relay node.
+    pub(crate) async fn forget_space(&self, space: &str, machine_id: Option<&str>) {
+        let prev_key = self
+            .routed
+            .lock()
+            .expect("routed")
+            .remove(space)
+            .map(|(k, _, _)| k);
+        let fallback_key = self
+            .fallbacks
+            .lock()
+            .expect("fallbacks")
+            .remove(space)
+            .map(|(k, _, _)| k);
+        let Some(machine_id) = machine_id else {
+            return;
+        };
+        let dialers: Vec<Arc<Dialer>> = {
+            let nodes = self.nodes.lock().await;
+            let mut out = Vec::new();
+            for key in [prev_key, fallback_key].into_iter().flatten() {
+                if let Some(Slot::Ready { dialer, .. }) = nodes.get(&key)
+                    && !out.iter().any(|d| Arc::ptr_eq(d, dialer))
+                {
+                    out.push(dialer.clone());
+                }
+            }
+            for (key, slot) in nodes.iter() {
+                if matches!(key, Key::Static(_))
+                    && let Slot::Ready { dialer, .. } = slot
+                    && !out.iter().any(|d| Arc::ptr_eq(d, dialer))
+                {
+                    out.push(dialer.clone());
+                }
+            }
+            out
+        };
+        for dialer in dialers {
+            dialer.forget(machine_id).await;
+        }
+    }
+
+    /// Drops the loopback forward on `relay`'s static mesh dialer for
+    /// `machine_id` after rotating to a different relay origin.
+    pub(crate) async fn forget_static_machine(&self, relay: &str, machine_id: &str) {
+        let key = Key::Static(relay.to_owned());
+        let dialer = {
+            let nodes = self.nodes.lock().await;
+            match nodes.get(&key) {
+                Some(Slot::Ready { dialer, .. }) => Some(dialer.clone()),
+                _ => None,
+            }
+        };
+        if let Some(dialer) = dialer {
+            dialer.forget(machine_id).await;
+        }
+    }
+
     /// Why a Space on the relay's HTTPS path should reconnect now: its
     /// machine joined the mesh since (checked at most every `every`).
     /// Reported once; the reconnect picks the route again.

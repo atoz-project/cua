@@ -560,12 +560,36 @@ public final class AppModel {
         try await cloud.approve(provider, approve: approve)
     }
 
+    /// Whether `space` is a persisted relay-reached Space (`relay:<id>` with
+    /// no host above it, carrying `startedAt > 0` or `cloud` metadata), rather
+    /// than an Account Relay computer's own desktop (`spaces::classify::is_relay_space`).
+    private func isRelaySpace(_ space: AppSpace) -> Bool {
+        guard space.id.hasPrefix("relay:") else { return false }
+        let own = String(space.id.dropFirst(6))
+        guard !own.isEmpty else { return false }
+        if let provider = space.provider, provider != .relay { return false }
+        if let host = space.host, !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        let hasStarted = (space.startedAt ?? 0) > 0
+        let hasCloud = space.cloud.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
+        return hasStarted || hasCloud
+    }
+
+    /// A machine's own desktop, not a Space (`spaces::classify::is_machine_desktop`).
+    private func isMachineDesktop(_ space: AppSpace) -> Bool {
+        if space.id == "this-mac" || space.status == .local { return true }
+        guard space.id.hasPrefix("relay:"), !isRelaySpace(space) else { return false }
+        if let provider = space.provider, provider != .relay { return false }
+        if let host = space.host, !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        let own = String(space.id.dropFirst(6))
+        return !own.isEmpty && !own.contains("/") && !own.hasPrefix("space-")
+    }
+
     /// What each machine sharing its desktop (`relay:<machine>`) reported
     /// as its hostname, by machine id: the page lists it and the device on
     /// it once.
     var relayHostnames: [String: String] {
         var out: [String: String] = [:]
-        for space in spaces where space.id.hasPrefix("relay:") && space.host == nil {
+        for space in spaces where isMachineDesktop(space) && space.id.hasPrefix("relay:") {
             if let name = backend.reportedHostname(id: space.id) { out[String(space.id.dropFirst(6))] = name }
         }
         return out
@@ -573,7 +597,7 @@ public final class AppModel {
 
     /// Your Spaces: neither This machine nor one of your machines.
     var realSpaces: [AppSpace] {
-        spaces.filter { !$0.id.hasPrefix("relay:") && !detail($0).isHost && !$0.hidden }
+        spaces.filter { !isMachineDesktop($0) && !detail($0).isHost && !$0.hidden }
     }
 
     /// Where "Add a computer" opens: the New UI's sheet (one row per way to
@@ -1299,7 +1323,7 @@ public final class AppModel {
     /// The name of one of your machines, from the Spaces it provides (or its
     /// own entry on the relay).
     private func machineName(of id: String) -> String? {
-        spaces.first { $0.id == "relay:\(id)" }?.name
+        spaces.first { isMachineDesktop($0) && $0.id == "relay:\(id)" }?.name
             ?? spaces.first { $0.host == id && $0.hostName != nil }?.hostName
     }
 

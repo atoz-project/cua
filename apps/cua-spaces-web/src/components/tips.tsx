@@ -38,6 +38,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useChildren } from "@/components/children/use-children";
 import { useHiddenSpaceIds } from "@/lib/prepare/store";
+import { canShareSpace } from "@/lib/space-access";
 import { realSpaces, spaceState } from "@/lib/spaces";
 import { cn } from "@/lib/utils";
 
@@ -51,7 +52,7 @@ const usePageTip = create<{ shown: number; add(): () => void }>((set) => ({
 }));
 
 /** The sharing facts a Space carries once the host reports them (`Space.access`). */
-type Access = { kind?: string; people?: unknown[]; canDelete?: boolean; canPower?: boolean };
+type Access = { kind?: string; people?: unknown[]; canDelete?: boolean; canPower?: boolean; canShare?: boolean };
 const accessOf = (s: Space): Access | undefined => (s as Space & { access?: Access }).access;
 const mine = (s: Space) => (accessOf(s)?.kind ?? "mine") === "mine";
 
@@ -177,7 +178,9 @@ const Bulb = ({ className }: { className?: string }) => (
  * Copy (and Open in Cursor where the core gives it).
  */
 export function PageTip({ place, space, onShare, className }: { place: "spaces" | "space"; space?: Space; onShare?: () => void; className?: string }) {
-  const tip = useTip(place, space);
+  const rawTip = useTip(place, space);
+  const canShare = Boolean(onShare) && (!space || canShareSpace(space));
+  const tip = rawTip && rawTip.action.kind === "share" && !canShare ? null : rawTip;
   const { send } = useTips();
   const { openExternal } = useSession();
   const add = usePageTip((s) => s.add);

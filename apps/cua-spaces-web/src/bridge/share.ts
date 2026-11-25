@@ -18,6 +18,7 @@ import type { CoreClient } from "./core";
 import type { ShareEntry, ShareGate, ShareInput, ShareSheetAction, ShareSheetState, ShareSheetView } from "./contracts/share";
 import type { Space } from "./contracts/spaces";
 import type { BridgeStore } from "./store";
+import { canShareSpace } from "@/lib/space-access";
 import { telemetryShare, type TelemetrySignal } from "./telemetry";
 
 export const shareInitial = (core: CoreClient) => core.call<ShareSheetState>("share.initial", {});
@@ -25,9 +26,10 @@ export const shareReduce = (core: CoreClient, input: ShareInput, state: ShareShe
   core.call<ShareSheetState>("share.reduce", { input, state, action });
 export const shareView = (core: CoreClient, input: ShareInput, state: ShareSheetState) => core.call<ShareSheetView>("share.view", { input, state });
 
-/** The Space can be shared: a relay host's, or a driver with `relay_attach`
- * (as the SwiftUI app decides it). */
-export const shareable = (space: Pick<Space, "id" | "sdk">): boolean => space.id.startsWith("relay:") || Boolean(space.sdk?.features.includes("relay_attach"));
+/** The Space can be shared: an Account Relay Space, or a driver with `relay_attach`
+ * (Static Relay Mode Spaces without account sharing are never shareable). */
+export const shareable = (space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "cloudDelete" | "access" | "sdk">): boolean =>
+  canShareSpace(space) && (space.id.startsWith("relay:") || Boolean(space.sdk?.features.includes("relay_attach")));
 
 export interface ShareSession {
   input: ShareInput;

@@ -93,6 +93,8 @@
   "computers.status.creating": "Creating",
   "computers.status.deleting": "Deleting",
   "computers.status.os_on_machine": "{os} on {machine}",
+  "computers.status.os_via_remote_relay": "{os} · {machine}",
+  "computers.status.remote_relay": "Remote relay",
   "computers.status.added_by_address": "a computer added by address",
   "computers.status.unknown_computer": "Unknown computer",
   "computers.status.pending_start": "Starting…",

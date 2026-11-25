@@ -15,7 +15,7 @@ import type { Machine, Space, SpaceOs } from "@/bridge";
 import { t } from "@/i18n";
 import { ownerLabel, peopleNames } from "@/lib/space-access";
 import { machineOs, reachable } from "@/lib/machines";
-import { isMachineDesktop, spaceState, type SpaceState } from "@/lib/spaces";
+import { isMachineDesktop, isStaticRelaySpace, spaceState, type SpaceState } from "@/lib/spaces";
 import { relativeTime } from "@/lib/utils";
 import { thisComputerLabel } from "./host-labels";
 
@@ -123,14 +123,19 @@ function ghostMachineIds(spaces: readonly Space[], machines: readonly Machine[])
   const known = new Set(machines.flatMap((m) => [m.id, ...(m.relayId ? [m.relayId] : [])]));
   const ghosts = new Set<string>();
   for (const s of spaces) {
+    if (!isMachineDesktop(s)) continue;
     const m = /^relay:([^/]+)$/.exec(s.id);
     if (m && !known.has(m[1]!) && (s.name === s.id || s.name === m[1])) ghosts.add(m[1]!);
   }
   return ghosts;
 }
 
-/** A Space id the relay knows (`relay:<machine>` or `relay:<machine>/<name>`): one that can be the default. */
-const relayId = (id: string): string | null => (id.startsWith("relay:") ? id : null);
+/** A Space id the account relay knows (`relay:<machine>` or `relay:<machine>/<name>`): one that can be the default. */
+const relayId = (space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "access">): string | null => {
+  if (!space.id.startsWith("relay:")) return null;
+  if (isStaticRelaySpace(space)) return null;
+  return space.id;
+};
 
 const spaceWord = (state: SpaceState): string =>
   ({
@@ -196,7 +201,7 @@ export function buildSpacesTree({
     const id = computerSpaceId(m);
     if (id) ids.add(id);
   }
-  for (const s of listed) if (relayId(s.id)) ids.add(s.id);
+  for (const s of listed) if (relayId(s)) ids.add(s.id);
   const isOnline = (m: Machine) => {
     const id = computerSpaceId(m);
     return m.online && !(id !== null && relayOnline?.get(id) === false);
@@ -230,7 +235,7 @@ export function buildSpacesTree({
   const spaceNode = (s: Space, parent: TreeNode | null, computer: TreeNode | null = parent, depth = 1): TreeNode => {
     const waits = computer !== null && !computer.online;
     const state = spaceState(s);
-    const settingsId = relayId(s.id);
+    const settingsId = relayId(s);
     const isDefault = settingsId !== null && settingsId === defaultKey;
     const word = waits ? t("computers.row.offline") : spaceWord(state);
     const n = runningOf(s.id);
@@ -276,7 +281,7 @@ export function buildSpacesTree({
 
   const roots: TreeNode[] = [];
   for (const m of ordered) {
-    const own = m.current ? (spaces.find((s) => s.id === "this-mac") ?? null) : (spaces.find((s) => s.id === `relay:${m.id}`) ?? null);
+    const own = m.current ? (spaces.find((s) => s.id === "this-mac") ?? null) : (spaces.find((s) => isMachineDesktop(s) && s.id === `relay:${m.id}`) ?? null);
     const id = computerSpaceId(m);
     const key = id ?? (m.current ? "this-mac" : `machine:${m.id}`);
     const kids = listed.filter(

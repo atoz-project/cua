@@ -844,6 +844,46 @@ impl Runtime {
         }
     }
 
+    async fn direct_ref_for_url(&self, input: &str) -> Option<SandboxRef> {
+        let s = input.trim();
+        if !(s.starts_with("http://") || s.starts_with("https://")) {
+            return None;
+        }
+        let wanted = cua_spacesd_client::Endpoint::parse(s).ok()?;
+        let held_key = {
+            let handles = self.inner.handles.lock().unwrap();
+            handles
+                .iter()
+                .find(|(_, h)| h.sandbox.direct_base_url() == Some(wanted.base_url()))
+                .map(|(k, _)| k.clone())
+        };
+        if let Some(key) = held_key
+            && !self.evict_if_stale(&key).await
+            && let Ok(r) = SandboxRef::parse(&key)
+        {
+            return Some(r);
+        }
+        if let Some(r) = self.inner.sandboxes.direct_ref_for_url(s) {
+            return Some(r);
+        }
+        #[cfg(feature = "spaces")]
+        {
+            let registry = self.inner.spaces.registry();
+            for (id, _) in self.registered_direct() {
+                if let Ok(Some(cred)) = registry.credential(&id)
+                    && cred.url.as_deref().is_some_and(|u| {
+                        cua_spacesd_client::Endpoint::parse(u)
+                            .is_ok_and(|e| e.base_url() == wanted.base_url())
+                    })
+                    && let Ok(r) = SandboxRef::parse(&id)
+                {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    }
+
     /// Resolves any accepted spelling of a sandbox (a qualified ref, a
     /// legacy id, or a bare name) to its qualified ref. A bare name is
     /// searched across the sandboxes this runtime holds, this machine's
@@ -851,6 +891,9 @@ impl Runtime {
     /// must match exactly one ([`Error::AmbiguousSandbox`] lists the
     /// qualified candidates otherwise).
     pub async fn resolve(&self, input: &str) -> Result<SandboxRef> {
+        if let Some(r) = self.direct_ref_for_url(input).await {
+            return Ok(r);
+        }
         let wanted = SandboxRef::parse(input)?;
         if let SandboxRef::Bare { name } = &wanted {
             // A held sandbox that was deleted behind this runtime must not
@@ -2174,5 +2217,60 @@ mod disk_floor_tests {
         assert!(disk_floor_in(&Unknown, home, 5 * GIB, 20 * GIB).is_ok());
         // A floor of 0 turns it off.
         assert!(disk_floor_in(&Free(0), home, 0, 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_url_on_relay_path_resolves_as_direct_across_get_and_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RuntimeConfig {
+            state_dir: Some(dir.path().join("sandboxes")),
+            spaces_home: Some(dir.path().to_path_buf()),
+            providers: Some(vec![]),
+            ..Default::default()
+        };
+        let rt = Runtime::new(cfg.clone()).unwrap();
+        let url = "https://relay.example/m/0123abcd4567ef89";
+
+        // Before connect_url, resolving a relay URL returns SandboxRef::Relay.
+        assert_eq!(
+            rt.resolve(url).await.unwrap().to_string(),
+            "relay:0123abcd4567ef89"
+        );
+
+        // Ephemeral (unnamed) connect_url stores handle under direct:<host:port>.
+        let rec = rt
+            .create(CreateRequest {
+                location: Some(format!("direct:{url}")),
+                token: Some("tok-1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rec.id, "direct:relay.example:443");
+        assert_eq!(
+            rec.endpoints.get("env").map(String::as_str),
+            Some("https://relay.example/m/0123abcd4567ef89")
+        );
+        assert_eq!(rt.resolve(url).await.unwrap().to_string(), rec.id);
+        assert_eq!(rt.record(url).await.unwrap().id, rec.id);
+        assert_eq!(rt.connect(url).await.unwrap().id, rec.id);
+
+        // Named connect_url persists via remember_direct and resolves in a fresh Runtime.
+        rt.create(CreateRequest {
+            location: Some(format!("direct:{url}")),
+            name: Some("saved-relay".into()),
+            token: Some("tok-2".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let rt2 = Runtime::new(cfg).unwrap();
+        assert_eq!(
+            rt2.resolve(url).await.unwrap().to_string(),
+            "direct:relay.example:443"
+        );
+        let reattached = rt2.connect(url).await.unwrap();
+        assert_eq!(reattached.id, "direct:relay.example:443");
+        assert_eq!(reattached.name, "saved-relay");
     }
 }

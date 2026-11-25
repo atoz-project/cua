@@ -48,7 +48,13 @@
       "reachable": true,
       "cloud": "aws",
       "cloudPlace": "AWS \u00b7 us-west-2",
-      "cloudDelete": "here"
+      "cloudDelete": "here",
+      "sharing": {
+        "ownerId": "u1",
+        "ownerEmail": "ada@example.com",
+        "ownerName": "Ada",
+        "role": "owner"
+      }
     },
     {
       "id": "relay:cloud-0000000000000e01",

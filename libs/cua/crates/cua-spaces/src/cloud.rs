@@ -620,16 +620,18 @@ mod tests {
                     let (status, body) = if path == "/v1/machines" {
                         (
                             "200 OK",
-                            serde_json::json!([{
-                                "id": machine_id,
-                                "name": "custom-sb",
-                                "online": true,
-                                "role": "owner",
-                                "meta": {
-                                    "cua.cloud.provider": "aws",
-                                    "cua.cloud.place": "AWS · us-west-2"
-                                }
-                            }])
+                            serde_json::json!({
+                                "machines": [{
+                                    "id": machine_id,
+                                    "name": "custom-sb",
+                                    "online": true,
+                                    "role": "owner",
+                                    "meta": {
+                                        "cua.cloud.provider": "aws",
+                                        "cua.cloud.place": "AWS · us-west-2"
+                                    }
+                                }]
+                            })
                             .to_string(),
                         )
                     } else {
@@ -692,12 +694,14 @@ mod tests {
         );
         assert_eq!(cred.token, None);
 
+        let listed = spaces.list().unwrap();
+        let custom_listed = listed
+            .iter()
+            .find(|s| s.id == "relay:m-custom")
+            .expect("custom-origin Account-Relay BYOC Space must be listed");
         assert!(
-            spaces
-                .list()
-                .unwrap()
-                .iter()
-                .any(|s| s.id == "relay:m-custom")
+            custom_listed.sharing.is_some(),
+            "custom-origin Account-Relay BYOC Space must propagate sharing facts from relay_cache"
         );
         assert_eq!(
             spaces.find("relay:m-custom").await.unwrap().id,

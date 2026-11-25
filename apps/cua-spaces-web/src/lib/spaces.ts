@@ -44,21 +44,53 @@ export function spaceState(space: Pick<Space, "status" | "power"> & { progress?:
   }
 }
 
+/** Structural fields shared by `Space` and wire `WkSpace` for relay classification. */
+export interface RelaySpaceFields {
+  id: string;
+  provider?: Space["provider"] | null;
+  host?: string | null;
+  startedAt?: number | null;
+  cloud?: string | null;
+}
+
+/**
+ * Whether `space` is a relay-reached Space (`relay:<id>` with no host above it,
+ * carrying `startedAt > 0` or `cloud` metadata), classifying it as a Space
+ * rather than an Account Relay Mode Computer's own desktop.
+ */
+export function isRelaySpace(space: RelaySpaceFields): boolean {
+  if (!space.id.startsWith("relay:")) return false;
+  if (space.provider != null && space.provider !== "relay") return false;
+  if (space.host?.trim()) return false;
+  return (space.startedAt != null && space.startedAt > 0) || Boolean(space.cloud?.trim());
+}
+
+/**
+ * Whether `space` is an unattached Static Relay Mode Space (a relay Space
+ * without Account Relay sharing attachment).
+ */
+export function isStaticRelaySpace(space: RelaySpaceFields & { access?: Space["access"] | null }): boolean {
+  if (!isRelaySpace(space)) return false;
+  return !space.access || (space.access.kind === "mine" && !space.access.canShare);
+}
+
 /**
  * A machine's own desktop, not a Space: this Mac (`this-mac`, status
- * `local`) or a relay machine sharing its desktop (`relay:<machine>` with no
- * host above it). These belong on Machines; the Spaces grid, its count and
- * the command palette leave them out.
+ * `local`) or an Account Relay computer sharing its desktop (`relay:<machine>`
+ * with no host, no persisted `startedAt`, and no `cloud` metadata). These
+ * belong on Computers; the Spaces grid, its count and the command palette
+ * leave them out.
  */
-export function isMachineDesktop(space: Pick<Space, "id" | "status" | "provider" | "host">): boolean {
+export function isMachineDesktop(space: RelaySpaceFields & Partial<Pick<Space, "status">>): boolean {
   if (space.status === "local" || space.id === "this-mac") return true;
-  if (space.provider !== "relay" || space.host || !space.id.startsWith("relay:")) return false;
+  if ((space.provider != null && space.provider !== "relay") || space.host?.trim() || !space.id.startsWith("relay:")) return false;
+  if (isRelaySpace(space)) return false;
   const own = space.id.slice("relay:".length);
   return own.length > 0 && !own.includes("/") && !own.startsWith("space-");
 }
 
 /** The Spaces a user created: every row but the machines' own desktops. */
-export function realSpaces<T extends Pick<Space, "id" | "status" | "provider" | "host">>(spaces: readonly T[]): T[] {
+export function realSpaces<T extends Pick<Space, "id" | "status" | "provider" | "host" | "startedAt" | "cloud">>(spaces: readonly T[]): T[] {
   return spaces.filter((s) => !isMachineDesktop(s));
 }
 
@@ -78,7 +110,7 @@ export const isUnsharedDesktop = (space: Pick<Space, "id" | "status">): boolean 
  * with no Space still sees the empty state. `hidden` (Hide on a row) leaves a desktop out; another
  * machine's desktop shows only while it shares it (`shares`).
  */
-export function listedSpaces<T extends Pick<Space, "id" | "status" | "provider" | "host">>(
+export function listedSpaces<T extends Pick<Space, "id" | "status" | "provider" | "host" | "startedAt" | "cloud">>(
   all: readonly T[],
   hidden: ReadonlySet<string> = new Set(),
   shares: (space: T) => boolean = () => true,
@@ -94,9 +126,9 @@ export function listedSpaces<T extends Pick<Space, "id" | "status" | "provider" 
 export const countedSpaces = <T extends Pick<Space, "id" | "status">>(listed: readonly T[]): T[] => listed.filter((s) => !isUnsharedDesktop(s));
 
 /** Running Spaces first, then the most recently used (Home, the Spaces page, the switcher and ⌘K). */
-export function orderSpaces<T extends Pick<Space, "id" | "status" | "power" | "lastUsedAt" | "provider" | "host"> & { progress?: Space["progress"] }>(
-  spaces: readonly T[],
-): T[] {
+export function orderSpaces<
+  T extends Pick<Space, "id" | "status" | "power" | "lastUsedAt" | "provider" | "host" | "startedAt" | "cloud"> & { progress?: Space["progress"] },
+>(spaces: readonly T[]): T[] {
   // A machine's desktop follows the Spaces in its state, and This Mac's unshared one is last.
   const rank = (s: T) => (isUnsharedDesktop(s) ? 9 : ORDER[spaceState(s)] + (isMachineDesktop(s) ? 0.5 : 0));
   // A desktop has no "last used": the host stamps it with the time it read the list (This Mac's
@@ -127,19 +159,44 @@ export function osLabel(space: Pick<Space, "os" | "osPrettyName">): string {
   return space.osPrettyName?.trim() || (space.os === "unknown" ? "" : OS_NAME[space.os]);
 }
 
-/** "macOS on Studio", or only the machine when the OS is not known. */
-export function spacePlace(space: Pick<Space, "os" | "osPrettyName">, machine: string): string {
-  const os = osLabel(space);
-  return os ? t("computers.status.os_on_machine", { os, machine }) : machine;
+/** Where a Space runs, with whether it is reached directly over a remote relay rather than a named machine or cloud. */
+export interface SpacePlacement {
+  label: string;
+  viaRemoteRelay: boolean;
 }
 
-/** The machine a Space runs on, by the machines' `spaceIds`. */
-export function machineName(machines: readonly Machine[], space: Pick<Space, "id" | "provider" | "hostName">): string {
+/** "macOS on Studio", "Ubuntu 24.04 · Remote relay", or only the machine when the OS is not known. */
+export function spacePlace(space: Pick<Space, "os" | "osPrettyName">, place: string | SpacePlacement): string {
+  const { label, viaRemoteRelay } = typeof place === "string" ? { label: place, viaRemoteRelay: false } : place;
+  const os = osLabel(space);
+  if (!os) return label;
+  if (viaRemoteRelay) return t("computers.status.os_via_remote_relay", { os, machine: label });
+  return t("computers.status.os_on_machine", { os, machine: label });
+}
+
+/** The machine or remote place a Space runs on, with typed remote-relay provenance. */
+export function machinePlacement(
+  machines: readonly Machine[],
+  space: Pick<Space, "id" | "provider" | "host" | "hostName" | "startedAt" | "cloud" | "cloudPlace">,
+): SpacePlacement {
   const machine = machines.find((m) => m.spaceIds.includes(space.id));
-  if (machine) return machine.name;
-  if (space.hostName) return space.hostName;
-  if (space.provider === "direct" || space.provider === undefined) return t("computers.status.added_by_address");
-  return t("computers.status.unknown_computer");
+  if (machine) return { label: machine.name, viaRemoteRelay: false };
+  if (space.hostName?.trim()) return { label: space.hostName.trim(), viaRemoteRelay: false };
+  if (space.cloudPlace?.trim()) return { label: space.cloudPlace.trim(), viaRemoteRelay: false };
+  if (space.cloud?.trim()) return { label: space.cloud.trim(), viaRemoteRelay: false };
+  if (isRelaySpace(space)) return { label: t("computers.status.remote_relay"), viaRemoteRelay: true };
+  if (space.provider === "direct" || space.provider === undefined) {
+    return { label: t("computers.status.added_by_address"), viaRemoteRelay: false };
+  }
+  return { label: t("computers.status.unknown_computer"), viaRemoteRelay: false };
+}
+
+/** The machine or remote place a Space runs on, by the machines' `spaceIds` or Static Relay metadata. */
+export function machineName(
+  machines: readonly Machine[],
+  space: Pick<Space, "id" | "provider" | "host" | "hostName" | "startedAt" | "cloud" | "cloudPlace">,
+): string {
+  return machinePlacement(machines, space).label;
 }
 
 /** What a Space's ⌘K entries also match: its OS, state, detail and the machine it runs on. */
@@ -264,8 +321,10 @@ const PROVIDER = (provider: "relay" | "direct"): string =>
   provider === "relay" ? t("computers.status.provider_relay") : t("computers.status.provider_direct");
 
 /** Where it runs, in words. */
-export function locationLabel(space: Pick<Space, "provider" | "cloudPlace">): string {
-  if (space.cloudPlace) return space.cloudPlace;
+export function locationLabel(space: Pick<Space, "id" | "provider" | "host" | "startedAt" | "cloud" | "cloudPlace">): string {
+  if (space.cloudPlace?.trim()) return space.cloudPlace.trim();
+  if (space.cloud?.trim()) return space.cloud.trim();
+  if (isRelaySpace(space)) return t("computers.status.remote_relay");
   const provider = space.provider ?? "direct";
   return provider === "local" ? thisComputerLabel() : PROVIDER(provider);
 }

@@ -162,16 +162,43 @@ impl Endpoint {
     }
 }
 
+/// Relay machine ids are DNS-label safe: `[a-z0-9-]{8,64}` without leading
+/// or trailing hyphens.
+pub fn valid_machine_id(id: &str) -> bool {
+    (8..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+}
+
+/// Inspects `url`'s non-empty path segments for `/m/<segment>[/...]`,
+/// returning `(machine_id_segment, has_extra_segments)`.
+pub fn relay_path_segments(url: &Url) -> Option<(&str, bool)> {
+    let mut segs = url.path_segments()?.filter(|p| !p.is_empty());
+    if segs.next()? != "m" {
+        return None;
+    }
+    let machine_id = segs.next()?;
+    Some((machine_id, segs.next().is_some()))
+}
+
+/// Returns `<machine-id>` when `url`'s path is `/m/<machine-id>` without extra
+/// segments and [`valid_machine_id`] holds.
+pub fn relay_machine_of_url(url: &Url) -> Option<&str> {
+    match relay_path_segments(url) {
+        Some((machine_id, false)) if valid_machine_id(machine_id) => Some(machine_id),
+        _ => None,
+    }
+}
+
 fn classify(url: &Url) -> EndpointKind {
-    let segments: Vec<&str> = url
-        .path_segments()
-        .map(|s| s.filter(|p| !p.is_empty()).collect())
-        .unwrap_or_default();
-    match segments.as_slice() {
-        ["m", machine_id, ..] => EndpointKind::Relay {
-            machine_id: (*machine_id).to_string(),
+    match relay_machine_of_url(url) {
+        Some(machine_id) => EndpointKind::Relay {
+            machine_id: machine_id.to_string(),
         },
-        _ => EndpointKind::Direct,
+        None => EndpointKind::Direct,
     }
 }
 
@@ -207,14 +234,35 @@ mod tests {
 
     #[test]
     fn relay_url_is_classified() {
-        let e = Endpoint::parse("https://relay.example/m/abc123").unwrap();
+        let e = Endpoint::parse("https://relay.example/m/abc12345").unwrap();
         assert_eq!(
             e.kind(),
             &EndpointKind::Relay {
-                machine_id: "abc123".into()
+                machine_id: "abc12345".into()
             }
         );
-        assert_eq!(e.ws_url("/media"), "wss://relay.example/m/abc123/media");
+        assert_eq!(e.ws_url("/media"), "wss://relay.example/m/abc12345/media");
+
+        // Trailing slash still round-trips to Relay.
+        let trailing = Endpoint::parse("https://relay.example/m/abc12345/").unwrap();
+        assert_eq!(
+            trailing.kind(),
+            &EndpointKind::Relay {
+                machine_id: "abc12345".into()
+            }
+        );
+
+        // Extra path segments or non-machine-id segments classify as Direct.
+        for direct_url in [
+            "https://relay.example/m/abc12345/mcp",
+            "https://relay.example/m/tools",
+            "https://relay.example/m/BAD_ID_01",
+            "https://relay.example/m/-leading1",
+            "https://relay.example/m/trailing-",
+        ] {
+            let parsed = Endpoint::parse(direct_url).unwrap();
+            assert_eq!(parsed.kind(), &EndpointKind::Direct, "{direct_url}");
+        }
     }
 
     #[test]
@@ -227,5 +275,35 @@ mod tests {
     fn ipv6_bare() {
         let e = Endpoint::parse("[::1]:5000").unwrap();
         assert_eq!(e.origin(), "http://[::1]:5000");
+    }
+
+    #[test]
+    fn relay_path_helpers_classify_segments_and_ids() {
+        let exact = Url::parse("https://relay.example/m/0123abcd4567ef89/").unwrap();
+        assert_eq!(
+            relay_path_segments(&exact),
+            Some(("0123abcd4567ef89", false))
+        );
+        assert_eq!(relay_machine_of_url(&exact), Some("0123abcd4567ef89"));
+
+        let extra = Url::parse("https://relay.example/m/0123abcd4567ef89/mcp").unwrap();
+        assert_eq!(
+            relay_path_segments(&extra),
+            Some(("0123abcd4567ef89", true))
+        );
+        assert_eq!(relay_machine_of_url(&extra), None);
+
+        let short = Url::parse("https://relay.example/m/tools").unwrap();
+        assert_eq!(relay_path_segments(&short), Some(("tools", false)));
+        assert_eq!(relay_machine_of_url(&short), None);
+
+        let bare_m = Url::parse("https://relay.example/m/").unwrap();
+        assert_eq!(relay_path_segments(&bare_m), None);
+
+        assert!(valid_machine_id("0123abcd4567ef89"));
+        assert!(!valid_machine_id("short"));
+        assert!(!valid_machine_id("-leading1"));
+        assert!(!valid_machine_id("trailing-"));
+        assert!(!valid_machine_id("UPPERCASE1"));
     }
 }

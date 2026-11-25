@@ -11,11 +11,18 @@
 //! handshake, this module only turns its rows into what the shells draw.
 
 pub mod access;
+pub mod classify;
 pub mod cover;
 pub mod creating;
 pub mod roster;
 pub mod sidebar;
 pub mod stream;
+
+pub use classify::{
+    RelayEntryKind, classify_relay_space, is_machine_desktop, is_relay_space, is_remote_desktop,
+    is_static_relay_space,
+};
+pub(crate) use classify::{is_account_cloud_delete, is_persisted_relay_row};
 
 use crate::model::{
     PowerControl, Space, SpaceOs, SpacePower, SpaceProvider, SpaceRow, SpaceSdkRef, SpaceStatus,
@@ -104,18 +111,26 @@ fn is_container_hostname(name: &str) -> bool {
 
 /// The name to show. A container's spacesd reports its hostname (12 hex
 /// digits), so the id's name (`local:<name>`, `cloud:<name>`) wins then.
+/// Empty or whitespace names fall back to the bare identifier without
+/// internal prefixes (`relay:`, `direct:`, `space://direct/`).
 pub fn name_of(id: &str, name: &str) -> String {
+    let trimmed = name.trim();
     let from_id = id
         .strip_prefix("local:")
         .or_else(|| id.strip_prefix("cloud:"))
         .filter(|rest| !rest.is_empty());
     if let Some(from_id) = from_id
-        && (name.is_empty() || is_container_hostname(name))
+        && (trimmed.is_empty() || is_container_hostname(trimmed))
     {
         return from_id.to_string();
     }
-    if name.is_empty() {
-        id.to_string()
+    if trimmed.is_empty() {
+        id.strip_prefix("space://direct/")
+            .or_else(|| id.strip_prefix("direct:"))
+            .or_else(|| id.strip_prefix("relay:"))
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(id)
+            .to_string()
     } else {
         name.to_string()
     }
@@ -164,6 +179,13 @@ fn detail_for(row: &SpaceRow, status: SpaceStatus) -> String {
                     .filter(|n| !n.is_empty())
                     .unwrap_or(host)
             ),
+            None if is_persisted_relay_row(row) => row
+                .host_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or("Remote relay")
+                .to_string(),
             None => "My machines".into(),
         },
         p => provider_label(p).into(),
@@ -381,33 +403,6 @@ pub fn count_active(spaces: &[Space]) -> u32 {
             )
         })
         .count() as u32
-}
-
-/// A machine's own desktop, not a Space: This machine (`this-mac`, and any
-/// row reported as `Local`), or one of your machines sharing its own desktop
-/// over the relay (`relay:<machine>` with no host above it). They belong
-/// with the machines (the sidebar's This Mac and My machines, the web UI's
-/// Machines page), not in the count of Spaces; the web UI's
-/// `isMachineDesktop` is the same rule.
-pub fn is_machine_desktop(space: &Space) -> bool {
-    if space.id == crate::host::THIS_MACHINE_ID || space.status == SpaceStatus::Local {
-        return true;
-    }
-    if space.provider != Some(SpaceProvider::Relay) || space.host.is_some() {
-        return false;
-    }
-    space
-        .id
-        .strip_prefix("relay:")
-        .is_some_and(|own| !own.is_empty() && !own.contains('/') && !own.starts_with("space-"))
-}
-
-/// Whether `space` is the desktop of one of your other machines, reached
-/// through the relay (`relay:<machine>`, no host above it): a machine's
-/// own desktop that is not This machine's. A Space the machine provides is
-/// a Space, not this.
-pub fn is_remote_desktop(space: &Space) -> bool {
-    is_machine_desktop(space) && space.id.starts_with("relay:")
 }
 
 /// Whether a machine's desktop can be opened right now.
@@ -969,6 +964,7 @@ mod tests {
         machine.id = "relay:96fedb7e1be65c3d31fa18587febde2c".into();
         machine.name = "Studio".into();
         machine.provider = "relay".into();
+        machine.added_at = None;
         machine.reachable = false;
         let mut provided = row();
         provided.id = "relay:space-ca12d6d23907f387".into();
@@ -1014,6 +1010,7 @@ mod tests {
             let mut r = row();
             r.id = format!("relay:{id}");
             r.provider = "relay".into();
+            r.added_at = None;
             r.features = features.iter().map(|f| f.to_string()).collect();
             r.reachable = reachable;
             row_to_space(&r, 0)

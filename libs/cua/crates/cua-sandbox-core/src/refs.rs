@@ -144,15 +144,7 @@ impl std::hash::Hash for SandboxRef {
     }
 }
 
-/// Relay machine ids are DNS-label safe: `[a-z0-9-]{8,64}`.
-pub fn valid_machine_id(id: &str) -> bool {
-    (8..=64).contains(&id.len())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && !id.starts_with('-')
-        && !id.ends_with('-')
-}
+pub use cua_spacesd_client::valid_machine_id;
 
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -224,6 +216,11 @@ impl SandboxRef {
         if s.starts_with("http://") || s.starts_with("https://") {
             let url = url::Url::parse(s).map_err(|_| bad("bad URL"))?;
             let host = url.host_str().ok_or_else(|| bad("URL without a host"))?;
+            if let Some(machine_id) = cua_spacesd_client::relay_machine_of_url(&url) {
+                return Ok(SandboxRef::Relay {
+                    machine_id: machine_id.to_string(),
+                });
+            }
             let port = url.port_or_known_default().unwrap_or(DEFAULT_DIRECT_PORT);
             return Ok(SandboxRef::Direct {
                 authority: authority(host, port),
@@ -443,6 +440,19 @@ mod tests {
             ("http://127.0.0.1", "direct:127.0.0.1:80"),
             ("http://127.0.0.1:4000/", "direct:127.0.0.1:4000"),
             ("https://h.example", "direct:h.example:443"),
+            (
+                "https://relay.example/m/0123abcd4567ef89",
+                "relay:0123abcd4567ef89",
+            ),
+            (
+                "https://relay.example/m/0123abcd4567ef89/",
+                "relay:0123abcd4567ef89",
+            ),
+            ("http://127.0.0.1:8765/m/tools", "direct:127.0.0.1:8765"),
+            (
+                "http://127.0.0.1:8765/m/0123abcd4567ef89/mcp",
+                "direct:127.0.0.1:8765",
+            ),
             ("direct:h", "direct:h:3211"),
             ("direct:::1", "direct:[::1]:3211"),
         ] {

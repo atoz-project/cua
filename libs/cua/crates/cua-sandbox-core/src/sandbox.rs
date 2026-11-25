@@ -1574,6 +1574,7 @@ impl Sandboxes {
             .inner
             .state
             .load(name)
+            .or_else(|| self.direct_state_for_url(name))
             .ok_or_else(|| Error::NotFound(name.into()))?;
         match state {
             s @ SandboxState::Local(_) if contrib::contrib_of(&s).is_some() => {
@@ -1746,6 +1747,29 @@ impl Sandboxes {
         }))
     }
 
+    fn direct_state_for_url(&self, input: &str) -> Option<SandboxState> {
+        let s = input.trim();
+        if !(s.starts_with("http://") || s.starts_with("https://")) {
+            return None;
+        }
+        let wanted = cua_spacesd_client::Endpoint::parse(s).ok()?;
+        self.inner.state.list_all().into_iter().find(|st| {
+            let SandboxState::Local(l) = st;
+            l.runtime_type == "direct"
+                && l.extra
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(|u| cua_spacesd_client::Endpoint::parse(u).ok())
+                    .is_some_and(|ep| ep.base_url() == wanted.base_url())
+        })
+    }
+
+    /// Returns `direct:<host:port>` when `input` is an `http(s)://` URL that
+    /// matches a remembered direct sandbox's stored URL.
+    pub fn direct_ref_for_url(&self, input: &str) -> Option<SandboxRef> {
+        self.direct_state_for_url(input).map(|s| state_ref(&s))
+    }
+
     /// Every known sandbox: state files plus instances the local runtime
     /// manages.
     pub async fn list(&self) -> Result<Vec<SandboxInfo>> {
@@ -1834,7 +1858,11 @@ impl Sandboxes {
 
     /// One sandbox's info (live status for local sandboxes).
     pub async fn get(&self, name: &str) -> Result<SandboxInfo> {
-        let state = self.inner.state.load(name);
+        let state = self
+            .inner
+            .state
+            .load(name)
+            .or_else(|| self.direct_state_for_url(name));
         match &state {
             Some(s) if contrib::contrib_of(s).is_some() => {
                 let (provider, id) = self.contrib_target(s)?;
@@ -1875,7 +1903,7 @@ impl Sandboxes {
             }
             Some(s) => Ok(SandboxInfo {
                 id: state_ref(s).to_string(),
-                name: name.into(),
+                name: s.name().into(),
                 provider: ProviderKind::Direct,
                 runtime_type: s.runtime_type().into(),
                 status: status_word(s.status()),
@@ -2713,6 +2741,14 @@ impl Sandbox {
                 provider: provider.0.name().into(),
                 name: self.name.clone(),
             },
+        }
+    }
+
+    /// Base URL when this sandbox is a direct URL connection.
+    pub fn direct_base_url(&self) -> Option<&url::Url> {
+        match &self.target {
+            Target::Direct { endpoint } => Some(endpoint.base_url()),
+            _ => None,
         }
     }
 
@@ -4313,5 +4349,34 @@ mod placement_tests {
         );
         assert_eq!(placement_of_backend("lume"), (Kind::Vm, Runtime::Lume));
         assert_eq!(placement_of_backend("moon"), (Kind::Auto, Runtime::Auto));
+    }
+
+    #[tokio::test]
+    async fn direct_ref_for_url_matches_remembered_relay_path_sandboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sbx = Sandboxes::builder().state_dir(dir.path()).build();
+        let url = "https://relay.example/m/0123abcd4567ef89";
+        assert_eq!(sbx.direct_ref_for_url(url), None);
+
+        sbx.remember_direct("my-relay-sb", url).unwrap();
+        let want = SandboxRef::Direct {
+            authority: "relay.example:443".into(),
+        };
+        assert_eq!(sbx.direct_ref_for_url(url), Some(want.clone()));
+        assert_eq!(
+            sbx.direct_ref_for_url("https://relay.example/m/0123abcd4567ef89/"),
+            Some(want)
+        );
+        assert_eq!(
+            sbx.direct_ref_for_url("https://relay.example/m/other9999abcd1111"),
+            None
+        );
+
+        let info = sbx.get(url).await.unwrap();
+        assert_eq!(info.id, "direct:relay.example:443");
+        assert_eq!(info.name, "my-relay-sb");
+        let connected = sbx.connect(url).await.unwrap();
+        assert_eq!(connected.id(), "direct:relay.example:443");
+        assert_eq!(connected.name(), "my-relay-sb");
     }
 }
