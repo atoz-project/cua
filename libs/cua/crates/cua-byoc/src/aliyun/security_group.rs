@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! Zero-ingress enterprise Security Group provisioning, verification, listing,
+//! Managed Security Group provisioning, egress verification/repair, listing,
 //! and inspection for `aliyun-ecs`.
 
 use std::collections::BTreeMap;
@@ -16,7 +16,7 @@ use super::net::{
 use crate::api::Result;
 use crate::model::{self, Connection, Resource};
 
-/// Name of `owner`'s zero-ingress Security Group (`cua-sandboxes-<owner>`).
+/// Name of `owner`'s dedicated Cua-tagged Security Group (`cua-sandboxes-<owner>`).
 pub fn sg_name(owner: &str) -> String {
     format!("cua-sandboxes-{}", model::label_value(owner))
 }
@@ -57,50 +57,55 @@ async fn verify_and_repair_sg(
 ) -> Result<()> {
     let profile_hint = api.profile_hint(conn);
     let ecs_ep = api.ecs_endpoint(region);
-    let attr = api
-        .call_ok(
-            &ecs_ep,
-            "GET",
-            "DescribeSecurityGroupAttribute",
-            ECS_API_VERSION,
-            &[
-                ("RegionId".into(), region.to_string()),
-                ("SecurityGroupId".into(), sg_id.to_string()),
-            ],
-            profile_hint,
-        )
-        .await?;
-
-    if let Some(inner) = attr["InnerAccessPolicy"].as_str()
-        && !inner.eq_ignore_ascii_case("Drop")
-    {
-        return Err(Error::Cloud(format!(
-            "aliyun-ecs: refusing security group {sg_id}: expected InnerAccessPolicy=Drop, got {inner:?}"
-        )));
-    }
-
-    let perms = attr["Permissions"]["Permission"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let mut next_token: Option<String> = None;
     let mut has_egress = false;
-    for p in &perms {
-        let dir = p["Direction"].as_str().unwrap_or("");
-        let policy = p["Policy"].as_str().unwrap_or("");
-        if dir.eq_ignore_ascii_case("ingress") && policy.eq_ignore_ascii_case("accept") {
-            return Err(Error::Cloud(format!(
-                "aliyun-ecs: refusing security group {sg_id}: unexpected ingress rule present"
-            )));
+    for _ in 0..20 {
+        let mut params = vec![
+            ("RegionId".into(), region.to_string()),
+            ("SecurityGroupId".into(), sg_id.to_string()),
+            ("Direction".into(), "egress".into()),
+        ];
+        if let Some(tok) = next_token.as_deref() {
+            params.push(("NextToken".into(), tok.to_string()));
         }
-        if dir.eq_ignore_ascii_case("egress")
-            && policy.eq_ignore_ascii_case("accept")
-            && p["IpProtocol"]
+        let attr = api
+            .call_ok(
+                &ecs_ep,
+                "GET",
+                "DescribeSecurityGroupAttribute",
+                ECS_API_VERSION,
+                &params,
+                profile_hint,
+            )
+            .await?;
+
+        let perms = attr["Permissions"]["Permission"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if perms.iter().any(|p| {
+            p["Direction"]
                 .as_str()
-                .is_some_and(|x| x.eq_ignore_ascii_case("all"))
-            && p["PortRange"].as_str() == Some("-1/-1")
-            && p["DestCidrIp"].as_str() == Some("0.0.0.0/0")
-        {
+                .is_some_and(|x| x.eq_ignore_ascii_case("egress"))
+                && p["Policy"]
+                    .as_str()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("accept"))
+                && p["IpProtocol"]
+                    .as_str()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("all"))
+                && p["PortRange"].as_str() == Some("-1/-1")
+                && p["DestCidrIp"].as_str() == Some("0.0.0.0/0")
+        }) {
             has_egress = true;
+            break;
+        }
+        next_token = attr["NextToken"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if next_token.is_none() {
+            break;
         }
     }
     if !has_egress {
@@ -174,7 +179,7 @@ pub(crate) async fn ensure_security_group(
         ("SecurityGroupName".into(), name.clone()),
         (
             "Description".into(),
-            "Cua sandboxes (outbound only, zero ingress)".into(),
+            "Cua sandboxes (managed outbound egress)".into(),
         ),
         ("SecurityGroupType".into(), "enterprise".into()),
         ("ClientToken".into(), token),

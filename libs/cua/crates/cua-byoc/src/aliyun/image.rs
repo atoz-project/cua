@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-//! Alibaba Cloud ECS Cloud Image ID resolution, validation, official OS
-//! image fallback, and Windows init header selection.
+//! Alibaba Cloud ECS Cloud Image ID resolution, validation, and official OS
+//! image fallback.
 
 use cua_sandbox_core::Error;
 use serde_json::Value;
@@ -12,8 +12,6 @@ use super::client::ECS_API_VERSION;
 use super::sizing::system_disk_for;
 use crate::api::Result;
 use crate::model::{Connection, ProvisionSpec};
-
-pub use crate::api::WindowsInitHeader;
 
 /// Resolved Alibaba Cloud ECS Cloud Image ID and metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,90 +28,110 @@ pub struct ResolvedCloudImage {
     pub owner_alias: Option<String>,
 }
 
-impl ResolvedCloudImage {
-    /// Whether this image is an official Alibaba Cloud system image (uses `vminit`).
-    pub fn is_official_aliyun(&self) -> bool {
-        self.source == "official-fallback"
-            || self.owner_alias.as_deref() == Some("system")
-            || self.image_id.contains("_alibase_")
-    }
+fn is_headless_windows(img: &Value) -> bool {
+    ["ImageId", "ImageName", "OSName", "OSNameEn"]
+        .into_iter()
+        .filter_map(|k| img[k].as_str())
+        .any(|raw| {
+            let lower = raw.to_ascii_lowercase();
+            lower.contains("wincore")
+                || lower.contains("without ui")
+                || lower.contains("without_ui")
+                || lower.contains("server core")
+        })
+}
 
-    /// The Windows `UserData` line-1 header required by this image's init agent.
-    pub fn windows_init_header(&self) -> WindowsInitHeader {
-        if self.is_official_aliyun() {
-            WindowsInitHeader::AliyunVminit
-        } else {
-            WindowsInitHeader::CloudbaseSysnative
-        }
+fn windows_release_tier(img: &Value) -> u8 {
+    let id_or_name = [img["ImageId"].as_str(), img["ImageName"].as_str()];
+    let labels = [
+        img["OSNameEn"].as_str(),
+        img["OSName"].as_str(),
+        img["Platform"].as_str(),
+    ];
+    let has_name_tok = |tok: &str| {
+        id_or_name
+            .into_iter()
+            .flatten()
+            .any(|s| s.to_ascii_lowercase().contains(tok))
+    };
+    let has_label_tok = |tok: &str| {
+        labels
+            .into_iter()
+            .flatten()
+            .any(|s| s.to_ascii_lowercase().contains(tok))
+    };
+    // Match release prefixes (`win2025` / `server 2025`), never bare 4-digit years
+    // inside `_alibase_<YYYYMMDD>.vhd` build-date suffixes.
+    if has_name_tok("win2025") || has_label_tok("server 2025") {
+        4
+    } else if has_name_tok("win2022") || has_label_tok("server 2022") {
+        3
+    } else if has_name_tok("win2019") || has_label_tok("server 2019") {
+        2
+    } else if has_name_tok("win20") || has_label_tok("server") {
+        1
+    } else {
+        0
     }
 }
 
+fn is_en_image(img: &Value) -> bool {
+    let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
+    let en = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
+    name.contains("en-us") || name.contains("_en_") || en.contains("english")
+}
+
+fn parse_size_and_owner(img: &Value, default_owner: Option<&str>) -> (Option<u32>, Option<String>) {
+    let size_gb = img["Size"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0);
+    let owner_alias = img["ImageOwnerAlias"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| default_owner.map(str::to_string));
+    (size_gb, owner_alias)
+}
+
 pub(crate) fn pick_official_image(arr: &[Value], is_windows: bool) -> Option<&Value> {
-    fn is_en(img: &Value) -> bool {
-        let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
-        let en = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
-        name.contains("en-us") || name.contains("_en_") || en.contains("english")
-    }
-    fn pick_best<'a>(candidates: &[&'a Value], prefer_en: bool) -> Option<&'a Value> {
-        candidates
-            .iter()
-            .copied()
-            .filter(|img| {
-                img["Status"].as_str() == Some("Available")
-                    && img["ImageId"]
-                        .as_str()
-                        .is_some_and(|s| !s.trim().is_empty())
-            })
-            .max_by(|a, b| {
-                let ea = prefer_en && is_en(a);
-                let eb = prefer_en && is_en(b);
+    arr.iter()
+        .filter(|img| {
+            img["Status"].as_str() == Some("Available")
+                && img["ImageId"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty())
+                && (!is_windows || !is_headless_windows(img))
+        })
+        .max_by(|a, b| {
+            let ta = if is_windows {
+                windows_release_tier(a)
+            } else {
+                0
+            };
+            let tb = if is_windows {
+                windows_release_tier(b)
+            } else {
+                0
+            };
+            ta.cmp(&tb).then_with(|| {
+                let ea = is_windows && is_en_image(a);
+                let eb = is_windows && is_en_image(b);
                 ea.cmp(&eb).then_with(|| {
-                    let ta = a["CreationTime"].as_str().unwrap_or("");
-                    let tb = b["CreationTime"].as_str().unwrap_or("");
-                    ta.cmp(tb).then_with(|| {
-                        a["ImageId"]
-                            .as_str()
-                            .unwrap_or("")
-                            .cmp(b["ImageId"].as_str().unwrap_or(""))
-                    })
+                    a["CreationTime"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b["CreationTime"].as_str().unwrap_or(""))
+                        .then_with(|| {
+                            a["ImageId"]
+                                .as_str()
+                                .unwrap_or("")
+                                .cmp(b["ImageId"].as_str().unwrap_or(""))
+                        })
                 })
             })
-    }
-
-    let all: Vec<&Value> = arr.iter().collect();
-    if is_windows {
-        let is_win_server = |img: &Value, needle: &str| {
-            let name = img["ImageName"].as_str().unwrap_or("").to_ascii_lowercase();
-            let id = img["ImageId"].as_str().unwrap_or("").to_ascii_lowercase();
-            let os_name = img["OSNameEn"].as_str().unwrap_or("").to_ascii_lowercase();
-            let platform = img["Platform"].as_str().unwrap_or("").to_ascii_lowercase();
-            name.contains(needle)
-                || id.contains(needle)
-                || os_name.contains(needle)
-                || platform.contains(needle)
-        };
-        let win2022: Vec<&Value> = all
-            .iter()
-            .copied()
-            .filter(|i| is_win_server(i, "win2022") || is_win_server(i, "2022"))
-            .collect();
-        let win2019: Vec<&Value> = all
-            .iter()
-            .copied()
-            .filter(|i| is_win_server(i, "win2019") || is_win_server(i, "2019"))
-            .collect();
-        let server_any: Vec<&Value> = all
-            .iter()
-            .copied()
-            .filter(|i| is_win_server(i, "server") || is_win_server(i, "win20"))
-            .collect();
-        pick_best(&win2022, true)
-            .or_else(|| pick_best(&win2019, true))
-            .or_else(|| pick_best(&server_any, true))
-            .or_else(|| pick_best(&all, true))
-    } else {
-        pick_best(&all, false)
-    }
+        })
 }
 
 /// Validates an explicit Cloud Image ID (custom `m-xxx`, shared, marketplace, or official)
@@ -176,15 +194,7 @@ pub(crate) async fn validate_image_id(
             "aliyun-ecs: Cloud Image ID {image_id:?} has OSType {os_type:?}, expected {expected_os:?}"
         )));
     }
-    let size_gb = img["Size"]
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
-        .filter(|&n| n > 0);
-    let owner_alias = img["ImageOwnerAlias"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase);
+    let (size_gb, owner_alias) = parse_size_and_owner(img, None);
     Ok(ResolvedCloudImage {
         image_id: img["ImageId"]
             .as_str()
@@ -199,7 +209,7 @@ pub(crate) async fn validate_image_id(
 }
 
 /// Looks up the newest available official Alibaba Cloud system image for `target_os`
-/// (`"linux"` -> Ubuntu 24.04; `"windows"` -> Windows Server 2022/2019) in `region`.
+/// (`"linux"` -> Ubuntu 24.04; `"windows"` -> Windows Server 2025/2022/2019 Desktop Experience).
 pub(crate) async fn resolve_official_image(
     api: &AliyunEcs,
     conn: &Connection,
@@ -243,7 +253,7 @@ pub(crate) async fn resolve_official_image(
 
     let chosen_val = if is_windows {
         let mut picked = None;
-        for pat in [Some("win2022*"), Some("win2019*"), None] {
+        for pat in [Some("win2025*"), Some("win2022*"), Some("win2019*"), None] {
             let arr = query_images(pat).await?;
             if let Some(img) = pick_official_image(&arr, true) {
                 picked = Some(img.clone());
@@ -271,16 +281,7 @@ pub(crate) async fn resolve_official_image(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let size_gb = img["Size"]
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
-        .filter(|&n| n > 0);
-    let owner_alias = img["ImageOwnerAlias"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .or_else(|| Some("system".to_string()));
+    let (size_gb, owner_alias) = parse_size_and_owner(&img, Some("system"));
     Ok(ResolvedCloudImage {
         image_id,
         os_type: if is_windows { "windows" } else { "linux" }.into(),
@@ -371,28 +372,64 @@ mod tests {
     }
 
     #[test]
-    fn windows_init_header_matches_official_vs_custom_images() {
-        let official = ResolvedCloudImage {
-            image_id: "win2022_x64_alibase.vhd".into(),
-            os_type: "windows".into(),
-            size_gb: Some(40),
-            source: "official-fallback",
-            owner_alias: Some("system".into()),
-        };
+    fn pick_official_windows_image_excludes_server_core_and_ignores_build_year_dates() {
+        let images = vec![
+            serde_json::json!({
+                "ImageId": "wincore_2025_x64_dtc_en-us_40G_alibase_20261014.vhd",
+                "ImageName": "wincore_2025_x64_dtc_en-us_40G_alibase_20261014.vhd",
+                "OSNameEn": "Windows Server 2025 DataCenter Edition 64bit English Edition(Without UI)",
+                "Platform": "Windows Server 2025",
+                "Status": "Available",
+                "CreationTime": "2026-10-14T00:00:00Z"
+            }),
+            serde_json::json!({
+                "ImageId": "wincore_2022_x64_dtc_en-us_40G_alibase_20261014.vhd",
+                "ImageName": "wincore_2022_x64_dtc_en-us_40G_alibase_20261014.vhd",
+                "OSNameEn": "Windows Server 2022 DataCenter Edition 64bit English Edition(Without UI)",
+                "Platform": "Windows Server 2022",
+                "Status": "Available",
+                "CreationTime": "2026-10-14T00:00:00Z"
+            }),
+            serde_json::json!({
+                "ImageId": "win2019_1809_x64_dtc_en-us_40G_alibase_20251101.vhd",
+                "ImageName": "win2019_1809_x64_dtc_en-us_40G_alibase_20251101.vhd",
+                "OSNameEn": "Windows Server 2019 DataCenter Edition 64bit English Edition",
+                "Platform": "Windows Server 2019",
+                "Status": "Available",
+                "CreationTime": "2025-11-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "ImageId": "win2022_21H2_x64_dtc_en-us_40G_alibase_20240901.vhd",
+                "ImageName": "win2022_21H2_x64_dtc_en-us_40G_alibase_20240901.vhd",
+                "OSNameEn": "Windows Server 2022 DataCenter Edition 64bit English Edition",
+                "Platform": "Windows Server 2022",
+                "Status": "Available",
+                "CreationTime": "2024-09-01T00:00:00Z"
+            }),
+            serde_json::json!({
+                "ImageId": "win2025_24H2_x64_dtc_en-us_40G_alibase_20251001.vhd",
+                "ImageName": "win2025_24H2_x64_dtc_en-us_40G_alibase_20251001.vhd",
+                "OSNameEn": "Windows Server 2025 DataCenter Edition 64bit English Edition",
+                "Platform": "Windows Server 2025",
+                "Status": "Available",
+                "CreationTime": "2025-10-01T00:00:00Z"
+            }),
+        ];
+        let picked = pick_official_image(&images, true).unwrap();
         assert_eq!(
-            official.windows_init_header(),
-            WindowsInitHeader::AliyunVminit
+            picked["ImageId"].as_str(),
+            Some("win2025_24H2_x64_dtc_en-us_40G_alibase_20251001.vhd")
         );
-        let custom = ResolvedCloudImage {
-            image_id: "m-custom-win11".into(),
-            os_type: "windows".into(),
-            size_gb: Some(60),
-            source: "per-create",
-            owner_alias: Some("self".into()),
-        };
+
+        let dated_2025_win2019_vs_2022 =
+            vec![images[0].clone(), images[2].clone(), images[3].clone()];
+        let picked_2022 = pick_official_image(&dated_2025_win2019_vs_2022, true).unwrap();
         assert_eq!(
-            custom.windows_init_header(),
-            WindowsInitHeader::CloudbaseSysnative
+            picked_2022["ImageId"].as_str(),
+            Some("win2022_21H2_x64_dtc_en-us_40G_alibase_20240901.vhd")
         );
+
+        let only_core = vec![images[0].clone(), images[1].clone()];
+        assert!(pick_official_image(&only_core, true).is_none());
     }
 }

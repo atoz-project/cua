@@ -700,12 +700,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
                     desktop_user: "Administrator",
                     desktop_password: desktop_password.as_deref().unwrap_or_default(),
                 };
-                provision.user_data = match prep.windows_header {
-                    Some(h) => {
-                        crate::bootstrap_win::windows_user_data_with_header(&boot, h.as_str())
-                    }
-                    None => windows_user_data(&boot),
-                };
+                provision.user_data = windows_user_data(&boot);
             }
             Tier::Vm => {
                 let (net_guard, share_slots) = VmBoot::switches();

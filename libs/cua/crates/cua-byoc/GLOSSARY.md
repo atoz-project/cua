@@ -1,6 +1,6 @@
 # Cua BYOC (Bring Your Own Cloud)
 
-Running Cua sandboxes and Spaces inside a user's own cloud account and connecting each machine back to a relay without exposing inbound public ports.
+Running Cua sandboxes and Spaces inside a user's own cloud account and connecting each machine back to a relay over outbound tunnels without requiring inbound ports.
 
 ## Language
 

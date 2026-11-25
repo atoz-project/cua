@@ -225,6 +225,17 @@ pub(crate) fn handle_sg(f: &mut FakeAliyun, action: &str, params: &Params) -> Re
                 }
                 rules.push(rule);
             }
+            if let Some(dir) = params
+                .get("Direction")
+                .map(String::as_str)
+                .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case("all"))
+            {
+                rules.retain(|r| {
+                    r["Direction"]
+                        .as_str()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(dir))
+                });
+            }
             let inner = if sg.inner_access_policy.is_empty() {
                 "Drop"
             } else {

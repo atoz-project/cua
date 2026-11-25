@@ -132,7 +132,7 @@ pub fn resolve_cua_bin() -> PathBuf {
 pub use cua_byoc::testing::fake_aliyun::{decode_cloud_init_write_files, decode_ps_puts};
 
 /// Returns `user_data` combined with all decoded `#cloud-config` `write_files:` payloads
-/// and Windows `#ps1_sysnative` `Put` payloads.
+/// and Windows `[powershell]` `Put` payloads.
 /// Keep cleartext-secret absence checks on the raw `user_data` string, and use this helper
 /// when inspecting scripts or env files embedded via `encoding: b64`.
 pub fn decode_user_data_scripts(user_data: &str) -> String {

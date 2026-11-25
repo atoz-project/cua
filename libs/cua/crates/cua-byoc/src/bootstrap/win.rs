@@ -4,27 +4,26 @@
 //! First-boot PowerShell `UserData` generator for Windows Direct VM
 //! Sandboxes (`--runtime native` on `aliyun-ecs`).
 //!
-//! Runs under 64-bit PowerShell via `vminit` (`[powershell]`, official
-//! Alibaba Cloud Windows images) or `cloudbase-init` (`#ps1_sysnative`,
-//! custom Windows 10/11 images), with a WOW64 -> `Sysnative` 64-bit
-//! self-relaunch guard, and:
-//! 1. Stages relay/environment credentials into an SID-ACL-restricted
-//!    directory (`SYSTEM`, `Administrators`, desktop user only) and removes
-//!    temporary staging artifacts.
+//! Runs under 64-bit PowerShell via Alibaba Cloud `vminit` (`[powershell]`),
+//! with a WOW64 -> `Sysnative` 64-bit self-relaunch guard, and:
+//! 1. Resolves the local Administrator account (matching `desktop_user` or
+//!    falling back to built-in SID `S-1-5-21-*-500`), activates it, sets its
+//!    password with `/Y`, stages relay/environment credentials into an
+//!    SID-ACL-restricted directory (`SYSTEM`, `Administrators`, desktop user
+//!    only), and removes temporary staging artifacts.
 //! 2. Detects pre-installed `cua-spacesd.exe` first; otherwise downloads from
 //!    the connection's custom mirror URL (or GitHub Releases by default) and
 //!    verifies SHA-256 before execution.
-//! 3. Blocks outbound access to cloud metadata endpoints (`100.100.100.200`,
-//!    `169.254.169.254`) via Windows Defender Firewall.
-//! 4. Configures unattended Windows AutoLogon and disables auto-lock,
+//! 3. Configures unattended Windows AutoLogon and disables auto-lock,
 //!    screensaver, and sleep timeouts.
-//! 5. Registers an `AtLogOn` interactive scheduled task (`LogonType
+//! 4. Registers an `AtLogOn` interactive scheduled task (`LogonType
 //!    Interactive`, `RunLevel Highest`) running `cua-spacesd.exe join` in
 //!    `SessionId >= 1` (never Session 0).
-//! 6. Registers a `SYSTEM` scheduled task triggered by
+//! 5. Registers a `SYSTEM` scheduled task triggered by
 //!    `Microsoft-Windows-TerminalServices-LocalSessionManager/Operational`
 //!    Event ID `24` to run `tscon.exe <SessionId> /dest:console`.
-//! 7. Schedules an in-guest TTL shutdown backstop when `ttl_secs > 0`.
+//! 6. Schedules an in-guest TTL shutdown backstop when `ttl_secs > 0`, and
+//!    detaches the AutoLogon reboot until `vminit` archives `POST_Main`.
 
 use std::collections::BTreeMap;
 
@@ -52,9 +51,6 @@ pub fn default_windows_spacesd_url() -> String {
 
 /// Maximum raw `UserData` length accepted by Alibaba Cloud ECS (16 KiB).
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
-
-/// Line-1 header required by `cloudbase-init` (custom Windows 10/11 images).
-pub const CLOUDBASE_HEADER: &str = "#ps1_sysnative";
 
 /// Line-1 header required by Alibaba Cloud `vminit` (`Plugin_Main_CloudinitUserData`).
 pub const ALIYUN_VMINIT_HEADER: &str = "[powershell]";
@@ -164,36 +160,31 @@ fn ps_single_quote(s: &str) -> String {
     }
 }
 
-/// Builds the compact `#ps1_sysnative` PowerShell script for `cloudbase-init`.
-///
-/// Secrets are base64-encoded inside the script and written directly to
-/// SID-ACL-protected files (`SYSTEM`, `Administrators`, `desktop_user`),
-/// never echoed to stdout/logs.
-pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
-    windows_user_data_with_header(boot, CLOUDBASE_HEADER)
+struct UserDataPayloads {
+    desktop_user: String,
+    dl_url: String,
+    expected_sha: Option<String>,
+    relay_token_b64: String,
+    machine_id_b64: String,
+    policy_b64: String,
+    jwks_b64: Option<String>,
+    env_token_b64: Option<String>,
+    extra_env_b64: Option<String>,
+    pass_b64: String,
+    launcher_b64: String,
+    tscon_b64: String,
+    reboot_wait_b64: String,
+    expire_b64: Option<String>,
 }
 
-/// Builds the compact PowerShell `UserData` script with an explicit line-1 header
-/// (`ALIYUN_VMINIT_HEADER` = `[powershell]` for Alibaba Cloud `vminit`, or
-/// `CLOUDBASE_HEADER` = `#ps1_sysnative` for `cloudbase-init`) and a 64-bit
-/// WOW64 -> `Sysnative` self-relaunch guard.
-pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> String {
+fn build_payloads(boot: &WindowsVmBoot<'_>) -> UserDataPayloads {
     let (dl_url, expected_sha) = split_download_url(boot.spacesd_download_url);
-    let desktop_user = if boot.desktop_user.trim().is_empty() {
-        "Administrator"
-    } else {
-        boot.desktop_user.trim()
+    let desktop_user = match boot.desktop_user.trim() {
+        "" => "Administrator".to_string(),
+        u => u.to_string(),
     };
-
-    let relay_token_b64 = b64(&boot.join.machine_token);
-    let machine_id_b64 = b64(&boot.join.machine_id);
-    let policy_b64 = b64(&boot.join.policy_json());
     let has_jwks = !boot.join.jwks_json.trim().is_empty();
-    let jwks_b64 = if has_jwks {
-        b64(&boot.join.jwks_json)
-    } else {
-        String::new()
-    };
+    let jwks_b64 = has_jwks.then(|| b64(&boot.join.jwks_json));
     let env_token = boot
         .env
         .get("CUA_ENV_TOKEN")
@@ -208,26 +199,33 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         .collect();
     let extra_env_b64 = (!extra_env.is_empty())
         .then(|| b64(&serde_json::to_string(&extra_env).unwrap_or_else(|_| "{}".into())));
-    let pass_b64 = b64(boot.desktop_password);
+    let has_extra_env = extra_env_b64.is_some();
 
-    let launcher_b64 = b64(&build_launcher_ps(
-        &boot.join.relay_url,
-        &boot.join.machine_id,
-        has_jwks,
-        env_token.is_some(),
-        extra_env_b64.is_some(),
-    ));
-    let tscon_b64 = b64(&build_tscon_ps());
-    let expire_ps = (boot.ttl_secs > 0).then(|| b64(&build_expire_ps()));
+    UserDataPayloads {
+        desktop_user,
+        dl_url,
+        expected_sha: expected_sha.map(str::to_ascii_lowercase),
+        relay_token_b64: b64(&boot.join.machine_token),
+        machine_id_b64: b64(&boot.join.machine_id),
+        policy_b64: b64(&boot.join.policy_json()),
+        jwks_b64,
+        env_token_b64,
+        extra_env_b64,
+        pass_b64: b64(boot.desktop_password),
+        launcher_b64: b64(&build_launcher_ps(
+            &boot.join.relay_url,
+            &boot.join.machine_id,
+            has_jwks,
+            env_token.is_some(),
+            has_extra_env,
+        )),
+        tscon_b64: b64(&build_tscon_ps()),
+        reboot_wait_b64: b64(&build_reboot_wait_ps()),
+        expire_b64: (boot.ttl_secs > 0).then(|| b64(&build_expire_ps())),
+    }
+}
 
-    let hdr = header.trim();
-    let mut s = format!(
-        "{hdr}\n\
-         {WOW64_SYSNATIVE_GUARD}\n\
-         $ErrorActionPreference = 'Stop'\n\
-         $ProgressPreference = 'SilentlyContinue'\n",
-    );
-
+fn push_preamble_and_admin_setup(s: &mut String, boot: &WindowsVmBoot<'_>, p: &UserDataPayloads) {
     s.push_str(&format!(
         "$provider = {prov}\n\
          $u = {user}\n\
@@ -246,37 +244,45 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          }}\n\
          function Dec([string]$b) {{ [Convert]::FromBase64String($b) }}\n\
          function Put([string]$p,[string]$b) {{ [IO.File]::WriteAllBytes($p,(Dec $b)) }}\n\
-         function Fetch([string]$u,[string]$o) {{ for ($i=1; $i -le 5; $i++) {{ try {{ Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $o; return }} catch {{ if ($i -eq 5) {{ throw }}; Start-Sleep -Seconds ($i*5) }} }} }}\n",
+         function Fetch([string]$u,[string]$o) {{ for ($i=1; $i -le 5; $i++) {{ try {{ Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $o; return }} catch {{ if ($i -eq 5) {{ throw }}; Start-Sleep -Seconds ($i*5) }} }} }}\n\
+         $pwPlain = [Text.Encoding]::UTF8.GetString((Dec {pw}))\n\
+         $la = @(Get-CimInstance -ClassName Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction SilentlyContinue)\n\
+         $ma = $la | Where-Object {{ $_.Name -eq $u }} | Select-Object -First 1\n\
+         if (-not $ma) {{ $ma = $la | Where-Object {{ $_.SID -like 'S-1-5-21-*-500' }} | Select-Object -First 1 }}\n\
+         if ($ma) {{\n\
+         \x20 $u = [string]$ma.Name\n\
+         \x20 Log \"ensuring active local admin account $u\"\n\
+         \x20 if ($pwPlain) {{ & net.exe user $u $pwPlain /active:yes /Y | Out-Null }} else {{ & net.exe user $u /active:yes | Out-Null }}\n\
+         \x20 if ($LASTEXITCODE -ne 0) {{ throw \"net user failed: $LASTEXITCODE\" }}\n\
+         }}\n",
         prov = ps_single_quote(boot.provider),
-        user = ps_single_quote(desktop_user),
+        user = ps_single_quote(&p.desktop_user),
+        pw = ps_single_quote(&p.pass_b64),
     ));
+}
 
+fn push_secret_staging(s: &mut String, p: &UserDataPayloads) {
     s.push_str(&format!(
-        "Log \"staging secrets for $provider\"\n\
-         & icacls.exe $sd /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \"$u`:(OI)(CI)M\" /T | Out-Null\n\
-         if ($LASTEXITCODE -ne 0) {{ throw \"icacls failed: $LASTEXITCODE\" }}\n\
-         New-Item -ItemType Directory -Force -Path $dd | Out-Null\n\
-         try {{\n\
-         \x20 Put (Join-Path $sd 'relay-token') {relay_tok}\n\
+        "  Put (Join-Path $sd 'relay-token') {relay_tok}\n\
          \x20 Put (Join-Path $sd 'machine-id') {mach_id}\n\
          \x20 Put (Join-Path $sd 'host-policy.json') {policy}\n",
-        relay_tok = ps_single_quote(&relay_token_b64),
-        mach_id = ps_single_quote(&machine_id_b64),
-        policy = ps_single_quote(&policy_b64),
+        relay_tok = ps_single_quote(&p.relay_token_b64),
+        mach_id = ps_single_quote(&p.machine_id_b64),
+        policy = ps_single_quote(&p.policy_b64),
     ));
-    if has_jwks {
+    if let Some(jwks) = &p.jwks_b64 {
         s.push_str(&format!(
             "  Put (Join-Path $sd 'jwks.json') {}\n",
-            ps_single_quote(&jwks_b64)
+            ps_single_quote(jwks)
         ));
     }
-    if let Some(et) = &env_token_b64 {
+    if let Some(et) = &p.env_token_b64 {
         s.push_str(&format!(
             "  Put (Join-Path $sd 'env-token') {}\n",
             ps_single_quote(et)
         ));
     }
-    if let Some(ee) = &extra_env_b64 {
+    if let Some(ee) = &p.extra_env_b64 {
         s.push_str(&format!(
             "  Put (Join-Path $sd 'extra-env.json') {}\n",
             ps_single_quote(ee)
@@ -284,17 +290,21 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
     }
     s.push_str(&format!(
         "  Put (Join-Path $sd 'launch-spacesd.ps1') {launcher}\n\
-         \x20 Put (Join-Path $sd 'tscon-recover.ps1') {tscon}\n",
-        launcher = ps_single_quote(&launcher_b64),
-        tscon = ps_single_quote(&tscon_b64),
+         \x20 Put (Join-Path $sd 'tscon-recover.ps1') {tscon}\n\
+         \x20 Put (Join-Path $sd 'reboot-wait.ps1') {reboot_wait}\n",
+        launcher = ps_single_quote(&p.launcher_b64),
+        tscon = ps_single_quote(&p.tscon_b64),
+        reboot_wait = ps_single_quote(&p.reboot_wait_b64),
     ));
+}
 
-    let expected_sha_ps = match expected_sha {
-        Some(hex) => ps_single_quote(&hex.to_ascii_lowercase()),
+fn push_spacesd_install(s: &mut String, p: &UserDataPayloads) {
+    let expected_sha_ps = match &p.expected_sha {
+        Some(hex) => ps_single_quote(hex),
         None => "$null".into(),
     };
-    let dl_url_b64 = b64(&dl_url);
-    let dl_url_redacted = cua_sandbox_core::byoc::redact_url(&dl_url);
+    let dl_url_b64 = b64(&p.dl_url);
+    let dl_url_redacted = cua_sandbox_core::byoc::redact_url(&p.dl_url);
     s.push_str(&format!(
         "  $exe = $null\n\
          \x20 foreach ($cand in @((Join-Path $bd 'cua-spacesd.exe'), (Join-Path $env:LOCALAPPDATA 'cua\\spacesd\\cua-spacesd.exe'))) {{\n\
@@ -327,46 +337,42 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
         dl_url_redacted = ps_single_quote(&dl_url_redacted),
         want_sha = expected_sha_ps,
     ));
+}
 
+fn push_autologon_and_desktop_policy(s: &mut String) {
     s.push_str(
-        "  foreach ($ip in @('100.100.100.200','169.254.169.254')) {\n\
-         \x20   $rn = \"Cua-Block-Metadata-$ip\"\n\
-         \x20   Get-NetFirewallRule -DisplayName $rn -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\n\
-         \x20   New-NetFirewallRule -DisplayName $rn -Direction Outbound -Action Block -RemoteAddress $ip -Profile Any | Out-Null\n\
-         \x20 }\n",
-    );
-
-    s.push_str(&format!(
         "  $wl = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'\n\
          \x20 Set-ItemProperty -Path $wl -Name 'AutoAdminLogon' -Value '1' -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'DefaultUserName' -Value $u -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'DefaultDomainName' -Value $env:COMPUTERNAME -Type String\n\
-         \x20 Set-ItemProperty -Path $wl -Name 'DefaultPassword' -Value ([Text.Encoding]::UTF8.GetString((Dec {pw}))) -Type String\n\
+         \x20 Set-ItemProperty -Path $wl -Name 'DefaultPassword' -Value $pwPlain -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'ForceAutoLogon' -Value '1' -Type String\n\
          \x20 $sp = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'\n\
-         \x20 if (-not (Test-Path -LiteralPath $sp)) {{ New-Item -Path $sp -Force | Out-Null }}\n\
+         \x20 if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }\n\
          \x20 Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord\n\
          \x20 $pp = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Personalization'\n\
-         \x20 if (-not (Test-Path -LiteralPath $pp)) {{ New-Item -Path $pp -Force | Out-Null }}\n\
+         \x20 if (-not (Test-Path -LiteralPath $pp)) { New-Item -Path $pp -Force | Out-Null }\n\
          \x20 Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord\n\
          \x20 Set-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name 'ScreenSaveActive' -Value '0' -Type String -ErrorAction SilentlyContinue\n\
          \x20 & reg.exe add 'HKU\\.DEFAULT\\Control Panel\\Desktop' /v ScreenSaveActive /t REG_SZ /d 0 /f | Out-Null\n\
          \x20 & powercfg.exe /change standby-timeout-ac 0 | Out-Null\n\
          \x20 & powercfg.exe /change monitor-timeout-ac 0 | Out-Null\n\
          \x20 & powercfg.exe /change hibernate-timeout-ac 0 | Out-Null\n",
-        pw = ps_single_quote(&pass_b64),
-    ));
+    );
+}
 
+fn push_scheduled_tasks_and_handoff(
+    s: &mut String,
+    boot: &WindowsVmBoot<'_>,
+    p: &UserDataPayloads,
+) {
     s.push_str(
         "  $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `\"$sd\\launch-spacesd.ps1`\"\"\n\
          \x20 $trg = New-ScheduledTaskTrigger -AtLogOn -User $u\n\
          \x20 $prn = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest\n\
          \x20 $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew\n\
-         \x20 Register-ScheduledTask -TaskName 'cua-spacesd' -Action $act -Trigger $trg -Principal $prn -Settings $set -Force | Out-Null\n",
-    );
-
-    s.push_str(
-        "  $tc = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'\n\
+         \x20 Register-ScheduledTask -TaskName 'cua-spacesd' -Action $act -Trigger $trg -Principal $prn -Settings $set -Force | Out-Null\n\
+         \x20 $tc = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace 'Root/Microsoft/Windows/TaskScheduler'\n\
          \x20 $et = New-CimInstance -CimClass $tc -ClientOnly\n\
          \x20 $et.Enabled = $true\n\
          \x20 $et.Subscription = \"<QueryList><Query Id='0' Path='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'><Select Path='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'>*[System[(EventID=24)]]</Select></Query></QueryList>\"\n\
@@ -375,40 +381,62 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20 $tSet = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances Queue\n\
          \x20 Register-ScheduledTask -TaskName 'cua-tscon-recover' -Action $tAct -Trigger $et -Principal $tPrn -Settings $tSet -Force | Out-Null\n",
     );
-
-    if let Some(exp_b64) = expire_ps {
-        let clamped = boot.ttl_secs.clamp(1, MAX_SHUTDOWN_TIMEOUT_SECS);
+    if let Some(exp_b64) = &p.expire_b64 {
         s.push_str(&format!(
             "  Set-Content -LiteralPath 'C:\\ProgramData\\cua\\expires' -Value '{expires}' -NoNewline -Encoding ASCII\n\
              \x20 Put (Join-Path $sd 'expire-check.ps1') {exp_script}\n\
              \x20 $eAct = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `\"$sd\\expire-check.ps1`\"\"\n\
              \x20 $eTrg = New-ScheduledTaskTrigger -AtStartup\n\
              \x20 $eTrg.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3650)).Repetition\n\
-             \x20 Register-ScheduledTask -TaskName 'cua-expire' -Action $eAct -Trigger $eTrg -Principal $tPrn -Settings $set -Force | Out-Null\n\
-             \x20 $hasSession = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -ge 1 }}).Count -gt 0\n\
-             \x20 if ($hasSession) {{\n\
-             \x20   & shutdown.exe /s /t {clamped} /f /c 'cua: sandbox TTL reached' | Out-Null\n\
-             \x20   Start-ScheduledTask -TaskName 'cua-spacesd'\n\
-             \x20 }} else {{\n\
-             \x20   Log 'rebooting for unattended AutoLogon interactive session'\n\
-             \x20   & shutdown.exe /r /t 5 /c 'cua: reboot for AutoLogon' | Out-Null\n\
-             \x20 }}\n",
+             \x20 Register-ScheduledTask -TaskName 'cua-expire' -Action $eAct -Trigger $eTrg -Principal $tPrn -Settings $set -Force | Out-Null\n",
             expires = boot.expires,
-            exp_script = ps_single_quote(&exp_b64),
-            clamped = clamped,
+            exp_script = ps_single_quote(exp_b64),
         ));
-    } else {
-        s.push_str(
-            "  $hasSession = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -ge 1 }).Count -gt 0\n\
-             \x20 if ($hasSession) {\n\
-             \x20   Start-ScheduledTask -TaskName 'cua-spacesd'\n\
-             \x20 } else {\n\
-             \x20   Log 'rebooting for unattended AutoLogon interactive session'\n\
-             \x20   & shutdown.exe /r /t 5 /c 'cua: reboot for AutoLogon' | Out-Null\n\
-             \x20 }\n",
-        );
     }
+    let session_ttl_shutdown = if boot.ttl_secs > 0 {
+        let clamped = boot.ttl_secs.clamp(1, MAX_SHUTDOWN_TIMEOUT_SECS);
+        format!("    & shutdown.exe /s /t {clamped} /f /c 'cua: sandbox TTL reached' | Out-Null\n")
+    } else {
+        String::new()
+    };
+    s.push_str(&format!(
+        "  $hasSession = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -ge 1 }}).Count -gt 0\n\
+         \x20 if ($hasSession) {{\n\
+         {session_ttl_shutdown}\
+         \x20   Start-ScheduledTask -TaskName 'cua-spacesd'\n\
+         \x20 }} else {{\n\
+         \x20   Log 'scheduling detached reboot after vminit POST_Main archival'\n\
+         \x20   Start-Process -FilePath \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $sd 'reboot-wait.ps1') -WindowStyle Hidden | Out-Null\n\
+         \x20 }}\n",
+    ));
+}
 
+/// Builds the compact `[powershell]` PowerShell `UserData` script for Alibaba
+/// Cloud `vminit` with a 64-bit WOW64 -> `Sysnative` self-relaunch guard.
+///
+/// Secrets are base64-encoded inside the script and written directly to
+/// SID-ACL-protected files (`SYSTEM`, `Administrators`, `desktop_user`),
+/// never echoed to stdout/logs.
+pub fn windows_user_data(boot: &WindowsVmBoot<'_>) -> String {
+    let payloads = build_payloads(boot);
+    let mut s = format!(
+        "{ALIYUN_VMINIT_HEADER}\n\
+         {WOW64_SYSNATIVE_GUARD}\n\
+         $ErrorActionPreference = 'Stop'\n\
+         $ProgressPreference = 'SilentlyContinue'\n"
+    );
+    push_preamble_and_admin_setup(&mut s, boot, &payloads);
+    s.push_str(
+        "Log \"staging secrets for $provider\"\n\
+         & icacls.exe $sd /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \"$u`:(OI)(CI)M\" /T | Out-Null\n\
+         if ($LASTEXITCODE -ne 0) { throw \"icacls failed: $LASTEXITCODE\" }\n\
+         New-Item -ItemType Directory -Force -Path $dd | Out-Null\n\
+         try {\n",
+    );
+    push_secret_staging(&mut s, &payloads);
+    push_spacesd_install(&mut s, &payloads);
+    push_autologon_and_desktop_policy(&mut s);
+    push_scheduled_tasks_and_handoff(&mut s, boot, &payloads);
     s.push_str(
         "} finally {\n\
          \x20 if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }\n\
@@ -416,7 +444,6 @@ pub fn windows_user_data_with_header(boot: &WindowsVmBoot<'_>, header: &str) -> 
          \x20 if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }\n\
          }\n",
     );
-
     s
 }
 
@@ -479,6 +506,15 @@ fn build_tscon_ps() -> String {
     .into()
 }
 
+fn build_reboot_wait_ps() -> String {
+    "$ErrorActionPreference = 'SilentlyContinue'\n\
+     for ($i = 0; $i -lt 120 -and (Test-Path -LiteralPath 'C:\\ProgramData\\aliyun\\vminit\\POST_Main'); $i++) {\n\
+     \x20 Start-Sleep -Milliseconds 500\n\
+     }\n\
+     & \"$env:SystemRoot\\System32\\shutdown.exe\" /r /t 0 /f /c 'cua: reboot for AutoLogon' | Out-Null\n"
+    .into()
+}
+
 fn build_expire_ps() -> String {
     "$ErrorActionPreference = 'Stop'\n\
      $f = 'C:\\ProgramData\\cua\\expires'\n\
@@ -493,69 +529,6 @@ fn build_expire_ps() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn account_join() -> Join {
-        Join {
-            relay_url: "https://relay.example.com".into(),
-            machine_id: "cloud-0123456789abcdef".into(),
-            machine_token: "cmt_account_secret_token_999".into(),
-            jwks_json: r#"{"keys":[{"kty":"OKP"}]}"#.into(),
-            owner: "acct-1".into(),
-            owner_email: "ada@example.com".into(),
-        }
-    }
-
-    fn static_join() -> Join {
-        Join {
-            relay_url: "https://relay.selfhosted.local".into(),
-            machine_id: "cloud-fedcba9876543210".into(),
-            machine_token: "static_relay_secret_token_777".into(),
-            jwks_json: String::new(),
-            owner: String::new(),
-            owner_email: String::new(),
-        }
-    }
-
-    fn boot_cfg<'a>(
-        join: &'a Join,
-        env: &'a BTreeMap<String, String>,
-        ttl_secs: u64,
-        spacesd_download_url: Option<&'a str>,
-        desktop_password: &'a str,
-    ) -> WindowsVmBoot<'a> {
-        WindowsVmBoot {
-            join,
-            env,
-            expires: if ttl_secs > 0 { 1_900_000_000 } else { 0 },
-            ttl_secs,
-            provider: "aliyun-ecs",
-            spacesd_download_url,
-            desktop_user: "Administrator",
-            desktop_password,
-        }
-    }
-
-    fn decode_put(script: &str, name: &str) -> Option<String> {
-        let needle = format!("'{name}') '");
-        let idx = script.find(&needle)? + needle.len();
-        let rest = &script[idx..];
-        let raw_b64 = &rest[..rest.find('\'')?];
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(raw_b64)
-            .ok()?;
-        String::from_utf8(bytes).ok()
-    }
-
-    fn decode_dl_url(script: &str) -> Option<String> {
-        let needle = "$dlUrl = [Text.Encoding]::UTF8.GetString((Dec '";
-        let idx = script.find(needle)? + needle.len();
-        let rest = &script[idx..];
-        let raw_b64 = &rest[..rest.find('\'')?];
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(raw_b64)
-            .ok()?;
-        String::from_utf8(bytes).ok()
-    }
 
     #[test]
     fn default_spacesd_version_pins_to_cua_host_driver_and_version_file() {
@@ -575,131 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn account_mode_windows_user_data_contract_and_size() {
-        let j = account_join();
-        let env = BTreeMap::from([("FOO_BAR".to_string(), "baz".to_string())]);
-        let pw = "WinPass!1234Abcd";
-        let ps = windows_user_data(&boot_cfg(&j, &env, 8 * 3600, None, pw));
-        assert!(ps.starts_with("#ps1_sysnative\n"));
-        assert!(
-            ps.len() < MAX_USER_DATA_BYTES,
-            "UserData {} >= 16 KiB",
-            ps.len()
-        );
-        assert!(!ps.contains(&j.machine_token) && !ps.contains(pw) && !ps.contains(&j.jwks_json));
-
-        assert!(ps.contains("*S-1-5-18:(OI)(CI)F"), "{ps}");
-        assert!(ps.contains("*S-1-5-32-544:(OI)(CI)F"), "{ps}");
-        let icacls_pos = ps.find("& icacls.exe $sd /inheritance:r").unwrap();
-        assert!(ps[icacls_pos..].contains(" /T "), "{ps}");
-        let dd_create_pos = ps
-            .find("New-Item -ItemType Directory -Force -Path $dd")
-            .unwrap();
-        assert!(dd_create_pos > icacls_pos);
-        assert!(!ps.contains("Put (Join-Path $stg 'relay-token')"));
-        assert!(!ps.contains("Move-Item -LiteralPath $_.FullName -Destination (Join-Path $sd"));
-        for f in ["relay-token", "machine-id", "host-policy.json", "jwks.json"] {
-            assert!(ps.contains(&format!("Put (Join-Path $sd '{f}')")));
-        }
-        assert!(ps.contains("Remove-Item -LiteralPath $stg -Recurse -Force"));
-
-        assert_eq!(
-            decode_put(&ps, "relay-token").as_deref(),
-            Some("cmt_account_secret_token_999")
-        );
-        assert_eq!(
-            decode_put(&ps, "machine-id").as_deref(),
-            Some("cloud-0123456789abcdef")
-        );
-        assert!(decode_put(&ps, "jwks.json").is_some());
-        assert!(decode_put(&ps, "env-token").is_none());
-        let policy: serde_json::Value =
-            serde_json::from_str(&decode_put(&ps, "host-policy.json").unwrap()).unwrap();
-        assert_eq!(policy["owner"], "acct-1");
-
-        assert!(ps.contains("Cua\\spacesd") && ps.contains("cua-spacesd.exe"));
-        assert!(ps.contains("cua\\spacesd\\cua-spacesd.exe"));
-        assert!(ps.contains(&default_windows_spacesd_url()));
-        assert!(ps.contains("Get-FileHash -Algorithm SHA256"));
-        assert!(ps.contains("SecurityProtocolType]::Tls12"));
-        assert!(ps.contains("-UseBasicParsing"));
-        assert!(ps.contains("100.100.100.200") && ps.contains("New-NetFirewallRule"));
-        for want in [
-            "AutoAdminLogon",
-            "DisableLockWorkstation",
-            "NoLockScreen",
-            "ScreenSaveActive",
-            "standby-timeout-ac 0",
-            "-AtLogOn",
-            "-LogonType Interactive -RunLevel Highest",
-            "EventID=24",
-            "NT AUTHORITY\\SYSTEM",
-            "shutdown.exe /s /t 28800",
-        ] {
-            assert!(ps.contains(want), "missing {want:?}");
-        }
-
-        let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
-        assert!(launcher.contains("CUA_DRIVER_POLICY_FILE"));
-        assert!(launcher.contains(".SessionId") && launcher.contains("$sid -lt 1"));
-        assert!(launcher.contains("--relay-jwks") && !launcher.contains("--token-file"));
-        assert!(launcher.contains("$cuaArgs"));
-        assert!(!launcher.contains("$args =") && !launcher.contains("@args"));
-
-        let tscon = decode_put(&ps, "tscon-recover.ps1").unwrap();
-        assert!(tscon.contains("tscon.exe") && tscon.contains("/dest:console"));
-        assert!(
-            tscon.contains("$ErrorActionPreference = 'Continue'") && tscon.contains("quser.exe")
-        );
-        assert!(decode_put(&ps, "expire-check.ps1").is_some());
-    }
-
-    #[test]
-    fn static_mode_custom_mirror_sha256_and_no_ttl() {
-        let j = static_join();
-        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_42".into())]);
-        let pw = generate_desktop_password();
-        assert!(pw.len() >= 16 && !pw.contains('\''));
-        let hex = "ab".repeat(32);
-        let mirror = format!("http://10.0.0.10:8080/mirror/cua-spacesd.exe#sha256={hex}");
-        let ps = windows_user_data(&boot_cfg(&j, &env, 0, Some(&mirror), &pw));
-        assert!(ps.starts_with("#ps1_sysnative\n") && ps.len() < MAX_USER_DATA_BYTES);
-        assert!(
-            !ps.contains("static_relay_secret_token_777")
-                && !ps.contains("env_secret_static_42")
-                && !ps.contains(&pw)
-        );
-        assert!(decode_put(&ps, "jwks.json").is_none());
-        assert_eq!(
-            decode_put(&ps, "env-token").as_deref(),
-            Some("env_secret_static_42")
-        );
-        let policy: serde_json::Value =
-            serde_json::from_str(&decode_put(&ps, "host-policy.json").unwrap()).unwrap();
-        assert!(policy.get("owner").is_none());
-
-        let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
-        assert!(!launcher.contains("--relay-jwks") && launcher.contains("--token-file"));
-        assert!(ps.contains("http://10.0.0.10:8080/mirror/cua-spacesd.exe"));
-        assert!(!ps.contains("#sha256=") && ps.contains(&hex));
-        assert!(!ps.contains("shutdown.exe /s") && decode_put(&ps, "expire-check.ps1").is_none());
-    }
-
-    #[test]
-    fn mirror_url_expands_version_arch_and_trailing_slash_preserving_query() {
-        let ver = default_spacesd_version();
-        let hex = "cd".repeat(32);
-
-        let templated = format!(
-            "https://mirror.example.com/v{{version}}/cua-spacesd-{{arch}}.exe#sha256={hex}"
-        );
-        let (url, sha) = split_download_url(Some(&templated));
-        assert_eq!(
-            url,
-            format!("https://mirror.example.com/v{ver}/cua-spacesd-x86_64.exe")
-        );
-        assert_eq!(sha, Some(hex.as_str()));
-
+    fn split_download_url_handles_directory_and_query_preservation() {
         let (dir_url, dir_sha) =
             split_download_url(Some("https://mirror.example.com/cua-spacesd/"));
         assert_eq!(
@@ -708,6 +557,7 @@ mod tests {
         );
         assert_eq!(dir_sha, None);
 
+        let ver = default_spacesd_version();
         let (q_url, q_sha) = split_download_url(Some(
             "https://mirror.example.com/v{version}/{arch}/?sig=SecretToken99",
         ));
@@ -718,204 +568,5 @@ mod tests {
             )
         );
         assert_eq!(q_sha, None);
-
-        let j = static_join();
-        let env = BTreeMap::new();
-        let ps = windows_user_data(&boot_cfg(
-            &j,
-            &env,
-            0,
-            Some("https://mirror.example.com/v{version}/{arch}/?sig=SecretToken99"),
-            "WinPass!1234Abcd",
-        ));
-        assert_eq!(decode_dl_url(&ps).as_deref(), Some(q_url.as_str()));
-        assert!(!ps.contains("SecretToken99"), "query leaked in plaintext");
-        assert!(ps.contains(&format!(
-            "https://mirror.example.com/v{ver}/x86_64/{WINDOWS_SPACESD_ASSET}"
-        )));
-        assert!(ps.contains("Fetch $dlUrl $dlTmp"));
-        assert!(ps.contains("Fetch \"$dlUrl.sha256\" $sumTmp"));
-    }
-
-    #[test]
-    fn utf8_without_bom_for_bin_path_and_utf8_reads_in_launcher() {
-        let j = account_join();
-        let env = BTreeMap::from([("GREETING".to_string(), "你好世界".to_string())]);
-        let ps = windows_user_data(&boot_cfg(&j, &env, 0, None, "WinPass!1234Abcd"));
-
-        assert!(
-            ps.contains(
-                "[IO.File]::WriteAllBytes((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8.GetBytes($exe))"
-            ),
-            "{ps}"
-        );
-        assert!(!ps.contains("Set-Content -LiteralPath (Join-Path $sd 'bin-path')"));
-
-        // Launcher explicitly decodes bin-path and extra-env.json as UTF-8 (safe on CP936/GBK).
-        let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
-        assert!(
-            launcher.contains(
-                "[IO.File]::ReadAllText((Join-Path $sd 'bin-path'), [Text.Encoding]::UTF8).Trim()"
-            ),
-            "{launcher}"
-        );
-        assert!(
-            launcher.contains(
-                "[IO.File]::ReadAllText((Join-Path $sd 'extra-env.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json"
-            ),
-            "{launcher}"
-        );
-        assert!(
-            !launcher.contains("Get-Content"),
-            "launcher must not use bare Get-Content on BOM-less UTF-8 files: {launcher}"
-        );
-        let extra: serde_json::Value =
-            serde_json::from_str(&decode_put(&ps, "extra-env.json").unwrap()).unwrap();
-        assert_eq!(extra["GREETING"], "你好世界");
-    }
-
-    #[test]
-    fn windows_vm_boot_debug_redacts_secrets_and_url_credentials_and_blocks_curly_quotes() {
-        let mut j = static_join();
-        j.relay_url = "https://relay.example\u{2019};Invoke-Expression(whoami)".into();
-        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_99".into())]);
-        let pw = "WinPass!Secret9988";
-        let secret_mirror = format!(
-            "https://dluser:MyPass998877@mirror.example.com/cua-spacesd.exe?sig=DeadBeefCafe9988#sha256={}",
-            "ab".repeat(32)
-        );
-        let boot = boot_cfg(&j, &env, 0, Some(&secret_mirror), pw);
-        let dbg = format!("{boot:?}");
-        for secret in [
-            pw,
-            "MyPass998877",
-            "DeadBeefCafe9988",
-            "env_secret_static_99",
-        ] {
-            assert!(!dbg.contains(secret), "Debug leaked {secret}: {dbg}");
-        }
-        assert!(
-            dbg.contains("<redacted>")
-                && dbg.contains("https://mirror.example.com/cua-spacesd.exe")
-        );
-
-        let ps = windows_user_data(&boot);
-        for secret in ["MyPass998877", "DeadBeefCafe9988", "dluser"] {
-            assert!(!ps.contains(secret), "{ps}");
-        }
-        assert!(
-            ps.contains("https://mirror.example.com/cua-spacesd.exe"),
-            "{ps}"
-        );
-        for q in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
-            assert!(!ps.contains(q), "raw curly quote {q:?} in UserData");
-            let j2 = static_join();
-            let curly_url = format!(
-                "https://mirror.example.com/cua{q};Invoke-Expression(whoami);#sha256={}",
-                "ab".repeat(32)
-            );
-            let ps2 = windows_user_data(&boot_cfg(&j2, &env, 0, Some(&curly_url), pw));
-            assert!(!ps2.contains(q) && !ps2.contains("Invoke-Expression"));
-        }
-        let launcher = decode_put(&ps, "launch-spacesd.ps1").unwrap();
-        assert!(!launcher.contains('\u{2019}') && !launcher.contains("Invoke-Expression"));
-        assert!(ps.contains("function Fetch(") && ps.contains("Fetch $dlUrl $dlTmp"));
-    }
-
-    #[test]
-    fn aliyun_vminit_header_and_wow64_guard_contract() {
-        let j = static_join();
-        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_vminit".into())]);
-        let ps = windows_user_data_with_header(
-            &boot_cfg(&j, &env, 8 * 3600, None, "WinPass!1234Abcd"),
-            ALIYUN_VMINIT_HEADER,
-        );
-        let mut lines = ps.lines();
-        assert_eq!(lines.next(), Some("[powershell]"));
-        let guard_line = lines.next().unwrap();
-        for want in [
-            "Is64BitOperatingSystem",
-            "Is64BitProcess",
-            r"Sysnative\WindowsPowerShell\v1.0\powershell.exe",
-            "$PSCommandPath",
-        ] {
-            assert!(guard_line.contains(want), "missing {want}");
-        }
-        assert!(
-            ps.len() < MAX_USER_DATA_BYTES,
-            "UserData {} >= 16 KiB",
-            ps.len()
-        );
-    }
-
-    #[test]
-    fn registry_policy_keys_guard_new_item_with_test_path() {
-        let j = static_join();
-        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_reg".into())]);
-        let boot = boot_cfg(&j, &env, 8 * 3600, None, "WinPass!1234Abcd");
-        for ps in [
-            windows_user_data(&boot),
-            windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
-        ] {
-            assert!(ps.len() < MAX_USER_DATA_BYTES);
-            assert!(ps.contains(
-                "if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }"
-            ));
-            assert!(ps.contains(
-                "if (-not (Test-Path -LiteralPath $pp)) { New-Item -Path $pp -Force | Out-Null }"
-            ));
-            for line in ps.lines() {
-                let trimmed = line.trim_start();
-                assert!(
-                    !trimmed.starts_with("New-Item -Path $sp")
-                        && !trimmed.starts_with("New-Item -Path $pp"),
-                    "unguarded New-Item: {line}"
-                );
-            }
-            assert!(ps.contains(
-                "Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord"
-            ));
-            assert!(
-                ps.contains("Set-ItemProperty -Path $pp -Name 'NoLockScreen' -Value 1 -Type DWord")
-            );
-        }
-    }
-
-    #[test]
-    fn finally_cleanup_guards_nullable_temp_paths_against_null_binding() {
-        let j = static_join();
-        let env = BTreeMap::from([("CUA_ENV_TOKEN".into(), "env_secret_static_finally".into())]);
-        let pinned_mirror = format!(
-            "https://mirror.example.com/cua-spacesd.exe#sha256={}",
-            "ab".repeat(32)
-        );
-        for url in [None, Some(pinned_mirror.as_str())] {
-            let boot = boot_cfg(&j, &env, 8 * 3600, url, "WinPass!1234Abcd");
-            for ps in [
-                windows_user_data(&boot),
-                windows_user_data_with_header(&boot, ALIYUN_VMINIT_HEADER),
-            ] {
-                assert!(ps.len() < MAX_USER_DATA_BYTES);
-                let finally_block = &ps[ps.find("} finally {").expect("finally block")..];
-                for expected in [
-                    "if ($dlTmp) { Remove-Item -LiteralPath $dlTmp -Force -ErrorAction SilentlyContinue }",
-                    "if ($sumTmp) { Remove-Item -LiteralPath $sumTmp -Force -ErrorAction SilentlyContinue }",
-                    "if ($stg) { Remove-Item -LiteralPath $stg -Recurse -Force -ErrorAction SilentlyContinue }",
-                ] {
-                    assert!(finally_block.contains(expected), "{finally_block}");
-                }
-                for line in ps.lines() {
-                    for stmt in line.split(';') {
-                        let trimmed = stmt.trim_start();
-                        assert!(
-                            !trimmed.starts_with("Remove-Item -LiteralPath $dlTmp")
-                                && !trimmed.starts_with("Remove-Item -LiteralPath $sumTmp")
-                                && !trimmed.starts_with("Remove-Item -LiteralPath $stg"),
-                            "unguarded Remove-Item: {line}"
-                        );
-                    }
-                }
-            }
-        }
     }
 }

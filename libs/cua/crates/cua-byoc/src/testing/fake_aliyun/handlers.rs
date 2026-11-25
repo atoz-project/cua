@@ -254,6 +254,8 @@ pub fn dispatch_locked(
             | "StopInstances"
             | "StartInstance"
             | "StartInstances"
+            | "ModifyInstanceAutoReleaseTime"
+            | "TagResources"
             | "DeleteInstance"
             | "DeleteInstances"
             | "GetInstanceConsoleOutput",
@@ -266,23 +268,31 @@ pub fn dispatch_locked(
     (resp, hooks)
 }
 
-fn handle_describe_instances(f: &FakeAliyun, params: &Params) -> Response {
+fn handle_describe_instances(f: &mut FakeAliyun, params: &Params) -> Response {
     let tag_filters = parse_tags(params);
     let id_filter: Option<Vec<String>> = params
         .get("InstanceIds")
         .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+    let region = params.get("RegionId").cloned();
     let items: Vec<Value> = f
         .instances
-        .values()
+        .values_mut()
         .filter(|inst| {
-            (inst.region_id.is_empty()
-                || params.get("RegionId").is_none_or(|r| &inst.region_id == r))
+            (inst.region_id.is_empty() || region.as_ref().is_none_or(|r| &inst.region_id == r))
                 && id_filter
                     .as_ref()
                     .is_none_or(|ids| ids.iter().any(|id| id == &inst.instance_id))
                 && tag_filters.iter().all(|(k, v)| inst.tags.get(k) == Some(v))
         })
-        .map(FakeInstance::to_api_json)
+        .map(|inst| {
+            if inst.status == "Pending" && inst.pending_describe_ticks > 0 {
+                inst.pending_describe_ticks -= 1;
+                if inst.pending_describe_ticks == 0 {
+                    inst.status = "Running".into();
+                }
+            }
+            inst.to_api_json()
+        })
         .collect();
     paged_ok("Instances", "Instance", items, params, "req-instances-1")
 }
@@ -361,6 +371,11 @@ fn handle_run_instances(f: &mut FakeAliyun, params: &Params, hooks: &mut PostHoo
             "The specified parameter \"HostName\" is not valid.",
         );
     }
+    if let Some(rel) = params.get("AutoReleaseTime")
+        && let Some(r) = validate_auto_release_time(rel)
+    {
+        return r;
+    }
 
     let vpc_id = f
         .vswitches
@@ -394,6 +409,7 @@ fn handle_run_instances(f: &mut FakeAliyun, params: &Params, hooks: &mut PostHoo
         instance_type: p_str(params, "InstanceType"),
         image_id: img_id,
         status: status.into(),
+        pending_describe_ticks: 0,
         instance_charge_type: p_str(params, "InstanceChargeType"),
         stopped_mode: p_str(params, "StoppedMode"),
         auto_release_time: params.get("AutoReleaseTime").cloned(),
@@ -428,6 +444,33 @@ fn handle_run_instances(f: &mut FakeAliyun, params: &Params, hooks: &mut PostHoo
     ok(json!({ "InstanceIdSets": { "InstanceIdSet": [id] }, "RequestId": "req-run-1" }))
 }
 
+fn validate_auto_release_time(rel: &str) -> Option<Response> {
+    if rel.is_empty() {
+        return None;
+    }
+    let Ok(ts) = humantime::parse_rfc3339(rel) else {
+        return Some(bad_req(
+            "InvalidAutoReleaseTime.Malformed",
+            "AutoReleaseTime must be UTC ISO 8601 (YYYY-MM-DDTHH:MM:SSZ).",
+        ));
+    };
+    if !rel.ends_with(":00Z") {
+        return Some(bad_req(
+            "InvalidAutoReleaseTime.Malformed",
+            "AutoReleaseTime must use :00Z UTC suffix.",
+        ));
+    }
+    if let Ok(d) = ts.duration_since(std::time::UNIX_EPOCH)
+        && d.as_secs() < crate::model::now() + 1800
+    {
+        return Some(bad_req(
+            "InvalidAutoReleaseTime.LessThanMin",
+            "AutoReleaseTime must be at least 30 minutes from now.",
+        ));
+    }
+    None
+}
+
 fn validate_instances(f: &FakeAliyun, ids: &[String], perm: &str) -> Option<Response> {
     for id in ids {
         let Some(inst) = f.instances.get(id) else {
@@ -457,6 +500,16 @@ fn set_instances_power(
         return r;
     }
     let power_cb = f.on_power.clone();
+    if !online
+        && ids
+            .iter()
+            .any(|id| f.instances.get(id).is_some_and(|i| i.status == "Pending"))
+    {
+        return bad_req(
+            "IncorrectInstanceStatus",
+            "The current status of the resource does not support this operation.",
+        );
+    }
     for id in &ids {
         if let Some(inst) = f.instances.get_mut(id) {
             inst.status = new_status.into();
@@ -496,6 +549,44 @@ fn handle_instance_ops(
             "req-start-1",
             hooks,
         ),
+        "ModifyInstanceAutoReleaseTime" => {
+            let id = p_str(params, "InstanceId");
+            if let Some(r) = validate_instances(
+                f,
+                std::slice::from_ref(&id),
+                "ecs:ModifyInstanceAutoReleaseTime",
+            ) {
+                return r;
+            }
+            let rel = p_str(params, "AutoReleaseTime");
+            if let Some(r) = validate_auto_release_time(&rel) {
+                return r;
+            }
+            if let Some(inst) = f.instances.get_mut(&id) {
+                inst.auto_release_time = (!rel.is_empty()).then_some(rel);
+            }
+            ok(json!({ "RequestId": "req-rel-1" }))
+        }
+        "TagResources" => {
+            let req_tags = parse_tags(params);
+            if let Some(r) = check_cua_tag(f, &req_tags, "ecs:TagResources") {
+                return r;
+            }
+            let ids: Vec<String> = (1..=32)
+                .filter_map(|i| params.get(&format!("ResourceId.{i}")).cloned())
+                .collect();
+            if p_or(params, "ResourceType", "instance") == "instance" {
+                if let Some(r) = validate_instances(f, &ids, "ecs:TagResources") {
+                    return r;
+                }
+                for id in &ids {
+                    if let Some(inst) = f.instances.get_mut(id) {
+                        inst.tags.extend(req_tags.clone());
+                    }
+                }
+            }
+            ok(json!({ "RequestId": "req-tag-1" }))
+        }
         "DeleteInstance" | "DeleteInstances" => {
             if f.fail_delete {
                 return err(

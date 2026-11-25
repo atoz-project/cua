@@ -647,6 +647,11 @@ pub const STARTED_BY: &str = "started_by";
 /// sweep says so, and it leaves on its next replacement.
 pub const DEFAULT_VPC: &str = "default_vpc";
 
+/// The [`Resource::extra`] key on a shared cloud network resource containing
+/// the provider-formatted human-readable reason why deletion is held (for
+/// example stopped decommissioned Cua instances awaiting scheduled release).
+pub const DECOMMISSIONING_HOLD: &str = "decommissioning_hold";
+
 /// What one Space asks a provider for.
 #[derive(Clone, Default)]
 pub struct ProvisionSpec {

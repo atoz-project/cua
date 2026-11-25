@@ -99,6 +99,7 @@ pub struct FakeInstance {
     pub instance_type: String,
     pub image_id: String,
     pub status: String,
+    pub pending_describe_ticks: u32,
     pub instance_charge_type: String,
     pub stopped_mode: String,
     pub auto_release_time: Option<String>,
@@ -223,6 +224,17 @@ impl FakeInstance {
             Vec::new()
         };
         let sgs = self.all_security_group_ids();
+        // Real ECS `DescribeInstances` formats `AutoReleaseTime` at minute
+        // precision (`YYYY-MM-DDTHH:MMZ`, 17 chars) without `:00` seconds.
+        let auto_release_wire = self
+            .auto_release_time
+            .as_deref()
+            .map(|s| {
+                s.strip_suffix(":00Z")
+                    .map(|p| format!("{p}Z"))
+                    .unwrap_or_else(|| s.to_string())
+            })
+            .unwrap_or_default();
         json!({
             "InstanceId": self.instance_id,
             "InstanceName": self.instance_name,
@@ -234,7 +246,7 @@ impl FakeInstance {
             "Status": self.status,
             "InstanceChargeType": self.instance_charge_type,
             "StoppedMode": self.stopped_mode,
-            "AutoReleaseTime": self.auto_release_time.clone().unwrap_or_default(),
+            "AutoReleaseTime": auto_release_wire,
             "InternetChargeType": self.internet_charge_type,
             "InternetMaxBandwidthOut": bw_out,
             "MetadataOptions": {

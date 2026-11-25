@@ -35,7 +35,9 @@ use cua_sandbox_core::Error;
 use cua_sandbox_core::byoc::{CloudCredentials, CloudKind};
 use cua_sandbox_core::placement::Runtime;
 
-use crate::api::{CloudApi, PreparedProvision, ResolvedSizing, Result, Target, Tested, cloud_err};
+use crate::api::{
+    CloudApi, PreparedProvision, ResolvedSizing, Result, SweepDelete, Target, Tested, cloud_err,
+};
 use crate::model::{self, Capabilities, Connection, ProvisionSpec, Resource, Tier, tag};
 
 pub use auth::{
@@ -46,7 +48,7 @@ pub use client::{
     Acs3SignedHeaders, ECS_API_VERSION, STS_API_VERSION, STS_ENDPOINT, SignRequest,
     VPC_API_VERSION, canonical_query_string, rfc3986_encode, sign_acs3,
 };
-pub use image::{ResolvedCloudImage, WindowsInitHeader};
+pub use image::ResolvedCloudImage;
 pub use sizing::{
     ESSD_USD_PER_GB_HOUR, LINUX_DEFAULT_DISK_GB, LINUX_INSTANCE_TYPE, MAX_DISK_GB, MIN_DISK_GB,
     SLIM_INSTANCE_TYPE, WINDOWS_DEFAULT_DISK_GB, WINDOWS_INSTANCE_TYPE, ecs_instance_spec,
@@ -509,8 +511,6 @@ impl CloudApi for AliyunEcs {
         };
 
         let resolved_image = image::resolve_image_id(self, &effective_conn, spec).await?;
-        let windows_header =
-            (spec.family == "windows").then(|| resolved_image.windows_init_header());
 
         Ok(PreparedProvision {
             sizing: Some(ResolvedSizing {
@@ -521,7 +521,6 @@ impl CloudApi for AliyunEcs {
                 usd_per_hour: inst_usd + disk_usd,
             }),
             cloud_image_id: Some(resolved_image.image_id),
-            windows_header,
             candidate_zones: stock_zones,
         })
     }
@@ -585,13 +584,13 @@ impl CloudApi for AliyunEcs {
         }
 
         let host_name = sanitize_hostname_for_family(&spec.name, &spec.family);
-        let auto_release =
-            (spec.ttl_secs > 0).then(|| model::rfc3339(model::now() + spec.ttl_secs.max(1860)));
+        let auto_release = (spec.ttl_secs > 0)
+            .then(|| model::rfc3339((model::now() + spec.ttl_secs.max(1860)).div_ceil(60) * 60));
         let user_data_b64 = (!spec.user_data.is_empty())
             .then(|| base64::engine::general_purpose::STANDARD.encode(spec.user_data.as_bytes()));
-        // Alibaba Cloud official Windows images support only IMDSv1 (`ImdsSupport: "v1"`),
+        // Alibaba Cloud Windows images support only IMDSv1 (`ImdsSupport: "v1"`),
         // so `HttpTokens=required` blocks `vminit` (`INSTANCE_metaservernotavailable`);
-        // Windows blocks `100.100.100.200` via Windows Defender Firewall before desktop logon.
+        // Windows instances attach zero RAM instance role.
         let http_tokens = if spec.family == "windows" {
             "optional"
         } else {
@@ -795,6 +794,15 @@ impl CloudApi for AliyunEcs {
 
     async fn delete(&self, conn: &Connection, r: &Resource, owner: &str) -> Result<()> {
         self.delete_resource(conn, r, owner).await
+    }
+
+    async fn delete_in_sweep(
+        &self,
+        conn: &Connection,
+        r: &Resource,
+        owner: &str,
+    ) -> Result<SweepDelete> {
+        self.delete_resource_in_sweep(conn, r, owner).await
     }
 
     async fn list_owned(&self, conn: &Connection, owner: &str) -> Result<Vec<Resource>> {

@@ -6,7 +6,7 @@
 #![cfg(feature = "aliyun-ecs")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use cua_byoc::RelayAccess;
@@ -14,7 +14,7 @@ use cua_byoc::aliyun_ecs::{AliyunEcs, TokenStore};
 use cua_byoc::api::{CloudApi, Target};
 use cua_byoc::model::{self, Tier};
 use cua_byoc::testing::FakeProvider;
-use cua_byoc::testing::fake_aliyun::{FakeSg, FakeVSwitch, FakeVpc, S, handle};
+use cua_byoc::testing::fake_aliyun::{FakeSg, FakeVSwitch, FakeVpc, MemStore, S, start_fake_with};
 use cua_host::relay::AccountTokens;
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::{CloudManager, ConnectRequest, RelayMode};
@@ -32,37 +32,10 @@ impl AccountTokens for FailingTokens {
     }
 }
 
-#[derive(Default)]
-struct MemStore(Mutex<Option<String>>);
-
-impl TokenStore for MemStore {
-    fn load(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
-    }
-    fn save(&self, t: &str) -> std::io::Result<()> {
-        *self.0.lock().unwrap() = Some(t.into());
-        Ok(())
-    }
-    fn clear(&self) -> bool {
-        self.0.lock().unwrap().take().is_some()
-    }
-}
-
 async fn start_aliyun(
     aliyun_config: Option<std::path::PathBuf>,
 ) -> (Arc<AliyunEcs>, S, Arc<MemStore>) {
-    let s: S = Arc::default();
-    let app = axum::Router::new().fallback(handle).with_state(s.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let base = format!("http://{addr}");
-    let store = Arc::new(MemStore::default());
-    let api = Arc::new(
-        AliyunEcs::with_endpoints(&base, &base, &base, store.clone(), aliyun_config)
-            .with_poll(std::time::Duration::from_millis(5)),
-    );
-    (api, s, store)
+    start_fake_with(std::time::Duration::from_millis(5), aliyun_config).await
 }
 
 fn seed_user_vpc(s: &S, region: &str, vpc_id: &str, vsw_id: &str, user_sg_id: Option<&str>) {

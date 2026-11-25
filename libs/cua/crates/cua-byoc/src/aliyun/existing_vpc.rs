@@ -6,8 +6,8 @@
 //!
 //! Keeps user-owned VPCs, VSwitches, and security groups untouched while
 //! validating existence/region/ownership and ensuring [`super::net`] manages
-//! only a dedicated Cua-tagged zero-ingress security group
-//! (`cua-sandboxes-<owner>`).
+//! only a dedicated Cua-tagged security group (`cua-sandboxes-<owner>`) with
+//! explicit outbound internet egress and no Cua-added inbound rules.
 
 use cua_sandbox_core::Error;
 

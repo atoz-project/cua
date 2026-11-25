@@ -572,6 +572,29 @@ pub(crate) async fn has_vpc_children(
     vpc_id: &str,
     profile_hint: Option<&str>,
 ) -> bool {
+    vpc_has_matching_children(api, region, vpc_id, profile_hint, |_| true).await
+}
+
+pub(crate) async fn vpc_has_non_cua_children(
+    api: &AliyunEcs,
+    region: &str,
+    vpc_id: &str,
+    expected_owner: Option<&str>,
+    profile_hint: Option<&str>,
+) -> bool {
+    vpc_has_matching_children(api, region, vpc_id, profile_hint, |tags| {
+        !super::net::is_cua_owned_tags(tags, expected_owner)
+    })
+    .await
+}
+
+async fn vpc_has_matching_children(
+    api: &AliyunEcs,
+    region: &str,
+    vpc_id: &str,
+    profile_hint: Option<&str>,
+    pred: impl Fn(&BTreeMap<String, String>) -> bool,
+) -> bool {
     let vpc_params = vec![
         ("RegionId".into(), region.to_string()),
         ("VpcId".into(), vpc_id.to_string()),
@@ -588,7 +611,7 @@ pub(crate) async fn has_vpc_children(
         .await
         && vswitches
             .iter()
-            .any(|vsw| vsw["VpcId"].as_str() == Some(vpc_id))
+            .any(|vsw| vsw["VpcId"].as_str() == Some(vpc_id) && pred(&tags_of(vsw)))
     {
         return true;
     }
@@ -602,7 +625,9 @@ pub(crate) async fn has_vpc_children(
             profile_hint,
         )
         .await
-        && sgs.iter().any(|sg| sg["VpcId"].as_str() == Some(vpc_id))
+        && sgs
+            .iter()
+            .any(|sg| sg["VpcId"].as_str() == Some(vpc_id) && pred(&tags_of(sg)))
     {
         return true;
     }
