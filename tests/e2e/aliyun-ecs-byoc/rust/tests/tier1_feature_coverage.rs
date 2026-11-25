@@ -899,10 +899,21 @@ async fn t1_f4_03() {
     .await
     .ok();
     let f = w.aliyun.lock().unwrap();
-    let ud = decode_user_data_scripts(&f.instances.values().next().unwrap().user_data_decoded);
+    let raw_ud = &f.instances.values().next().unwrap().user_data_decoded;
+    assert!(raw_ud.starts_with("[powershell]\n"), "{raw_ud}");
+    let ud = decode_user_data_scripts(raw_ud);
     assert!(ud.contains("AutoAdminLogon"), "{ud}");
     assert!(ud.contains("Interactive"), "{ud}");
-    assert!(ud.contains("100.100.100.200"), "{ud}");
+    assert!(!ud.contains("100.100.100.200"), "{ud}");
+    assert!(!ud.contains("New-NetFirewallRule"), "{ud}");
+    assert!(
+        ud.contains("S-1-5-21-*-500") && ud.contains("/active:yes /Y"),
+        "{ud}"
+    );
+    assert!(
+        ud.contains("POST_Main") && ud.contains("reboot-wait.ps1"),
+        "{ud}"
+    );
     assert!(
         ud.contains("tscon.exe") && ud.contains("/dest:console"),
         "{ud}"

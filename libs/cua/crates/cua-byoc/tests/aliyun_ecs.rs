@@ -16,7 +16,7 @@ use cua_byoc::aliyun_net;
 use cua_byoc::api::{CloudApi, Target};
 use cua_byoc::model::{self, Connection, ProvisionSpec, Resource};
 use cua_byoc::testing::fake_aliyun::{
-    FakeAliyun, FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc, S, handle,
+    FakeAliyun, FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc, MemStore, S, handle,
 };
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::{ConnectRequest, DETAIL_RELAY_MACHINE};
@@ -64,22 +64,6 @@ impl Drop for EnvGuard {
                 None => std::env::remove_var("ALIBABA_CLOUD_ACCESS_KEY_SECRET"),
             }
         }
-    }
-}
-
-#[derive(Default)]
-struct MemStore(Mutex<Option<String>>);
-
-impl TokenStore for MemStore {
-    fn load(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
-    }
-    fn save(&self, t: &str) -> std::io::Result<()> {
-        *self.0.lock().unwrap() = Some(t.into());
-        Ok(())
-    }
-    fn clear(&self) -> bool {
-        self.0.lock().unwrap().take().is_some()
     }
 }
 
@@ -2740,7 +2724,10 @@ async fn windows_direct_vm_account_mode_lifecycle_and_userdata_contract() {
     assert!(user_data.contains("*S-1-5-32-544:(OI)(CI)F"));
     assert!(user_data.contains("https://mirror.example.com/cua-spacesd.exe"));
     assert!(user_data.contains(&mirror_sha));
-    assert!(user_data.contains("100.100.100.200"));
+    assert!(!user_data.contains("100.100.100.200"));
+    assert!(!user_data.contains("New-NetFirewallRule"));
+    assert!(user_data.contains("S-1-5-21-*-500"));
+    assert!(user_data.contains("Start-Process") && user_data.contains("reboot-wait.ps1"));
     assert!(user_data.contains("AutoAdminLogon"));
     assert!(user_data.contains("-AtLogOn"));
     assert!(user_data.contains("EventID=24"));
@@ -4300,7 +4287,7 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("HttpTokens").map(String::as_str),
         Some("optional")
     );
-    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("[powershell]\n"));
 
     let mut lin_over = sb_create_opts("lin-override");
     lin_over.cloud_image_id = Some("m-create-lin".into());
@@ -4356,7 +4343,7 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
         r.params.get("HttpTokens").map(String::as_str),
         Some("optional")
     );
-    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("#ps1_sysnative"));
+    assert!(decode_b64_str(r.params.get("UserData").unwrap()).starts_with("[powershell]\n"));
 }
 
 #[tokio::test]
@@ -5488,7 +5475,7 @@ async fn windows_run_instances_enforces_netbios_hostname_15_char_limit_and_uniqu
         machine_type: "ecs.c7.xlarge".into(),
         machine_type_explicit: true,
         disk_gb: 60,
-        user_data: "#ps1_sysnative\nWrite-Output ok\n".into(),
+        user_data: "[powershell]\nWrite-Output ok\n".into(),
         tags: model::tags("owner-hn", "win-hn", "cloud-hn", 0),
         ttl_secs: 3600,
         arch: "amd64".into(),

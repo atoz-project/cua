@@ -122,8 +122,9 @@ async fn t4_01() {
         let inst = f.instances.values().next().unwrap();
         assert_eq!(inst.internet_max_bandwidth_out.as_deref(), Some("0"));
         assert_eq!(inst.image_id, "m-win11-corp");
+        assert!(inst.user_data_decoded.starts_with("[powershell]\n"));
         assert!(inst.user_data_decoded.contains(&win_mir));
-        assert!(inst.user_data_decoded.contains("100.100.100.200"));
+        assert!(!inst.user_data_decoded.contains("100.100.100.200"));
         assert!(decode_user_data_scripts(&inst.user_data_decoded).contains("tscon.exe"));
     }
 

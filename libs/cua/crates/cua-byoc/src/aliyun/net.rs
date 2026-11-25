@@ -8,9 +8,9 @@
 //! One VPC per cua home and region (`cua-sb-<owner>`, `10.77.0.0/16`):
 //! - one `/20` VSwitch per availability zone (`cua-sb-<owner>-<zone>`,
 //!   `10.77.<16*k>.0/20`, skipping any CIDRs already in use in the VPC);
-//! - one zero-ingress enterprise Security Group (`cua-sandboxes-<owner>`) with
-//!   explicit outbound-only internet egress (`0.0.0.0/0`, `all`, `-1/-1`,
-//!   `accept`, priority `1`) and no inbound or intra-group lateral traffic;
+//! - one enterprise Security Group (`cua-sandboxes-<owner>`) with explicit
+//!   outbound internet egress (`0.0.0.0/0`, `all`, `-1/-1`, `accept`,
+//!   priority `1`), tolerating external CSAS or operator ingress rules;
 //! - every part carries all 6 Cua tags at creation time (`cua-machine=""`);
 //! - existing account VPCs, default VPCs, VSwitches, and Security Groups
 //!   without Cua's tags are never modified or deleted.
@@ -28,9 +28,10 @@ use super::existing_vpc;
 use super::security_group::{describe_security_group, ensure_security_group, list_security_groups};
 use super::vpc::{
     describe_vpc, describe_vswitch, ensure_vpc, has_vpc_children, list_vpcs, list_vswitches,
+    vpc_has_non_cua_children,
 };
 use super::zones::discover_zones_with_stock;
-use crate::api::Result;
+use crate::api::{Result, SweepDelete};
 use crate::model::{self, Connection, Resource, tag};
 
 pub use super::security_group::sg_name;
@@ -46,7 +47,7 @@ pub const DEFAULT_PUBLIC_BANDWIDTH_MBPS: u32 = 100;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NetworkMode {
     /// Cua-managed isolated VPC (`cua-sb-<owner>`), per-zone `/20` VSwitches,
-    /// and zero-ingress Security Group (`cua-sandboxes-<owner>`).
+    /// and dedicated Cua-tagged Security Group (`cua-sandboxes-<owner>`).
     Isolated,
     /// User-supplied existing VPC and VSwitch (`--vpc-id`, `--vswitch-id`).
     Existing { vpc_id: String, vswitch_id: String },
@@ -309,11 +310,7 @@ pub async fn describe_part(
     if r.id.is_empty() {
         return Ok(None);
     }
-    let region = if r.region.is_empty() {
-        conn.region.as_str()
-    } else {
-        r.region.as_str()
-    };
+    let region = super::lifecycle::effective_region(conn, r);
     match r.resource_type.as_str() {
         "vpc" => describe_vpc(api, conn, region, &r.id).await,
         "vswitch" | "subnet" => describe_vswitch(api, conn, region, &r.id).await,
@@ -355,19 +352,55 @@ fn is_retryable_delete_code(code: &str) -> bool {
         )
 }
 
-async fn has_active_blocker(
+pub(crate) fn is_cua_owned_tags(
+    tags: &BTreeMap<String, String>,
+    expected_owner: Option<&str>,
+) -> bool {
+    match expected_owner {
+        Some(owner) => model::is_ours(tags, owner),
+        None => {
+            tags.get(tag::MANAGED).map(String::as_str) == Some("true")
+                && tags.get(tag::OWNER).is_some_and(|o| !o.is_empty())
+        }
+    }
+}
+
+pub(crate) fn auto_release_hold_reason(until: Option<&str>) -> String {
+    match until.and_then(super::lifecycle::normalize_aliyun_iso8601) {
+        Some(ts) => format!("held by stopped Cua instances awaiting AutoReleaseTime ({ts})"),
+        None => "held by stopped Cua instances awaiting AutoReleaseTime".to_string(),
+    }
+}
+
+pub(crate) fn held_delete_error(r: &Resource, reason: &str) -> Error {
+    Error::Cloud(format!(
+        "aliyun-ecs: cannot delete {} {} yet: {reason}",
+        r.resource_type, r.id
+    ))
+}
+
+enum ActiveBlocker {
+    None,
+    DecommissioningOnly(Option<String>),
+    Active,
+}
+
+async fn classify_active_blocker(
     api: &AliyunEcs,
     region: &str,
     r: &Resource,
+    expected_owner: Option<&str>,
     profile_hint: Option<&str>,
-) -> bool {
+) -> ActiveBlocker {
     let mut params = vec![("RegionId".into(), region.to_string())];
     match r.resource_type.as_str() {
         "security_group" => params.push(("SecurityGroupId".into(), r.id.clone())),
         "vswitch" | "subnet" => params.push(("VSwitchId".into(), r.id.clone())),
         "vpc" => params.push(("VpcId".into(), r.id.clone())),
-        _ => return false,
+        _ => return ActiveBlocker::None,
     }
+    let mut has_decomm = false;
+    let mut latest_until: Option<String> = None;
     if let Ok(instances) = api
         .paginated_page_number(
             &api.ecs_endpoint(region),
@@ -394,12 +427,40 @@ async fn has_active_blocker(
                 "vpc" => inst["VpcAttributes"]["VpcId"].as_str() == Some(r.id.as_str()),
                 _ => false,
             };
-            if refs_part {
-                return true;
+            if !refs_part {
+                continue;
+            }
+            let tags = tags_of(&inst);
+            let is_decomm = is_cua_owned_tags(&tags, expected_owner)
+                && tags
+                    .get(super::lifecycle::DECOMMISSIONED_TAG_KEY)
+                    .map(String::as_str)
+                    == Some("true");
+            if !is_decomm {
+                return ActiveBlocker::Active;
+            }
+            has_decomm = true;
+            if let Some(ts) = inst["AutoReleaseTime"]
+                .as_str()
+                .and_then(super::lifecycle::normalize_aliyun_iso8601)
+                && latest_until.as_deref().is_none_or(|cur| ts.as_str() > cur)
+            {
+                latest_until = Some(ts);
             }
         }
     }
-    r.resource_type == "vpc" && has_vpc_children(api, region, &r.id, profile_hint).await
+    if has_decomm {
+        if r.resource_type == "vpc"
+            && vpc_has_non_cua_children(api, region, &r.id, expected_owner, profile_hint).await
+        {
+            return ActiveBlocker::Active;
+        }
+        return ActiveBlocker::DecommissioningOnly(latest_until);
+    }
+    if r.resource_type == "vpc" && has_vpc_children(api, region, &r.id, profile_hint).await {
+        return ActiveBlocker::Active;
+    }
+    ActiveBlocker::None
 }
 
 /// Deletes one network part (`security_group`, `vswitch`/`subnet`, `vpc`),
@@ -407,7 +468,10 @@ async fn has_active_blocker(
 /// dependency violations while failing fast on active blockers, and treating
 /// `NotFound` as `Ok(())`.
 pub async fn delete_part(api: &AliyunEcs, conn: &Connection, r: &Resource) -> Result<()> {
-    delete_part_owned(api, conn, r, None).await
+    match delete_part_owned(api, conn, r, None).await? {
+        SweepDelete::Deleted => Ok(()),
+        SweepDelete::Held { reason } => Err(held_delete_error(r, &reason)),
+    }
 }
 
 pub(crate) async fn delete_part_owned(
@@ -415,45 +479,33 @@ pub(crate) async fn delete_part_owned(
     conn: &Connection,
     r: &Resource,
     expected_owner: Option<&str>,
-) -> Result<()> {
+) -> Result<SweepDelete> {
     existing_vpc::guard_user_network_untouched(conn, r)?;
     if r.id.is_empty() {
-        return Ok(());
+        return Ok(SweepDelete::Deleted);
     }
     if is_network_type(&r.resource_type) {
         let Some((_, tags)) = describe_part(api, conn, r).await? else {
-            return Ok(());
+            return Ok(SweepDelete::Deleted);
         };
-        match expected_owner {
-            Some(owner) => {
-                if !model::is_ours(&tags, owner) {
-                    return Err(Error::Cloud(format!(
-                        "aliyun-ecs: refusing to delete {} {} (it does not carry {}=true and {}={})",
-                        r.resource_type,
-                        r.id,
-                        tag::MANAGED,
-                        tag::OWNER,
-                        model::label_value(owner)
-                    )));
-                }
-            }
-            None => {
-                let is_cua_tagged = tags.get(tag::MANAGED).map(String::as_str) == Some("true")
-                    && tags.get(tag::OWNER).is_some_and(|o| !o.is_empty());
-                if !is_cua_tagged {
-                    return Err(Error::Cloud(format!(
-                        "aliyun-ecs: refusing to delete non-Cua-owned {} {}",
-                        r.resource_type, r.id
-                    )));
-                }
-            }
+        if !is_cua_owned_tags(&tags, expected_owner) {
+            return match expected_owner {
+                Some(owner) => Err(Error::Cloud(format!(
+                    "aliyun-ecs: refusing to delete {} {} (it does not carry {}=true and {}={})",
+                    r.resource_type,
+                    r.id,
+                    tag::MANAGED,
+                    tag::OWNER,
+                    model::label_value(owner)
+                ))),
+                None => Err(Error::Cloud(format!(
+                    "aliyun-ecs: refusing to delete non-Cua-owned {} {}",
+                    r.resource_type, r.id
+                ))),
+            };
         }
     }
-    let region = if r.region.is_empty() {
-        conn.region.as_str()
-    } else {
-        r.region.as_str()
-    };
+    let region = super::lifecycle::effective_region(conn, r);
     let profile_hint = api.profile_hint(conn);
     let (endpoint, action, version, id_param) = match r.resource_type.as_str() {
         "security_group" => (
@@ -491,21 +543,31 @@ pub(crate) async fn delete_part_owned(
             .call_raw(&endpoint, "POST", action, version, &params, profile_hint)
             .await?;
         if status.is_success() {
-            return Ok(());
+            return Ok(SweepDelete::Deleted);
         }
         let code = match &body {
             ApiBody::Json(v) => api_error_code_message(v).0,
             ApiBody::Text(_) => "",
         };
         if is_not_found_code(code) {
-            return Ok(());
+            return Ok(SweepDelete::Deleted);
         }
         // Alibaba Cloud keeps primary ENIs in `Status: Deleting` for up to ~4 minutes
         // after `DeleteInstance(Force=true)` before `DeleteVSwitch` succeeds (~376s budget
         // at the default 2s poll interval; unit tests override `poll_interval()` to 10ms).
         if is_retryable_delete_code(code) && tries < 100 {
-            if tries == 0 && has_active_blocker(api, region, r, profile_hint).await {
-                return Err(map_api_error(action, version, status, &body));
+            if tries == 0 {
+                match classify_active_blocker(api, region, r, expected_owner, profile_hint).await {
+                    ActiveBlocker::None => {}
+                    ActiveBlocker::DecommissioningOnly(until) => {
+                        return Ok(SweepDelete::Held {
+                            reason: auto_release_hold_reason(until.as_deref()),
+                        });
+                    }
+                    ActiveBlocker::Active => {
+                        return Err(map_api_error(action, version, status, &body));
+                    }
+                }
             }
             let poll = api.poll_interval();
             let wait = if tries < 12 {

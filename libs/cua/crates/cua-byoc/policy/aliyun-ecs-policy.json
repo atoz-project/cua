@@ -115,6 +115,7 @@
       "Action": [
         "ecs:StartInstance",
         "ecs:StopInstance",
+        "ecs:ModifyInstanceAutoReleaseTime",
         "ecs:DeleteInstance",
         "ecs:GetInstanceConsoleOutput"
       ],

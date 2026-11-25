@@ -462,6 +462,7 @@ user, then connect with that user's AccessKey pair
       "Action": [
         "ecs:StartInstance",
         "ecs:StopInstance",
+        "ecs:ModifyInstanceAutoReleaseTime",
         "ecs:DeleteInstance",
         "ecs:GetInstanceConsoleOutput"
       ],
@@ -517,7 +518,8 @@ Why it is shaped this way:
   `acs:RequestTag/cua-managed: "true"`, so Cua can create and tag only
   Cua-managed resources.
 - **Changes require the tag on the resource.** `ecs:StartInstance`,
-  `ecs:StopInstance`, `ecs:DeleteInstance`, `ecs:GetInstanceConsoleOutput`,
+  `ecs:StopInstance`, `ecs:ModifyInstanceAutoReleaseTime`, `ecs:DeleteInstance`,
+  `ecs:GetInstanceConsoleOutput`,
   `ecs:AuthorizeSecurityGroupEgress`, `ecs:DeleteSecurityGroup`,
   `vpc:DeleteVpc`, `vpc:DeleteVSwitch` and adding a VSwitch to a Cua VPC all
   check `acs:ResourceTag/cua-managed: "true"`, so untagged instances and user
@@ -527,31 +529,33 @@ Why it is shaped this way:
   `ecs:CreateSecurityGroup` references `vpc/*`, which allows launching into
   either Cua's isolated VPC or an existing VPC (`--vpc-id`, `--vswitch-id`)
   and custom Cloud Image IDs (`--cloud-image-id`).
-- **IMDSv2 on Linux, firewall-enforced metadata isolation on Windows, and no `ram:*`.**
-  Cua launches Linux ECS instances with `HttpTokens=required` (IMDSv2). On
-  Windows, Alibaba Cloud's `vminit` and `cloudbase-init` agents do not support
-  IMDSv2 (`ImdsSupport: "v1"`), so Windows instances launch with
-  `HttpTokens=optional` paired with an outbound Windows Defender Firewall block
-  on `100.100.100.200` and `169.254.169.254` applied during first-boot
-  `UserData` before any desktop session runs. Cua never assigns a RAM instance
-  role; the policy includes zero `ram:*` actions and zero wildcard actions.
+- **IMDSv2 on Linux, zero RAM instance role on Windows, and no `ram:*`.**
+  Cua launches Linux ECS instances with `HttpTokens=required` (IMDSv2) and
+  blocks `100.100.100.200` on the host firewall. On Windows, Alibaba Cloud's
+  `vminit` agent requires IMDSv1 (`ImdsSupport: "v1"`), so Windows instances
+  launch with `HttpTokens=optional` and zero RAM instance role, without
+  blocking `100.100.100.200` on the Windows firewall so `vminit` and Cloud
+  Assistant stay functional. Cua never assigns a RAM instance role; the policy
+  includes zero `ram:*` actions and zero wildcard actions.
 
 ## What a Space on a cloud host can reach
 
-A Space is untrusted code, so each computer Cua starts in your cloud blocks
-Docker-on-VM containers and Direct VM guests (`--runtime native`) from the
-places they should never see. The rules are installed in the computer's own OS
-firewall on first boot before a container or guest session runs, so a Space
-cannot change them. They apply to every provider.
+A Space is untrusted code, so each Linux host computer Cua starts in your
+cloud blocks Docker-on-VM containers and Linux Direct VM guests (`--runtime native`)
+from the places they should never see. The rules are installed in the Linux
+host's own OS firewall (`iptables` / `nft`) on first boot before a container
+or guest session runs, so a Space cannot change them.
 
-A container or Direct VM guest can reach the public internet and DNS, and nothing else:
+A Linux container or Linux Direct VM guest can reach the public internet and DNS, and nothing else:
 
 - **The cloud's metadata services** (`169.254.169.254`, `169.254.170.2`,
   `fd00:ec2::254`, `168.63.129.16`, `100.100.100.200` on Alibaba Cloud ECS),
-  which hold the host's credentials and start-up data. Both Docker-on-VM
-  containers and Direct VM Sandbox guests (Linux `cloud-init` and Windows
-  PowerShell `UserData`) block `100.100.100.200` on the host firewall. Only DNS
-  on port 53 to the host's own resolver passes.
+  which hold the host's credentials and start-up data. Both Linux Docker-on-VM
+  containers and Linux Direct VM Sandbox guests block `100.100.100.200` on the
+  host firewall. Windows Direct VM sandboxes on Alibaba Cloud ECS do not install
+  an outbound metadata firewall block so `vminit` and Cloud Assistant remain
+  accessible with zero RAM instance role attached. Only DNS on port 53 to the
+  host's own resolver passes on Linux hosts.
 - **The computer's own network**: the VPC or virtual network and subnet it
   sits in, read at boot.
 - **Private and reserved ranges**: `10.0.0.0/8`, `172.16.0.0/12`,

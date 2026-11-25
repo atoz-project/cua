@@ -74,33 +74,12 @@ pub struct ResolvedSizing {
     pub usd_per_hour: f64,
 }
 
-/// Line-1 script header for Windows Direct VM `UserData`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum WindowsInitHeader {
-    /// `#ps1_sysnative` for `cloudbase-init` (custom Windows 10/11 images).
-    #[default]
-    CloudbaseSysnative,
-    /// `[powershell]` for Alibaba Cloud `vminit` (official Windows Server images).
-    AliyunVminit,
-}
-
-impl WindowsInitHeader {
-    /// The exact line-1 header string expected by the Windows guest init agent.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WindowsInitHeader::CloudbaseSysnative => crate::bootstrap_win::CLOUDBASE_HEADER,
-            WindowsInitHeader::AliyunVminit => crate::bootstrap_win::ALIYUN_VMINIT_HEADER,
-        }
-    }
-}
-
-/// Single-pass resolved sizing, Cloud Image ID, Windows init header, and
-/// candidate availability zones returned by [`CloudApi::prepare_provision`].
+/// Single-pass resolved sizing, Cloud Image ID, and candidate availability
+/// zones returned by [`CloudApi::prepare_provision`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreparedProvision {
     pub sizing: Option<ResolvedSizing>,
     pub cloud_image_id: Option<String>,
-    pub windows_header: Option<WindowsInitHeader>,
     /// Optional ordered availability zones where the selected shape has stock.
     pub candidate_zones: Option<Vec<String>>,
 }
@@ -193,6 +172,21 @@ impl Tested {
     }
 }
 
+/// Outcome of [`CloudApi::delete_in_sweep`] when a shared resource may be
+/// temporarily kept while decommissioned instances await scheduled cloud
+/// release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SweepDelete {
+    /// Resource was deleted (or was already absent).
+    Deleted,
+    /// Shared resource is still held only by stopped decommissioned instances
+    /// awaiting their scheduled cloud release timer.
+    Held {
+        /// Human-readable reason surfaced in sweep output.
+        reason: String,
+    },
+}
+
 /// One cloud.
 #[async_trait]
 pub trait CloudApi: Send + Sync + 'static {
@@ -272,9 +266,9 @@ pub trait CloudApi: Send + Sync + 'static {
     /// and [`crate::install`]). Default: no-op.
     fn scope_home(&self, _home: &std::path::Path) {}
 
-    /// Resolves effective machine sizing, Cloud Image ID, Windows init header,
-    /// and any provider-specific launch plan in a single pass before limit
-    /// checks and [`CloudApi::provision`].
+    /// Resolves effective machine sizing, Cloud Image ID, and any
+    /// provider-specific launch plan in a single pass before limit checks and
+    /// [`CloudApi::provision`].
     async fn prepare_provision(
         &self,
         _conn: &Connection,
@@ -357,6 +351,20 @@ pub trait CloudApi: Send + Sync + 'static {
     /// Deletes it (refused unless its tags are `owner`'s). Deleting one
     /// already gone is not an error.
     async fn delete(&self, conn: &Connection, r: &Resource, owner: &str) -> Result<()>;
+
+    /// Deletes `r` during a sweep, returning [`SweepDelete::Held`] instead of
+    /// failing when only stopped decommissioned instances keep a shared
+    /// resource attached.
+    async fn delete_in_sweep(
+        &self,
+        conn: &Connection,
+        r: &Resource,
+        owner: &str,
+    ) -> Result<SweepDelete> {
+        self.delete(conn, r, owner)
+            .await
+            .map(|()| SweepDelete::Deleted)
+    }
 
     /// Every resource in `conn`'s account and region tagged
     /// `cua-managed=true` and `cua-owner=<owner>`.

@@ -88,7 +88,7 @@ pub mod trust;
 pub mod usage;
 
 pub use api::{
-    CloudApi, PreparedProvision, Result, Secret, SecretSource, Target, Tested, WindowsInitHeader,
+    CloudApi, PreparedProvision, Result, Secret, SecretSource, SweepDelete, Target, Tested,
 };
 /// Routes of public TCP shares (they live in `cua-share`; this path stays
 /// for the cloud modules).

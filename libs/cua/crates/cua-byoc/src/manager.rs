@@ -694,7 +694,8 @@ impl CloudManager for Clouds {
                         left.len(),
                         sweep::describe_live(&left),
                         p.name()
-                    ) + &sweep::unverified_hint(&left);
+                    ) + &sweep::unverified_hint(&left)
+                        + &sweep::decommissioning_hint(&left, p.name());
                     let mut a = audit::entry("disconnect", p.name(), "user");
                     a.outcome = "failed".into();
                     a.detail = format!("delete left {}", left.len());

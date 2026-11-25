@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use cua_sandbox_core::byoc::{CloudSweepItem, CloudSweepReport};
 
-use crate::api::{CloudApi, Result};
+use crate::api::{CloudApi, Result, SweepDelete};
 use crate::audit;
 use crate::model::{self, Connection, Resource, now};
 use crate::state::Store;
@@ -41,6 +41,10 @@ pub struct Verdict {
     pub delete: bool,
     /// Why.
     pub reason: String,
+}
+
+fn is_shared(r: &Resource) -> bool {
+    !matches!(r.resource_type.as_str(), "instance" | "sandbox")
 }
 
 /// The sweeper's decision for `r`, as the cloud shows it with `tags`,
@@ -70,13 +74,14 @@ pub fn verdict(
         .map(|x| x.expires)
         .filter(|e| *e > 0)
         .unwrap_or_else(|| model::tag_expires(tags));
-    let shared = !matches!(r.resource_type.as_str(), "instance" | "sandbox");
-    if shared {
-        return if all && !instances_left {
-            del("shared resource, no Cua instance left")
-        } else {
-            keep("shared by Cua sandboxes here")
-        };
+    if is_shared(r) {
+        if !all || instances_left {
+            return keep("shared by Cua sandboxes here");
+        }
+        if let Some(why) = r.extra.get(model::DECOMMISSIONING_HOLD) {
+            return keep(why);
+        }
+        return del("shared resource, no Cua instance left");
     }
     if all {
         return del("--all");
@@ -235,8 +240,11 @@ pub async fn sweep_provider(
             reason: v.reason.clone(),
         };
         if v.delete && !dry_run {
-            match provider.delete(conn_for(&r.region), r, &owner).await {
-                Ok(()) => {
+            match provider
+                .delete_in_sweep(conn_for(&r.region), r, &owner)
+                .await
+            {
+                Ok(SweepDelete::Deleted) => {
                     item.action = "deleted".into();
                     store.audit(audit::of_resource(
                         "resource_deleted",
@@ -266,6 +274,10 @@ pub async fn sweep_provider(
                             t,
                         );
                     }
+                }
+                Ok(SweepDelete::Held { reason }) => {
+                    item.action = "keep".into();
+                    item.reason = reason;
                 }
                 Err(e) => {
                     item.action = "failed".into();
@@ -386,7 +398,10 @@ pub(crate) fn describe_live(rs: &[Live]) -> String {
             let id = if r.id.is_empty() { &r.name } else { &r.id };
             match &l.unverified {
                 Some(why) => format!("{} {id} (unverified: {why})", r.resource_type),
-                None => format!("{} {id}", r.resource_type),
+                None => match r.extra.get(model::DECOMMISSIONING_HOLD) {
+                    Some(why) => format!("{} {id} ({why})", r.resource_type),
+                    None => format!("{} {id}", r.resource_type),
+                },
             }
         })
         .collect::<Vec<_>>()
@@ -395,6 +410,20 @@ pub(crate) fn describe_live(rs: &[Live]) -> String {
         s.push_str(&format!(" and {} more", rs.len() - SHOWN));
     }
     s
+}
+
+/// Guidance appended to `disconnect --delete` errors when stopped decommissioned
+/// instances awaiting scheduled cloud release keep Cua's network resources attached.
+pub(crate) fn decommissioning_hint(rs: &[Live], provider_name: &str) -> String {
+    if !rs
+        .iter()
+        .any(|l| l.resource.extra.contains_key(model::DECOMMISSIONING_HOLD))
+    {
+        return String::new();
+    }
+    format!(
+        " Stopped decommissioned instances awaiting scheduled cloud release keep these network resources attached until their release timer fires; wait until then and retry `cua cloud disconnect {provider_name} --delete`."
+    )
 }
 
 /// Every Cua resource of `provider` that may still be there: what the cloud
@@ -671,5 +700,171 @@ mod tests {
         assert!(sg1.same_identity(&sg1_unnamed));
         assert!(pending.same_identity(&sg1));
         assert!(sg2.same_identity(&pending));
+    }
+
+    #[test]
+    fn decommissioning_hold_keeps_shared_resource_and_formats_hint() {
+        let t = tags("me", "", "", 0);
+        let mut sg = Resource {
+            provider: "aliyun-ecs".into(),
+            id: "sg-hold".into(),
+            resource_type: "security_group".into(),
+            ..Default::default()
+        };
+        sg.extra.insert(
+            model::DECOMMISSIONING_HOLD.into(),
+            "held by stopped Cua instances awaiting AutoReleaseTime (2026-11-25T06:30:00Z)".into(),
+        );
+        let v_unforced = verdict(&sg, &t, "me", &[], false, false, NOW);
+        assert!(!v_unforced.delete, "{v_unforced:?}");
+        assert_eq!(v_unforced.reason, "shared by Cua sandboxes here");
+
+        let v_live = verdict(&sg, &t, "me", &[], true, true, NOW);
+        assert!(!v_live.delete, "{v_live:?}");
+        assert_eq!(v_live.reason, "shared by Cua sandboxes here");
+
+        let v = verdict(&sg, &t, "me", &[], true, false, NOW);
+        assert!(!v.delete, "{v:?}");
+        assert!(v.reason.contains("AutoReleaseTime"), "{v:?}");
+        assert!(v.reason.contains("2026-11-25T06:30:00Z"), "{v:?}");
+
+        let live = vec![Live {
+            resource: sg,
+            unverified: None,
+        }];
+        let desc = describe_live(&live);
+        assert!(desc.contains("AutoReleaseTime"), "{desc}");
+        let hint = decommissioning_hint(&live, "aliyun-ecs");
+        assert!(
+            hint.contains("cua cloud disconnect aliyun-ecs --delete"),
+            "{hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_provider_converts_single_pass_decommissioning_hold_error_to_keep() {
+        struct HoldApi {
+            sg_tags: BTreeMap<String, String>,
+        }
+        #[async_trait::async_trait]
+        impl CloudApi for HoldApi {
+            fn name(&self) -> &'static str {
+                "aliyun-ecs"
+            }
+            fn title(&self) -> &'static str {
+                "Alibaba Cloud ECS"
+            }
+            fn tier(&self) -> model::Tier {
+                model::Tier::Vm
+            }
+            fn arches(&self) -> Vec<&'static str> {
+                vec!["amd64"]
+            }
+            fn detect(&self) -> cua_sandbox_core::byoc::CloudCredentials {
+                Default::default()
+            }
+            fn resolve(&self, _t: &crate::api::Target) -> Result<Connection> {
+                unimplemented!()
+            }
+            fn kinds(&self, _c: &Connection) -> Vec<cua_sandbox_core::byoc::CloudKind> {
+                vec![]
+            }
+            async fn test(&self, _c: &Connection) -> crate::api::Tested {
+                unimplemented!()
+            }
+            async fn provision(
+                &self,
+                _c: &Connection,
+                _s: &model::ProvisionSpec,
+            ) -> Result<Vec<Resource>> {
+                unimplemented!()
+            }
+            async fn describe(
+                &self,
+                _c: &Connection,
+                _r: &Resource,
+            ) -> Result<Option<(String, BTreeMap<String, String>)>> {
+                Ok(None)
+            }
+            async fn stop(&self, _c: &Connection, _r: &Resource, _o: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn start(&self, _c: &Connection, _r: &Resource, _o: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _c: &Connection, _r: &Resource, _o: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn delete_in_sweep(
+                &self,
+                _c: &Connection,
+                r: &Resource,
+                _o: &str,
+            ) -> Result<SweepDelete> {
+                if is_shared(r) {
+                    return Ok(SweepDelete::Held {
+                        reason: "held by stopped Cua instances awaiting AutoReleaseTime (2026-11-25T06:45:00Z)".into(),
+                    });
+                }
+                Ok(SweepDelete::Deleted)
+            }
+            async fn list_owned(&self, _c: &Connection, _o: &str) -> Result<Vec<Resource>> {
+                Ok(vec![
+                    Resource {
+                        provider: "aliyun-ecs".into(),
+                        id: "i-1".into(),
+                        resource_type: "instance".into(),
+                        region: "cn-hangzhou".into(),
+                        tags: self.sg_tags.clone(),
+                        state: "running".into(),
+                        ..Default::default()
+                    },
+                    Resource {
+                        provider: "aliyun-ecs".into(),
+                        id: "sg-1".into(),
+                        resource_type: "security_group".into(),
+                        region: "cn-hangzhou".into(),
+                        tags: self.sg_tags.clone(),
+                        state: "available".into(),
+                        ..Default::default()
+                    },
+                ])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let owner = store.owner_id().unwrap();
+        let api = HoldApi {
+            sg_tags: tags(&owner, "", "", 0),
+        };
+        let conn = Connection {
+            provider: "aliyun-ecs".into(),
+            region: "cn-hangzhou".into(),
+            ..Default::default()
+        };
+        let rows = sweep_provider(
+            &api,
+            &conn,
+            &store,
+            SweepOpts {
+                dry_run: false,
+                all: true,
+                actor: "sweep",
+                forget_missing: false,
+            },
+        )
+        .await
+        .unwrap();
+        let sg_row = rows.iter().find(|r| r.resource.id == "sg-1").unwrap();
+        assert_eq!(sg_row.action, "keep", "{sg_row:?}");
+        assert!(sg_row.reason.contains("2026-11-25T06:45:00Z"), "{sg_row:?}");
+        assert!(
+            !store
+                .audit_entries(20)
+                .unwrap()
+                .iter()
+                .any(|a| a.outcome == "failed")
+        );
     }
 }

@@ -284,8 +284,8 @@ fetches `cua-spacesd-x86_64-pc-windows-msvc.exe`, each verified against its
 single-file `#sha256=` fragment and uses per-asset `.sha256` sidecars instead.
 
 When `--vpc-id` and `--vswitch-id` are both provided (in the same region), Cua
-places ECS instances in your VSwitch and creates or reuses only a Cua-tagged
-zero-ingress security group without modifying your existing security groups.
+places ECS instances in your VSwitch and creates or reuses only a dedicated Cua-tagged
+security group (outbound internet egress, no Cua-added inbound rules) without modifying your existing security groups.
 With `--no-public-ip`, Cua sets `InternetMaxBandwidthOut=0` so instances rely on
 your VPC's NAT gateway or private route to reach the relay.
 
@@ -331,7 +331,7 @@ and `cloud_status`, `cloud_test`, `cloud_connect`, `cloud_disconnect`,
 | Azure | One VM (Ubuntu 24.04, no SSH key, no managed identity) with its disk, network interface and public IPv4 address, in the connection's resource group. Docker runs the image on it. | A virtual network and a network security group, `cua-sb-<owner>`, with no rules of their own: Azure's defaults deny inbound traffic from the internet. |
 | Hetzner | One server with an IPv4 address and Docker (Ubuntu 24.04), and no SSH key. Docker runs the image on it. | One firewall, `cua-sb-<owner>`, with no rules: Hetzner drops all inbound traffic. Your project's other firewalls are never used or changed. |
 | Modal | One Modal sandbox running the image. | Nothing. |
-| Alibaba Cloud ECS | One ECS instance and its `cloud_essd` system disk (Docker-on-VM for `linux` / `linux-slim` by default; Direct VM for `windows` or `--runtime native`). | Isolated `cua-sb-<owner>` VPC, VSwitch and zero-ingress security group `cua-sandboxes-<owner>` (or only a Cua-tagged zero-ingress security group when attaching to `--vpc-id` / `--vswitch-id`). |
+| Alibaba Cloud ECS | One ECS instance and its `cloud_essd` system disk (Docker-on-VM for `linux` / `linux-slim` by default; Direct VM for `windows` or `--runtime native`). | Isolated `cua-sb-<owner>` VPC, VSwitch and dedicated Cua-tagged security group `cua-sandboxes-<owner>` (outbound internet egress, no Cua-added inbound rules; or only the security group when attaching to `--vpc-id` / `--vswitch-id`). |
 
 - Nothing else is created: no IAM/RAM users or keys, and no change to existing
   networks, security groups or firewall rules.
@@ -464,28 +464,35 @@ its disk.
     explicit `--profile <name>` in `~/.aliyun/config.json`, saved credentials
     in Cua's credential store, or the active `current` profile in
     `~/.aliyun/config.json` (`AK` mode).
-  - **Metadata isolation**: Linux instances launch with `HttpTokens=required`
-    (IMDSv2), while Windows instances launch with `HttpTokens=optional`
-    (Alibaba Cloud Windows `vminit` and `cloudbase-init` require IMDSv1) and
-    zero RAM instance role. Both Docker-on-VM containers and Direct VM guests
-    block the ECS metadata service (`100.100.100.200` and `169.254.169.254`) on
-    the guest OS firewall during first boot before any container or desktop
-    session runs.
+  - **Metadata handling**: Linux instances launch with `HttpTokens=required`
+    (IMDSv2) and block `100.100.100.200` and `169.254.169.254` on the Linux
+    host firewall. Windows instances launch with `HttpTokens=optional` (Alibaba
+    Cloud Windows `vminit` requires IMDSv1) and zero RAM instance role, without
+    blocking `100.100.100.200` on the guest Windows firewall so `vminit` and
+    Cloud Assistant continue to function normally.
   - **Billing and release**: `PostPaid` with `StoppedMode=StopCharging` and
     native ECS `AutoReleaseTime` (`--ttl-hours`, default `8`), plus an in-guest
     TTL shutdown timer. If `RunInstances` fails or times out, Cua reads
     `GetInstanceConsoleOutput` (redacted, saved under
-    `~/.cua/cloud/boot-logs/<id>.log`) and deletes the instance.
-  - **Windows Server vs. custom Windows 10 and Windows 11 images**:
-    - Official Alibaba Cloud Windows Server images use Alibaba Cloud `vminit`
-      (which executes `[powershell]` `UserData` scripts). If you supply a
-      custom Windows 10 or Windows 11 image via `--windows-image-id` or
-      `--cloud-image-id`, it MUST have `cloudbase-init` installed and enabled
-      so ECS executes the `#ps1_sysnative` `UserData` bootstrap script.
-    - At boot, `UserData` configures AutoLogon, an `AtLogOn` scheduled task so
+    `~/.cua/cloud/boot-logs/<id>.log`) and deletes the instance; if
+    `ecs:DeleteInstance` is denied by a RAM/organization policy, Cua stops the
+    instance (`StopCharging`) and tightens `AutoReleaseTime` to the shortest
+    platform window (~31 minutes ahead).
+  - **Windows Server and custom Windows 10 and Windows 11 images**:
+    - Official Alibaba Cloud Windows Server desktop images (excluding headless
+      `wincore` / Server Core images, preferring `win2025`, `win2022`, then
+      `win2019`) and custom Windows 10/11/Server images on `aliyun-ecs` both use
+      Alibaba Cloud `vminit` (`[powershell]` `UserData`). Custom images supplied
+      via `--windows-image-id` or `--cloud-image-id` must have Alibaba Cloud
+      `vminit` enabled rather than `cloudbase-init`.
+    - At boot, `UserData` resolves the local Administrator account (matching by
+      name or built-in SID `S-1-5-21-*-500`, enabling it if disabled),
+      configures AutoLogon, registers an `AtLogOn` interactive scheduled task so
       `cua-spacesd` runs in an unlocked interactive desktop session
-      (`Session >= 1`, never Session 0), and an Event ID `24` `tscon.exe`
-      recovery task so an RDP disconnect keeps the interactive desktop active.
+      (`Session >= 1`, never Session 0), installs an Event ID `24` `tscon.exe`
+      recovery task so an RDP disconnect keeps the interactive desktop active,
+      and waits for `vminit` to finish archiving `POST_Main` before triggering
+      the AutoLogon reboot.
     - **Screen capture (`GDI` vs. `WGC`)**: classic Win32 windows capture
       via **GDI** (`PrintWindow`), whereas DirectComposition, WinUI3 and UWP
       applications (such as Windows 11 Notepad, Calculator and Settings) have no

@@ -2,53 +2,24 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 //! Regression tests for Aliyun ECS single-pass `prepare_provision`,
-//! SKU-exact budget enforcement, `WindowsInitHeader` selection, cross-region
+//! SKU-exact budget enforcement, `[powershell]` header emission, cross-region
 //! resolution, and fast `has_active_blocker` rollback.
 #![cfg(feature = "aliyun-ecs")]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use cua_byoc::RelayAccess;
-use cua_byoc::aliyun_ecs::{AliyunEcs, TokenStore};
-use cua_byoc::api::{CloudApi, Target, WindowsInitHeader};
+use cua_byoc::api::{CloudApi, Target};
 use cua_byoc::model::{self, ProvisionSpec, Resource};
 use cua_byoc::testing::fake_aliyun::{
-    FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc, S, handle,
+    FakeImage, FakeInstance, FakeSg, FakeVSwitch, FakeVpc, S, start_fake,
 };
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::ConnectRequest;
 use cua_sandbox_core::{CreateOptions, ProviderKind, Sandboxes};
 use cua_spacesd_client::testing::{MockAuth, MockServer};
-
-#[derive(Default)]
-struct MemStore(Mutex<Option<String>>);
-
-impl TokenStore for MemStore {
-    fn load(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
-    }
-    fn save(&self, t: &str) -> std::io::Result<()> {
-        *self.0.lock().unwrap() = Some(t.into());
-        Ok(())
-    }
-    fn clear(&self) -> bool {
-        self.0.lock().unwrap().take().is_some()
-    }
-}
-
-async fn start_fake(poll: Duration) -> (AliyunEcs, S) {
-    let s: S = Arc::default();
-    let app = axum::Router::new().fallback(handle).with_state(s.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let base = format!("http://{addr}");
-    let store = Arc::new(MemStore::default());
-    let api = AliyunEcs::with_endpoints(&base, &base, &base, store, None).with_poll(poll);
-    (api, s)
-}
 
 fn decode_b64(s: &str) -> String {
     String::from_utf8(base64::engine::general_purpose::STANDARD.decode(s).unwrap()).unwrap()
@@ -74,14 +45,14 @@ async fn build_connected_aliyun(
     let relay = Arc::new(FakeRelay::start().await);
     relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
     let mock_spacesd = MockServer::start(MockAuth::default()).await;
-    let (api, s) = start_fake(poll).await;
+    let (api, s, _) = start_fake(poll).await;
     if !extra_images.is_empty() {
         s.lock().unwrap().images.extend(extra_images);
     }
     let sandboxes = cua_byoc::install_with(
         Sandboxes::builder().state_dir(home.path().join("sandboxes")),
         home.path(),
-        vec![Arc::new(api)],
+        vec![api],
         RelayAccess::new(
             relay.url.clone(),
             Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
@@ -123,6 +94,21 @@ fn install_online_hook(s: &S, relay: &Arc<FakeRelay>, mock_url: String) {
     }));
 }
 
+fn win2025_system_image() -> FakeImage {
+    FakeImage {
+        image_id: "win2025_24H2_x64_dtc_en-us_40G_alibase_20261014.vhd".into(),
+        image_name: "win2025_24H2_x64_dtc_en-us_40G_alibase_20261014.vhd".into(),
+        os_type: "windows".into(),
+        os_name_en: Some("Windows Server 2025 DataCenter Edition 64bit English Edition".into()),
+        arch: "x86_64".into(),
+        status: "Available".into(),
+        owner_alias: "system".into(),
+        creation_time: "2026-10-14T00:00:00Z".into(),
+        size_gb: 40,
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls() {
     let (_home, sandboxes, s, relay, mock_spacesd) =
@@ -151,7 +137,11 @@ async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls()
         "expected single DescribeImages call during create"
     );
 
-    s.lock().unwrap().calls.clear();
+    {
+        let mut f = s.lock().unwrap();
+        f.add_image(win2025_system_image());
+        f.calls.clear();
+    }
     let mut win_official = CreateOptions::new(ProviderKind::Contrib, "windows");
     win_official.contrib = Some("aliyun-ecs".into());
     win_official.name = Some("single-pass-win-official".into());
@@ -215,8 +205,8 @@ async fn create_runs_single_pass_prepare_provision_without_duplicate_api_calls()
         decode_b64(run.params.get("UserData").unwrap())
     };
     assert!(
-        custom_ud.starts_with("#ps1_sysnative\r\n") || custom_ud.starts_with("#ps1_sysnative\n"),
-        "custom Windows image must use Cloudbase-Init #ps1_sysnative header, got: {:?}",
+        custom_ud.starts_with("[powershell]\r\n") || custom_ud.starts_with("[powershell]\n"),
+        "custom Windows image must use Aliyun Vminit [powershell] header, got: {:?}",
         &custom_ud[..custom_ud.len().min(80)]
     );
 }
@@ -249,7 +239,8 @@ async fn budget_checked_against_exact_resolved_sku_and_blocks_pricier_fallback()
 
 #[tokio::test]
 async fn prepare_provision_uses_spec_region_and_preserves_sku_and_header() {
-    let (api, s) = start_fake(Duration::from_millis(5)).await;
+    let (api, s, _) = start_fake(Duration::from_millis(5)).await;
+    s.lock().unwrap().add_image(win2025_system_image());
     let mut conn = api
         .resolve(&Target {
             provider: "aliyun-ecs".into(),
@@ -282,7 +273,6 @@ async fn prepare_provision_uses_spec_region_and_preserves_sku_and_header() {
     };
 
     let prep = api.prepare_provision(&conn, &spec).await.unwrap();
-    assert_eq!(prep.windows_header, Some(WindowsInitHeader::AliyunVminit));
     let sizing = prep.sizing.as_ref().expect("resolved sizing");
     let resolved_sku = sizing
         .machine_type
@@ -317,7 +307,7 @@ async fn prepare_provision_uses_spec_region_and_preserves_sku_and_header() {
 
 #[tokio::test]
 async fn fast_rollback_short_circuits_immediately_when_cua_owned_peer_uses_network() {
-    let (api, s) = start_fake(Duration::from_secs(5)).await;
+    let (api, s, _) = start_fake(Duration::from_secs(5)).await;
     api.stage_secret(&Target {
         provider: "aliyun-ecs".into(),
         token: Some("LTAI_TEST_AK:secret123".into()),
@@ -425,7 +415,7 @@ async fn fast_rollback_short_circuits_immediately_when_cua_owned_peer_uses_netwo
 
 #[tokio::test]
 async fn canonical_fake_preserves_client_token_idempotency_across_requests() {
-    let (api, s) = start_fake(Duration::from_millis(5)).await;
+    let (api, s, _) = start_fake(Duration::from_millis(5)).await;
     api.stage_secret(&Target {
         provider: "aliyun-ecs".into(),
         token: Some("LTAI_TEST_AK:secret123".into()),
@@ -465,7 +455,7 @@ async fn canonical_fake_preserves_client_token_idempotency_across_requests() {
 
 #[tokio::test]
 async fn direct_provision_unprepared_cloud_image_id_runs_prepare_and_fails_validation() {
-    let (api, s) = start_fake(Duration::from_millis(5)).await;
+    let (api, s, _) = start_fake(Duration::from_millis(5)).await;
     api.stage_secret(&Target {
         provider: "aliyun-ecs".into(),
         token: Some("LTAI_TEST_AK:secret123".into()),

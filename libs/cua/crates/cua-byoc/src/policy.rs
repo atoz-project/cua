@@ -539,6 +539,7 @@ mod tests {
             "ecs:AuthorizeSecurityGroupEgress",
             "ecs:StartInstance",
             "ecs:StopInstance",
+            "ecs:ModifyInstanceAutoReleaseTime",
             "ecs:DeleteInstance",
             "ecs:DeleteSecurityGroup",
             "vpc:DeleteVSwitch",

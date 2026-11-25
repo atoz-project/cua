@@ -68,7 +68,8 @@ async fn t3_01() {
         let inst = f.instances.values().next().unwrap();
         assert_eq!(inst.image_id, "m-win11-override");
         assert_eq!(inst.http_tokens.as_deref(), Some("optional"));
-        assert!(inst.user_data_decoded.starts_with("#ps1_sysnative\n"));
+        assert!(inst.user_data_decoded.starts_with("[powershell]\n"));
+        assert!(!inst.user_data_decoded.contains("100.100.100.200"));
         assert!(inst.user_data_decoded.contains("Is64BitOperatingSystem"));
         assert!(inst.user_data_decoded.contains(&mirror_url));
     }
@@ -694,4 +695,122 @@ async fn t3_10() {
     .await
     .ok();
     assert_eq!(w.relay.static_machines().len(), 2);
+}
+
+#[tokio::test]
+async fn t3_scp_delete_forbidden_lifecycle() {
+    let w = AliyunWorld::start().await;
+    w.relay.add_static_token("static-relay-secret");
+    {
+        let mut f = w.aliyun.lock().unwrap();
+        f.enforce_cua_managed_tag_condition = true;
+        f.forbidden_actions.insert("ecs:DeleteInstance".into());
+        f.add_image(FakeImage {
+            image_id: "m-win11-scp".into(),
+            image_name: "m-win11-scp".into(),
+            os_type: "windows".into(),
+            arch: "x86_64".into(),
+            status: "Available".into(),
+            owner_alias: "self".into(),
+            region_id: "cn-hangzhou".into(),
+            ..Default::default()
+        });
+    }
+    let mirror_url = w.mirror.windows_url();
+    w.run_with_stdin(
+        &[
+            "cloud",
+            "connect",
+            "aliyun-ecs",
+            "--token-stdin",
+            "--relay-mode",
+            "static",
+            "--relay-url",
+            &w.relay.url,
+            "--relay-token-stdin",
+            "--windows-image-id",
+            "m-win11-scp",
+            "--spacesd-download-url",
+            &mirror_url,
+            "--json",
+        ],
+        "LTAI_TEST_AK:secret123\nstatic-relay-secret\n",
+    )
+    .await
+    .ok();
+
+    w.run(&[
+        "sb",
+        "create",
+        "windows",
+        "--on",
+        "aliyun-ecs",
+        "--name",
+        "t3-scp-win",
+        "--json",
+    ])
+    .await
+    .ok();
+
+    w.run(&["sb", "rm", "t3-scp-win", "--force"]).await.ok();
+    {
+        let f = w.aliyun.lock().unwrap();
+        let inst = f
+            .instances
+            .values()
+            .next()
+            .expect("decommissioned instance");
+        assert_eq!(inst.status, "Stopped");
+        assert_eq!(inst.stopped_mode, "StopCharging");
+        assert!(inst.auto_release_time.is_some());
+        assert_eq!(
+            inst.tags.get("cua-decommissioned").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    let ls = w.run(&["sb", "ls", "--json"]).await;
+    ls.ok();
+    assert!(!ls.stdout.contains("t3-scp-win"), "{}", ls.stdout);
+
+    let swept = w
+        .run(&[
+            "cloud",
+            "sweep",
+            "aliyun-ecs",
+            "--all",
+            "--delete",
+            "--json",
+        ])
+        .await;
+    swept.ok();
+    let swept_json = swept.json();
+    let rows = swept_json["resources"].as_array().expect("resources array");
+    assert!(!rows.is_empty(), "{swept_json}");
+    for row in rows {
+        assert_eq!(row["action"].as_str(), Some("keep"), "{row}");
+        assert!(
+            row["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("AutoReleaseTime")),
+            "{row}"
+        );
+    }
+
+    let disc_hold = w
+        .run(&["cloud", "disconnect", "aliyun-ecs", "--delete"])
+        .await;
+    assert_ne!(disc_hold.code, 0);
+    assert!(
+        disc_hold.combined().contains("AutoReleaseTime"),
+        "{}",
+        disc_hold.combined()
+    );
+
+    w.aliyun.lock().unwrap().instances.clear();
+    w.run(&["cloud", "disconnect", "aliyun-ecs", "--delete", "--json"])
+        .await
+        .ok();
+    let f = w.aliyun.lock().unwrap();
+    assert!(f.vpcs.is_empty() && f.vswitches.is_empty() && f.security_groups.is_empty());
 }
