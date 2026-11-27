@@ -934,6 +934,55 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
 }
 
 #[tokio::test]
+async fn terminated_instance_remains_in_sweep_and_blocks_disconnect_until_exact_absence() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    {
+        let mut f = fix.s.lock().unwrap();
+        f.forbidden_actions.remove("ecs:DeleteInstance");
+        f.delete_instance_without_removal = true;
+    }
+    let mut opts = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts.contrib = Some("aliyun-ecs".into());
+    opts.name = Some("win11-terminated-visible".into());
+    opts.os = "windows".into();
+    opts.disk_gb = Some(100);
+    opts.ready_timeout = Duration::from_secs(10);
+    let sb = fix.sbx.create(opts).await.unwrap();
+    let inst_id = sb.provider_details()["id"].clone();
+    fix.s.lock().unwrap().instances.get_mut(&inst_id).unwrap().status = "Terminated".into();
+
+    let err = sb.delete().await.unwrap_err();
+    assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+    let store = cua_byoc::Store::new(fix.home.path());
+    assert!(store.resources().unwrap().iter().any(|r| r.id == inst_id));
+
+    let clouds = fix.clouds();
+    let swept = clouds
+        .sweep(Some("aliyun-ecs"), false, false)
+        .await
+        .unwrap();
+    let row = swept
+        .resources
+        .iter()
+        .find(|item| item.resource.id == inst_id)
+        .expect("a visible Terminated instance must remain in sweep");
+    assert_eq!(row.resource.state, "terminated");
+    assert_eq!(row.action, "keep");
+
+    let err = clouds.disconnect("aliyun-ecs", true).await.unwrap_err();
+    assert!(err.to_string().contains(&inst_id), "{err}");
+    assert!(store.connection("aliyun-ecs").unwrap().is_some());
+    assert!(store.resources().unwrap().iter().any(|r| r.id == inst_id));
+
+    fix.s.lock().unwrap().instances.clear();
+    clouds.disconnect("aliyun-ecs", true).await.unwrap();
+    assert!(store.connection("aliyun-ecs").unwrap().is_none());
+    assert!(!store.resources().unwrap().iter().any(|r| r.id == inst_id));
+}
+
+#[tokio::test]
 async fn delete_instance_success_requires_provider_absence_before_completion() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::clear();
