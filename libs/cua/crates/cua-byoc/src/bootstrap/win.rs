@@ -347,6 +347,7 @@ fn push_autologon_and_desktop_policy(s: &mut String) {
          \x20 Set-ItemProperty -Path $wl -Name 'DefaultDomainName' -Value $env:COMPUTERNAME -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'DefaultPassword' -Value $pwPlain -Type String\n\
          \x20 Set-ItemProperty -Path $wl -Name 'ForceAutoLogon' -Value '1' -Type String\n\
+         \x20 Set-ItemProperty -Path $wl -Name 'AutoLogonCount' -Value 1 -Type DWord\n\
          \x20 $sp = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'\n\
          \x20 if (-not (Test-Path -LiteralPath $sp)) { New-Item -Path $sp -Force | Out-Null }\n\
          \x20 Set-ItemProperty -Path $sp -Name 'DisableLockWorkstation' -Value 1 -Type DWord\n\
@@ -400,7 +401,15 @@ fn push_scheduled_tasks_and_handoff(
         String::new()
     };
     s.push_str(&format!(
-        "  $hasSession = @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -ge 1 }}).Count -gt 0\n\
+        "  $prevEap = $ErrorActionPreference\n\
+         \x20 $ErrorActionPreference = 'Continue'\n\
+         \x20 try {{\n\
+         \x20   & quser.exe $u 2>$null | Out-Null\n\
+         \x20   $hasTargetUserSession = $LASTEXITCODE -eq 0\n\
+         \x20 }} finally {{\n\
+         \x20   $ErrorActionPreference = $prevEap\n\
+         \x20 }}\n\
+         \x20 $hasSession = $hasTargetUserSession -and @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -ge 1 }}).Count -gt 0\n\
          \x20 if ($hasSession) {{\n\
          {session_ttl_shutdown}\
          \x20   Start-ScheduledTask -TaskName 'cua-spacesd'\n\
