@@ -4347,6 +4347,132 @@ async fn run_instances_receives_resolved_image_instance_type_and_disk_across_pre
 }
 
 #[tokio::test]
+async fn initial_provider_details_use_describe_instances_metadata() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(None, None);
+
+    let (api, s, _) = start(None).await;
+    s.lock().unwrap().add_image(FakeImage {
+        image_id: "m-requested-linux".into(),
+        image_name: "requested-linux".into(),
+        os_type: "linux".into(),
+        arch: "x86_64".into(),
+        status: "Available".into(),
+        size_gb: 20,
+        ..Default::default()
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let relay = Arc::new(FakeRelay::start().await);
+    relay.add_account("acct-tok", "user-1", Some("ada@example.com"));
+    let access = RelayAccess::new(
+        relay.url.clone(),
+        Arc::new(cua_host::relay::StaticToken("acct-tok".into())),
+    );
+    let mock_spacesd = cua_spacesd_client::testing::MockServer::start(
+        cua_spacesd_client::testing::MockAuth::default(),
+    )
+    .await;
+    let describe_auto_release = Arc::new(Mutex::new(true));
+    {
+        let relay = relay.clone();
+        let mock_url = mock_spacesd.url();
+        let s_hook = s.clone();
+        let describe_auto_release_hook = describe_auto_release.clone();
+        let mut f = s.lock().unwrap();
+        f.on_run_instance = Some(Arc::new(move |id, params| {
+            {
+                let mut f = s_hook.lock().unwrap();
+                let instance = f.instances.get_mut(id).unwrap();
+                instance.image_id = "m-described-linux".into();
+                instance.auto_release_time = (*describe_auto_release_hook.lock().unwrap())
+                    .then(|| "2030-01-02T04:25:00Z".into());
+            }
+            for i in 1..=10 {
+                if params.get(&format!("Tag.{i}.Key")).map(String::as_str)
+                    == Some(model::tag::MACHINE)
+                    && let Some(mid) = params.get(&format!("Tag.{i}.Value"))
+                {
+                    relay.tunnel(mid, &mock_url);
+                    relay.set_online(mid, true, "0.16.5");
+                    break;
+                }
+            }
+        }));
+    }
+
+    let sandboxes = cua_byoc::install_with(
+        Sandboxes::builder().state_dir(home.path().join("sandboxes")),
+        home.path(),
+        vec![Arc::new(api)],
+        access,
+    )
+    .build();
+    sandboxes
+        .clouds()
+        .unwrap()
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut options = sb_create_opts("provider-metadata");
+    options.cloud_image_id = Some("m-requested-linux".into());
+    options.ttl = Some(std::time::Duration::from_secs(3600));
+    options.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sandboxes.create(options).await.unwrap();
+
+    let launched_instance_id = {
+        let f = s.lock().unwrap();
+        let run = f
+            .calls
+            .iter()
+            .rfind(|c| c.action == "RunInstances" && !c.params.contains_key("DryRun"))
+            .unwrap();
+        assert_eq!(
+            run.params.get("ImageId").map(String::as_str),
+            Some("m-requested-linux")
+        );
+        assert!(run.params.contains_key("AutoReleaseTime"));
+        assert_eq!(f.instances.len(), 1);
+        f.instances.values().next().unwrap().instance_id.clone()
+    };
+    let details = sb.provider_details();
+    let image_id = details.get("cloud_image_id").map(String::as_str);
+    assert_eq!(image_id, Some("m-described-linux"));
+    assert_ne!(image_id, Some("m-requested-linux"));
+    assert_eq!(
+        details.get("id").map(String::as_str),
+        Some(launched_instance_id.as_str())
+    );
+    assert_eq!(
+        details.get("auto_release_time").map(String::as_str),
+        Some("2030-01-02T04:25:00Z")
+    );
+    let requested_expires = details
+        .get("expires")
+        .map(String::as_str)
+        .expect("requested TTL expiry");
+    assert_ne!(requested_expires, "2030-01-02T04:25:00Z");
+
+    *describe_auto_release.lock().unwrap() = false;
+    let mut options = sb_create_opts("provider-metadata-no-auto-release");
+    options.cloud_image_id = Some("m-requested-linux".into());
+    options.ttl = Some(std::time::Duration::from_secs(3600));
+    options.ready_timeout = std::time::Duration::from_secs(10);
+    let sb = sandboxes.create(options).await.unwrap();
+    let details = sb.provider_details();
+    assert!(details.contains_key("expires"));
+    assert!(!details.contains_key("auto_release_time"));
+}
+
+#[tokio::test]
 async fn cloud_sandboxes_create_rejects_disk_zero_and_whitespace_directly() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set(None, None);

@@ -66,11 +66,18 @@ struct OwnedInstance {
 }
 
 impl AliyunEcs {
-    async fn describe_instance_raw(
+    pub(super) async fn describe_instance_raw(
         &self,
         conn: &Connection,
         r: &Resource,
-    ) -> Result<Option<(String, BTreeMap<String, String>, Option<u64>)>> {
+    ) -> Result<
+        Option<(
+            String,
+            BTreeMap<String, String>,
+            Option<u64>,
+            Option<String>,
+        )>,
+    > {
         if r.id.is_empty() || r.resource_type != "instance" {
             return Ok(None);
         }
@@ -96,13 +103,23 @@ impl AliyunEcs {
         else {
             return Ok(None);
         };
+        let cloud_image_id = inst["ImageId"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let tags = net::tags_of(inst);
         let state = if tags.get(DECOMMISSIONED_TAG_KEY).map(String::as_str) == Some("true") {
             "terminated".to_string()
         } else {
             state_of(inst["Status"].as_str().unwrap_or(""))
         };
-        Ok(Some((state, tags, parse_auto_release_secs(inst))))
+        Ok(Some((
+            state,
+            tags,
+            parse_auto_release_secs(inst),
+            cloud_image_id,
+        )))
     }
 
     fn refuse_unowned(verb: &str, r: &Resource, owner: &str) -> Error {
@@ -147,7 +164,8 @@ impl AliyunEcs {
         owner: &str,
         verb: &str,
     ) -> Result<Option<OwnedInstance>> {
-        let Some((state, tags, cloud_auto_release)) = self.describe_instance_raw(conn, r).await?
+        let Some((state, tags, cloud_auto_release, _)) =
+            self.describe_instance_raw(conn, r).await?
         else {
             return Ok(None);
         };
@@ -261,7 +279,7 @@ impl AliyunEcs {
         Ok(self
             .describe_instance_raw(conn, r)
             .await?
-            .map(|(state, tags, _)| (state, tags)))
+            .map(|(state, tags, _, _)| (state, tags)))
     }
 
     pub(crate) async fn stop_resource(

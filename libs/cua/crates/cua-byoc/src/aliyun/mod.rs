@@ -39,6 +39,7 @@ use crate::api::{
     CloudApi, PreparedProvision, ResolvedSizing, Result, SweepDelete, Target, Tested, cloud_err,
 };
 use crate::model::{self, Capabilities, Connection, ProvisionSpec, Resource, Tier, tag};
+use crate::provider::detail;
 
 pub use auth::{
     AliyunCredentials, CuaCredentialStore, SECRET_NAME, TokenStore, aliyun_config_path,
@@ -726,6 +727,21 @@ impl CloudApi for AliyunEcs {
                         state: "pending".into(),
                         ..Default::default()
                     };
+                    // Metadata is optional because the new instance is not tracked for rollback yet.
+                    if let Ok(Some((_, _, cloud_auto_release, cloud_image_id))) =
+                        self.describe_instance_raw(&effective_conn, &r).await
+                    {
+                        if let Some(auto_release_time) = cloud_auto_release {
+                            r.extra.insert(
+                                detail::AUTO_RELEASE_TIME.into(),
+                                model::rfc3339(auto_release_time),
+                            );
+                        }
+                        if let Some(cloud_image_id) = cloud_image_id {
+                            r.extra
+                                .insert(detail::CLOUD_IMAGE_ID.into(), cloud_image_id);
+                        }
+                    }
                     r.extra.insert("machine_type".into(), instance_type);
                     r.extra.insert("image".into(), image_id);
                     r.extra.insert("vpc".into(), net.vpc_id);
