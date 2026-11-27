@@ -730,6 +730,64 @@ async fn delete_instance_forbidden_handles_pending_and_failed_boot_rollback() {
 }
 
 #[tokio::test]
+async fn failed_create_rollback_without_ttl_remains_sweep_deletable_after_refresh() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    {
+        let mut f = fix.s.lock().unwrap();
+        f.on_run_instance = None;
+        f.boot_fail = Some(BootFailMode::StopImmediately);
+        f.forbidden_actions
+            .insert("ecs:ModifyInstanceAutoReleaseTime".into());
+    }
+    let mut opts = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts.contrib = Some("aliyun-ecs".into());
+    opts.name = Some("win11-no-ttl-rollback".into());
+    opts.os = "windows".into();
+    opts.disk_gb = Some(100);
+    opts.ttl = Some(Duration::ZERO);
+    opts.ready_timeout = Duration::from_millis(80);
+    assert!(fix.sbx.create(opts).await.is_err());
+
+    let store = cua_byoc::Store::new(fix.home.path());
+    let rollback = store
+        .resources()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.sandbox == "aliyun-ecs:win11-no-ttl-rollback")
+        .expect("failed-create rollback record must remain");
+    assert_eq!(rollback.expires, 0);
+    let delete_calls = fix.s.lock().unwrap().count_calls("DeleteInstance");
+
+    let swept = fix
+        .clouds()
+        .sweep(Some("aliyun-ecs"), false, false)
+        .await
+        .unwrap();
+    let row = swept
+        .resources
+        .iter()
+        .find(|item| item.resource.id == rollback.id)
+        .expect("rollback instance must remain in sweep");
+    assert_eq!(row.action, "failed");
+    assert!(row.reason.contains("a failed create left it"), "{row:?}");
+    assert!(row.reason.contains("ModifyInstanceAutoReleaseTime"), "{row:?}");
+    assert_eq!(
+        fix.s.lock().unwrap().count_calls("DeleteInstance"),
+        delete_calls + 1,
+        "a no-TTL failed create must retry deletion"
+    );
+    let retained = store
+        .resources()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == rollback.id)
+        .unwrap();
+    assert_eq!(retained.state, "failed");
+}
+
+#[tokio::test]
 async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_backstop() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::clear();
