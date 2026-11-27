@@ -22,7 +22,7 @@ use cua_byoc::testing::fake_aliyun::{
 };
 use cua_host::testing::FakeRelay;
 use cua_sandbox_core::byoc::{CloudManager, ConnectRequest};
-use cua_sandbox_core::{CreateOptions, Error, ProviderKind, Sandboxes};
+use cua_sandbox_core::{CreateOptions, Error, ProviderKind, Sandboxes, Status};
 use cua_spacesd_client::testing::{MockAuth, MockServer};
 use serde_json::json;
 
@@ -423,9 +423,11 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
 
     fix.s.lock().unwrap().calls.clear();
     let del_now = model::now();
-    sb.delete().await.unwrap();
+    let original_details = sb.provider_details();
+    let inst_id = original_details["id"].clone();
+    let delete_err = sb.delete().await.unwrap_err();
 
-    {
+    let rel_str = {
         let f = fix.s.lock().unwrap();
         // Single inspect_owned_instance call reused by decommission_without_delete (+1 poll).
         assert!(f.count_calls("DescribeInstances") <= 2, "{:?}", f.calls);
@@ -451,9 +453,9 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
             rel_call.params.get("RegionId").map(String::as_str),
             Some("cn-hangzhou")
         );
-        let rel_str = rel_call.params.get("AutoReleaseTime").unwrap();
+        let rel_str = rel_call.params.get("AutoReleaseTime").unwrap().clone();
         assert!(rel_str.ends_with(":00Z"), "expected :00Z UTC: {rel_str}");
-        let rel_secs = humantime::parse_rfc3339(rel_str)
+        let rel_secs = humantime::parse_rfc3339(&rel_str)
             .unwrap()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -485,31 +487,85 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
             inst.tags.get("cua-decommissioned").map(String::as_str),
             Some("true")
         );
-    }
+        rel_str
+    };
 
-    assert!(fix.sbx.list().await.unwrap().is_empty());
+    let delete_error = delete_err.to_string();
+    assert!(
+        delete_error.contains("Forbidden.RAM")
+            && delete_error.contains("AutoReleaseTime")
+            && delete_error.contains(&rel_str),
+        "scheduled deletion must retain its evidence: {delete_error}"
+    );
 
-    // `sweep --delete` keeps shared network parts for active instances / unforced runs,
-    // while `sweep --all --delete` reports the AutoReleaseTime decommissioning hold.
+    let listed = fix.sbx.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].name, "win11-scp-del");
+    assert_eq!(listed[0].status, Status::Suspended);
+    let persisted = fix.sbx.persisted_details("win11-scp-del");
+    assert_eq!(persisted.get("auto_release_time"), Some(&rel_str));
+    assert_eq!(
+        persisted.get(cua_sandbox_core::byoc::DETAIL_RELAY_MACHINE),
+        original_details.get(cua_sandbox_core::byoc::DETAIL_RELAY_MACHINE)
+    );
+
+    let store = cua_byoc::Store::new(fix.home.path());
+    let recorded = store
+        .resources()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == inst_id)
+        .expect("scheduled instance record must be retained");
+    assert_eq!(recorded.state, "stopped");
+    assert_eq!(recorded.extra.get("auto_release_time"), Some(&rel_str));
+    let status = clouds.status(Some("aliyun-ecs")).await.unwrap();
+    let status_instance = status
+        .resources
+        .iter()
+        .find(|r| r.id == inst_id)
+        .expect("cloud status must retain the scheduled instance");
+    assert_eq!(status_instance.state, "stopped");
+    let audits = store.audit_entries(1000).unwrap();
+    assert!(audits.iter().any(|a| {
+        a.action == "resource_deleted" && a.id == inst_id && a.outcome == "failed"
+    }));
+    assert!(!audits.iter().any(|a| {
+        a.action == "resource_deleted" && a.id == inst_id && a.outcome == "ok"
+    }));
+
+    // A scheduled instance remains visible in every sweep, while shared network
+    // parts stay held until its provider-attested release timer fires.
     let swept_normal = clouds
         .sweep(Some("aliyun-ecs"), false, false)
         .await
         .unwrap();
+    let normal_instance = swept_normal
+        .resources
+        .iter()
+        .find(|i| i.resource.id == inst_id)
+        .expect("normal sweep must list the scheduled instance");
+    assert_eq!(normal_instance.resource.state, "stopped");
+    assert_ne!(normal_instance.action, "deleted");
+    let swept_all = clouds.sweep(Some("aliyun-ecs"), false, true).await.unwrap();
+    let held_instance = swept_all
+        .resources
+        .iter()
+        .find(|i| i.resource.id == inst_id)
+        .expect("forced sweep must list the scheduled instance");
+    assert_eq!(held_instance.action, "keep");
+    assert_eq!(held_instance.resource.state, "stopped");
     assert!(
-        swept_normal
+        held_instance.reason.contains("Forbidden.RAM")
+            && held_instance.reason.contains(&rel_str),
+        "expected denial and provider-read schedule: {held_instance:?}"
+    );
+    assert!(
+        swept_all
             .resources
             .iter()
-            .all(|i| i.action == "keep" && i.reason == "shared by Cua sandboxes here"),
-        "{swept_normal:?}"
-    );
-    let swept_all = clouds.sweep(Some("aliyun-ecs"), false, true).await.unwrap();
-    assert!(
-        swept_all.resources.iter().all(|i| {
-            i.resource.resource_type != "instance"
-                && i.action == "keep"
-                && i.reason.contains("AutoReleaseTime")
-        }),
-        "expected AutoReleaseTime hold reason: {swept_all:?}"
+            .filter(|i| i.resource.resource_type != "instance")
+            .all(|i| i.action == "keep" && i.reason.contains("AutoReleaseTime")),
+        "expected AutoReleaseTime network holds: {swept_all:?}"
     );
 
     // Direct `CloudApi::delete` on a held shared network part must return a clean diagnostic
@@ -550,32 +606,28 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
         "expected AutoReleaseTime guidance in disconnect error: {disc_err}"
     );
 
-    // Repeating `api.delete` on a decommissioned instance is a no-op with 0 DeleteInstance calls.
-    let inst_id = fix
-        .s
-        .lock()
-        .unwrap()
-        .instances
-        .keys()
-        .next()
-        .unwrap()
-        .clone();
-    let decomm_res = Resource {
-        provider: "aliyun-ecs".into(),
-        id: inst_id,
-        resource_type: "instance".into(),
-        region: "cn-hangzhou".into(),
-        ..Default::default()
-    };
+    // Repeating deletion of the still-visible decommissioned instance stays
+    // pending and does not issue another DeleteInstance.
     fix.s.lock().unwrap().calls.clear();
-    fix.api
-        .delete(&conn(&fix.api), &decomm_res, &fix.owner)
-        .await
-        .unwrap();
+    let repeated = fix.sbx.delete("win11-scp-del").await.unwrap_err();
+    assert!(repeated.to_string().contains("AutoReleaseTime"));
     assert_eq!(fix.s.lock().unwrap().count_calls("DeleteInstance"), 0);
+    assert!(store.resources().unwrap().iter().any(|r| r.id == inst_id));
 
-    // Simulate cloud AutoReleaseTime firing: shared network parts now delete cleanly.
+    // Only the instance's actual disappearance permits record and state removal.
     fix.s.lock().unwrap().instances.clear();
+    fix.sbx.delete("win11-scp-del").await.unwrap();
+    assert!(fix.sbx.list().await.unwrap().is_empty());
+    assert!(!store.resources().unwrap().iter().any(|r| r.id == inst_id));
+    assert!(
+        !clouds
+            .status(Some("aliyun-ecs"))
+            .await
+            .unwrap()
+            .resources
+            .iter()
+            .any(|r| r.id == inst_id)
+    );
     let disc_ok = clouds.disconnect("aliyun-ecs", true).await.unwrap();
     assert!(disc_ok.left.is_empty(), "{disc_ok:?}");
     let f = fix.s.lock().unwrap();
