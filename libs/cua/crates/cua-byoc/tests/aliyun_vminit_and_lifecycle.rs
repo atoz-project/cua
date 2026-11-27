@@ -689,7 +689,7 @@ async fn delete_instance_forbidden_handles_pending_and_failed_boot_rollback() {
         );
     }
 
-    // Failed boot rollback retains a stopped, scheduled record for the sweeper.
+    // Failed boot rollback retains its schedule and remains eligible for sweep deletion.
     {
         let mut f = fix.s.lock().unwrap();
         f.on_run_instance = None;
@@ -718,7 +718,7 @@ async fn delete_instance_forbidden_handles_pending_and_failed_boot_rollback() {
         .into_iter()
         .find(|r| r.sandbox == "aliyun-ecs:win11-scp-rollback")
         .expect("failed-create rollback record must remain");
-    assert_eq!(rollback.state, "stopped");
+    assert_eq!(rollback.state, "failed");
     let rollback_release = fix.s.lock().unwrap().instances[&rollback.id]
         .auto_release_time
         .clone()

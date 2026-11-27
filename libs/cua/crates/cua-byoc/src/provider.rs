@@ -188,7 +188,11 @@ impl CloudSandboxes {
         updated.name = fresh.name;
         updated.region = fresh.region;
         updated.zone = fresh.zone;
-        updated.state = fresh.state;
+        updated.state = if rec.state == "failed" {
+            rec.state.clone()
+        } else {
+            fresh.state
+        };
         updated.expires = fresh.expires;
         updated.tags = fresh.tags;
         updated.extra.remove(detail::AUTO_RELEASE_TIME);
@@ -284,9 +288,9 @@ impl CloudSandboxes {
                         &e.to_string(),
                     ));
                     tracing::warn!(resource = %r.id, "rollback left it for the sweeper: {e}");
-                    if !self.refresh_record(conn, owner, r).await {
-                        let mut failed = r.clone();
-                        failed.state = "failed".into();
+                    let mut failed = r.clone();
+                    failed.state = "failed".into();
+                    if !self.refresh_record(conn, owner, &failed).await {
                         let _ = self.store.record(failed);
                     }
                 }
