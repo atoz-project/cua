@@ -213,16 +213,12 @@ pub async fn sweep_provider(
     let instances_left = listed.iter().any(|r| {
         matches!(r.resource_type.as_str(), "instance" | "sandbox")
             && !verdict(r, &r.tags, &owner, &records, all, true, t).delete
-            && r.state != "terminated"
     });
     let mut out = Vec::new();
     // Instances and sandboxes first, shared resources after them.
     let mut ordered: Vec<&Resource> = listed.iter().collect();
     ordered.sort_by_key(|r| r.delete_rank());
     for r in ordered {
-        if r.state == "terminated" {
-            continue;
-        }
         let mut v = verdict(r, &r.tags, &owner, &records, all, instances_left, t);
         if !v.delete && r.extra.contains_key(model::DEFAULT_VPC) {
             v.reason.push_str(
@@ -441,7 +437,7 @@ pub(crate) async fn live_resources(
     let t = now();
     let mut out: Vec<Live> = listed
         .iter()
-        .filter(|r| r.state != "terminated" && wanted(r))
+        .filter(|r| wanted(r))
         .map(|r| Live {
             resource: r.clone(),
             unverified: None,
@@ -489,11 +485,7 @@ pub(crate) async fn live_resources(
                 there.zone = String::new();
             }
             match p.describe(&there, &rec).await {
-                Ok(Some((state, tags)))
-                    if state != "terminated" && model::is_ours(&tags, &owner) =>
-                {
-                    None
-                }
+                Ok(Some((_, tags))) if model::is_ours(&tags, &owner) => None,
                 Ok(_) => continue,
                 Err(e) => Some(format!(
                     "recorded in {}, could not be checked: {e}",
