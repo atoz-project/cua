@@ -272,8 +272,28 @@ pub async fn sweep_provider(
                     }
                 }
                 Ok(SweepDelete::Held { reason }) => {
+                    let fresh = provider
+                        .list_owned(conn_for(&r.region), &owner)
+                        .await?
+                        .into_iter()
+                        .find(|current| current.same_identity(r))
+                        .ok_or_else(|| {
+                            cua_sandbox_core::Error::Cloud(format!(
+                                "{} was held after deletion but missing from the provider refresh",
+                                r.id
+                            ))
+                        })?;
                     item.action = "keep".into();
                     item.reason = reason;
+                    if let Some(rec) = records.iter().find(|rec| rec.same_identity(r)) {
+                        let updated = crate::provider::merge_refreshed_record(rec, fresh);
+                        item.resource = updated.wire(t);
+                        store
+                            .record(updated)
+                            .map_err(cua_sandbox_core::Error::Io)?;
+                    } else {
+                        item.resource = fresh.wire(t);
+                    }
                 }
                 Err(e) => {
                     item.action = "failed".into();

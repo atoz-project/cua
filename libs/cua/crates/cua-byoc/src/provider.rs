@@ -76,6 +76,23 @@ pub struct CloudSandboxes {
     relay: RelayAccess,
 }
 
+pub(crate) fn merge_refreshed_record(rec: &Resource, fresh: Resource) -> Resource {
+    let mut updated = rec.clone();
+    updated.name = fresh.name;
+    updated.region = fresh.region;
+    updated.zone = fresh.zone;
+    updated.state = if rec.state == "failed" {
+        rec.state.clone()
+    } else {
+        fresh.state
+    };
+    updated.expires = fresh.expires;
+    updated.tags = fresh.tags;
+    updated.extra.remove(detail::AUTO_RELEASE_TIME);
+    updated.extra.extend(fresh.extra);
+    updated
+}
+
 impl CloudSandboxes {
     /// `api`, recording into `store`, joining its sandboxes to `relay`.
     pub fn new(api: Arc<dyn CloudApi>, store: Arc<Store>, relay: RelayAccess) -> Self {
@@ -184,19 +201,7 @@ impl CloudSandboxes {
         }) else {
             return false;
         };
-        let mut updated = rec.clone();
-        updated.name = fresh.name;
-        updated.region = fresh.region;
-        updated.zone = fresh.zone;
-        updated.state = if rec.state == "failed" {
-            rec.state.clone()
-        } else {
-            fresh.state
-        };
-        updated.expires = fresh.expires;
-        updated.tags = fresh.tags;
-        updated.extra.remove(detail::AUTO_RELEASE_TIME);
-        updated.extra.extend(fresh.extra);
+        let updated = merge_refreshed_record(rec, fresh);
         if let Err(e) = self.store.record(updated) {
             tracing::warn!(resource = %rec.id, "could not save refreshed resource: {e}");
             return false;
