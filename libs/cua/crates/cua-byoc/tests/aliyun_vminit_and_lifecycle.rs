@@ -772,7 +772,10 @@ async fn failed_create_rollback_without_ttl_remains_sweep_deletable_after_refres
         .expect("rollback instance must remain in sweep");
     assert_eq!(row.action, "failed");
     assert!(row.reason.contains("a failed create left it"), "{row:?}");
-    assert!(row.reason.contains("ModifyInstanceAutoReleaseTime"), "{row:?}");
+    assert!(
+        row.reason.contains("ModifyInstanceAutoReleaseTime"),
+        "{row:?}"
+    );
     assert_eq!(
         fix.s.lock().unwrap().count_calls("DeleteInstance"),
         delete_calls + 1,
@@ -1132,7 +1135,13 @@ async fn terminated_instance_remains_in_sweep_and_blocks_disconnect_until_exact_
     opts.ready_timeout = Duration::from_secs(10);
     let sb = fix.sbx.create(opts).await.unwrap();
     let inst_id = sb.provider_details()["id"].clone();
-    fix.s.lock().unwrap().instances.get_mut(&inst_id).unwrap().status = "Terminated".into();
+    fix.s
+        .lock()
+        .unwrap()
+        .instances
+        .get_mut(&inst_id)
+        .unwrap()
+        .status = "Terminated".into();
 
     let err = sb.delete().await.unwrap_err();
     assert!(matches!(err, Error::Timeout(_)), "{err:?}");

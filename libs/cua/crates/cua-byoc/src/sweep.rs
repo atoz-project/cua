@@ -288,9 +288,7 @@ pub async fn sweep_provider(
                     if let Some(rec) = records.iter().find(|rec| rec.same_identity(r)) {
                         let updated = crate::provider::merge_refreshed_record(rec, fresh);
                         item.resource = updated.wire(t);
-                        store
-                            .record(updated)
-                            .map_err(cua_sandbox_core::Error::Io)?;
+                        store.record(updated).map_err(cua_sandbox_core::Error::Io)?;
                     } else {
                         item.resource = fresh.wire(t);
                     }
