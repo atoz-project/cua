@@ -389,3 +389,24 @@ fn registry_and_finally_cleanup_guards() {
         }
     }
 }
+
+#[test]
+fn oobe_explorer_does_not_suppress_target_user_autologon_reboot() {
+    let j = static_join();
+    let env = BTreeMap::new();
+    let ps = windows_user_data(&boot_cfg(&j, &env, 8 * 3600, None, "WinPass!1234Abcd"));
+
+    assert!(
+        ps.contains("Set-ItemProperty -Path $wl -Name 'AutoLogonCount' -Value 1 -Type DWord"),
+        "AutoLogon must be limited to one boot: {ps}"
+    );
+    assert!(
+        ps.contains(concat!(
+            "& quser.exe $u 2>$null | Out-Null\n",
+            "  $hasSession = ($LASTEXITCODE -eq 0) -and ",
+            "@(Get-Process -Name explorer -ErrorAction SilentlyContinue | ",
+            "Where-Object { $_.SessionId -ge 1 }).Count -gt 0"
+        )),
+        "OOBE Explorer must not suppress the target user's AutoLogon reboot: {ps}"
+    );
+}
