@@ -189,7 +189,12 @@ impl CloudSandboxes {
     }
 
     async fn refresh_record(&self, conn: &Connection, owner: &str, rec: &Resource) -> bool {
-        let listed = match self.api.list_owned(conn, owner).await {
+        let mut scoped = conn.clone();
+        if !rec.region.is_empty() && rec.region != conn.region {
+            scoped.region = rec.region.clone();
+            scoped.zone = String::new();
+        }
+        let listed = match self.api.list_owned(&scoped, owner).await {
             Ok(listed) => listed,
             Err(e) => {
                 tracing::warn!(resource = %rec.id, "could not refresh retained resource: {e}");
