@@ -402,8 +402,15 @@ fn oobe_explorer_does_not_suppress_target_user_autologon_reboot() {
     );
     assert!(
         ps.contains(concat!(
-            "& quser.exe $u 2>$null | Out-Null\n",
-            "  $hasSession = ($LASTEXITCODE -eq 0) -and ",
+            "$prevEap = $ErrorActionPreference\n",
+            "  $ErrorActionPreference = 'Continue'\n",
+            "  try {\n",
+            "    & quser.exe $u 2>$null | Out-Null\n",
+            "    $hasTargetUserSession = $LASTEXITCODE -eq 0\n",
+            "  } finally {\n",
+            "    $ErrorActionPreference = $prevEap\n",
+            "  }\n",
+            "  $hasSession = $hasTargetUserSession -and ",
             "@(Get-Process -Name explorer -ErrorAction SilentlyContinue | ",
             "Where-Object { $_.SessionId -ge 1 }).Count -gt 0"
         )),

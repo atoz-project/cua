@@ -401,8 +401,15 @@ fn push_scheduled_tasks_and_handoff(
         String::new()
     };
     s.push_str(&format!(
-        "  & quser.exe $u 2>$null | Out-Null\n\
-         \x20 $hasSession = ($LASTEXITCODE -eq 0) -and @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -ge 1 }}).Count -gt 0\n\
+        "  $prevEap = $ErrorActionPreference\n\
+         \x20 $ErrorActionPreference = 'Continue'\n\
+         \x20 try {{\n\
+         \x20   & quser.exe $u 2>$null | Out-Null\n\
+         \x20   $hasTargetUserSession = $LASTEXITCODE -eq 0\n\
+         \x20 }} finally {{\n\
+         \x20   $ErrorActionPreference = $prevEap\n\
+         \x20 }}\n\
+         \x20 $hasSession = $hasTargetUserSession -and @(Get-Process -Name explorer -ErrorAction SilentlyContinue | Where-Object {{ $_.SessionId -ge 1 }}).Count -gt 0\n\
          \x20 if ($hasSession) {{\n\
          {session_ttl_shutdown}\
          \x20   Start-ScheduledTask -TaskName 'cua-spacesd'\n\
