@@ -269,6 +269,9 @@ pub fn dispatch_locked(
 }
 
 fn handle_describe_instances(f: &mut FakeAliyun, params: &Params) -> Response {
+    if let Some(response) = &f.describe_instances_response {
+        return ok(response.clone());
+    }
     let tag_filters = parse_tags(params);
     let id_filter: Option<Vec<String>> = params
         .get("InstanceIds")
@@ -600,11 +603,13 @@ fn handle_instance_ops(
                 return r;
             }
             let power_cb = f.on_power.clone();
-            for id in &ids {
-                if let Some(inst) = f.instances.remove(id)
-                    && let Some(ref cb) = power_cb
-                {
-                    hooks.power.push((inst, false, cb.clone()));
+            if !f.delete_instance_without_removal {
+                for id in &ids {
+                    if let Some(inst) = f.instances.remove(id)
+                        && let Some(cb) = &power_cb
+                    {
+                        hooks.power.push((inst, false, cb.clone()));
+                    }
                 }
             }
             ok(json!({ "RequestId": "req-del-1" }))

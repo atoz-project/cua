@@ -585,6 +585,40 @@ impl Sandboxes {
         self.inner.state.restrict(&instance_name(instance, &o.name))
     }
 
+    pub(super) fn refresh_contrib_state(
+        &self,
+        name: &str,
+        instance: &crate::ProviderInstance,
+    ) -> Result<()> {
+        let Some(SandboxState::Local(mut state)) = self.inner.state.load(name) else {
+            return Err(Error::NotFound(format!(
+                "sandbox {name} has no persisted state"
+            )));
+        };
+        state.status = match &instance.status {
+            Status::Running => "running".into(),
+            Status::Suspended => "suspended".into(),
+            Status::Stopped => "stopped".into(),
+            Status::Provisioning => "provisioning".into(),
+            Status::Unknown(status) => status.clone(),
+        };
+        state.extra.remove(crate::state::STOP_REASON);
+        let public: Map<String, Value> = instance
+            .details
+            .iter()
+            .filter(|(key, _)| !key.starts_with('_'))
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect();
+        if public.is_empty() {
+            state.extra.remove(DETAILS_KEY);
+        } else {
+            state
+                .extra
+                .insert(DETAILS_KEY.into(), Value::Object(public));
+        }
+        self.inner.state.save(&SandboxState::Local(state))
+    }
+
     /// Reattaches to a persisted contrib sandbox.
     pub(super) async fn connect_contrib(&self, l: LocalState) -> Result<Sandbox> {
         let state = SandboxState::Local(l.clone());

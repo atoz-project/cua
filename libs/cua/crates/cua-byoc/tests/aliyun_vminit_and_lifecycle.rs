@@ -429,8 +429,6 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
 
     let rel_str = {
         let f = fix.s.lock().unwrap();
-        // Single inspect_owned_instance call reused by decommission_without_delete (+1 poll).
-        assert!(f.count_calls("DescribeInstances") <= 2, "{:?}", f.calls);
         let stop_call = f
             .calls_for("StopInstance")
             .into_iter()
@@ -526,12 +524,16 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
         .expect("cloud status must retain the scheduled instance");
     assert_eq!(status_instance.state, "stopped");
     let audits = store.audit_entries(1000).unwrap();
-    assert!(audits.iter().any(|a| {
-        a.action == "resource_deleted" && a.id == inst_id && a.outcome == "failed"
-    }));
-    assert!(!audits.iter().any(|a| {
-        a.action == "resource_deleted" && a.id == inst_id && a.outcome == "ok"
-    }));
+    assert!(
+        audits.iter().any(|a| {
+            a.action == "resource_deleted" && a.id == inst_id && a.outcome == "failed"
+        })
+    );
+    assert!(
+        !audits
+            .iter()
+            .any(|a| { a.action == "resource_deleted" && a.id == inst_id && a.outcome == "ok" })
+    );
 
     // A scheduled instance remains visible in every sweep, while shared network
     // parts stay held until its provider-attested release timer fires.
@@ -555,9 +557,8 @@ async fn delete_instance_forbidden_force_stops_tightens_autorelease_and_keeps_ne
     assert_eq!(held_instance.action, "keep");
     assert_eq!(held_instance.resource.state, "stopped");
     assert!(
-        held_instance.reason.contains("Forbidden.RAM")
-            && held_instance.reason.contains(&rel_str),
-        "expected denial and provider-read schedule: {held_instance:?}"
+        held_instance.reason.contains("DeleteInstance") && held_instance.reason.contains(&rel_str),
+        "expected decommission reason and provider-read schedule: {held_instance:?}"
     );
     assert!(
         swept_all
@@ -666,10 +667,12 @@ async fn delete_instance_forbidden_handles_pending_and_failed_boot_rollback() {
         region: "cn-hangzhou".into(),
         ..Default::default()
     };
-    fix.api
+    let pending_err = fix
+        .api
         .delete(&conn(&fix.api), &pend_res, &fix.owner)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(pending_err.to_string().contains("AutoReleaseTime"));
     {
         let f = fix.s.lock().unwrap();
         let inst = f.instances.get("i-scp-pending").unwrap();
@@ -686,7 +689,7 @@ async fn delete_instance_forbidden_handles_pending_and_failed_boot_rollback() {
         );
     }
 
-    // Failed boot rollback when DeleteInstance is forbidden degrades cleanly to StopCharging.
+    // Failed boot rollback retains a stopped, scheduled record for the sweeper.
     {
         let mut f = fix.s.lock().unwrap();
         f.on_run_instance = None;
@@ -708,6 +711,22 @@ async fn delete_instance_forbidden_handles_pending_and_failed_boot_rollback() {
             && i.tags.get("cua-decommissioned").map(String::as_str) == Some("true")
     }));
     assert!(fix.sbx.list().await.unwrap().is_empty());
+    let store = cua_byoc::Store::new(fix.home.path());
+    let rollback = store
+        .resources()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.sandbox == "aliyun-ecs:win11-scp-rollback")
+        .expect("failed-create rollback record must remain");
+    assert_eq!(rollback.state, "stopped");
+    let rollback_release = fix.s.lock().unwrap().instances[&rollback.id]
+        .auto_release_time
+        .clone()
+        .unwrap();
+    assert_eq!(
+        rollback.extra.get("auto_release_time"),
+        Some(&rollback_release)
+    );
 }
 
 #[tokio::test]
@@ -740,13 +759,13 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
         .sweep(Some("aliyun-ecs"), false, false)
         .await
         .unwrap();
-    assert!(
-        swept_exp
-            .resources
-            .iter()
-            .any(|i| i.resource.id == "i-scp-expired" && i.action == "deleted"),
-        "{swept_exp:?}"
-    );
+    let expired = swept_exp
+        .resources
+        .iter()
+        .find(|i| i.resource.id == "i-scp-expired")
+        .expect("scheduled expired instance must remain in sweep");
+    assert_eq!(expired.action, "keep");
+    assert!(expired.reason.contains("AutoReleaseTime"));
     {
         let f = fix.s.lock().unwrap();
         let exp_inst = f.instances.get("i-scp-expired").unwrap();
@@ -768,7 +787,7 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
         assert!(rel_secs >= exp_now + 1800 && rel_secs <= exp_now + 1980);
     }
 
-    // --no-ttl (expires == 0) succeeds when ModifyInstanceAutoReleaseTime is allowed.
+    // --no-ttl (expires == 0) remains held when ModifyInstanceAutoReleaseTime is allowed.
     fix.s.lock().unwrap().seed_instance(FakeInstance {
         instance_id: "i-scp-no-ttl-allowed".into(),
         instance_name: "cua-aliyun-ecs-no-ttl-ok".into(),
@@ -781,7 +800,8 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
         ]),
         ..Default::default()
     });
-    fix.api
+    let no_ttl_allowed = fix
+        .api
         .delete(
             &conn(&fix.api),
             &Resource {
@@ -795,7 +815,8 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
             &fix.owner,
         )
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(no_ttl_allowed.to_string().contains("AutoReleaseTime"));
     assert!(
         fix.s
             .lock()
@@ -807,8 +828,8 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
             .is_some()
     );
 
-    // If ModifyInstanceAutoReleaseTime is also forbidden: fail on missing cloud AutoReleaseTime,
-    // succeed when cloud AutoReleaseTime is already armed at launch.
+    // If ModifyInstanceAutoReleaseTime is also forbidden, a missing cloud timer
+    // fails and an existing provider timer remains the held release deadline.
     let future_rel = model::rfc3339(((model::now() + 28800).div_ceil(60)) * 60);
     {
         let mut f = fix.s.lock().unwrap();
@@ -832,7 +853,7 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
             instance_name: "cua-aliyun-ecs-with-ttl".into(),
             region_id: "cn-hangzhou".into(),
             status: "Running".into(),
-            auto_release_time: Some(future_rel),
+            auto_release_time: Some(future_rel.clone()),
             tags: BTreeMap::from([
                 ("cua-managed".into(), "true".into()),
                 ("cua-owner".into(), fix.owner_tag.clone()),
@@ -868,7 +889,8 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
         "Stopped"
     );
 
-    fix.api
+    let with_ttl_err = fix
+        .api
         .delete(
             &conn(&fix.api),
             &Resource {
@@ -882,7 +904,25 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
             &fix.owner,
         )
         .await
+        .unwrap_err();
+    assert!(
+        with_ttl_err.to_string().contains(&future_rel),
+        "held error must expose the existing provider timer: {with_ttl_err}"
+    );
+    let listed = fix
+        .api
+        .list_owned(&conn(&fix.api), &fix.owner)
+        .await
         .unwrap();
+    let listed_with_ttl = listed
+        .iter()
+        .find(|r| r.id == "i-scp-with-ttl")
+        .expect("modification-denied instance must remain listed");
+    assert_eq!(listed_with_ttl.state, "stopped");
+    assert_eq!(
+        listed_with_ttl.extra.get("auto_release_time"),
+        Some(&future_rel)
+    );
     let f = fix.s.lock().unwrap();
     let with_ttl = f.instances.get("i-scp-with-ttl").unwrap();
     assert_eq!(with_ttl.status, "Stopped");
@@ -891,4 +931,155 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
         with_ttl.tags.get("cua-decommissioned").map(String::as_str),
         Some("true")
     );
+}
+
+#[tokio::test]
+async fn delete_instance_success_requires_provider_absence_before_completion() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    {
+        let mut f = fix.s.lock().unwrap();
+        f.forbidden_actions.remove("ecs:DeleteInstance");
+        f.delete_instance_without_removal = true;
+        for (id, status) in [
+            ("i-delete-visible", "Running"),
+            ("i-delete-terminated", "Terminated"),
+        ] {
+            f.seed_instance(FakeInstance {
+                instance_id: id.into(),
+                instance_name: format!("cua-{id}"),
+                region_id: "cn-hangzhou".into(),
+                status: status.into(),
+                tags: BTreeMap::from([
+                    ("cua-managed".into(), "true".into()),
+                    ("cua-owner".into(), fix.owner_tag.clone()),
+                ]),
+                ..Default::default()
+            });
+        }
+    }
+
+    for (id, status) in [
+        ("i-delete-visible", "Running"),
+        ("i-delete-terminated", "Terminated"),
+    ] {
+        fix.s.lock().unwrap().calls.clear();
+        let err = fix
+            .api
+            .delete(
+                &conn(&fix.api),
+                &Resource {
+                    provider: "aliyun-ecs".into(),
+                    id: id.into(),
+                    resource_type: "instance".into(),
+                    region: "cn-hangzhou".into(),
+                    ..Default::default()
+                },
+                &fix.owner,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        let f = fix.s.lock().unwrap();
+        assert_eq!(f.count_calls("DeleteInstance"), 1);
+        assert_eq!(f.instances[id].status, status);
+    }
+}
+
+#[tokio::test]
+async fn delete_instance_forbidden_tag_failure_still_returns_held() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    {
+        let mut f = fix.s.lock().unwrap();
+        f.forbidden_actions.insert("ecs:TagResources".into());
+        f.seed_instance(FakeInstance {
+            instance_id: "i-tag-denied".into(),
+            instance_name: "cua-aliyun-ecs-tag-denied".into(),
+            region_id: "cn-hangzhou".into(),
+            status: "Running".into(),
+            tags: BTreeMap::from([
+                ("cua-managed".into(), "true".into()),
+                ("cua-owner".into(), fix.owner_tag.clone()),
+            ]),
+            ..Default::default()
+        });
+    }
+    let err = fix
+        .api
+        .delete(
+            &conn(&fix.api),
+            &Resource {
+                provider: "aliyun-ecs".into(),
+                id: "i-tag-denied".into(),
+                resource_type: "instance".into(),
+                region: "cn-hangzhou".into(),
+                ..Default::default()
+            },
+            &fix.owner,
+        )
+        .await
+        .unwrap_err();
+    let actual_release = fix.s.lock().unwrap().instances["i-tag-denied"]
+        .auto_release_time
+        .clone()
+        .unwrap();
+    assert!(
+        err.to_string().contains("Forbidden.RAM") && err.to_string().contains(&actual_release),
+        "tag failure must not erase the scheduled outcome: {err}"
+    );
+    let listed = fix
+        .api
+        .list_owned(&conn(&fix.api), &fix.owner)
+        .await
+        .unwrap();
+    let instance = listed
+        .iter()
+        .find(|r| r.id == "i-tag-denied")
+        .expect("tag failure must not hide the scheduled instance");
+    assert_eq!(instance.state, "stopped");
+    assert_eq!(
+        instance.extra.get("auto_release_time"),
+        Some(&actual_release)
+    );
+    assert!(!instance.tags.contains_key("cua-decommissioned"));
+}
+
+#[tokio::test]
+async fn describe_instances_rejects_malformed_multiple_and_mismatched_rows() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    let resource = Resource {
+        provider: "aliyun-ecs".into(),
+        id: "i-exact".into(),
+        resource_type: "instance".into(),
+        region: "cn-hangzhou".into(),
+        ..Default::default()
+    };
+    let cases = [
+        ("missing array", json!({ "Instances": {} })),
+        (
+            "multiple rows",
+            json!({ "Instances": { "Instance": [
+                { "InstanceId": "i-exact" },
+                { "InstanceId": "i-exact" }
+            ] } }),
+        ),
+        (
+            "mismatched ID",
+            json!({ "Instances": { "Instance": [{ "InstanceId": "i-other" }] } }),
+        ),
+    ];
+    for (case, response) in cases {
+        fix.s.lock().unwrap().describe_instances_response = Some(response);
+        let err = fix
+            .api
+            .describe(&conn(&fix.api), &resource)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Cloud(_)), "{case}: {err:?}");
+    }
 }

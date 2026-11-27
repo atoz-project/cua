@@ -728,16 +728,16 @@ impl CloudApi for AliyunEcs {
                         ..Default::default()
                     };
                     // Metadata is optional because the new instance is not tracked for rollback yet.
-                    if let Ok(Some((_, _, cloud_auto_release, cloud_image_id))) =
+                    if let Ok(Some(described)) =
                         self.describe_instance_raw(&effective_conn, &r).await
                     {
-                        if let Some(auto_release_time) = cloud_auto_release {
+                        if let Some(auto_release_time) = described.cloud_auto_release {
                             r.extra.insert(
                                 detail::AUTO_RELEASE_TIME.into(),
                                 model::rfc3339(auto_release_time),
                             );
                         }
-                        if let Some(cloud_image_id) = cloud_image_id {
+                        if let Some(cloud_image_id) = described.cloud_image_id {
                             r.extra
                                 .insert(detail::CLOUD_IMAGE_ID.into(), cloud_image_id);
                         }

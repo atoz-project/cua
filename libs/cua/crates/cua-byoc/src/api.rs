@@ -172,15 +172,13 @@ impl Tested {
     }
 }
 
-/// Outcome of [`CloudApi::delete_in_sweep`] when a shared resource may be
-/// temporarily kept while decommissioned instances await scheduled cloud
-/// release.
+/// Outcome of [`CloudApi::delete_in_sweep`], including resources that remain present.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SweepDelete {
-    /// Resource was deleted (or was already absent).
+    /// Resource was deleted or was already absent.
     Deleted,
-    /// Shared resource is still held only by stopped decommissioned instances
-    /// awaiting their scheduled cloud release timer.
+    /// The resource remains present, such as a stopped instance awaiting its
+    /// AutoReleaseTime or a network resource held by such an instance.
     Held {
         /// Human-readable reason surfaced in sweep output.
         reason: String,

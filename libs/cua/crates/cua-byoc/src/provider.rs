@@ -171,6 +171,35 @@ impl CloudSandboxes {
             }))
     }
 
+    async fn refresh_record(&self, conn: &Connection, owner: &str, rec: &Resource) -> bool {
+        let listed = match self.api.list_owned(conn, owner).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!(resource = %rec.id, "could not refresh retained resource: {e}");
+                return false;
+            }
+        };
+        let Some(fresh) = listed.into_iter().find(|r| {
+            r.provider == rec.provider && r.resource_type == rec.resource_type && r.id == rec.id
+        }) else {
+            return false;
+        };
+        let mut updated = rec.clone();
+        updated.name = fresh.name;
+        updated.region = fresh.region;
+        updated.zone = fresh.zone;
+        updated.state = fresh.state;
+        updated.expires = fresh.expires;
+        updated.tags = fresh.tags;
+        updated.extra.remove(detail::AUTO_RELEASE_TIME);
+        updated.extra.extend(fresh.extra);
+        if let Err(e) = self.store.record(updated) {
+            tracing::warn!(resource = %rec.id, "could not save refreshed resource: {e}");
+            return false;
+        }
+        true
+    }
+
     fn instance(&self, r: &Resource, status: Status, conn: &Connection) -> ProviderInstance {
         let mut i = ProviderInstance::new(
             r.id.clone(),
@@ -254,12 +283,12 @@ impl CloudSandboxes {
                         "failed",
                         &e.to_string(),
                     ));
-                    // Kept, marked: the sweeper deletes it at once (no grace
-                    // period for a create that already failed).
                     tracing::warn!(resource = %r.id, "rollback left it for the sweeper: {e}");
-                    let mut failed = r.clone();
-                    failed.state = "failed".into();
-                    let _ = self.store.record(failed);
+                    if !self.refresh_record(conn, owner, r).await {
+                        let mut failed = r.clone();
+                        failed.state = "failed".into();
+                        let _ = self.store.record(failed);
+                    }
                 }
             }
         }
@@ -866,6 +895,7 @@ impl cua_sandbox_core::Provider for CloudSandboxes {
             }
         };
         if let Err(e) = self.api.delete(&conn, &rec, &owner).await {
+            self.refresh_record(&conn, &owner, &rec).await;
             self.store.audit(audit::of_resource(
                 "resource_deleted",
                 &rec,

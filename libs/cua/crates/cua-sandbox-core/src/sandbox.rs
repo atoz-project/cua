@@ -3546,7 +3546,19 @@ impl Sandbox {
                 }
             }
             Target::Contrib { provider, instance } => {
-                provider.0.delete(&instance.id).await?;
+                if let Err(delete_error) = provider.0.delete(&instance.id).await {
+                    if !self.ephemeral {
+                        let refreshed = provider.0.get(&instance.id).await.and_then(|current| {
+                            self.mgr.refresh_contrib_state(&self.name, &current)
+                        });
+                        if let Err(refresh_error) = refreshed {
+                            return Err(Error::Cloud(format!(
+                                "{delete_error}. Cua could not refresh the retained sandbox state. {refresh_error}"
+                            )));
+                        }
+                    }
+                    return Err(delete_error);
+                }
                 if !self.ephemeral {
                     self.mgr.inner.state.delete(&self.name)?;
                 }

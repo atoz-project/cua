@@ -314,7 +314,6 @@ pub async fn sweep_provider(
         } else if scoped {
             match provider.describe(conn_for(&rec.region), rec).await {
                 Ok(None) => Some("no longer in the cloud"),
-                Ok(Some((state, _))) if state == "terminated" => Some("no longer in the cloud"),
                 Ok(Some((_, tags))) if !model::is_ours(&tags, &owner) => {
                     Some("not Cua-owned in the cloud")
                 }
