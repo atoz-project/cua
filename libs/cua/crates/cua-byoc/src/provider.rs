@@ -38,8 +38,12 @@ pub const ONLINE_WAIT: Duration = Duration::from_secs(20 * 60);
 pub mod detail {
     /// Where it runs ("AWS · us-west-2").
     pub const PLACE: &str = cua_sandbox_core::byoc::DETAIL_PLACE;
+    /// The provider-attested automatic release time (RFC 3339).
+    pub const AUTO_RELEASE_TIME: &str = "auto_release_time";
     /// The machine type.
     pub const MACHINE_TYPE: &str = "machine_type";
+    /// The provider-attested cloud image ID.
+    pub const CLOUD_IMAGE_ID: &str = "cloud_image_id";
     /// The estimated cost per hour (US dollars).
     pub const USD_PER_HOUR: &str = "usd_per_hour";
     /// When it expires (RFC 3339), when it does.
@@ -181,7 +185,13 @@ impl CloudSandboxes {
         }
         i.details
             .insert(detail::PLACE.into(), conn.label(self.api.title()));
-        for k in [detail::MACHINE_TYPE, detail::USD_PER_HOUR, detail::RUNTIME] {
+        for k in [
+            detail::MACHINE_TYPE,
+            detail::CLOUD_IMAGE_ID,
+            detail::AUTO_RELEASE_TIME,
+            detail::USD_PER_HOUR,
+            detail::RUNTIME,
+        ] {
             if let Some(v) = r.extra.get(k) {
                 i.details.insert(k.into(), v.clone());
             }
