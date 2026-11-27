@@ -1060,6 +1060,61 @@ async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_back
 }
 
 #[tokio::test]
+async fn delete_after_region_switch_refreshes_record_in_instance_region() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    let mut opts = CreateOptions::new(ProviderKind::Contrib, "windows");
+    opts.contrib = Some("aliyun-ecs".into());
+    opts.name = Some("win11-region-switch".into());
+    opts.os = "windows".into();
+    opts.disk_gb = Some(100);
+    opts.ready_timeout = Duration::from_secs(10);
+    let sb = fix.sbx.create(opts).await.unwrap();
+    let inst_id = sb.provider_details()["id"].clone();
+
+    let clouds = fix.clouds();
+    clouds
+        .connect_with(&ConnectRequest {
+            target: Target {
+                provider: "aliyun-ecs".into(),
+                region: Some("cn-beijing".into()),
+                token: Some("LTAI_TEST_AK:secret123".into()),
+                windows_image_id: Some("m-2zeeqpoalo73r1psdqjb".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let store = cua_byoc::Store::new(fix.home.path());
+    assert_eq!(
+        store.connection("aliyun-ecs").unwrap().unwrap().region,
+        "cn-beijing"
+    );
+
+    let err = sb.delete().await.unwrap_err();
+    assert!(err.to_string().contains("AutoReleaseTime"), "{err}");
+    let release = fix.s.lock().unwrap().instances[&inst_id]
+        .auto_release_time
+        .clone()
+        .unwrap();
+    let record = store
+        .resources()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == inst_id)
+        .unwrap();
+    assert_eq!(record.region, "cn-hangzhou");
+    assert_eq!(record.state, "stopped");
+    assert_eq!(record.extra.get("auto_release_time"), Some(&release));
+    assert_eq!(
+        fix.sbx.persisted_details("win11-region-switch")["auto_release_time"],
+        release
+    );
+}
+
+#[tokio::test]
 async fn terminated_instance_remains_in_sweep_and_blocks_disconnect_until_exact_absence() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::clear();
