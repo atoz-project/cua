@@ -788,6 +788,74 @@ async fn failed_create_rollback_without_ttl_remains_sweep_deletable_after_refres
 }
 
 #[tokio::test]
+async fn sweep_first_forbidden_delete_refreshes_held_item_and_record() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::clear();
+    let fix = ForbiddenDeleteFixture::start().await;
+    let store = cua_byoc::Store::new(fix.home.path());
+    let id = "i-sweep-first-held";
+    let expires = model::now().saturating_sub(60);
+    let tags = BTreeMap::from([
+        ("cua-managed".into(), "true".into()),
+        ("cua-owner".into(), fix.owner_tag.clone()),
+        ("cua-expires".into(), expires.to_string()),
+    ]);
+    store
+        .record(Resource {
+            provider: "aliyun-ecs".into(),
+            id: id.into(),
+            resource_type: "instance".into(),
+            name: "cua-sweep-first-held".into(),
+            region: "cn-hangzhou".into(),
+            sandbox: "aliyun-ecs:sweep-first-held".into(),
+            state: "running".into(),
+            expires,
+            tags: tags.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    fix.s.lock().unwrap().seed_instance(FakeInstance {
+        instance_id: id.into(),
+        instance_name: "cua-sweep-first-held".into(),
+        region_id: "cn-hangzhou".into(),
+        status: "Running".into(),
+        tags,
+        ..Default::default()
+    });
+
+    let clouds = fix.clouds();
+    let swept = clouds
+        .sweep(Some("aliyun-ecs"), false, false)
+        .await
+        .unwrap();
+    let row = swept
+        .resources
+        .iter()
+        .find(|item| item.resource.id == id)
+        .expect("held instance must remain in sweep");
+    let release = fix.s.lock().unwrap().instances[id]
+        .auto_release_time
+        .clone()
+        .unwrap();
+    assert_eq!(row.action, "keep");
+    assert_eq!(row.resource.state, "stopped");
+    assert_eq!(row.resource.sandbox, "aliyun-ecs:sweep-first-held");
+    assert!(row.reason.contains(&release), "{row:?}");
+
+    let record = store
+        .resources()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap();
+    assert_eq!(record.state, "stopped");
+    assert_eq!(record.extra.get("auto_release_time"), Some(&release));
+    let status = clouds.status(Some("aliyun-ecs")).await.unwrap();
+    let status_row = status.resources.iter().find(|r| r.id == id).unwrap();
+    assert_eq!(status_row.state, "stopped");
+}
+
+#[tokio::test]
 async fn delete_instance_forbidden_sweeps_expired_orphan_and_enforces_cloud_backstop() {
     let _env_lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::clear();
