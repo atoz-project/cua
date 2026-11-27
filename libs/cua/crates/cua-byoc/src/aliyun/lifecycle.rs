@@ -18,6 +18,7 @@ use super::existing_vpc;
 use super::net;
 use crate::api::{Result, SweepDelete};
 use crate::model::{self, Connection, Resource, tag};
+use crate::provider::detail;
 
 pub(crate) const DECOMMISSIONED_TAG_KEY: &str = "cua-decommissioned";
 
@@ -60,9 +61,12 @@ fn parse_auto_release_secs(inst: &serde_json::Value) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-struct OwnedInstance {
-    state: String,
-    cloud_auto_release: Option<u64>,
+pub(super) struct InstanceDescription {
+    pub(super) state: String,
+    pub(super) tags: BTreeMap<String, String>,
+    pub(super) cloud_auto_release: Option<u64>,
+    pub(super) cloud_image_id: Option<String>,
+    pub(super) stopped_mode: Option<String>,
 }
 
 impl AliyunEcs {
@@ -70,16 +74,12 @@ impl AliyunEcs {
         &self,
         conn: &Connection,
         r: &Resource,
-    ) -> Result<
-        Option<(
-            String,
-            BTreeMap<String, String>,
-            Option<u64>,
-            Option<String>,
-        )>,
-    > {
-        if r.id.is_empty() || r.resource_type != "instance" {
-            return Ok(None);
+    ) -> Result<Option<InstanceDescription>> {
+        if r.id.trim().is_empty() || r.resource_type != "instance" {
+            return Err(Error::InvalidArgument(format!(
+                "aliyun-ecs: DescribeInstances requires one non-empty instance ID, got {} {:?}",
+                r.resource_type, r.id
+            )));
         }
         let region = effective_region(conn, r);
         let profile_hint = self.profile_hint(conn);
@@ -97,29 +97,47 @@ impl AliyunEcs {
                 profile_hint,
             )
             .await?;
-        let Some(inst) = v["Instances"]["Instance"]
-            .as_array()
-            .and_then(|a| a.first())
-        else {
-            return Ok(None);
+        let rows = v["Instances"]["Instance"].as_array().ok_or_else(|| {
+            Error::Cloud(format!(
+                "aliyun-ecs: DescribeInstances for {} returned no Instances.Instance array",
+                r.id
+            ))
+        })?;
+        let inst = match rows.as_slice() {
+            [] => return Ok(None),
+            [inst] if inst["InstanceId"].as_str() == Some(r.id.as_str()) => inst,
+            [inst] => {
+                return Err(Error::Cloud(format!(
+                    "aliyun-ecs: DescribeInstances for {} returned instance {:?}",
+                    r.id,
+                    inst["InstanceId"].as_str().unwrap_or_default()
+                )));
+            }
+            _ => {
+                return Err(Error::Cloud(format!(
+                    "aliyun-ecs: DescribeInstances for {} returned {} instances",
+                    r.id,
+                    rows.len()
+                )));
+            }
         };
         let cloud_image_id = inst["ImageId"]
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let tags = net::tags_of(inst);
-        let state = if tags.get(DECOMMISSIONED_TAG_KEY).map(String::as_str) == Some("true") {
-            "terminated".to_string()
-        } else {
-            state_of(inst["Status"].as_str().unwrap_or(""))
-        };
-        Ok(Some((
-            state,
-            tags,
-            parse_auto_release_secs(inst),
+        let stopped_mode = inst["StoppedMode"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok(Some(InstanceDescription {
+            state: state_of(inst["Status"].as_str().unwrap_or("")),
+            tags: net::tags_of(inst),
+            cloud_auto_release: parse_auto_release_secs(inst),
             cloud_image_id,
-        )))
+            stopped_mode,
+        }))
     }
 
     fn refuse_unowned(verb: &str, r: &Resource, owner: &str) -> Error {
@@ -163,19 +181,14 @@ impl AliyunEcs {
         r: &Resource,
         owner: &str,
         verb: &str,
-    ) -> Result<Option<OwnedInstance>> {
-        let Some((state, tags, cloud_auto_release, _)) =
-            self.describe_instance_raw(conn, r).await?
-        else {
+    ) -> Result<Option<InstanceDescription>> {
+        let Some(described) = self.describe_instance_raw(conn, r).await? else {
             return Ok(None);
         };
-        if !model::is_ours(&tags, owner) {
+        if !model::is_ours(&described.tags, owner) {
             return Err(Self::refuse_unowned(verb, r, owner));
         }
-        Ok(Some(OwnedInstance {
-            state,
-            cloud_auto_release,
-        }))
+        Ok(Some(described))
     }
 
     async fn stop_owned_instance(
@@ -279,7 +292,7 @@ impl AliyunEcs {
         Ok(self
             .describe_instance_raw(conn, r)
             .await?
-            .map(|(state, tags, _, _)| (state, tags)))
+            .map(|described| (described.state, described.tags)))
     }
 
     pub(crate) async fn stop_resource(
@@ -350,12 +363,44 @@ impl AliyunEcs {
         Ok(())
     }
 
+    async fn decommissioned_outcome(
+        &self,
+        conn: &Connection,
+        r: &Resource,
+        denial: &str,
+    ) -> Result<SweepDelete> {
+        let Some(current) = self.describe_instance_raw(conn, r).await? else {
+            return Ok(SweepDelete::Deleted);
+        };
+        if current.state != "stopped" || current.stopped_mode.as_deref() != Some("StopCharging") {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: {denial}; instance {} remains visible as {} with StoppedMode={}",
+                r.id,
+                current.state,
+                current.stopped_mode.as_deref().unwrap_or("unknown")
+            )));
+        }
+        let Some(auto_release) = current.cloud_auto_release else {
+            return Err(Error::Cloud(format!(
+                "aliyun-ecs: {denial}; stopped instance {} has no valid AutoReleaseTime",
+                r.id
+            )));
+        };
+        let auto_release = model::rfc3339(auto_release);
+        Ok(SweepDelete::Held {
+            reason: format!(
+                "{denial}; instance remains stopped with StopCharging and AutoReleaseTime ({auto_release})"
+            ),
+        })
+    }
+
     async fn decommission_without_delete(
         &self,
         conn: &Connection,
         r: &Resource,
-        owned: &OwnedInstance,
-    ) -> Result<()> {
+        owned: &InstanceDescription,
+        denial: &str,
+    ) -> Result<SweepDelete> {
         self.stop_owned_instance(conn, r, &owned.state, true)
             .await?;
         let region = effective_region(conn, r);
@@ -385,9 +430,8 @@ impl AliyunEcs {
                     ApiBody::Text(_) => "",
                 };
                 if is_instance_not_found(m_code) {
-                    return Ok(());
-                }
-                if is_permission_denied(m_code)
+                    // The fresh exact describe below decides whether it is absent.
+                } else if is_permission_denied(m_code)
                     && let Some(existing_ts) = owned.cloud_auto_release
                 {
                     tracing::warn!(
@@ -439,7 +483,7 @@ impl AliyunEcs {
                 );
             }
         }
-        Ok(())
+        self.decommissioned_outcome(conn, r, denial).await
     }
 
     pub(crate) async fn delete_resource(
@@ -473,8 +517,14 @@ impl AliyunEcs {
         else {
             return Ok(SweepDelete::Deleted);
         };
-        if matches!(owned.state.as_str(), "terminated" | "deleted") {
-            return Ok(SweepDelete::Deleted);
+        if owned.tags.get(DECOMMISSIONED_TAG_KEY).map(String::as_str) == Some("true") {
+            return self
+                .decommissioned_outcome(
+                    conn,
+                    r,
+                    "DeleteInstance was denied when this instance was decommissioned",
+                )
+                .await;
         }
         let region = effective_region(conn, r);
         let profile_hint = self.profile_hint(conn);
@@ -497,11 +547,20 @@ impl AliyunEcs {
                 ApiBody::Text(_) => "",
             };
             if is_instance_not_found(code) {
-                return Ok(SweepDelete::Deleted);
+                return match self.describe_instance_raw(conn, r).await? {
+                    None => Ok(SweepDelete::Deleted),
+                    Some(current) => Err(Error::Cloud(format!(
+                        "aliyun-ecs: DeleteInstance reported {code} for {}, but a fresh DescribeInstances returned it as {}",
+                        r.id, current.state
+                    ))),
+                };
             }
             if is_permission_denied(code) {
-                self.decommission_without_delete(conn, r, &owned).await?;
-                return Ok(SweepDelete::Deleted);
+                let denial =
+                    map_api_error("DeleteInstance", ECS_API_VERSION, status, &body).to_string();
+                return self
+                    .decommission_without_delete(conn, r, &owned, &denial)
+                    .await;
             }
             return Err(map_api_error(
                 "DeleteInstance",
@@ -511,15 +570,15 @@ impl AliyunEcs {
             ));
         }
         for _ in 0..30 {
-            match self.describe_resource(conn, r).await? {
+            match self.describe_instance_raw(conn, r).await? {
                 None => return Ok(SweepDelete::Deleted),
-                Some((st, _)) if matches!(st.as_str(), "terminated" | "deleted") => {
-                    return Ok(SweepDelete::Deleted);
-                }
-                _ => tokio::time::sleep(self.poll_interval()).await,
+                Some(_) => tokio::time::sleep(self.poll_interval()).await,
             }
         }
-        Ok(SweepDelete::Deleted)
+        Err(Error::Timeout(format!(
+            "aliyun-ecs: instance {} remained visible after 30 DeleteInstance presence checks",
+            r.id
+        )))
     }
 
     pub(crate) async fn list_owned_resources(
@@ -561,24 +620,23 @@ impl AliyunEcs {
                 continue;
             }
             let st = state_of(inst["Status"].as_str().unwrap_or(""));
-            if tags.get(DECOMMISSIONED_TAG_KEY).map(String::as_str) == Some("true") {
-                if !matches!(st.as_str(), "terminated" | "deleted") {
-                    let rel = inst["AutoReleaseTime"]
-                        .as_str()
-                        .and_then(normalize_aliyun_iso8601);
-                    if let Some(vpc) = inst["VpcAttributes"]["VpcId"].as_str() {
-                        record_hold(vpc, rel.as_deref());
-                    }
-                    if let Some(vsw) = inst["VpcAttributes"]["VSwitchId"].as_str() {
-                        record_hold(vsw, rel.as_deref());
-                    }
-                    if let Some(sgs) = inst["SecurityGroupIds"]["SecurityGroupId"].as_array() {
-                        for sg in sgs.iter().filter_map(|v| v.as_str()) {
-                            record_hold(sg, rel.as_deref());
-                        }
+            let decommissioned =
+                tags.get(DECOMMISSIONED_TAG_KEY).map(String::as_str) == Some("true");
+            if decommissioned && !matches!(st.as_str(), "terminated" | "deleted") {
+                let rel = inst["AutoReleaseTime"]
+                    .as_str()
+                    .and_then(normalize_aliyun_iso8601);
+                if let Some(vpc) = inst["VpcAttributes"]["VpcId"].as_str() {
+                    record_hold(vpc, rel.as_deref());
+                }
+                if let Some(vsw) = inst["VpcAttributes"]["VSwitchId"].as_str() {
+                    record_hold(vsw, rel.as_deref());
+                }
+                if let Some(sgs) = inst["SecurityGroupIds"]["SecurityGroupId"].as_array() {
+                    for sg in sgs.iter().filter_map(|v| v.as_str()) {
+                        record_hold(sg, rel.as_deref());
                     }
                 }
-                continue;
             }
             let id = inst["InstanceId"].as_str().unwrap_or_default().to_string();
             if id.is_empty() {
@@ -611,6 +669,12 @@ impl AliyunEcs {
                 && !vsw.is_empty()
             {
                 r.extra.insert("vswitch".into(), vsw.into());
+            }
+            if let Some(auto_release) = parse_auto_release_secs(&inst) {
+                r.extra.insert(
+                    detail::AUTO_RELEASE_TIME.into(),
+                    model::rfc3339(auto_release),
+                );
             }
             out.push(r);
         }

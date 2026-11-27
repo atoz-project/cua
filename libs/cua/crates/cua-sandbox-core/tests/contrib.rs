@@ -28,6 +28,7 @@ struct Fake {
     /// `create` makes the sandbox, then never returns (the platform is
     /// still booting it when a create is cancelled).
     hang: std::sync::atomic::AtomicBool,
+    delete_denied: std::sync::atomic::AtomicBool,
 }
 
 impl Fake {
@@ -38,6 +39,7 @@ impl Fake {
             created: Mutex::default(),
             live: Mutex::default(),
             hang: Default::default(),
+            delete_denied: Default::default(),
         })
     }
 }
@@ -105,6 +107,9 @@ impl Provider for Fake {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        if self.delete_denied.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Cloud("decommission scheduled".into()));
+        }
         self.live.lock().unwrap().remove(id);
         Ok(())
     }
@@ -998,4 +1003,81 @@ async fn disk_gb_zero_and_whitespace_cloud_image_or_instance_type_fail_invalid_a
 
     assert!(e.fake.created.lock().unwrap().is_empty());
     assert!(cloud.created.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn contrib_delete_error_refreshes_retained_state_and_details() {
+    let e = env(false).await;
+    let name = "cua-contrib-scheduled";
+    let sb = e
+        .sbx
+        .create(opts("ghcr.io/trycua/linux:24.04").name(name))
+        .await
+        .unwrap();
+    e.fake
+        .delete_denied
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let release = "2026-11-27T07:20:00Z";
+    {
+        let mut live = e.fake.live.lock().unwrap();
+        let instance = live.get_mut("sbx1").unwrap();
+        instance.status = Status::Suspended;
+        instance
+            .details
+            .insert("auto_release_time".into(), release.into());
+    }
+
+    let err = sb.delete().await.unwrap_err();
+    assert!(matches!(err, Error::Cloud(_)), "{err:?}");
+    assert!(err.to_string().contains("decommission scheduled"));
+    let listed = e.sbx.list().await.unwrap();
+    let row = listed.iter().find(|row| row.name == name).unwrap();
+    assert_eq!(row.status, Status::Suspended);
+    assert_eq!(e.sbx.get(name).await.unwrap().status, Status::Suspended);
+    assert_eq!(e.sbx.persisted_details(name)["auto_release_time"], release);
+    assert!(e.fake.live.lock().unwrap().contains_key("sbx1"));
+
+    e.fake
+        .delete_denied
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    e.sbx.delete(name).await.unwrap();
+    assert!(e.fake.live.lock().unwrap().is_empty());
+    assert!(e.sbx.connect(name).await.is_err());
+}
+
+#[tokio::test]
+async fn contrib_delete_by_name_error_refreshes_retained_state_and_details() {
+    let e = env(false).await;
+    let name = "cua-contrib-scheduled-by-name";
+    e.sbx
+        .create(opts("ghcr.io/trycua/linux:24.04").name(name))
+        .await
+        .unwrap();
+    e.fake
+        .delete_denied
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let release = "2026-11-27T07:20:00Z";
+    {
+        let mut live = e.fake.live.lock().unwrap();
+        let instance = live.get_mut("sbx1").unwrap();
+        instance.status = Status::Suspended;
+        instance
+            .details
+            .insert("auto_release_time".into(), release.into());
+    }
+
+    let err = e.sbx.delete(name).await.unwrap_err();
+    assert!(matches!(err, Error::Cloud(_)), "{err:?}");
+    assert!(err.to_string().contains("decommission scheduled"));
+    let listed = e.sbx.list().await.unwrap();
+    let row = listed.iter().find(|row| row.name == name).unwrap();
+    assert_eq!(row.status, Status::Suspended);
+    assert_eq!(e.sbx.persisted_details(name)["auto_release_time"], release);
+    assert!(e.fake.live.lock().unwrap().contains_key("sbx1"));
+
+    e.fake
+        .delete_denied
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    e.sbx.delete(name).await.unwrap();
+    assert!(e.sbx.connect(name).await.is_err());
 }

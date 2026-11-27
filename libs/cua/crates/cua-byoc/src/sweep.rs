@@ -213,16 +213,12 @@ pub async fn sweep_provider(
     let instances_left = listed.iter().any(|r| {
         matches!(r.resource_type.as_str(), "instance" | "sandbox")
             && !verdict(r, &r.tags, &owner, &records, all, true, t).delete
-            && r.state != "terminated"
     });
     let mut out = Vec::new();
     // Instances and sandboxes first, shared resources after them.
     let mut ordered: Vec<&Resource> = listed.iter().collect();
     ordered.sort_by_key(|r| r.delete_rank());
     for r in ordered {
-        if r.state == "terminated" {
-            continue;
-        }
         let mut v = verdict(r, &r.tags, &owner, &records, all, instances_left, t);
         if !v.delete && r.extra.contains_key(model::DEFAULT_VPC) {
             v.reason.push_str(
@@ -276,8 +272,26 @@ pub async fn sweep_provider(
                     }
                 }
                 Ok(SweepDelete::Held { reason }) => {
+                    let fresh = provider
+                        .list_owned(conn_for(&r.region), &owner)
+                        .await?
+                        .into_iter()
+                        .find(|current| current.same_identity(r))
+                        .ok_or_else(|| {
+                            cua_sandbox_core::Error::Cloud(format!(
+                                "{} was held after deletion but missing from the provider refresh",
+                                r.id
+                            ))
+                        })?;
                     item.action = "keep".into();
                     item.reason = reason;
+                    if let Some(rec) = records.iter().find(|rec| rec.same_identity(r)) {
+                        let updated = crate::provider::merge_refreshed_record(rec, fresh);
+                        item.resource = updated.wire(t);
+                        store.record(updated).map_err(cua_sandbox_core::Error::Io)?;
+                    } else {
+                        item.resource = fresh.wire(t);
+                    }
                 }
                 Err(e) => {
                     item.action = "failed".into();
@@ -314,7 +328,6 @@ pub async fn sweep_provider(
         } else if scoped {
             match provider.describe(conn_for(&rec.region), rec).await {
                 Ok(None) => Some("no longer in the cloud"),
-                Ok(Some((state, _))) if state == "terminated" => Some("no longer in the cloud"),
                 Ok(Some((_, tags))) if !model::is_ours(&tags, &owner) => {
                     Some("not Cua-owned in the cloud")
                 }
@@ -442,7 +455,7 @@ pub(crate) async fn live_resources(
     let t = now();
     let mut out: Vec<Live> = listed
         .iter()
-        .filter(|r| r.state != "terminated" && wanted(r))
+        .filter(|r| wanted(r))
         .map(|r| Live {
             resource: r.clone(),
             unverified: None,
@@ -490,11 +503,7 @@ pub(crate) async fn live_resources(
                 there.zone = String::new();
             }
             match p.describe(&there, &rec).await {
-                Ok(Some((state, tags)))
-                    if state != "terminated" && model::is_ours(&tags, &owner) =>
-                {
-                    None
-                }
+                Ok(Some((_, tags))) if model::is_ours(&tags, &owner) => None,
                 Ok(_) => continue,
                 Err(e) => Some(format!(
                     "recorded in {}, could not be checked: {e}",

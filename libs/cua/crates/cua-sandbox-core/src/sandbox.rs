@@ -2344,6 +2344,25 @@ impl Sandboxes {
         }
     }
 
+    async fn retained_contrib_delete_error(
+        &self,
+        name: &str,
+        provider: &dyn crate::Provider,
+        id: &str,
+        delete_error: Error,
+    ) -> Error {
+        let refreshed = provider
+            .get(id)
+            .await
+            .and_then(|current| self.refresh_contrib_state(name, &current));
+        match refreshed {
+            Ok(()) => delete_error,
+            Err(refresh_error) => Error::Cloud(format!(
+                "{delete_error}. Cua could not refresh the retained sandbox state. {refresh_error}"
+            )),
+        }
+    }
+
     /// Deletes by name: removes the instance, then the state file.
     ///
     /// Idempotent about the backing resource: a state file whose VM or
@@ -2384,7 +2403,11 @@ impl Sandboxes {
                 let (provider, id) = self.contrib_target(&s)?;
                 match provider.delete(&id).await {
                     Ok(()) | Err(Error::NotFound(_)) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        return Err(self
+                            .retained_contrib_delete_error(name, provider.as_ref(), &id, e)
+                            .await);
+                    }
                 }
             }
             _ => {}
@@ -3546,7 +3569,20 @@ impl Sandbox {
                 }
             }
             Target::Contrib { provider, instance } => {
-                provider.0.delete(&instance.id).await?;
+                if let Err(delete_error) = provider.0.delete(&instance.id).await {
+                    if !self.ephemeral {
+                        return Err(self
+                            .mgr
+                            .retained_contrib_delete_error(
+                                &self.name,
+                                provider.0.as_ref(),
+                                &instance.id,
+                                delete_error,
+                            )
+                            .await);
+                    }
+                    return Err(delete_error);
+                }
                 if !self.ephemeral {
                     self.mgr.inner.state.delete(&self.name)?;
                 }
